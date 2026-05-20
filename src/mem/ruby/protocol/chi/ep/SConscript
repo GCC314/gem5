@@ -1,0 +1,17 @@
+# -*- mode:python -*-
+
+# Copyright (c) 2024 UBCC Project
+# All rights reserved.
+
+Import('*')
+
+if env['CONF']['PROTOCOL'] != 'CHI':
+    Return()
+
+SimObject('EPController.py',
+    sim_objects=['EPRNFController', 'EPSNFController'])
+
+DebugFlag('RubyEPController')
+
+Source('EPRNFController.cc')
+Source('EPSNFController.cc')
