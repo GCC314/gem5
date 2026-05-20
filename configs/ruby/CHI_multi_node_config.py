@@ -1,18 +1,11 @@
 """
 CHI multi-node configuration for STRICT domain isolation.
 
-Each logical node has independent RN-F, HN-F, and SN-F controller sets
-with enforced per-node downstream filtering. Cross-node ordinary CHI
-messages are prevented by BOTH:
-  a) Contiguous, non-interleaved HN-F address partition
-  b) Strict downstream destination filtering (ALWAYS enabled)
+Each logical node has independent RN-F, HN-F, SN-F, EP-RNF, and EP-SNF
+controller sets with enforced per-node downstream filtering.
 
-Architecture (N=2 example):
-  Node0: CPU0,1 -> L1 -> Shared L2 -> HN-F0 [0, 128MB) -> SN-F0
-  Node1: CPU2,3 -> L1 -> Shared L2 -> HN-F1 [128MB, 256MB) -> SN-F1
-
-Cross-node checker: Python-level post-creation validation ensures
-every controller's downstream list contains only same-node targets.
+EP controllers (M3+): EP-RNF serves as snoop destination; EP-SNF handles
+DSM Remote ReadNoSnp. Created by create_ep_controllers().
 
 Used with --chi-config. Requires --num-l3caches=N --num-dirs=N (power-of-2).
 """
@@ -32,6 +25,47 @@ from ruby.CHI_config import (
 )
 
 CORES_PER_NODE = 2
+
+
+def _make_ep_post_hook(num_nodes, data_channel_size=32):
+    """Return a post-hook function that creates EP controllers in topology."""
+    def _hook(ruby_sys, options, network_cntrls, all_cntrls):
+        base = options.num_cpus * 2 + options.num_l3caches + 100
+        for ni in range(num_nodes):
+            # EP-RNF
+            ep_rnf = EPRNFController(
+                node_id=ni, version=base, ruby_system=ruby_sys,
+                data_channel_size=data_channel_size,
+                reqOut=MessageBuffer(), snpOut=MessageBuffer(),
+                rspOut=MessageBuffer(), datOut=MessageBuffer(),
+                reqIn=MessageBuffer(), snpIn=MessageBuffer(),
+                rspIn=MessageBuffer(), datIn=MessageBuffer())
+            base += 1
+            for attr in ['reqOut','rspOut','snpOut','datOut']:
+                getattr(ep_rnf, attr).out_port = ruby_sys.network.in_port
+            for attr in ['reqIn','rspIn','snpIn','datIn']:
+                getattr(ep_rnf, attr).in_port = ruby_sys.network.out_port
+            network_cntrls.append(ep_rnf); all_cntrls.append(ep_rnf)
+            if not hasattr(ruby_sys, '_ep_rnfs'): ruby_sys._ep_rnfs = []
+            ruby_sys._ep_rnfs.append(ep_rnf)
+
+            # EP-SNF
+            ep_snf = EPSNFController(
+                node_id=ni, version=base, ruby_system=ruby_sys,
+                data_channel_size=data_channel_size,
+                reqOut=MessageBuffer(), snpOut=MessageBuffer(),
+                rspOut=MessageBuffer(), datOut=MessageBuffer(),
+                reqIn=MessageBuffer(), snpIn=MessageBuffer(),
+                rspIn=MessageBuffer(), datIn=MessageBuffer())
+            base += 1
+            for attr in ['reqOut','rspOut','snpOut','datOut']:
+                getattr(ep_snf, attr).out_port = ruby_sys.network.in_port
+            for attr in ['reqIn','rspIn','snpIn','datIn']:
+                getattr(ep_snf, attr).in_port = ruby_sys.network.out_port
+            network_cntrls.append(ep_snf); all_cntrls.append(ep_snf)
+            if not hasattr(ruby_sys, '_ep_snfs'): ruby_sys._ep_snfs = []
+            ruby_sys._ep_snfs.append(ep_snf)
+    return _hook
 
 
 def _tag(node_id, controllers):
@@ -161,6 +195,14 @@ class MultiNodeCHI_RNF(CHI_Node):
         if len(cpus) % cores_per != 0:
             m5.fatal(f"CPU count ({len(cpus)}) not multiple of "
                      f"cores_per_node ({cores_per})")
+
+        # M3: EP post-hook (enable with --enable-ep-controllers flag)
+        if getattr(options, 'enable_ep_controllers', False):
+            parent_sys = getattr(ruby_system, '_parent', None)
+            if parent_sys and not getattr(parent_sys, '_chi_post_hook', None):
+                parent_sys._chi_post_hook = _make_ep_post_hook(num_nodes)
+                print(f"M3: EP post-hook registered for {num_nodes} nodes")
+
         rnfs = []
         for ni in range(num_nodes):
             ncpus = cpus[ni * cores_per:(ni + 1) * cores_per]
@@ -244,3 +286,58 @@ class MultiNodeCHI_SNF(_BaseSNF):
 CHI_RNF = MultiNodeCHI_RNF
 CHI_HNF = MultiNodeCHI_HNF
 CHI_SNF_MainMem = MultiNodeCHI_SNF
+
+
+def create_ep_controllers(ruby_system, num_nodes, data_channel_size=32):
+    """Create per-node EP-RNF and EP-SNF controllers and wire them
+    to the Ruby network. Returns a post-hook function for CHI.py.
+
+    Usage: system._chi_post_hook = create_ep_controllers(system.ruby, num_nodes)
+    """
+    def _post_hook(ruby_sys, options, network_cntrls, all_cntrls):
+        # Get base version
+        base_version = options.num_cpus * 2 + options.num_l3caches + 100
+
+        for ni in range(num_nodes):
+            # EP-RNF
+            ep_rnf = EPRNFController(
+                node_id=ni, version=base_version,
+                ruby_system=ruby_sys, data_channel_size=data_channel_size)
+            base_version += 1
+            ep_rnf.reqOut.out_port = ruby_sys.network.in_port
+            ep_rnf.rspOut.out_port = ruby_sys.network.in_port
+            ep_rnf.snpOut.out_port = ruby_sys.network.in_port
+            ep_rnf.datOut.out_port = ruby_sys.network.in_port
+            ep_rnf.reqIn.in_port = ruby_sys.network.out_port
+            ep_rnf.rspIn.in_port = ruby_sys.network.out_port
+            ep_rnf.snpIn.in_port = ruby_sys.network.out_port
+            ep_rnf.datIn.in_port = ruby_sys.network.out_port
+            network_cntrls.append(ep_rnf)
+            all_cntrls.append(ep_rnf)
+            if not hasattr(ruby_sys, '_ep_rnfs'):
+                ruby_sys._ep_rnfs = []
+            ruby_sys._ep_rnfs.append(ep_rnf)
+
+            # EP-SNF
+            ep_snf = EPSNFController(
+                node_id=ni, version=base_version,
+                ruby_system=ruby_sys, data_channel_size=data_channel_size)
+            base_version += 1
+            ep_snf.reqOut.out_port = ruby_sys.network.in_port
+            ep_snf.rspOut.out_port = ruby_sys.network.in_port
+            ep_snf.snpOut.out_port = ruby_sys.network.in_port
+            ep_snf.datOut.out_port = ruby_sys.network.in_port
+            ep_snf.reqIn.in_port = ruby_sys.network.out_port
+            ep_snf.rspIn.in_port = ruby_sys.network.out_port
+            ep_snf.snpIn.in_port = ruby_sys.network.out_port
+            ep_snf.datIn.in_port = ruby_sys.network.out_port
+            network_cntrls.append(ep_snf)
+            all_cntrls.append(ep_snf)
+            if not hasattr(ruby_sys, '_ep_snfs'):
+                ruby_sys._ep_snfs = []
+            ruby_sys._ep_snfs.append(ep_snf)
+
+        print(f"M3: Created {num_nodes} EP-RNF + {num_nodes} EP-SNF "
+              f"controllers in topology")
+
+    return _post_hook

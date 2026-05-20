@@ -247,6 +247,11 @@ def create_system(
         if not k.startswith("__"):
             setattr(options, k, getattr(params, k))
 
+    # Hook: allow external config to register EP controllers before topology
+    ep_post_hook = getattr(system, "_chi_post_hook", None)
+    if ep_post_hook:
+        ep_post_hook(ruby_system, options, network_cntrls, all_cntrls)
+
     if options.topology == "CustomMesh":
         topology = create_topology(network_nodes, options)
     elif options.topology in ["Crossbar", "Pt2Pt"]:
