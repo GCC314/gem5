@@ -97,3 +97,4 @@ or start discussions. To join the mailing list please visit
 We hope you enjoy using gem5. When appropriate we advise sharing your
 contributions to the project. <https://www.gem5.org/contributing> can help you
 get started. Additional information can be found in the CONTRIBUTING.md file.
+M0 test line added from container.
