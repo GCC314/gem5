@@ -50,6 +50,9 @@ def define_options(parser):
         "Required for CustomMesh topology",
     )
     parser.add_argument("--enable-dvm", default=False, action="store_true")
+    parser.add_argument("--enable-ep-controllers", default=False,
+                        action="store_true",
+                        help="Enable EP-RNF/EP-SNF controllers in topology")
 
 
 def read_config_file(file):

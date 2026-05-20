@@ -27,6 +27,25 @@ from ruby.CHI_config import (
 CORES_PER_NODE = 2
 
 
+def _make_downstream_check_hook():
+    """Return a post-hook that validates RN-F/HN-F downstream isolation."""
+    def _hook(ruby_sys, options, network_cntrls, all_cntrls):
+        errors = []
+        for rnf in getattr(ruby_sys, 'rnf', []):
+            rnf_nid = rnf._node_id
+            for c in rnf._ll_cntrls:
+                dests = getattr(c, 'downstream_destinations', [])
+                for d in dests:
+                    d_nid = getattr(d, '_node_id', -1)
+                    if d_nid != rnf_nid and d_nid != -1:
+                        errors.append(
+                            f"RN-F node{rnf_nid} -> HN-F node{d_nid} CROSS-NODE")
+        if errors:
+            fatal("Cross-node downstream VIOLATION:\n" + "\n".join(errors))
+        print(f"M2: Downstream isolation check passed ({len(ruby_sys.rnf)} RN-Fs)")
+    return _hook
+
+
 def _make_ep_post_hook(num_nodes, data_channel_size=32):
     """Return a post-hook function that creates EP controllers in topology."""
     def _hook(ruby_sys, options, network_cntrls, all_cntrls):
@@ -196,12 +215,20 @@ class MultiNodeCHI_RNF(CHI_Node):
             m5.fatal(f"CPU count ({len(cpus)}) not multiple of "
                      f"cores_per_node ({cores_per})")
 
-        # M3: EP post-hook (enable with --enable-ep-controllers flag)
-        if getattr(options, 'enable_ep_controllers', False):
-            parent_sys = getattr(ruby_system, '_parent', None)
-            if parent_sys and not getattr(parent_sys, '_chi_post_hook', None):
-                parent_sys._chi_post_hook = _make_ep_post_hook(num_nodes)
+        # M2: Register downstream validation hook (runs after all downstreams set)
+        parent_sys = getattr(ruby_system, '_parent', None)
+        if parent_sys and not getattr(parent_sys, '_chi_post_hook', None):
+            # Always set downstream validation; optionally add EP controllers
+            hooks = []
+            hooks.append(_make_downstream_check_hook())
+            if getattr(options, 'enable_ep_controllers', False):
+                hooks.append(_make_ep_post_hook(num_nodes))
                 print(f"M3: EP post-hook registered for {num_nodes} nodes")
+
+            def _combined_hook(ruby_sys, opts, net_ctrl, all_ctrl):
+                for h in hooks:
+                    h(ruby_sys, opts, net_ctrl, all_ctrl)
+            parent_sys._chi_post_hook = _combined_hook
 
         rnfs = []
         for ni in range(num_nodes):
