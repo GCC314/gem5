@@ -90,5 +90,58 @@ EPRNFController::sendSnoopResp(const CHIRequestMsg *snoop)
     }
 }
 
+// === M4: Sentinel Registration API ===
+
+void
+EPRNFController::registerExternalSharer(Addr addr)
+{
+    sentinelTracker.insertSharer(addr, nodeId);
+    DPRINTF(RubyCHIGeneric,
+            "EPRNFController[%d] registered ExternalSharer for addr=0x%lx\n",
+            m_version, addr);
+}
+
+void
+EPRNFController::registerExternalOwner(Addr addr)
+{
+    sentinelTracker.insertOwner(addr, nodeId);
+    DPRINTF(RubyCHIGeneric,
+            "EPRNFController[%d] registered ExternalOwner for addr=0x%lx\n",
+            m_version, addr);
+}
+
+void
+EPRNFController::unregisterSentinel(Addr addr)
+{
+    sentinelTracker.remove(addr);
+    DPRINTF(RubyCHIGeneric,
+            "EPRNFController[%d] unregistered sentinel for addr=0x%lx\n",
+            m_version, addr);
+}
+
+bool
+EPRNFController::hasSentinel(Addr addr) const
+{
+    return sentinelTracker.isPresent(addr);
+}
+
+SentinelState
+EPRNFController::getSentinelState(Addr addr) const
+{
+    return sentinelTracker.getState(addr);
+}
+
+int
+EPRNFController::getSentinelCount() const
+{
+    return sentinelTracker.count();
+}
+
+void
+EPRNFController::dumpSentinels() const
+{
+    sentinelTracker.dump();
+}
+
 } // namespace ruby
 } // namespace gem5

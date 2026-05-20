@@ -11,6 +11,7 @@
 #ifndef __MEM_RUBY_PROTOCOL_CHI_EP_EPRNFCONTROLLER_HH__
 #define __MEM_RUBY_PROTOCOL_CHI_EP_EPRNFCONTROLLER_HH__
 
+#include "mem/ruby/protocol/chi/ep/SentinelTracker.hh"
 #include "mem/ruby/protocol/chi/generic/CHIGenericController.hh"
 #include "params/EPRNFController.hh"
 
@@ -31,6 +32,17 @@ class EPRNFController : public CHIGenericController
 
     int getNodeId() const { return nodeId; }
 
+    // Sentinel registration API (M4)
+    void registerExternalSharer(Addr addr);
+    void registerExternalOwner(Addr addr);
+    void unregisterSentinel(Addr addr);
+    bool hasSentinel(Addr addr) const;
+    SentinelState getSentinelState(Addr addr) const;
+    int getSentinelCount() const;
+    void dumpSentinels() const;
+
+    SentinelTracker& getSentinelTracker() { return sentinelTracker; }
+
   protected:
     bool recvRequestMsg(const CHIRequestMsg *msg) override;
     bool recvSnoopMsg(const CHIRequestMsg *msg) override;
@@ -43,6 +55,7 @@ class EPRNFController : public CHIGenericController
     const int nodeId;
     int snoopsReceived;
     int responsesSent;
+    SentinelTracker sentinelTracker;
 };
 
 } // namespace ruby
