@@ -1,6 +1,7 @@
 # Copyright (c) 2024 UBCC Project
 
 from m5.params import *
+from m5.SimObject import SimObject
 
 from m5.objects.CHIGeneric import CHIGenericController as CHIGenericParent
 
