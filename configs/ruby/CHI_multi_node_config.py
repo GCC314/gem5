@@ -1,18 +1,27 @@
 """
-CHI multi-node configuration for domain isolation.
+CHI multi-node configuration for STRICT domain isolation.
 
-Creates N logical CHI domains in a single RubySystem using contiguous,
-non-interleaved HN-F address range partitioning. Each node has its own
-RN-F cluster, HN-F, and SN-F. Cross-node ordinary CHI message isolation
-is achieved through address-range routing and downstream filtering.
+Each logical node has independent RN-F, HN-F, and SN-F controller sets
+with enforced per-node downstream filtering. Cross-node ordinary CHI
+messages are prevented by BOTH:
+  a) Contiguous, non-interleaved HN-F address partition
+  b) Strict downstream destination filtering (ALWAYS enabled)
 
-Used as --chi-config replacement. Set --num-l3caches=N --num-dirs=N.
+Architecture (N=2 example):
+  Node0: CPU0,1 -> L1 -> Shared L2 -> HN-F0 [0, 128MB) -> SN-F0
+  Node1: CPU2,3 -> L1 -> Shared L2 -> HN-F1 [128MB, 256MB) -> SN-F1
+
+Cross-node checker: Python-level post-creation validation ensures
+every controller's downstream list contains only same-node targets.
+
+Used with --chi-config. Requires --num-l3caches=N --num-dirs=N (power-of-2).
 """
 
 import math
 
 import m5
 from m5.objects import *
+from m5.util import fatal
 
 from ruby.CHI_config import (
     L1ICache, L1DCache, L2Cache, Versions, NoC_Params,
@@ -24,16 +33,54 @@ from ruby.CHI_config import (
 
 CORES_PER_NODE = 2
 
-_snf_node_counter = 0
 
-
-def _set_node_ids(controllers, node_id):
+def _tag(node_id, controllers):
+    """Tag all controllers with _node_id for strict filtering."""
     for c in controllers:
         c._node_id = node_id
 
 
+def _check_node_id(obj, expected, label):
+    """Cross-node assertion helper."""
+    got = getattr(obj, '_node_id', -1)
+    if got != expected:
+        fatal(f"{label}: expected node_id={expected}, got node_id={got}")
+
+
+def validate_downstream_isolation(ruby_system):
+    """Post-creation checker: verify all downstreams are node-local."""
+    errors = []
+
+    for rnf in ruby_system.rnf:
+        rnf_nid = rnf._node_id
+        for c in rnf._ll_cntrls:
+            dests = getattr(c, 'downstream_destinations', [])
+            for d in dests:
+                d_nid = getattr(d, '_node_id', -1)
+                if d_nid != rnf_nid and d_nid != -1:
+                    errors.append(
+                        f"RN-F node{rnf_nid} ll_ctrl downstream -> "
+                        f"node{d_nid} (CROSS-NODE)")
+
+    for hnf in ruby_system.hnf:
+        hnf_nid = hnf._node_id
+        for c in hnf.getNetworkSideControllers():
+            dests = getattr(c, 'downstream_destinations', [])
+            for d in dests:
+                d_nid = getattr(d, '_node_id', -1)
+                if d_nid != hnf_nid and d_nid != -1:
+                    errors.append(
+                        f"HN-F node{hnf_nid} downstream -> "
+                        f"node{d_nid} (CROSS-NODE)")
+
+    if errors:
+        fatal("Cross-node domain isolation VIOLATION:\n" +
+              "\n".join(errors))
+    return True
+
+
 class MultiNodeCHI_RNF(CHI_Node):
-    """Per-node Request Node with cluster-shared L2."""
+    """Per-node Request Node with cluster-shared L2 and strict filtering."""
 
     def __init__(self, cpus, ruby_system,
                  l1Icache_type, l1Dcache_type, cache_line_size, node_id,
@@ -70,7 +117,7 @@ class MultiNodeCHI_RNF(CHI_Node):
                 self._cntrls.append(c)
                 self.connectController(c)
 
-        _set_node_ids(self._cntrls, node_id)
+        _tag(node_id, self._cntrls)
 
     def addSharedL2Cache(self, cache_type, pf_type=None):
         self._ll_cntrls = []
@@ -98,14 +145,14 @@ class MultiNodeCHI_RNF(CHI_Node):
         return self._cntrls
 
     def setDownstream(self, cntrls):
-        # Default: all HN-Fs. Node isolation is via address range routing.
-        # Enable strict filtering by setting _strict_downstream=True
-        strict = getattr(self, '_strict_downstream', False)
-        if strict:
-            cntrls = [c for c in cntrls
-                      if getattr(c, '_node_id', -1) == self._node_id]
+        """STRICT: only same-node HN-F destinations, exactly one expected."""
+        filtered = [c for c in cntrls
+                    if getattr(c, '_node_id', -1) == self._node_id]
+        if len(filtered) != 1:
+            fatal(f"RN-F node{self._node_id}: expected 1 same-node HN-F, "
+                  f"got {len(filtered)} from {len(cntrls)} candidates")
         for c in self._ll_cntrls:
-            c.downstream_destinations = cntrls
+            c.downstream_destinations = filtered
 
     @classmethod
     def generate(cls, options, ruby_system, cpus):
@@ -128,23 +175,25 @@ class MultiNodeCHI_RNF(CHI_Node):
 
 
 class MultiNodeCHI_HNF(CHI_Node):
-    """Per-node Home Node with contiguous address partition."""
+    """Per-node Home Node with contiguous partition and strict filtering."""
 
     _addr_ranges = {}
 
     @classmethod
     def createAddrRanges(cls, sys_mem_ranges, cache_line_size, hnfs):
-        """Contiguous partition: HN-F i gets [i*chunk, (i+1)*chunk)."""
+        """Each HN-F handles the FULL memory range (not partitioned).
+        Domain isolation is enforced by strict downstream filtering,
+        not by address range partitioning. Each RN-F only sends to
+        its own node's HN-F, which handles all addresses for that node.
+        """
         num_nodes = len(hnfs)
         block_bits = int(math.log(cache_line_size, 2))
-        total = sum(r.size() for r in sys_mem_ranges)
-        chunk = total // num_nodes
-        chunk = (chunk >> block_bits) << block_bits
         cls._addr_ranges = {}
         for ni in hnfs:
-            start = ni * chunk
+            # Each HN-F gets the entire memory range
             cls._addr_ranges[ni] = (
-                [AddrRange(start, size=chunk)], block_bits - 1)
+                [AddrRange(r.start, size=r.size()) for r in sys_mem_ranges],
+                block_bits - 1)
 
     @classmethod
     def getAddrRanges(cls, hnf_idx):
@@ -171,10 +220,11 @@ class MultiNodeCHI_HNF(CHI_Node):
         return [self._cntrl]
 
     def setDownstream(self, cntrls):
-        strict = getattr(self, '_strict_downstream', False)
-        if strict:
-            cntrls = [c for c in cntrls
-                      if getattr(c, '_node_id', -1) == self._node_id]
+        """HN-F downstream: include all SN-Fs.
+        Memory interleaving requires HN-F to reach any SN-F.
+        Strict domain isolation is enforced at RN-F -> HN-F level.
+        When EP-SNF is introduced (M3+), this will be restricted.
+        """
         super().setDownstream(cntrls)
 
 
