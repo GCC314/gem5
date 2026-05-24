@@ -98,44 +98,8 @@ EPController::regStats()
 }
 
 void
-EPRNFController::recvSnoopMsg(const CHIRequestMsg *msg)
+EPController::collateStats()
 {
-    DPRINTF(RubyCHIGeneric, "EP_RNF node_id=%d recvSnoopMsg type=%s addr=0x%lx\n",
-            _nodeId, msg->m_type, msg->m_addr);
-
-    if (_backend)
-        _backend->checkAddr(msg->m_addr);
-
-    NetDest dest;
-    dest.add(msg->m_requestor);
-    auto rsp = std::make_shared<CHIResponseMsg>(
-        curTick(), cacheLineSize, m_ruby_system,
-        msg->m_addr, CHIResponseType_SnpResp_I,
-        m_machineID, dest,
-        false, false, 0, 0, MessageSizeType_Control);
-    sendResponseMsg(rsp);
-    return true;
-}
-
-void
-EPRNFController::selfTest()
-{
-    DPRINTF(RubyCHIGeneric, "EP_RNF node_id=%d selfTest begin\n", _nodeId);
-
-    auto test_req = std::make_shared<CHIRequestMsg>(
-        curTick(), cacheLineSize, m_ruby_system);
-    test_req->m_addr = 0x10000000;
-    test_req->m_type = CHIRequestType_SnpShared;
-    test_req->m_requestor = m_machineID;
-
-    auto *snp_buf = snpIn;
-    if (snp_buf->areNSlotsAvailable(1, curTick())) {
-        snp_buf->enqueue(test_req, curTick());
-        DPRINTF(RubyCHIGeneric,
-                "EP_RNF node_id=%d selfTest: injected SnpShared\n", _nodeId);
-    }
-
-    DPRINTF(RubyCHIGeneric, "EP_RNF node_id=%d selfTest end\n", _nodeId);
 }
 
 void
@@ -241,6 +205,28 @@ EPController::functionalReadBuffers(PacketPtr& pkt, WriteMask &mask)
 EPRNFController::EPRNFController(const Params &p)
   : EPController(p), _backend(p.ep_backend)
 {
+}
+
+void
+EPRNFController::selfTest()
+{
+    DPRINTF(RubyCHIGeneric, "EP_RNF node_id=%d selfTest begin\n", _nodeId);
+
+    auto test_req = std::make_shared<CHIRequestMsg>(
+        curTick(), cacheLineSize, m_ruby_system);
+    test_req->m_addr = 0x10000000;
+    test_req->m_type = CHIRequestType_SnpShared;
+    test_req->m_requestor = m_machineID;
+
+    auto *snp_buf = snpIn;
+    if (snp_buf->areNSlotsAvailable(1, curTick())) {
+        snp_buf->enqueue(test_req, curTick(), cyclesToTicks(Cycles(1)),
+                         false, false);
+        DPRINTF(RubyCHIGeneric,
+                "EP_RNF node_id=%d selfTest: injected SnpShared\n", _nodeId);
+    }
+
+    DPRINTF(RubyCHIGeneric, "EP_RNF node_id=%d selfTest end\n", _nodeId);
 }
 
 void

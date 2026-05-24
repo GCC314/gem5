@@ -41,7 +41,8 @@ EPSNFController::selfTest()
 
     auto *req_buf = reqIn;
     if (req_buf->areNSlotsAvailable(1, curTick())) {
-        req_buf->enqueue(test_req, curTick());
+        req_buf->enqueue(test_req, curTick(), cyclesToTicks(Cycles(1)),
+                         false, false);
         DPRINTF(RubyCHIGeneric,
                 "EP_SNF node_id=%d selfTest: injected ReadNoSnp\n", _nodeId);
     }
