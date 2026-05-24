@@ -1,0 +1,228 @@
+# Basic Framework Configuration for UBCC
+# N=3 nodes, L=2 cores per cluster, D=2 clusters per node
+# SegSize = 128MB
+
+import math
+
+import m5
+from m5.objects import *
+
+from .CHI_config import (
+    CHI_Node, CHI_L1Controller, CHI_L2Controller,
+    CHI_HNFController, CHI_SNF_Base, CHI_SNF_MainMem,
+    L1ICache, L1DCache, L2Cache,
+    Versions, CPUSequencerWrapper,
+    TriggerMessageBuffer, OrderedTriggerMessageBuffer,
+    Base_CHI_Cache_Controller,
+)
+
+DEFAULT_N = 3
+DEFAULT_L = 2
+DEFAULT_D = 2
+DEFAULT_SEG_SIZE = 128 * 1024 * 1024
+
+def _seg(size_mb):
+    return size_mb * 1024 * 1024
+
+class NodeAddressMap:
+    def __init__(self, num_nodes=DEFAULT_N, seg_size=DEFAULT_SEG_SIZE):
+        assert num_nodes == 3
+        self.num_nodes = num_nodes
+        self.seg_size = seg_size
+        self.dsm_base = 2 * seg_size
+        self.dsm_end = (2 + num_nodes) * seg_size
+
+    def isDsm(self, pa):
+        return self.dsm_base <= pa < self.dsm_end
+
+    def homeNode(self, pa):
+        if not self.isDsm(pa):
+            return -1
+        return (pa - self.dsm_base) // self.seg_size
+
+    def isDsmLocal(self, node_id, pa):
+        if not self.isDsm(pa):
+            return False
+        return self.homeNode(pa) == node_id
+
+    def isDsmRemote(self, node_id, pa):
+        if not self.isDsm(pa):
+            return False
+        return self.homeNode(pa) != node_id
+
+class NodeConfig:
+    def __init__(self, node_id, num_nodes=DEFAULT_N, seg_size=DEFAULT_SEG_SIZE):
+        self.node_id = node_id
+        self.num_nodes = num_nodes
+        self.seg_size = seg_size
+        self.addr_map = NodeAddressMap(num_nodes, seg_size)
+        self.local_private_base = node_id * 5 * seg_size + 0 * seg_size
+        self.local_private_end = node_id * 5 * seg_size + 1 * seg_size
+        self.ubcc_exclusive_base = node_id * 5 * seg_size + 1 * seg_size
+        self.ubcc_exclusive_end = node_id * 5 * seg_size + 2 * seg_size
+
+    @property
+    def local_private_range(self):
+        return AddrRange(self.local_private_base, size=self.seg_size)
+
+    @property
+    def ubcc_exclusive_range(self):
+        return AddrRange(self.ubcc_exclusive_base, size=self.seg_size)
+
+    @staticmethod
+    def dsm_global_range(seg_size=DEFAULT_SEG_SIZE):
+        return AddrRange(2 * seg_size, size=3 * seg_size)
+
+    @staticmethod
+    def dsm_range_for(node_id, seg_size=DEFAULT_SEG_SIZE):
+        base = (2 + node_id) * seg_size
+        return AddrRange(base, size=seg_size)
+
+def get_all_system_ranges(seg_size=DEFAULT_SEG_SIZE, num_nodes=DEFAULT_N):
+    ranges = []
+    for n in range(num_nodes):
+        cfg = NodeConfig(n, num_nodes, seg_size)
+        ranges.append(cfg.local_private_range)
+        ranges.append(cfg.ubcc_exclusive_range)
+    ranges.append(NodeConfig.dsm_global_range(seg_size))
+    return ranges
+
+
+class ClusterCHI_RNF(CHI_Node):
+    def __init__(self, cpus, ruby_system, cache_line_size,
+                 l1Icache_type=None, l1Dcache_type=None):
+        super().__init__(ruby_system)
+
+        if l1Icache_type is None:
+            l1Icache_type = L1ICache
+        if l1Dcache_type is None:
+            l1Dcache_type = L1DCache
+
+        self._block_size_bits = int(math.log(cache_line_size, 2))
+        self._seqs = []
+        self._cntrls = []
+        self._ll_cntrls = []
+        self._cpus = cpus
+
+        for cpu in self._cpus:
+            cpu.inst_sequencer = RubySequencer(
+                version=Versions.getSeqId(), ruby_system=ruby_system)
+            cpu.data_sequencer = RubySequencer(
+                version=Versions.getSeqId(), ruby_system=ruby_system)
+            self._seqs.append(
+                CPUSequencerWrapper(cpu.inst_sequencer, cpu.data_sequencer))
+            l1i_cache = l1Icache_type(
+                start_index_bit=self._block_size_bits, is_icache=True)
+            l1d_cache = l1Dcache_type(
+                start_index_bit=self._block_size_bits, is_icache=False)
+            cpu.l1i = CHI_L1Controller(
+                ruby_system, cpu.inst_sequencer, l1i_cache, NULL)
+            cpu.l1d = CHI_L1Controller(
+                ruby_system, cpu.data_sequencer, l1d_cache, NULL)
+            cpu.inst_sequencer.dcache = NULL
+            cpu.data_sequencer.dcache = cpu.l1d.cache
+            cpu.l1d.sc_lock_enabled = True
+            cpu._ll_cntrls = [cpu.l1i, cpu.l1d]
+            for c in cpu._ll_cntrls:
+                self._cntrls.append(c)
+                self.connectController(c)
+                self._ll_cntrls.append(c)
+
+    def addPrivL2Cache(self, cache_type=L2Cache):
+        self._ll_cntrls = []
+        for cpu in self._cpus:
+            l2_cache = cache_type(
+                start_index_bit=self._block_size_bits, is_icache=False)
+            cpu.l2 = CHI_L2Controller(self._ruby_system, l2_cache, NULL)
+            self._cntrls.append(cpu.l2)
+            self.connectController(cpu.l2)
+            self._ll_cntrls.append(cpu.l2)
+            for c in cpu._ll_cntrls:
+                c.downstream_destinations = [cpu.l2]
+            cpu._ll_cntrls = [cpu.l2]
+
+    def getSequencers(self):
+        return self._seqs
+
+    def getAllControllers(self):
+        return self._cntrls
+
+    def getNetworkSideControllers(self):
+        return self._cntrls
+
+    def setDownstream(self, cntrls):
+        for c in self._ll_cntrls:
+            c.downstream_destinations = cntrls
+
+    def getCpus(self):
+        return self._cpus
+
+
+class MultiNodeCHI_HNF(CHI_Node):
+    def __init__(self, node_id, ruby_system, addr_ranges, llcache_type):
+        super().__init__(ruby_system)
+        self._node_id = node_id
+        self._addr_ranges = addr_ranges
+        self._cntrls = []
+
+        hnf_cache = llcache_type()
+        self._hnf_cntrl = CHI_HNFController(
+            ruby_system, hnf_cache, NULL, addr_ranges)
+        self._hnf_cntrl.node_id = node_id
+        self._cntrls.append(self._hnf_cntrl)
+        self.connectController(self._hnf_cntrl)
+
+    @property
+    def node_id(self):
+        return self._node_id
+
+    def getAllControllers(self):
+        return self._cntrls
+
+    def getNetworkSideControllers(self):
+        return self._cntrls
+
+    def getHNFController(self):
+        return self._hnf_cntrl
+
+
+class UBCCHNFNode(MultiNodeCHI_HNF):
+    def __init__(self, node_id, ruby_system, addr_ranges, llcache_type):
+        super().__init__(node_id, ruby_system, addr_ranges, llcache_type)
+
+
+class UBBCL_SNF(CHI_SNF_Base):
+    def __init__(self, ruby_system, parent, mem_ctrl, addr_ranges=None):
+        super().__init__(ruby_system, parent)
+        if mem_ctrl:
+            self._cntrl.memory_out_port = mem_ctrl.port
+        if addr_ranges:
+            self._cntrl.addr_ranges = addr_ranges
+        elif mem_ctrl:
+            self._cntrl.addr_ranges = self.getMemRange(mem_ctrl)
+
+    def set_addr_ranges(self, addr_ranges):
+        self._cntrl.addr_ranges = addr_ranges
+
+    def set_memory_port(self, mem_ctrl):
+        self._cntrl.memory_out_port = mem_ctrl.port
+
+
+class UBBCDL_SNF(UBBCL_SNF):
+    pass
+
+
+class NodeTopology:
+    def __init__(self, node_id, node_config, ruby_system,
+                 cls_per_node, cpus_per_cluster, cache_line_size):
+        self.node_id = node_id
+        self.node_config = node_config
+        self.ruby_system = ruby_system
+
+        self.clusters = []
+        self.hnf = None
+        self.l_snf = None
+        self.dl_snf = None
+        self.ep_snf = None
+        self.ep_rnf = None
+        self.ep_backend = None

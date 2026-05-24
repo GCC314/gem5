@@ -1,0 +1,19 @@
+# EP (Endpoint) controllers for UBCC basic framework
+
+Import('*')
+
+if env['CONF']['PROTOCOL'] != 'CHI':
+    Return()
+
+SimObject('EPController.py', sim_objects=['EPController'])
+SimObject('EPRNFController.py', sim_objects=['EPRNFController'])
+SimObject('EPSNFController.py', sim_objects=['EPSNFController'])
+SimObject('EPBackend.py', sim_objects=['EPBackend'])
+
+Source('EPRNFController.cc')
+Source('EPSNFController.cc')
+Source('EPBackend.cc')
+Source('UBCCController.cc')
+
+DebugFlag('RubyEP')
+DebugFlag('RubyEPVerbose')

@@ -41,6 +41,8 @@ class Process(SimObject):
     def map(self, vaddr, paddr, size, cacheable=False):
         pass
 
+    phys_pool_id = Param.Int(0, "physical memory pool id for this process")
+
     input = Param.String("cin", "filename for stdin")
     output = Param.String("cout", "filename for stdout")
     errout = Param.String("cerr", "filename for stderr")

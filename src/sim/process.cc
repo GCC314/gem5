@@ -119,6 +119,7 @@ Process::Process(const ProcessParams &params, EmulationPageTable *pTable,
       useForClone(false),
       zeroPages(params.zeroPages),
       pTable(pTable),
+      physPoolId(params.phys_pool_id),
       objFile(obj_file),
       argv(params.cmd), envp(params.env),
       executable(params.executable == "" ? params.cmd[0] : params.executable),
@@ -128,7 +129,8 @@ Process::Process(const ProcessParams &params, EmulationPageTable *pTable,
       _uid(params.uid), _euid(params.euid),
       _gid(params.gid), _egid(params.egid),
       _pid(params.pid), _ppid(params.ppid),
-      _pgid(params.pgid), drivers(params.drivers),
+      _pgid(params.pgid),
+      drivers(params.drivers),
       fds(std::make_shared<FDArray>(
                   params.input, params.output, params.errout)),
       childClearTID(0),
@@ -337,7 +339,7 @@ Process::allocateMem(Addr vaddr, int64_t size, bool clobber)
     }
 
     const int npages = divCeil(size, page_size);
-    const Addr paddr = seWorkload->allocPhysPages(npages);
+    const Addr paddr = seWorkload->allocPhysPages(npages, physPoolId);
     const Addr pages_size = npages * page_size;
     pTable->map(page_addr, paddr, pages_size,
                 clobber ? EmulationPageTable::Clobber :
@@ -377,7 +379,7 @@ Process::deallocateMem(Addr vaddr, int64_t size)
             pTable->unmap(page_vaddr, page_size);
 
             // Deallocate the physical page.
-            seWorkload->deallocPhysPage(page_paddr);
+            seWorkload->deallocPhysPage(page_paddr, physPoolId);
         }
     }
 }
@@ -387,7 +389,7 @@ Process::replicatePage(Addr vaddr, Addr new_paddr, ThreadContext *old_tc,
                        ThreadContext *new_tc, bool allocate_page)
 {
     if (allocate_page)
-        new_paddr = seWorkload->allocPhysPages(1);
+        new_paddr = seWorkload->allocPhysPages(1, physPoolId);
 
     // Read from old physical page.
     const size_t buf_size = pTable->pageSize();

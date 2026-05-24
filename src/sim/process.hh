@@ -194,6 +194,8 @@ class Process : public SimObject
 
     EmulationPageTable *pTable;
 
+    int physPoolId = 0;
+
     // Memory proxy for initial image load.
     std::unique_ptr<SETranslatingPortProxy> initVirtMem;
 

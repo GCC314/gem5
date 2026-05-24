@@ -1,0 +1,38 @@
+#ifndef __MEM_RUBY_PROTOCOL_CHI_EP_EPBACKEND_HH__
+#define __MEM_RUBY_PROTOCOL_CHI_EP_EPBACKEND_HH__
+
+#include <cstdint>
+#include <vector>
+
+#include "params/EPBackend.hh"
+#include "sim/sim_object.hh"
+
+namespace gem5
+{
+
+namespace ruby
+{
+
+class UBCCController;
+
+class EPBackend : public SimObject
+{
+  public:
+    PARAMS(EPBackend);
+    EPBackend(const Params &p);
+    ~EPBackend();
+
+    void init() override;
+    void wakeup();
+
+    int nodeId() const { return _nodeId; }
+
+  private:
+    const int _nodeId;
+    UBCCController *_ubcc = nullptr;
+};
+
+} // namespace ruby
+} // namespace gem5
+
+#endif // __MEM_RUBY_PROTOCOL_CHI_EP_EPBACKEND_HH__
