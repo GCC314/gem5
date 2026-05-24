@@ -98,7 +98,8 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
         ep_backend = EPBackend(node_id=node_id)
 
         nd['ep_rnf_cntrl'] = EPRNFController(
-            version=0, ruby_system=ruby_system, node_id=node_id,
+            version=chi_defs.Versions.getVersion(chi_defs.CHI_Cache_Controller),
+            ruby_system=ruby_system, node_id=node_id,
             data_channel_size=params.data_width,
             ep_backend=ep_backend,
             addr_ranges=[NodeConfig.dsm_range_for(
@@ -110,7 +111,8 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
         all_cntrls.append(nd['ep_rnf_cntrl'])
 
         nd['ep_snf_cntrl'] = EPSNFController(
-            version=1, ruby_system=ruby_system, node_id=node_id,
+            version=chi_defs.Versions.getVersion(chi_defs.CHI_Cache_Controller),
+            ruby_system=ruby_system, node_id=node_id,
             data_channel_size=params.data_width,
             ep_backend=ep_backend,
             addr_ranges=[NodeConfig.dsm_range_for(nid, seg_size)
@@ -165,6 +167,10 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
         if not k.startswith("__"):
             setattr(options, k, getattr(params, k))
 
+    mem_dests = []
+    nd0 = per_node[0]
+    mem_dests.extend(nd0['l_snf'].getAllControllers())
+
     from .Ruby import create_topology
 
     if options.topology == "CustomMesh":
@@ -177,4 +183,4 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
     else:
         m5.fatal(f"{options.topology} not supported!")
 
-    return (cpu_sequencers, [], topology)
+    return (cpu_sequencers, mem_dests, topology)
