@@ -202,7 +202,7 @@ EPController::functionalReadBuffers(PacketPtr& pkt, WriteMask &mask)
 }
 
 EPRNFController::EPRNFController(const Params &p)
-  : EPController(p)
+  : EPController(p), _backend(p.ep_backend)
 {
 }
 

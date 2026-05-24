@@ -13,3 +13,4 @@ class EPRNFController(EPController):
 
     addr_range = Param.AddrRange(AddrRange(0, size="1MiB"),
                                  "Address range served")
+    ep_backend = Param.EPBackend(NULL, "EPBackend for this endpoint")

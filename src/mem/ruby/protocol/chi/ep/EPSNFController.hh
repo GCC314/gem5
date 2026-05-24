@@ -21,8 +21,6 @@ class EPSNFController : public EPController
     void wakeup() override;
     void print(std::ostream& out) const override;
 
-    void setBackend(EPBackend *backend) { _backend = backend; }
-
   protected:
     bool recvRequestMsg(const CHIRequestMsg *msg) override;
     bool recvSnoopMsg(const CHIRequestMsg *msg) override;

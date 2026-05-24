@@ -158,37 +158,7 @@ class ClusterCHI_RNF(CHI_Node):
         return self._cpus
 
 
-class MultiNodeCHI_HNF(CHI_Node):
-    def __init__(self, node_id, ruby_system, addr_ranges, llcache_type):
-        super().__init__(ruby_system)
-        self._node_id = node_id
-        self._addr_ranges = addr_ranges
-        self._cntrls = []
 
-        hnf_cache = llcache_type()
-        self._hnf_cntrl = CHI_HNFController(
-            ruby_system, hnf_cache, NULL, addr_ranges)
-        self._hnf_cntrl.node_id = node_id
-        self._cntrls.append(self._hnf_cntrl)
-        self.connectController(self._hnf_cntrl)
-
-    @property
-    def node_id(self):
-        return self._node_id
-
-    def getAllControllers(self):
-        return self._cntrls
-
-    def getNetworkSideControllers(self):
-        return self._cntrls
-
-    def getHNFController(self):
-        return self._hnf_cntrl
-
-
-class UBCCHNFNode(MultiNodeCHI_HNF):
-    def __init__(self, node_id, ruby_system, addr_ranges, llcache_type):
-        super().__init__(node_id, ruby_system, addr_ranges, llcache_type)
 
 
 class UBBCL_SNF(CHI_SNF_Base):
@@ -226,3 +196,33 @@ class NodeTopology:
         self.ep_snf = None
         self.ep_rnf = None
         self.ep_backend = None
+
+
+class EPNodeWrapper(CHI_Node):
+    def __init__(self, ruby_system):
+        super().__init__(ruby_system)
+        self._cntrl = None
+
+    def getAllControllers(self):
+        return [self._cntrl] if self._cntrl else []
+
+    def getNetworkSideControllers(self):
+        return [self._cntrl] if self._cntrl else []
+
+    def setController(self, cntrl):
+        self._cntrl = cntrl
+
+
+class HNNodeWrapper(CHI_Node):
+    def __init__(self, ruby_system):
+        super().__init__(ruby_system)
+        self._cntrl = None
+
+    def getAllControllers(self):
+        return [self._cntrl] if self._cntrl else []
+
+    def getNetworkSideControllers(self):
+        return [self._cntrl] if self._cntrl else []
+
+    def setController(self, cntrl):
+        self._cntrl = cntrl

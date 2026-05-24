@@ -13,7 +13,7 @@ namespace ruby
 {
 
 EPSNFController::EPSNFController(const Params &p)
-  : EPController(p)
+  : EPController(p), _backend(p.ep_backend)
 {
 }
 
