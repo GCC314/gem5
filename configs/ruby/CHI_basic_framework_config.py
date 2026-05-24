@@ -219,6 +219,7 @@ class EPNodeWrapper(CHI_Node):
         return [self._cntrl] if self._cntrl else []
 
     def setController(self, cntrl):
+        setattr(self, 'ctrl', cntrl)
         self._cntrl = cntrl
 
 
@@ -234,4 +235,5 @@ class HNNodeWrapper(CHI_Node):
         return [self._cntrl] if self._cntrl else []
 
     def setController(self, cntrl):
+        setattr(self, 'ctrl', cntrl)
         self._cntrl = cntrl

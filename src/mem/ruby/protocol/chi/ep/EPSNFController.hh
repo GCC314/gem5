@@ -21,6 +21,8 @@ class EPSNFController : public EPController
     void wakeup() override;
     void print(std::ostream& out) const override;
 
+    void selfTest();
+
   protected:
     bool recvRequestMsg(const CHIRequestMsg *msg) override;
     bool recvSnoopMsg(const CHIRequestMsg *msg) override;
