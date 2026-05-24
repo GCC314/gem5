@@ -167,10 +167,6 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
         if not k.startswith("__"):
             setattr(options, k, getattr(params, k))
 
-    mem_dests = []
-    nd0 = per_node[0]
-    mem_dests.extend(nd0['l_snf'].getAllControllers())
-
     from .Ruby import create_topology
 
     if options.topology == "CustomMesh":
@@ -183,4 +179,4 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
     else:
         m5.fatal(f"{options.topology} not supported!")
 
-    return (cpu_sequencers, mem_dests, topology)
+    return (cpu_sequencers, [], topology)
