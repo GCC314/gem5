@@ -90,7 +90,10 @@ def get_all_system_ranges(seg_size=DEFAULT_SEG_SIZE, num_nodes=DEFAULT_N):
 
 class ClusterCHI_RNF(CHI_Node):
     def __init__(self, cpus, ruby_system, cache_line_size,
-                 l1Icache_type=None, l1Dcache_type=None):
+                 l1Icache_type=None, l1Dcache_type=None,
+                 l1i_assoc=2, l1d_assoc=2,
+                 l1i_size="32kB", l1d_size="32kB",
+                 l2_assoc=8, l2_size="256kB"):
         super().__init__(ruby_system)
 
         if l1Icache_type is None:
@@ -104,6 +107,9 @@ class ClusterCHI_RNF(CHI_Node):
         self._ll_cntrls = []
         self._cpus = cpus
 
+        self._l2_assoc = l2_assoc
+        self._l2_size = l2_size
+
         for cpu in self._cpus:
             cpu.inst_sequencer = RubySequencer(
                 version=Versions.getSeqId(), ruby_system=ruby_system)
@@ -112,9 +118,11 @@ class ClusterCHI_RNF(CHI_Node):
             self._seqs.append(
                 CPUSequencerWrapper(cpu.inst_sequencer, cpu.data_sequencer))
             l1i_cache = l1Icache_type(
-                start_index_bit=self._block_size_bits, is_icache=True)
+                start_index_bit=self._block_size_bits, is_icache=True,
+                assoc=l1i_assoc, size=l1i_size)
             l1d_cache = l1Dcache_type(
-                start_index_bit=self._block_size_bits, is_icache=False)
+                start_index_bit=self._block_size_bits, is_icache=False,
+                assoc=l1d_assoc, size=l1d_size)
             cpu.l1i = CHI_L1Controller(
                 ruby_system, cpu.inst_sequencer, l1i_cache, NULL)
             cpu.l1d = CHI_L1Controller(
@@ -132,7 +140,8 @@ class ClusterCHI_RNF(CHI_Node):
         self._ll_cntrls = []
         for cpu in self._cpus:
             l2_cache = cache_type(
-                start_index_bit=self._block_size_bits, is_icache=False)
+                start_index_bit=self._block_size_bits, is_icache=False,
+                assoc=self._l2_assoc, size=self._l2_size)
             cpu.l2 = CHI_L2Controller(self._ruby_system, l2_cache, NULL)
             self._cntrls.append(cpu.l2)
             self.connectController(cpu.l2)

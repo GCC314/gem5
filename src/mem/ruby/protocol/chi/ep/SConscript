@@ -10,6 +10,7 @@ SimObject('EPRNFController.py', sim_objects=['EPRNFController'])
 SimObject('EPSNFController.py', sim_objects=['EPSNFController'])
 SimObject('EPBackend.py', sim_objects=['EPBackend'])
 
+Source('NodeAddressMap.cc')
 Source('EPRNFController.cc')
 Source('EPSNFController.cc')
 Source('EPBackend.cc')

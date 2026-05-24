@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <vector>
 
+#include "mem/ruby/protocol/chi/ep/NodeAddressMap.hh"
 #include "params/EPBackend.hh"
 #include "sim/sim_object.hh"
 
@@ -27,8 +28,12 @@ class EPBackend : public SimObject
 
     int nodeId() const { return _nodeId; }
 
+    bool checkAddr(uint64_t pa) const;
+    const NodeAddressMap& addrMap() const { return _addrMap; }
+
   private:
     const int _nodeId;
+    NodeAddressMap _addrMap;
     UBCCController *_ubcc = nullptr;
 };
 
