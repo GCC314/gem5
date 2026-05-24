@@ -73,9 +73,7 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
         nd['hnf_wrapper'], nd['hnf_cntrl'] = _make_hnf(
             ruby_system,
             [NodeConfig(node_id, num_nodes, seg_size).local_private_range,
-             NodeConfig.dsm_range_for(0, seg_size),
-             NodeConfig.dsm_range_for(1, seg_size),
-             NodeConfig.dsm_range_for(2, seg_size)],
+             NodeConfig(node_id, num_nodes, seg_size).ubcc_exclusive_range],
             HNFCache, node_id)
 
         setattr(ruby_system, f"hnf_node{node_id}", nd['hnf_wrapper'])
