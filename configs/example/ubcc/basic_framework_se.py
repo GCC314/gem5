@@ -35,10 +35,9 @@ def config_system(args):
     addr_map = NodeAddressMap(num_nodes, seg_size)
 
     dsm_va_base = MaxAddr - 4 * seg_size
-    args.dsm_base = dsm_va_base
 
-    system.dsm_va_base = dsm_va_base
-    system.dsm_va_end = dsm_va_base + num_nodes * seg_size
+    # DSM VA base is a Python local — not attached to system SimObject
+    dsm_va_end = dsm_va_base + num_nodes * seg_size
 
     node_memories = []
     for node_id in range(num_nodes):
@@ -55,7 +54,7 @@ def config_system(args):
         system.addChildByName(f"node{node_id}_ubcc_mem", ubcc_mem)
 
         dsm_node_mem = SimpleMemory(
-            range=NodeConfig.dsm_range_for(node_id, seg_size))
+            range=NodeConfig.dsm_range_for(node_id, seg_size, cfg.phy_base))
         dsm_node_mem.port = membus.mem_side_ports
         system.addChildByName(f"node{node_id}_dsm_mem", dsm_node_mem)
 
