@@ -20,46 +20,77 @@ DEFAULT_N = 3
 DEFAULT_L = 2
 DEFAULT_D = 2
 DEFAULT_SEG_SIZE = 128 * 1024 * 1024
+NODE_ADDR_SHIFT = 40
 
-def _seg(size_mb):
-    return size_mb * 1024 * 1024
+def _node_base(node_id):
+    return node_id << NODE_ADDR_SHIFT
+
 
 class NodeAddressMap:
+    """Per-node PA classification helper.
+    Each node i has PA space at [i<<40, i<<40 + 5*SegSize).
+    DSM_k in node i's view is at offset 2*SegSize + k*SegSize.
+    """
     def __init__(self, num_nodes=DEFAULT_N, seg_size=DEFAULT_SEG_SIZE):
         assert num_nodes == 3
         self.num_nodes = num_nodes
         self.seg_size = seg_size
-        self.dsm_base = 2 * seg_size
-        self.dsm_end = (2 + num_nodes) * seg_size
+        self.node_shift = NODE_ADDR_SHIFT
 
-    def isDsm(self, pa):
-        return self.dsm_base <= pa < self.dsm_end
+    def nodeBase(self, node_id):
+        return node_id << self.node_shift
 
-    def homeNode(self, pa):
-        if not self.isDsm(pa):
+    def dsmLocalBase(self, node_id):
+        return self.nodeBase(node_id) + 2 * self.seg_size
+
+    def isDsm(self, node_id, pa):
+        """Check if pa is in node_id's DSM window."""
+        base = self.nodeBase(node_id)
+        dsm_start = base + 2 * self.seg_size
+        dsm_end = dsm_start + self.num_nodes * self.seg_size
+        return dsm_start <= pa < dsm_end
+
+    def homeNode(self, node_id, pa):
+        """Extract DSM home node from a pa in node_id's view."""
+        if not self.isDsm(node_id, pa):
             return -1
-        return (pa - self.dsm_base) // self.seg_size
+        base = self.nodeBase(node_id)
+        return (pa - base - 2 * self.seg_size) // self.seg_size
 
     def isDsmLocal(self, node_id, pa):
-        if not self.isDsm(pa):
+        if not self.isDsm(node_id, pa):
             return False
-        return self.homeNode(pa) == node_id
+        return self.homeNode(node_id, pa) == node_id
 
     def isDsmRemote(self, node_id, pa):
-        if not self.isDsm(pa):
+        if not self.isDsm(node_id, pa):
             return False
-        return self.homeNode(pa) != node_id
+        return self.homeNode(node_id, pa) != node_id
+
+    def srcNodeId(self, pa):
+        return (pa >> self.node_shift) & ((1 << 8) - 1)
+
+    def dsmOffset(self, pa):
+        return pa & (self.seg_size - 1)
+
+    def buildDsmPA(self, tgt_node_id, home_node_id, offset):
+        return (self.nodeBase(tgt_node_id)
+                + 2 * self.seg_size
+                + home_node_id * self.seg_size
+                + offset)
+
 
 class NodeConfig:
     def __init__(self, node_id, num_nodes=DEFAULT_N, seg_size=DEFAULT_SEG_SIZE):
         self.node_id = node_id
         self.num_nodes = num_nodes
         self.seg_size = seg_size
+        self.phy_base = _node_base(node_id)
         self.addr_map = NodeAddressMap(num_nodes, seg_size)
-        self.local_private_base = node_id * 5 * seg_size + 0 * seg_size
-        self.local_private_end = node_id * 5 * seg_size + 1 * seg_size
-        self.ubcc_exclusive_base = node_id * 5 * seg_size + 1 * seg_size
-        self.ubcc_exclusive_end = node_id * 5 * seg_size + 2 * seg_size
+        self.local_private_base = self.phy_base + 0 * seg_size
+        self.local_private_end   = self.phy_base + 1 * seg_size
+        self.ubcc_exclusive_base = self.phy_base + 1 * seg_size
+        self.ubcc_exclusive_end  = self.phy_base + 2 * seg_size
 
     @property
     def local_private_range(self):
@@ -74,8 +105,9 @@ class NodeConfig:
         return AddrRange(2 * seg_size, size=3 * seg_size)
 
     @staticmethod
-    def dsm_range_for(node_id, seg_size=DEFAULT_SEG_SIZE):
-        base = (2 + node_id) * seg_size
+    def dsm_range_for(node_id, seg_size=DEFAULT_SEG_SIZE, phy_base=0):
+        """DSM_k range in the caller's node PA space."""
+        base = phy_base + (2 + node_id) * seg_size
         return AddrRange(base, size=seg_size)
 
 def get_all_system_ranges(seg_size=DEFAULT_SEG_SIZE, num_nodes=DEFAULT_N):

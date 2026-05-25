@@ -39,13 +39,14 @@ EPBackend::wakeup()
 bool
 EPBackend::checkAddr(uint64_t pa) const
 {
-    if (_addrMap.isDsm(pa)) {
-        int h = _addrMap.homeNode(pa);
+    if (_addrMap.isDsm(_nodeId, pa)) {
+        int h = _addrMap.homeNode(_nodeId, pa);
         if (h == _nodeId) {
             return true;
         } else {
             fatal("EPBackend node_id=%d: cross-node DSM access "
-                  "PA=0x%lx home_node=%d", _nodeId, pa, h);
+                  "PA=0x%lx src=%d home_node=%d",
+                  _nodeId, pa, _addrMap.srcNodeId(pa), h);
         }
     }
     fatal("EPBackend node_id=%d: forbidden non-DSM access PA=0x%lx",

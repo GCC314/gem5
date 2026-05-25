@@ -111,7 +111,7 @@ def config_system(args):
                 proc.phys_pool_id = node_id * 3
 
                 for nid in range(num_nodes):
-                    dsm_pa_base = addr_map.dsm_base + nid * seg_size
+                    dsm_pa_base = addr_map.dsmLocalBase(nid)
                     dsm_va = dsm_va_base + nid * seg_size
                     proc.map(dsm_va, dsm_pa_base, seg_size, cacheable=True)
 
@@ -137,7 +137,7 @@ def config_system(args):
         print(f"[node_id={i // (DEFAULT_D * DEFAULT_L)}] "
               f"cpu {i}: phys_pool_id={cpu.phys_pool_id}")
     print(f"DSM VA base: {hex(dsm_va_base)}")
-    print(f"DSM global PA: {hex(addr_map.dsm_base)} - {hex(addr_map.dsm_end)}")
+    print(f"DSM local base per node: {[hex(addr_map.dsmLocalBase(nid)) for nid in range(num_nodes)]}")
     print("Instantiated N=%d L=%d D=%d system" %
           (num_nodes, DEFAULT_L, DEFAULT_D))
 
