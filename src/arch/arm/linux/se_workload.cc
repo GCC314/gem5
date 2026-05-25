@@ -49,6 +49,7 @@
 #include "cpu/thread_context.hh"
 #include "mem/se_translating_port_proxy.hh"
 #include "sim/syscall_emul.hh"
+#include "sim/sync_wait.hh"
 
 namespace gem5
 {
@@ -141,6 +142,15 @@ static SyscallReturn
 setTLSFunc64(SyscallDesc *desc, ThreadContext *tc, uint32_t tlsPtr)
 {
     tc->setMiscReg(MISCREG_TPIDRRO_EL0, tlsPtr);
+    return 0;
+}
+
+template <typename ABI>
+static SyscallReturn
+syncWaitFunc(SyscallDesc *desc, ThreadContext *tc, uint64_t node_mask)
+{
+    auto *sys = tc->getSystemPtr();
+    sys->syncWait.barrierWait(tc, static_cast<uint32_t>(node_mask));
     return 0;
 }
 
@@ -494,6 +504,7 @@ class SyscallTable32 : public SyscallDescTable<EmuLinux::SyscallABI32>
               {base + 397, "sys_statx", ignoreFunc},
               {base + 398, "sys_rseq", ignoreFunc},
               {base + 435, "clone3", clone3Func<ArmLinux32>},
+               {base + 436, "sync_wait", syncWaitFunc<EmuLinux::SyscallABI32>},
           })
     {}
 };
@@ -789,6 +800,7 @@ class SyscallTable64 : public SyscallDescTable<EmuLinux::SyscallABI64>
                {base + 293, "rseq", ignoreWarnOnceFunc},
                {base + 294, "kexec_file_load"},
                {base + 435, "clone3", clone3Func<ArmLinux64>},
+               {base + 436, "sync_wait", syncWaitFunc<EmuLinux::SyscallABI64>},
                {base + 1024, "open", openFunc<ArmLinux64>},
                {base + 1025, "link"},
                {base + 1026, "unlink", unlinkFunc},

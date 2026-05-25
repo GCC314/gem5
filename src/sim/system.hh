@@ -62,6 +62,7 @@
 #include "sim/redirect_path.hh"
 #include "sim/se_signal.hh"
 #include "sim/sim_object.hh"
+#include "sim/sync_wait.hh"
 #include "sim/workload.hh"
 
 namespace gem5
@@ -601,6 +602,9 @@ class System : public SimObject, public PCEventScope
     static void printSystems();
 
     FutexMap futexMap;
+
+    /** Cross-node barrier manager for SE-mode synchronization. */
+    SyncWaitManager syncWait;
 
     static const int maxPID = 32768;
 
