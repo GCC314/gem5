@@ -29,6 +29,7 @@ class EPBackend : public SimObject
     int nodeId() const { return _nodeId; }
 
     bool checkAddr(uint64_t pa) const;
+    bool checkDsmAddr(uint64_t pa) const;
     const NodeAddressMap& addrMap() const { return _addrMap; }
 
   private:

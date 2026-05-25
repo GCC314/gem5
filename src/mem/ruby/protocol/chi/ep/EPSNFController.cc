@@ -71,7 +71,7 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
             _nodeId, msg->m_type, msg->m_addr);
 
     if (_backend)
-        _backend->checkAddr(msg->m_addr);
+        _backend->checkDsmAddr(msg->m_addr);
 
     NetDest dest;
     dest.add(msg->m_requestor);
@@ -100,7 +100,7 @@ EPSNFController::recvSnoopMsg(const CHIRequestMsg *msg)
 {
     DPRINTF(RubyCHIGeneric, "EP_SNF node_id=%d recvSnoopMsg\n", _nodeId);
     if (_backend)
-        _backend->checkAddr(msg->m_addr);
+        _backend->checkDsmAddr(msg->m_addr);
     return true;
 }
 

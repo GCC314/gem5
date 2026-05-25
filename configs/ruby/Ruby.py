@@ -132,6 +132,11 @@ def define_options(parser):
 
 
 def setup_memory_controllers(system, ruby, dir_cntrls, options):
+    # Protocols that provide their own memory backstores may not return
+    # directory controllers for this generic builder path.
+    if len(dir_cntrls) == 0:
+        return
+
     if options.numa_high_bit:
         block_size_bits = (
             options.numa_high_bit + 1 - int(math.log(options.num_dirs, 2))

@@ -33,6 +33,11 @@ def _make_snf(ruby_system, addr_ranges):
     return snf
 
 
+def _make_dram_memctrl(addr_range):
+    dram = DDR4_2400_8x8(range=addr_range)
+    return MemCtrl(dram=dram)
+
+
 def _make_ep_node(ruby_system, ep_cntrl, node_id):
     wrapper = EPNodeWrapper(ruby_system)
     wrapper.setController(ep_cntrl)
@@ -61,6 +66,7 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
     cpu_sequencers = []
     network_nodes = []
     all_cntrls = []
+    mem_backstores = []
 
     per_node = {nid: {} for nid in range(num_nodes)}
 
@@ -81,19 +87,27 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
         network_nodes.append(nd['hnf_wrapper'])
         all_cntrls.append(nd['hnf_cntrl'])
 
-        nd['l_snf'] = _make_snf(
-            ruby_system,
-            [cfg.local_private_range, cfg.ubcc_exclusive_range])
+        l_backstore_range = AddrRange(cfg.local_private_base, size=2 * seg_size)
+        nd['l_memctrl'] = _make_dram_memctrl(l_backstore_range)
+        nd['l_snf'] = chi_defs.CHI_SNF_MainMem(ruby_system, None, nd['l_memctrl'])
+        nd['l_snf']._cntrl.addr_ranges = [cfg.local_private_range,
+                                          cfg.ubcc_exclusive_range]
         setattr(ruby_system, f"l_snf_node{node_id}", nd['l_snf'])
+        setattr(system, f"l_snf_memctrl_node{node_id}", nd['l_memctrl'])
         network_nodes.append(nd['l_snf'])
         all_cntrls.extend(nd['l_snf'].getAllControllers())
+        mem_backstores.append(nd['l_memctrl'])
 
-        nd['dl_snf'] = _make_snf(
-            ruby_system,
-            [NodeConfig.dsm_range_for(node_id, seg_size, cfg.phy_base)])
+        dl_range = NodeConfig.dsm_range_for(node_id, seg_size, cfg.phy_base)
+        nd['dl_memctrl'] = _make_dram_memctrl(dl_range)
+        nd['dl_snf'] = chi_defs.CHI_SNF_MainMem(ruby_system, None,
+                                                nd['dl_memctrl'])
+        nd['dl_snf']._cntrl.addr_ranges = [dl_range]
         setattr(ruby_system, f"dl_snf_node{node_id}", nd['dl_snf'])
+        setattr(system, f"dl_snf_memctrl_node{node_id}", nd['dl_memctrl'])
         network_nodes.append(nd['dl_snf'])
         all_cntrls.extend(nd['dl_snf'].getAllControllers())
+        mem_backstores.append(nd['dl_memctrl'])
 
         ep_backend = EPBackend(node_id=node_id)
 

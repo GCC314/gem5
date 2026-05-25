@@ -54,5 +54,16 @@ EPBackend::checkAddr(uint64_t pa) const
     return false;
 }
 
+bool
+EPBackend::checkDsmAddr(uint64_t pa) const
+{
+    if (_addrMap.isDsm(_nodeId, pa))
+        return true;
+
+    fatal("EPBackend node_id=%d: non-DSM address on EP path PA=0x%lx",
+          _nodeId, pa);
+    return false;
+}
+
 } // namespace ruby
 } // namespace gem5
