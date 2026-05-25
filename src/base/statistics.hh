@@ -87,6 +87,8 @@
 #include "base/str.hh"
 #include "base/types.hh"
 
+#include "sim/backtrace.hh"
+
 namespace gem5
 {
 
