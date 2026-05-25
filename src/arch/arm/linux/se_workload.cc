@@ -149,9 +149,14 @@ template <typename ABI>
 static SyscallReturn
 syncWaitFunc(SyscallDesc *desc, ThreadContext *tc, uint64_t node_mask)
 {
+    // High 32 bits non-zero: only 32-bit masks are supported.
+    if (node_mask >> 32) {
+        return -EINVAL;
+    }
+
     auto *sys = tc->getSystemPtr();
-    sys->syncWait.barrierWait(tc, static_cast<uint32_t>(node_mask));
-    return 0;
+    int ret = sys->syncWait.barrierWait(tc, static_cast<uint32_t>(node_mask));
+    return ret;
 }
 
 class SyscallTable32 : public SyscallDescTable<EmuLinux::SyscallABI32>

@@ -28,6 +28,8 @@
 
 #include "sim/sync_wait.hh"
 
+#include <cerrno>
+
 #include "cpu/thread_context.hh"
 
 namespace gem5
@@ -45,9 +47,23 @@ SyncWaitManager::popcount(uint32_t v)
     return v & 0x3Fu;
 }
 
-void
+int
 SyncWaitManager::barrierWait(ThreadContext *tc, uint32_t node_mask)
 {
+    // ── Validation ──────────────────────────────────────────────
+    // 1. node_mask must be non-zero.
+    if (node_mask == 0) {
+        return -EINVAL;
+    }
+
+    // 2. node_mask must not set bits beyond MAX_NODE_COUNT-1.
+    //    Allowed mask bits: (1 << MAX_NODE_COUNT) - 1
+    uint32_t max_valid_mask = (1u << MAX_NODE_COUNT) - 1u;
+    if (node_mask & ~max_valid_mask) {
+        return -EINVAL;
+    }
+    // ── End validation ──────────────────────────────────────────
+
     auto it = barriers.find(node_mask);
 
     // First encounter of this node_mask: create the barrier.
@@ -71,7 +87,7 @@ SyncWaitManager::barrierWait(ThreadContext *tc, uint32_t node_mask)
 
     // Duplicate call by the same thread within the same round: ignore.
     if (bs.arrived.find(tc) != bs.arrived.end()) {
-        return;
+        return 0;
     }
 
     // Register this thread.
@@ -91,6 +107,8 @@ SyncWaitManager::barrierWait(ThreadContext *tc, uint32_t node_mask)
         // Mark round as complete so next round will auto-reset.
         bs.gathering = false;
     }
+
+    return 0;
 }
 
 } // namespace gem5

@@ -57,6 +57,11 @@ class ThreadContext;
  */
 class SyncWaitManager
 {
+  public:
+    /** Maximum number of nodes in the current topology.
+     *  Only bits 0..(MAX_NODE_COUNT-1) are valid in node_mask. */
+    static constexpr uint32_t MAX_NODE_COUNT = 3;
+
   private:
     /** Per-barrier-instance state. */
     struct BarrierState
@@ -87,6 +92,7 @@ class SyncWaitManager
      * @param tc        The calling thread context.
      * @param node_mask The barrier identifier; popcount(mask) gives the
      *                  expected number of threads.
+     * @return 0 on success; negative errno (-EINVAL) on invalid node_mask.
      *
      * If not all expected threads have arrived, the calling thread is
      * suspended. When the last expected thread arrives, all waiting
@@ -96,8 +102,12 @@ class SyncWaitManager
      * safely ignored.
      * After a round completes and a new round begins, the barrier
      * state is automatically reset.
+     *
+     * Returns -EINVAL if:
+     *   - node_mask == 0
+     *   - node_mask contains bits beyond MAX_NODE_COUNT-1
      */
-    void barrierWait(ThreadContext *tc, uint32_t node_mask);
+    int barrierWait(ThreadContext *tc, uint32_t node_mask);
 };
 
 } // namespace gem5
