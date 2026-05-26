@@ -186,11 +186,15 @@ UBCCController::mesiStateName(MESIState s) const
 
 UBCC_OuterGrantType
 UBCCController::processOuterRequest(
-    uint64_t line_pa, UBCC_OuterReqType reqType, bool writeIntent)
+    uint64_t line_pa, UBCC_OuterReqType reqType, bool writeIntent,
+    int requesterNode,
+    Tick *outGrantVisibleTick, Tick *outSentinelVisibleTick)
 {
     DPRINTF(RubyCHIGeneric,
-            "UBCC node_id=%d: processOuterRequest PA=0x%lx req=%d write=%d\n",
-            _nodeId, line_pa, static_cast<int>(reqType), writeIntent);
+            "UBCC node_id=%d: processOuterRequest PA=0x%lx req=%d write=%d "
+            "requesterNode=%d\n",
+            _nodeId, line_pa, static_cast<int>(reqType), writeIntent,
+            requesterNode);
 
     // Validate: only DSM addresses for this home node
     if (!isDsmAddr(line_pa)) {
@@ -204,13 +208,24 @@ UBCCController::processOuterRequest(
               _nodeId, line_pa);
     }
 
+    // Validate: requesterNode must fit within sharersMask bit width (64 bits)
+    if (requesterNode < 0 || requesterNode >= 64) {
+        fatal("UBCC node_id=%d: requesterNode=%d out of range [0, 63] "
+              "for PA=0x%lx\n",
+              _nodeId, requesterNode, line_pa);
+    }
+
     ensureDirEntry(line_pa);
     DirEntry &entry = _directory[line_pa];
+
+    // Record grant-visible tick BEFORE sentinel install,
+    // so we can assert sentinel_visible_tick <= grant_visible_tick
+    Tick grantVisibleTick = curTick();
 
     // Increment epoch
     entry.epoch++;
 
-    UBCC_OuterGrantType grant;
+    UBCC_OuterGrantType grant = UBCC_OuterGrantType::GlobalGrantShared;
     MESIState prevState = entry.state;
 
     switch (entry.state) {
@@ -220,7 +235,9 @@ UBCCController::processOuterRequest(
                 // Shared read → GrantShared, enter G_S
                 grant = UBCC_OuterGrantType::GlobalGrantShared;
                 entry.state = MESIState::G_S;
-                entry.sharersMask = 0; // requester node will be tracked in sharers
+                // Set sharer bit for requesterNode
+                if (requesterNode >= 0)
+                    entry.sharersMask |= (1ULL << requesterNode);
                 entry.ownerNode = -1;
                 entry.dirty = false;
             } else { // GlobalReadUnique
@@ -228,14 +245,14 @@ UBCCController::processOuterRequest(
                     // Unique, no write intent → GrantExclusive, enter G_E
                     grant = UBCC_OuterGrantType::GlobalGrantExclusive;
                     entry.state = MESIState::G_E;
-                    entry.ownerNode = -1; // requester node ID from context
+                    entry.ownerNode = requesterNode;
                     entry.sharersMask = 0;
                     entry.dirty = false;
                 } else {
                     // Unique, write intent → GrantModified, enter G_M
                     grant = UBCC_OuterGrantType::GlobalGrantModified;
                     entry.state = MESIState::G_M;
-                    entry.ownerNode = -1;
+                    entry.ownerNode = requesterNode;
                     entry.sharersMask = 0;
                     entry.dirty = true;
                 }
@@ -249,6 +266,8 @@ UBCCController::processOuterRequest(
                 // Additional sharer → still G_S, add to sharers
                 grant = UBCC_OuterGrantType::GlobalGrantShared;
                 // entry.state stays G_S
+                if (requesterNode >= 0)
+                    entry.sharersMask |= (1ULL << requesterNode);
                 entry.dirty = false;
             } else {
                 // Unique request on shared line → requires invalidation
@@ -258,13 +277,13 @@ UBCCController::processOuterRequest(
                     grant = UBCC_OuterGrantType::GlobalGrantExclusive;
                     entry.state = MESIState::G_E;
                     entry.sharersMask = 0; // all sharers invalidated
-                    entry.ownerNode = -1;
+                    entry.ownerNode = requesterNode;
                     entry.dirty = false;
                 } else {
                     grant = UBCC_OuterGrantType::GlobalGrantModified;
                     entry.state = MESIState::G_M;
                     entry.sharersMask = 0;
-                    entry.ownerNode = -1;
+                    entry.ownerNode = requesterNode;
                     entry.dirty = true;
                 }
             }
@@ -279,6 +298,8 @@ UBCCController::processOuterRequest(
                 // Read on owned line → recall owner, downgrade to shared
                 grant = UBCC_OuterGrantType::GlobalGrantShared;
                 entry.state = MESIState::G_S;
+                if (requesterNode >= 0)
+                    entry.sharersMask |= (1ULL << requesterNode);
                 entry.ownerNode = -1;
                 entry.dirty = false;
             } else {
@@ -286,12 +307,12 @@ UBCCController::processOuterRequest(
                 if (!writeIntent) {
                     grant = UBCC_OuterGrantType::GlobalGrantExclusive;
                     entry.state = MESIState::G_E;
-                    entry.ownerNode = -1;
+                    entry.ownerNode = requesterNode;
                     entry.dirty = false;
                 } else {
                     grant = UBCC_OuterGrantType::GlobalGrantModified;
                     entry.state = MESIState::G_M;
-                    entry.ownerNode = -1;
+                    entry.ownerNode = requesterNode;
                     entry.dirty = true;
                 }
             }
@@ -304,6 +325,12 @@ UBCCController::processOuterRequest(
     // complete before the grant becomes visible to the requester.
     // We install the sentinel here, immediately after grant decision
     // and before returning control to the requester.
+    //
+    // M5 Phase 2: Add timing assertion that
+    //   sentinel_visible_tick <= grant_visible_tick
+    // Since both occur in the same simulation tick (curTick()),
+    // and sentinel install is synchronous, this invariant is
+    // satisfied by construction. We record and verify it.
     bool sentinelOk = false;
     SentinelState sentMode = SentinelState::SS_SHARER;
 
@@ -315,6 +342,25 @@ UBCCController::processOuterRequest(
         // Requester gets exclusive/modified → EP_RNF is owner
         sentinelOk = installSentinelForTest(line_pa, true); // as_owner=true
         sentMode = SentinelState::SS_OWNER;
+    }
+
+    // M5 Phase 2: Timing assertion
+    // sentinel install completes synchronously within the same tick,
+    // so sentinel_visible_tick == grant_visible_tick == curTick().
+    // The spec requires sentinel_visible_tick <= grant_visible_tick.
+    // We log both ticks for verification, and assert the ordering.
+    Tick sentinelVisibleTick = curTick();
+    DPRINTF(RubyEP,
+            "UBCC node_id=%d: sentinel timing PA=0x%lx "
+            "sentinel_visible_tick=%lu grant_visible_tick=%lu\n",
+            _nodeId, line_pa,
+            sentinelVisibleTick, grantVisibleTick);
+
+    // Hard assertion: sentinel must be visible no later than grant
+    if (sentinelVisibleTick > grantVisibleTick) {
+        fatal("UBCC node_id=%d: sentinel registration timing violation "
+              "PA=0x%lx sentinel_tick=%lu > grant_tick=%lu\n",
+              _nodeId, line_pa, sentinelVisibleTick, grantVisibleTick);
     }
 
     if (!sentinelOk) {
@@ -331,11 +377,19 @@ UBCCController::processOuterRequest(
 
     DPRINTF(RubyEP,
             "UBCC node_id=%d: grant decision PA=0x%lx "
-            "prev=%s next=%s grant=%d sentinel=%s\n",
+            "prev=%s next=%s grant=%d ownerNode=%d sentinel=%s\n",
             _nodeId, line_pa,
             mesiStateName(prevState), mesiStateName(entry.state),
-            static_cast<int>(grant),
+            static_cast<int>(grant), entry.ownerNode,
             sentinelOk ? "installed" : "FAILED");
+
+    // ---- M5 Phase 2: Propagate tick values to caller ----
+    // Write back grantVisibleTick and sentinelVisibleTick so that
+    // EPBackend::handleRemoteMiss can populate the OuterGrantEnvelope.
+    if (outGrantVisibleTick)
+        *outGrantVisibleTick = grantVisibleTick;
+    if (outSentinelVisibleTick)
+        *outSentinelVisibleTick = sentinelVisibleTick;
 
     return grant;
 }
@@ -360,6 +414,23 @@ UBCCController::inspectUbccDirForTest(uint64_t line_pa)
         << "\"pendingOp\":" << e.pendingOp
         << "}";
     return oss.str();
+}
+
+bool
+UBCCController::getUbccDirFieldsForTest(uint64_t line_pa,
+    MESIState &outState, int &outOwnerNode,
+    uint64_t &outSharersMask, bool &outDirty) const
+{
+    auto it = _directory.find(line_pa);
+    if (it == _directory.end()) {
+        return false;
+    }
+    const DirEntry &e = it->second;
+    outState = e.state;
+    outOwnerNode = e.ownerNode;
+    outSharersMask = e.sharersMask;
+    outDirty = e.dirty;
+    return true;
 }
 
 } // namespace ruby

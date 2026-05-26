@@ -96,9 +96,11 @@ void runSelfTest(EPBackend *backend, int home_node)
     uint64_t dsm_pa_local = ((2ULL * segSize) + 0x100) & ~0x3FULL;
 
     // Home node used for UBCC directory inspection (node 0)
-    int home_node_for_dir = 0;
-    int remote_node_1 = 1;  // home for dsm_pa_remote_n1
-    int remote_node_2 = 2;  // home for dsm_pa_remote_n2
+    // (currently unused but retained for documentation)
+    (void)(3*segSize); // keep segSize usage marker
+    // int home_node_for_dir = 0;
+    // int remote_node_1 = 1;  // home for dsm_pa_remote_n1
+    // int remote_node_2 = 2;  // home for dsm_pa_remote_n2
 
     // ---- Test 1: TC-M5-7 — Only ubcc_needed_perm and ubcc_write_intent exist ----
     // Create a CHIRequestMsg and verify the two UBCC fields are accessible
@@ -276,7 +278,7 @@ void runSelfTest(EPBackend *backend, int home_node)
             // Directly create an entry in node 0's UBCC directory
             // using a local DSM address (homed on node 0).
             UBCC_OuterGrantType grant = ubcc->processOuterRequest(
-                dsm_pa_local, UBCC_OuterReqType::GlobalReadShared, false);
+                dsm_pa_local, UBCC_OuterReqType::GlobalReadShared, false, 0);
 
             std::string dir_json = ubcc->inspectUbccDirForTest(dsm_pa_local);
             bool has_state = (dir_json.find("\"state\"") != std::string::npos);
@@ -342,6 +344,198 @@ void runSelfTest(EPBackend *backend, int home_node)
                  "SKIP:requires SLICC-generated protocol path; "
                  "prepareRequestRetry calls setUbccSideband "
                  "instead of hardcoded defaults");
+    }
+
+    // ---- Test 8: M5 Phase 2 — MESI 5-state transition tests ----
+    // Five independent test cases, each verifying:
+    //   - Starting state transition is correct
+    //   - ownerNode / sharersMask / dirty fields are updated correctly
+    //   - Return grant type is correct (0=Shared, 1=Exclusive, 2=Modified)
+    //
+    // Test addresses (locally-homed DSM on node 0):
+    //   We use dsm_pa_local + k*0x40 for k=0..4 to get 5 distinct lines.
+    {
+        UBCCController *ubcc = backend->getUBCC();
+        if (!ubcc) {
+            M5_CHECK("M5-MESI-*: UBCC not available", false,
+                     "SKIP:UBCC not available — requires M5 infrastructure");
+        } else {
+            int requester = 0; // self-node for these single-node UBCC tests
+            UBCCController::MESIState state;
+            int ownerNode;
+            uint64_t sharersMask;
+            bool dirty;
+
+            // --- Test 8a: G_I + Shared → G_S (GrantShared, result 0) ---
+            {
+                uint64_t pa1 = dsm_pa_local + 0x40;
+                UBCC_OuterGrantType grant =
+                    ubcc->processOuterRequest(pa1,
+                        UBCC_OuterReqType::GlobalReadShared, false,
+                        requester);
+
+                M5_CHECK("M5-MESI-1a: G_I+Shared grant type == GrantShared",
+                         grant == UBCC_OuterGrantType::GlobalGrantShared,
+                         std::string("grant=") + std::to_string(static_cast<int>(grant)));
+
+                bool exists = ubcc->getUbccDirFieldsForTest(
+                    pa1, state, ownerNode, sharersMask, dirty);
+                M5_CHECK("M5-MESI-1b: G_I+Shared → entry exists", exists, "");
+                M5_CHECK("M5-MESI-1c: G_I+Shared → state == G_S",
+                         exists && state == UBCCController::MESIState::G_S,
+                         exists ? std::string("state=") +
+                             std::to_string(static_cast<int>(state)) :
+                             "entry missing");
+                M5_CHECK("M5-MESI-1d: G_I+Shared → ownerNode == -1",
+                         exists && ownerNode == -1,
+                         exists ? std::string("ownerNode=") +
+                             std::to_string(ownerNode) : "entry missing");
+                M5_CHECK("M5-MESI-1e: G_I+Shared → sharersMask has bit 0 set",
+                         exists && (sharersMask & (1ULL << requester)),
+                         "sharersMask should have requester bit set");
+                M5_CHECK("M5-MESI-1f: G_I+Shared → dirty == false",
+                         exists && dirty == false,
+                         "dirty should be false after Shared grant");
+            }
+
+            // --- Test 8b: G_I + Unique, no writeIntent → G_E (GrantExclusive, result 1) ---
+            {
+                uint64_t pa2 = dsm_pa_local + 0x80;
+                UBCC_OuterGrantType grant =
+                    ubcc->processOuterRequest(pa2,
+                        UBCC_OuterReqType::GlobalReadUnique, false,
+                        requester);
+
+                M5_CHECK("M5-MESI-2a: G_I+Unique/nowrite grant type == GrantExclusive",
+                         grant == UBCC_OuterGrantType::GlobalGrantExclusive,
+                         std::string("grant=") + std::to_string(static_cast<int>(grant)));
+
+                bool exists = ubcc->getUbccDirFieldsForTest(
+                    pa2, state, ownerNode, sharersMask, dirty);
+                M5_CHECK("M5-MESI-2b: G_I+Unique/nowrite → entry exists", exists, "");
+                M5_CHECK("M5-MESI-2c: G_I+Unique/nowrite → state == G_E",
+                         exists && state == UBCCController::MESIState::G_E,
+                         exists ? std::string("state=") +
+                             std::to_string(static_cast<int>(state)) :
+                             "entry missing");
+                M5_CHECK("M5-MESI-2d: G_I+Unique/nowrite → ownerNode == requester",
+                         exists && ownerNode == requester,
+                         exists ? std::string("ownerNode=") +
+                             std::to_string(ownerNode) : "entry missing");
+                M5_CHECK("M5-MESI-2e: G_I+Unique/nowrite → sharersMask == 0",
+                         exists && sharersMask == 0,
+                         "sharersMask should be 0 in exclusive state");
+                M5_CHECK("M5-MESI-2f: G_I+Unique/nowrite → dirty == false",
+                         exists && dirty == false,
+                         "dirty should be false in G_E");
+            }
+
+            // --- Test 8c: G_I + Unique, writeIntent → G_M (GrantModified, result 2) ---
+            {
+                uint64_t pa3 = dsm_pa_local + 0xC0;
+                UBCC_OuterGrantType grant =
+                    ubcc->processOuterRequest(pa3,
+                        UBCC_OuterReqType::GlobalReadUnique, true,
+                        requester);
+
+                M5_CHECK("M5-MESI-3a: G_I+Unique/write grant type == GrantModified",
+                         grant == UBCC_OuterGrantType::GlobalGrantModified,
+                         std::string("grant=") + std::to_string(static_cast<int>(grant)));
+
+                bool exists = ubcc->getUbccDirFieldsForTest(
+                    pa3, state, ownerNode, sharersMask, dirty);
+                M5_CHECK("M5-MESI-3b: G_I+Unique/write → entry exists", exists, "");
+                M5_CHECK("M5-MESI-3c: G_I+Unique/write → state == G_M",
+                         exists && state == UBCCController::MESIState::G_M,
+                         exists ? std::string("state=") +
+                             std::to_string(static_cast<int>(state)) :
+                             "entry missing");
+                M5_CHECK("M5-MESI-3d: G_I+Unique/write → ownerNode == requester",
+                         exists && ownerNode == requester,
+                         exists ? std::string("ownerNode=") +
+                             std::to_string(ownerNode) : "entry missing");
+                M5_CHECK("M5-MESI-3e: G_I+Unique/write → sharersMask == 0",
+                         exists && sharersMask == 0,
+                         "sharersMask should be 0 in modified state");
+                M5_CHECK("M5-MESI-3f: G_I+Unique/write → dirty == true",
+                         exists && dirty == true,
+                         "dirty should be true in G_M");
+            }
+
+            // --- Test 8d: G_S + Unique, no writeIntent → G_E (invalidation, GrantExclusive) ---
+            {
+                uint64_t pa4 = dsm_pa_local + 0x100;
+                // First: bring line to G_S via Shared request
+                ubcc->processOuterRequest(pa4,
+                    UBCC_OuterReqType::GlobalReadShared, false, requester);
+
+                // Then: Unique request with no write intent → should go to G_E
+                UBCC_OuterGrantType grant =
+                    ubcc->processOuterRequest(pa4,
+                        UBCC_OuterReqType::GlobalReadUnique, false,
+                        requester);
+
+                M5_CHECK("M5-MESI-4a: G_S+Unique/nowrite grant type == GrantExclusive",
+                         grant == UBCC_OuterGrantType::GlobalGrantExclusive,
+                         std::string("grant=") + std::to_string(static_cast<int>(grant)));
+
+                bool exists = ubcc->getUbccDirFieldsForTest(
+                    pa4, state, ownerNode, sharersMask, dirty);
+                M5_CHECK("M5-MESI-4b: G_S+Unique/nowrite → entry exists", exists, "");
+                M5_CHECK("M5-MESI-4c: G_S+Unique/nowrite → state == G_E",
+                         exists && state == UBCCController::MESIState::G_E,
+                         exists ? std::string("state=") +
+                             std::to_string(static_cast<int>(state)) :
+                             "entry missing");
+                M5_CHECK("M5-MESI-4d: G_S+Unique/nowrite → ownerNode == requester",
+                         exists && ownerNode == requester,
+                         exists ? std::string("ownerNode=") +
+                             std::to_string(ownerNode) : "entry missing");
+                M5_CHECK("M5-MESI-4e: G_S+Unique/nowrite → sharersMask == 0 (invalidated)",
+                         exists && sharersMask == 0,
+                         "sharersMask should be cleared after invalidation");
+                M5_CHECK("M5-MESI-4f: G_S+Unique/nowrite → dirty == false",
+                         exists && dirty == false,
+                         "dirty should be false in G_E");
+            }
+
+            // --- Test 8e: G_E + Shared → G_S (downgrade, GrantShared) ---
+            {
+                uint64_t pa5 = dsm_pa_local + 0x140;
+                // First: bring line to G_E via Unique request (no write intent)
+                ubcc->processOuterRequest(pa5,
+                    UBCC_OuterReqType::GlobalReadUnique, false, requester);
+
+                // Then: Shared request → should downgrade to G_S
+                UBCC_OuterGrantType grant =
+                    ubcc->processOuterRequest(pa5,
+                        UBCC_OuterReqType::GlobalReadShared, false,
+                        requester);
+
+                M5_CHECK("M5-MESI-5a: G_E+Shared grant type == GrantShared",
+                         grant == UBCC_OuterGrantType::GlobalGrantShared,
+                         std::string("grant=") + std::to_string(static_cast<int>(grant)));
+
+                bool exists = ubcc->getUbccDirFieldsForTest(
+                    pa5, state, ownerNode, sharersMask, dirty);
+                M5_CHECK("M5-MESI-5b: G_E+Shared → entry exists", exists, "");
+                M5_CHECK("M5-MESI-5c: G_E+Shared → state == G_S",
+                         exists && state == UBCCController::MESIState::G_S,
+                         exists ? std::string("state=") +
+                             std::to_string(static_cast<int>(state)) :
+                             "entry missing");
+                M5_CHECK("M5-MESI-5d: G_E+Shared → ownerNode == -1 (downgraded)",
+                         exists && ownerNode == -1,
+                         exists ? std::string("ownerNode=") +
+                             std::to_string(ownerNode) : "entry missing");
+                M5_CHECK("M5-MESI-5e: G_E+Shared → sharersMask has requester bit",
+                         exists && (sharersMask & (1ULL << requester)),
+                         "sharersMask should have requester set after downgrade");
+                M5_CHECK("M5-MESI-5f: G_E+Shared → dirty == false",
+                         exists && dirty == false,
+                         "dirty should be false in G_S");
+            }
+        }
     }
 
     printf("=== M5 Self-Test Results: %d/%d PASS, %d FAIL, %d SKIP ===\n",

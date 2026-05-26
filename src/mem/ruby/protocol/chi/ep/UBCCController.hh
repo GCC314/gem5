@@ -7,6 +7,8 @@
 #include <set>
 #include <string>
 
+#include "base/types.hh"
+
 namespace gem5
 {
 
@@ -50,19 +52,35 @@ class UBCCController
     /**
      * Process an outer protocol request from a requester node.
      *
-     * @param line_pa   Physical address (home node's view)
-     * @param reqType   GlobalReadShared or GlobalReadUnique
-     * @param writeIntent  True if requester has write intent (for E/M split)
-     * @return          Grant type (GlobalGrantShared/Exclusive/Modified)
+     * @param line_pa             Physical address (home node's view)
+     * @param reqType             GlobalReadShared or GlobalReadUnique
+     * @param writeIntent         True if requester has write intent
+     * @param requesterNode       Node ID of the requesting node
+     * @param outGrantVisibleTick Output: tick when grant decision was made
+     * @param outSentinelVisibleTick Output: tick when sentinel was installed
+     * @return                    Grant type (GlobalGrantShared/Exclusive/Modified)
      */
     UBCC_OuterGrantType processOuterRequest(
-        uint64_t line_pa, UBCC_OuterReqType reqType, bool writeIntent);
+        uint64_t line_pa, UBCC_OuterReqType reqType, bool writeIntent,
+        int requesterNode = -1,
+        Tick *outGrantVisibleTick = nullptr,
+        Tick *outSentinelVisibleTick = nullptr);
 
     /**
      * Inspect the home UBCC directory entry for a given line.
      * Returns a JSON-like string for Python test consumption.
      */
     std::string inspectUbccDirForTest(uint64_t line_pa);
+
+    /**
+     * Direct field access to UBCC directory entry for C++ self-test use.
+     * Returns true if the entry exists, false otherwise.
+     * Fills out-parameters with the current MESI state, ownerNode,
+     * sharersMask, and dirty flag.
+     */
+    bool getUbccDirFieldsForTest(uint64_t line_pa, MESIState &outState,
+                                  int &outOwnerNode, uint64_t &outSharersMask,
+                                  bool &outDirty) const;
 
     // ---- M4 Sentinel Registration Test Hooks ----
 
@@ -122,7 +140,7 @@ class UBCCController
         uint64_t lineAddr;
         MESIState state;
         // Mask of node IDs that hold shared copies (bit i = node i)
-        uint32_t sharersMask;
+        uint64_t sharersMask;
         // Node ID of the exclusive/modified owner (-1 if none)
         int ownerNode;
         // True if the owner holds dirty (modified) data

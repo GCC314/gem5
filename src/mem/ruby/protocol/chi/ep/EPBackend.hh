@@ -28,9 +28,38 @@ enum class OuterReqType {
 
 // Outer protocol grant types sent from home UBCC to requester EPBackend.
 enum class OuterGrantType {
-    GlobalGrantShared,     // Shared read granted
-    GlobalGrantExclusive,  // Clean exclusive owner granted
-    GlobalGrantModified    // Dirty modified owner granted
+    GlobalGrantShared,     // Shared read granted (result code 0)
+    GlobalGrantExclusive,  // Clean exclusive owner granted (result code 1)
+    GlobalGrantModified    // Dirty modified owner granted (result code 2)
+};
+
+// ---- M5 Phase 2: Outer Message Envelope ----
+// Structured wire format for outer protocol messages between EP_SNF
+// (requester) and home UBCC.  Replaces Phase 1's ad-hoc parameter passing
+// with a proper message envelope for audit, log, and future network
+// migration.
+struct OuterReqEnvelope {
+    uint64_t linePa;         // Physical address (home node's view)
+    OuterReqType reqType;    // GlobalReadShared or GlobalReadUnique
+    bool writeIntent;        // True if requester has write intent
+    int srcNode;             // Requester node ID
+    uint64_t epoch;          // Per-transaction epoch
+
+    OuterReqEnvelope() : linePa(0), reqType(OuterReqType::GlobalReadShared),
+                         writeIntent(false), srcNode(-1), epoch(0) {}
+};
+
+struct OuterGrantEnvelope {
+    uint64_t linePa;            // Physical address (home node's view)
+    OuterGrantType grantType;   // GrantShared/Exclusive/Modified
+    int homeNode;               // Home node ID
+    uint64_t epoch;             // Per-transaction epoch
+    Tick grantVisibleTick;      // Tick when grant decision was made
+    Tick sentinelVisibleTick;   // Tick when sentinel was installed
+
+    OuterGrantEnvelope() : linePa(0),
+        grantType(OuterGrantType::GlobalGrantShared),
+        homeNode(-1), epoch(0), grantVisibleTick(0), sentinelVisibleTick(0) {}
 };
 
 // Requester-side per-line bookkeeping state.
@@ -50,6 +79,7 @@ struct RequesterLineEntry {
     OuterReqType pendingReq;
     uint64_t epoch;
     bool writeIntent;
+    int homeNode;      // Home node for this remote line (-1 if local)
 };
 
 // ---- M5 Inspection API return types ----
@@ -60,6 +90,7 @@ struct RequesterLineSnapshot {
     int pendingReq; // OuterReqType cast to int
     bool writeIntent;
     uint64_t epoch;
+    int homeNode;   // Home node for this remote line (-1 if none)
 };
 
 // Snapshot of the last UBCC sideband observed by EP_SNF on a recvRequestMsg.
@@ -99,7 +130,24 @@ class EPBackend : public SimObject
     // Called after home UBCC makes a grant decision.
     // Returns the OuterGrantType that was granted.
     OuterGrantType handleGrant(uint64_t line_pa, OuterGrantType grant,
-                               int homeNode);
+                                int homeNode);
+
+    // ---- M5 Phase 2: Outer Message Envelope Accessors ----
+    // Returns the last outer request envelope for test inspection.
+    const OuterReqEnvelope& lastOuterReqEnvelope() const { return _lastReqEnv; }
+    // Returns the last outer grant envelope for test inspection.
+    const OuterGrantEnvelope& lastOuterGrantEnvelope() const { return _lastGrantEnv; }
+
+    /**
+     * Diagnose the expected grant for a given sideband combination
+     * without actually issuing the request.  Used by ARM_SYNC tests
+     * to verify protocol path setup before real execution.
+     *
+     * @param neededPerm  0=Shared, 1=Unique
+     * @param writeIntent write intent flag
+     * @return String describing the expected grant type ("Shared"/"Exclusive"/"Modified")
+     */
+    std::string diagnoseExpectedGrant(int neededPerm, bool writeIntent) const;
 
     // ---- M4 Sentinel Registration Test Hooks ----
     // These are exposed to Python via gem5's Swig/SWIG bindings.
@@ -152,6 +200,11 @@ class EPBackend : public SimObject
     // Last sideband values recorded by recvRequestMsg.
     // Only for test/observation hooks; not used in protocol decisions.
     SidebandSnapshot _lastSideband;
+
+    // ---- M5 Phase 2: Outer Message Envelopes ----
+    // Last outer request and grant envelopes for test inspection.
+    OuterReqEnvelope _lastReqEnv;
+    OuterGrantEnvelope _lastGrantEnv;
 };
 
 } // namespace ruby

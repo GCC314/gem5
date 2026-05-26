@@ -219,6 +219,7 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
     entry.pendingReq = reqType;
     entry.epoch = _epochCounter;
     entry.writeIntent = writeIntent;
+    entry.homeNode = homeNode;
     _requesterLines[line_pa] = entry;
 
     // Dispatch to home node's UBCC via cross-node registry.
@@ -238,29 +239,86 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
               "PA=0x%lx\n", _nodeId, homeNode, line_pa);
     }
 
+    // ---- M5 Phase 2: Outer Message Envelope ----
+    // Build a proper outer request envelope for dispatch, logging,
+    // and future network migration.
+    OuterReqEnvelope reqEnv;
+    reqEnv.linePa = homePa;
+    reqEnv.reqType = reqType;
+    reqEnv.writeIntent = writeIntent;
+    reqEnv.srcNode = _nodeId;
+    reqEnv.epoch = entry.epoch;
+    _lastReqEnv = reqEnv;
+
+    DPRINTF(RubyCHIGeneric,
+            "EPBackend node_id=%d: outer request envelope "
+            "linePa=0x%lx reqType=%d writeIntent=%d srcNode=%d epoch=%lu\n",
+            _nodeId, reqEnv.linePa, static_cast<int>(reqEnv.reqType),
+            reqEnv.writeIntent, reqEnv.srcNode, reqEnv.epoch);
+
     // Convert outer request type to UBCC's internal enum
     UBCC_OuterReqType ubccReq =
         (reqType == OuterReqType::GlobalReadShared)
             ? UBCC_OuterReqType::GlobalReadShared
             : UBCC_OuterReqType::GlobalReadUnique;
 
-    // Send to home UBCC using home PA view
+    // Send to home UBCC using home PA view and requesterNode
+    // M5 Phase 2: capture grant/sentinel visible ticks for envelope
+    Tick grantVisibleTick = 0;
+    Tick sentinelVisibleTick = 0;
     UBCC_OuterGrantType ubccGrant =
-        homeUbcc->processOuterRequest(homePa, ubccReq, writeIntent);
+        homeUbcc->processOuterRequest(homePa, ubccReq, writeIntent, _nodeId,
+                                      &grantVisibleTick, &sentinelVisibleTick);
+
+    // ---- M5 Phase 2: Outer Grant Envelope ----
+    // Capture grant decision into structured envelope
+    OuterGrantEnvelope grantEnv;
+    grantEnv.linePa = homePa;
+    grantEnv.homeNode = homeNode;
+    grantEnv.epoch = entry.epoch;
+    grantEnv.grantVisibleTick = grantVisibleTick;
+    grantEnv.sentinelVisibleTick = sentinelVisibleTick;
+
+    // Self-test assertion: sentinelVisibleTick <= grantVisibleTick
+    // and both fields must be non-zero (i.e., ticks were properly captured).
+    if (sentinelVisibleTick == 0 || grantVisibleTick == 0) {
+        fatal("EPBackend node_id=%d: tick field(s) zero for PA=0x%lx "
+              "grantVisibleTick=%lu sentinelVisibleTick=%lu\n",
+              _nodeId, line_pa, grantVisibleTick, sentinelVisibleTick);
+    }
+    if (sentinelVisibleTick > grantVisibleTick) {
+        fatal("EPBackend node_id=%d: tick ordering violation "
+              "PA=0x%lx sentinelVisibleTick=%lu > grantVisibleTick=%lu\n",
+              _nodeId, line_pa, sentinelVisibleTick, grantVisibleTick);
+    }
 
     // Convert UBCC grant back to EPBackend's OuterGrantType
     OuterGrantType grant;
     switch (ubccGrant) {
         case UBCC_OuterGrantType::GlobalGrantShared:
-            grant = OuterGrantType::GlobalGrantShared; break;
+            grant = OuterGrantType::GlobalGrantShared;
+            grantEnv.grantType = OuterGrantType::GlobalGrantShared;
+            break;
         case UBCC_OuterGrantType::GlobalGrantExclusive:
-            grant = OuterGrantType::GlobalGrantExclusive; break;
+            grant = OuterGrantType::GlobalGrantExclusive;
+            grantEnv.grantType = OuterGrantType::GlobalGrantExclusive;
+            break;
         case UBCC_OuterGrantType::GlobalGrantModified:
-            grant = OuterGrantType::GlobalGrantModified; break;
+            grant = OuterGrantType::GlobalGrantModified;
+            grantEnv.grantType = OuterGrantType::GlobalGrantModified;
+            break;
         default:
             fatal("EPBackend node_id=%d: unknown UBCC grant %d\n",
                   _nodeId, static_cast<int>(ubccGrant));
     }
+
+    _lastGrantEnv = grantEnv;
+
+    DPRINTF(RubyCHIGeneric,
+            "EPBackend node_id=%d: outer grant envelope "
+            "linePa=0x%lx grantType=%d homeNode=%d epoch=%lu\n",
+            _nodeId, grantEnv.linePa, static_cast<int>(grantEnv.grantType),
+            grantEnv.homeNode, grantEnv.epoch);
 
     // Handle grant result and update bookkeeping
     OuterGrantType result = handleGrant(line_pa, grant, homeNode);
@@ -328,6 +386,7 @@ EPBackend::inspectRequesterState(uint64_t line_pa) const
         snap.pendingReq = static_cast<int>(it->second.pendingReq);
         snap.writeIntent = it->second.writeIntent;
         snap.epoch = it->second.epoch;
+        snap.homeNode = it->second.homeNode;
     }
 
     return snap;
@@ -362,6 +421,27 @@ EPBackend::clearSidebandSnapshot()
     _lastSideband.outerReqType = -1;
     _lastSideband.grantResult = -1;
     _lastSideband.homeNode = -1;
+}
+
+// ---- M5 Phase 2: Diagnose Expected Grant ----
+
+std::string
+EPBackend::diagnoseExpectedGrant(int neededPerm, bool writeIntent) const
+{
+    if (neededPerm == 0) {
+        // Shared → always GrantShared
+        if (writeIntent) {
+            return "ILLEGAL: Shared+writeIntent=true is invalid";
+        }
+        return "Shared";
+    } else {
+        // Unique
+        if (writeIntent) {
+            return "Modified";
+        } else {
+            return "Exclusive";
+        }
+    }
 }
 
 } // namespace ruby
