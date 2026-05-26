@@ -1589,6 +1589,7 @@ action(Send_ReadNoSnp, desc="") {
     prepareRequest(tbe, CHIRequestType:ReadNoSnp, out_msg);
     out_msg.Destination.add(mapAddressToDownstreamMachine(tbe.addr));
     out_msg.dataToFwdRequestor := false;
+    setUbccSideband(tbe, out_msg);
     allowRequestRetry(tbe, out_msg);
   }
 }
@@ -1608,6 +1609,7 @@ action(Send_ReadNoSnpDMT, desc="") {
     prepareRequest(tbe, req, out_msg);
     out_msg.Destination.add(mapAddressToDownstreamMachine(tbe.addr));
     out_msg.dataToFwdRequestor := true;
+    setUbccSideband(tbe, out_msg);
     allowRequestRetry(tbe, out_msg);
   }
 }

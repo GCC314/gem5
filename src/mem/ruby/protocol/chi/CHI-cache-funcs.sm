@@ -670,6 +670,39 @@ void prepareRequest(TBE tbe, CHIRequestType type, CHIRequestMsg & out_msg) {
   out_msg.txnId := tbe.txnId;
 
   assert(tbe.txnId != static_cast(Addr, "value", -1));
+
+  // Default UBCC sideband: Shared, no write intent
+  out_msg.ubcc_needed_perm := 0;
+  out_msg.ubcc_write_intent := false;
+}
+
+// UBCC sideband: populate permission intent based on HN upper request
+// semantics (stored in tbe.reqType). Only meaningful for messages destined
+// to EP_SNF; harmless (unused) on local SNF paths.
+void setUbccSideband(TBE tbe, CHIRequestMsg & out_msg) {
+  CHIRequestType rt := tbe.reqType;
+
+  // Shared (0), no write intent: pure loads
+  if ((rt == CHIRequestType:Load) ||
+      (rt == CHIRequestType:ReadShared) ||
+      (rt == CHIRequestType:ReadOnce)) {
+    out_msg.ubcc_needed_perm := 0;
+    out_msg.ubcc_write_intent := false;
+  }
+  // Unique (1), no write intent: read-for-ownership without immediate write
+  else if ((rt == CHIRequestType:ReadNotSharedDirty) ||
+           (rt == CHIRequestType:CleanUnique)) {
+    out_msg.ubcc_needed_perm := 1;
+    out_msg.ubcc_write_intent := false;
+  }
+  // Unique (1), write intent: store / write-miss
+  else {
+    // Store, StoreLine, ReadUnique, MakeReadUnique, AtomicLoad, AtomicStore,
+    // WriteUniquePtl, WriteUniqueFull, WriteUniqueZero, WriteBackFull,
+    // WriteEvictFull, WriteCleanFull, and all other write-bearing types.
+    out_msg.ubcc_needed_perm := 1;
+    out_msg.ubcc_write_intent := true;
+  }
 }
 
 void prepareRequestAtomic(TBE tbe, CHIRequestType type,
@@ -713,6 +746,11 @@ void prepareRequestRetry(TBE tbe, CHIRequestMsg & out_msg) {
   out_msg.is_remote_pf := tbe.is_local_pf || tbe.is_remote_pf;
   out_msg.atomic_op.clear();
   out_msg.atomic_op.orMask(tbe.atomic_op);
+
+  // Preserve UBCC sideband from original request semantics on retry.
+  // Sideband is derived from tbe.reqType (the original CPU request type),
+  // which does not change across retries.
+  setUbccSideband(tbe, out_msg);
 }
 
 void prepareRequestRetryDVM(TBE tbe, CHIRequestMsg & out_msg) {

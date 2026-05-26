@@ -126,6 +126,13 @@ structure(CHIRequestMsg, desc="", interface="Message") {
 
   MessageSizeType MessageSize, default="MessageSizeType_Control";
 
+  // UBCC Sideband: permission intent for remote DSM outer protocol.
+  // Set by HN when issuing ReadNoSnp to EP_SNF. Not used on local paths.
+  // ubcc_needed_perm: 0=Shared, 1=Unique
+  // ubcc_write_intent: false=clean (GrantExclusive), true=dirty (GrantModified)
+  int ubcc_needed_perm, desc="UBCC needed permission (0=Shared,1=Unique)", default="0";
+  bool ubcc_write_intent, desc="UBCC write intent for MESI E/M distinction", default="false";
+
   // No data for functional access
   bool functionalRead(Packet *pkt) { return false; }
   bool functionalRead(Packet *pkt, WriteMask &mask) { return false; }
