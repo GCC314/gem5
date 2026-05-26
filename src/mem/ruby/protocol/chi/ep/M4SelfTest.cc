@@ -384,10 +384,16 @@ void runSelfTest(UBCCController *ubcc, int home_node)
 
     // Signal failure via a visible mechanism that Python can detect.
     // The test harness (test_sentinel_registration.py) parses this.
+    // CRITICAL: fflush(stdout) ensures all output is written to the
+    // OS buffer before the Python harness reads the captured file.
+    // Without this, C++ stdio buffering can cause the Python harness
+    // to miss the PASSED/FAILED marker line printed above.
     if (_failed > 0) {
         printf("M4_SELF_TEST_FAILED=1\n");
+        fflush(stdout);
     } else {
         printf("M4_SELF_TEST_PASSED=1\n");
+        fflush(stdout);
     }
 }
 
