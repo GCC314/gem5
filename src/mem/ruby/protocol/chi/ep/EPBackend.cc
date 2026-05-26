@@ -344,21 +344,24 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
                     _nodeId, recallOwnerNode);
             bool recallOk = ownerBackend->handleRecallRequest(recallMsg);
             if (!recallOk) {
-                DPRINTF(RubyEP,
-                        "EPBackend node_id=%d: owner EPBackend node %d "
-                        "rejected recall\n",
-                        _nodeId, recallOwnerNode);
+                // M6 P0-2: Recall failure must abort the grant.
+                // Proceeding to handleGrant after a failed recall
+                // violates the protocol (the line may still be owned
+                // by the recalled node with conflicting permissions).
+                fatal("EPBackend node_id=%d: owner EPBackend node %d "
+                      "rejected recall for PA=0x%lx - "
+                      "cannot proceed with grant\n",
+                      _nodeId, recallOwnerNode, line_pa);
             }
         } else {
-            // Fallback: if the owner EPBackend is not found in the
-            // registry (e.g., single-node tests), fall back to
-            // direct recall response. This path should only be
-            // exercised in single-node self-tests.
-            DPRINTF(RubyEP,
-                    "EPBackend node_id=%d: owner EPBackend for node %d "
-                    "not found in registry, using direct fallback\n",
-                    _nodeId, recallOwnerNode);
-            homeUbcc->processRecallResponse(homePa, recallOwnerNode, true);
+            // M6 P0-1: No fallback — owner EPBackend must be in registry.
+            // Bypassing the owner EPBackend with a direct
+            // processRecallResponse call silently skips the proper
+            // recall path and must never happen.
+            fatal("EPBackend node_id=%d: owner EPBackend for node %d "
+                  "not found in registry for recall PA=0x%lx - "
+                  "cannot bypass recall path\n",
+                  _nodeId, recallOwnerNode, line_pa);
         }
     }
 
@@ -552,12 +555,13 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
             recallMsg.homeNode, recallMsg.epoch,
             recallMsg.isReadRequest, recallMsg.dataNeeded);
 
-    // Validate: this node must be the recall target
+    // M6 P0-3: Validate — this node must be the recall target.
+    // A mismatch indicates a routing bug or stale recall message;
+    // silently processing is a correctness hazard.
     if (recallMsg.ownerNode != _nodeId) {
-        warn("EPBackend node_id=%d: recall target mismatch "
-             "expected=%d got=%d\n",
-             _nodeId, recallMsg.ownerNode, _nodeId);
-        // Still process for now (single-process simulation)
+        fatal("EPBackend node_id=%d: recall target mismatch "
+              "expected=%d got=%d\n",
+              _nodeId, recallMsg.ownerNode, _nodeId);
     }
 
     // Store recall message for inspection
@@ -603,21 +607,16 @@ EPBackend::sendRecallResponse(const OuterRecallResponse &response)
     _lastRecallResponse = response;
     _recallResponseSentCount++;
 
-    // Route response to home node's UBCC
+    // Route response to home node's UBCC.
+    // M6 P0-1: No fallback — the home UBCC must be registered.
+    // Falling back to local _ubcc silently bypasses the home node's
+    // directory and must never happen.
     UBCCController *homeUbcc = UBCCController::getInstance(response.homeNode);
     if (!homeUbcc) {
-        // Fallback: use our own UBCC if home node's UBCC not found
-        DPRINTF(RubyEP,
-                "EPBackend node_id=%d: home UBCC for node %d not found\n",
-                _nodeId, response.homeNode);
-        homeUbcc = _ubcc;
-    }
-
-    if (!homeUbcc) {
-        warn("EPBackend node_id=%d: no UBCC available for recall response "
-             "homeNode=%d PA=0x%lx\n",
-             _nodeId, response.homeNode, response.linePa);
-        return false;
+        fatal("EPBackend node_id=%d: home UBCC for node %d not found "
+              "for recall response PA=0x%lx - "
+              "cannot fall back to local UBCC\n",
+              _nodeId, response.homeNode, response.linePa);
     }
 
     // Complete the recall at the home UBCC
