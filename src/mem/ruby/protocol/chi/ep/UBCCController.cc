@@ -821,6 +821,15 @@ bool
 UBCCController::processInvalidationAck(uint64_t line_pa, int ackNode,
                                         uint64_t responseEpoch)
 {
+    // Validate ackNode boundaries BEFORE any directory access or early-return.
+    // ackNode must be in [0, 63] to safely compute (1ULL << ackNode).
+    if (ackNode < 0 || ackNode >= 64) {
+        warn("UBCC node_id=%d: processInvalidationAck PA=0x%lx "
+             "ackNode=%d out of range [0, 63] — REJECTED\n",
+             _nodeId, line_pa, ackNode);
+        return false;
+    }
+
     auto it = _directory.find(line_pa);
     if (it == _directory.end()) {
         DPRINTF(RubyEP,
@@ -830,15 +839,6 @@ UBCCController::processInvalidationAck(uint64_t line_pa, int ackNode,
     }
 
     DirEntry &entry = it->second;
-
-    // M8 P1-4: Validate ackNode boundaries at entry, before any early-return.
-    // ackNode must be in [0, 63] to safely compute (1ULL << ackNode).
-    if (ackNode < 0 || ackNode >= 64) {
-        warn("UBCC node_id=%d: processInvalidationAck PA=0x%lx "
-             "ackNode=%d out of range [0, 63] — REJECTED\n",
-             _nodeId, line_pa, ackNode);
-        return false;
-    }
 
     // ---- Stale epoch check ----
     if (!checkEpochForLine(line_pa, responseEpoch)) {
