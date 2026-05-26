@@ -70,9 +70,69 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
     DPRINTF(RubyCHIGeneric, "EP_SNF node_id=%d recvRequestMsg type=%s addr=0x%lx\n",
             _nodeId, msg->m_type, msg->m_addr);
 
-    if (_backend)
-        _backend->checkDsmAddr(msg->m_addr);
+    // ---- M5 R1: Request type gate ----
+    // EP_SNF only services ReadNoSnp (and ReadNoSnpSep) requests.
+    // All other request types (Load, Store, DVM, Snoop variants, etc.)
+    // are not valid on the EP_SNF receive path and must be rejected
+    // or deferred to the base class.
+    if (msg->m_type != CHIRequestType_ReadNoSnp &&
+        msg->m_type != CHIRequestType_ReadNoSnpSep) {
+        // This is a protocol violation — only ReadNoSnp[Sep] should
+        // arrive at EP_SNF.  Warn and return unhandled; production
+        // code would trigger a protocol-level error response.
+        DPRINTF(RubyCHIGeneric,
+                "EP_SNF node_id=%d: unsupported request type %s addr=0x%lx "
+                "-- returning false (unhandled)\n",
+                _nodeId, msg->m_type, msg->m_addr);
+        fatal("EP_SNF node_id=%d: received non-ReadNoSnp request type "
+              "msg_type=%d for PA=0x%lx\n", _nodeId, msg->m_type, msg->m_addr);
+        return false;
+    }
 
+    if (!_backend) {
+        fatal("EP_SNF node_id=%d: no backend attached\n", _nodeId);
+    }
+
+    _backend->checkDsmAddr(msg->m_addr);
+
+    // ---- M5: Read UBCC Sideband Fields ----
+    int neededPerm = msg->m_ubcc_needed_perm;  // 0=Shared, 1=Unique
+    bool writeIntent = msg->m_ubcc_write_intent;
+
+    DPRINTF(RubyCHIGeneric,
+            "EP_SNF node_id=%d: sideband neededPerm=%d writeIntent=%d\n",
+            _nodeId, neededPerm, writeIntent);
+
+    // Validate: neededPerm must be 0 (Shared) or 1 (Unique)
+    if (neededPerm != 0 && neededPerm != 1) {
+        fatal("EP_SNF node_id=%d: invalid neededPerm=%d (must be 0 or 1) "
+              "PA=0x%lx\n", _nodeId, neededPerm, msg->m_addr);
+    }
+
+    // Validate: Shared + true is illegal
+    if (neededPerm == 0 && writeIntent) {
+        fatal("EP_SNF node_id=%d: illegal sideband Shared+writeIntent=true "
+              "PA=0x%lx\n", _nodeId, msg->m_addr);
+    }
+
+    // Map sideband to outer request and dispatch
+    // GlobalReadShared or GlobalReadUnique
+    int homeNode = -1;
+    int grantResult = _backend->handleRemoteMiss(
+        msg->m_addr, neededPerm, writeIntent, homeNode);
+
+    DPRINTF(RubyCHIGeneric,
+            "EP_SNF node_id=%d: grantResult=%d homeNode=%d\n",
+            _nodeId, grantResult, homeNode);
+
+    // ---- M5: Record sideband for inspection by Python tests ----
+    _backend->recordSideband(msg->m_addr, neededPerm, writeIntent,
+                              (neededPerm == 0) ? 0 : 1,  // 0=GlobalReadShared, 1=GlobalReadUnique
+                              grantResult, homeNode);
+
+    // Respond to HN with RespSepData + CompData
+    // For M5, we send dummy/zero data since the data path through
+    // DL_SNF is not yet implemented (M6/M7 will add recall/writeback).
     NetDest dest;
     dest.add(msg->m_requestor);
 

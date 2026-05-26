@@ -1,6 +1,9 @@
 #include "mem/ruby/protocol/chi/ep/EPBackend.hh"
 
+#include <sstream>
+
 #include "base/logging.hh"
+#include "debug/RubyCHIGeneric.hh"
 #include "mem/ruby/protocol/chi/ep/UBCCController.hh"
 #include "mem/ruby/system/RubySystem.hh"
 #include "params/EPBackend.hh"
@@ -14,7 +17,8 @@ namespace ruby
 EPBackend::EPBackend(const Params &p)
   : SimObject(p),
     _nodeId(p.node_id),
-    _addrMap(3, 128ULL * 1024 * 1024)
+    _addrMap(3, 128ULL * 1024 * 1024),
+    _lastSideband{false, 0, 0, false, -1, -1, -1}
 {
     // Pass RubySystem to UBCCController for SentinelHelper init
     // RubySystem is available via the params
@@ -32,6 +36,11 @@ EPBackend::~EPBackend()
  */
 void m4SelfTest_run(EPBackend*);
 
+/**
+ * Forward declare the M5 self-test entry point (defined in M5SelfTest.cc).
+ */
+void m5SelfTest_run(EPBackend*);
+
 
 void
 EPBackend::init()
@@ -41,9 +50,10 @@ EPBackend::init()
     // ---- M4 Sentinel Registration Self-Test ----
     // Runs during instantiation; results printed to stdout.
     // Python test harness parses the output.
-    // Only one node (node 0) runs the self-test to avoid duplicate output.
+    // Only one node (node 0) runs the self-tests to avoid duplicate output.
     if (_nodeId == 0 && _ubcc) {
         m4SelfTest_run(this);
+        m5SelfTest_run(this);
     }
 }
 
@@ -142,6 +152,216 @@ EPBackend::incrementEpRnfSnoopCount()
 {
     if (_ubcc)
         _ubcc->incrementEpRnfSnoopCount();
+}
+
+// ---- M5: Remote Miss Request Dispatch ----
+
+int
+EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
+                             int& outHomeNode)
+{
+    DPRINTF(RubyCHIGeneric,
+            "EPBackend node_id=%d: handleRemoteMiss PA=0x%lx "
+            "neededPerm=%d writeIntent=%d\n",
+            _nodeId, line_pa, neededPerm, writeIntent);
+
+    // Validate: neededPerm must be 0 (Shared) or 1 (Unique)
+    if (neededPerm != 0 && neededPerm != 1) {
+        fatal("EPBackend node_id=%d: invalid neededPerm=%d "
+              "(must be 0 or 1) for PA=0x%lx\n",
+              _nodeId, neededPerm, line_pa);
+    }
+
+    // Validate: Shared + true is illegal
+    if (neededPerm == 0 && writeIntent) {
+        fatal("EPBackend node_id=%d: illegal sideband combination "
+              "Shared+writeIntent=true for PA=0x%lx\n",
+              _nodeId, line_pa);
+    }
+
+    // Validate DSM address
+    if (!_addrMap.isDsm(_nodeId, line_pa)) {
+        fatal("EPBackend node_id=%d: non-DSM address on remote miss path "
+              "PA=0x%lx\n", _nodeId, line_pa);
+    }
+
+    int homeNode = _addrMap.homeNode(_nodeId, line_pa);
+    if (homeNode < 0 || homeNode == _nodeId) {
+        fatal("EPBackend node_id=%d: invalid home node %d for PA=0x%lx\n",
+              _nodeId, homeNode, line_pa);
+    }
+    outHomeNode = homeNode;
+
+    // Translate PA from requester's view to home node's view.
+    uint64_t offset = _addrMap.dsmOffset(line_pa);
+    uint64_t homePa = _addrMap.buildDsmPA(homeNode, homeNode, offset);
+
+    DPRINTF(RubyCHIGeneric,
+            "EPBackend node_id=%d: translating PA 0x%lx -> home PA 0x%lx "
+            "homeNode=%d offset=0x%lx\n",
+            _nodeId, line_pa, homePa, homeNode, offset);
+
+    // Map sideband to outer request type
+    OuterReqType reqType;
+    if (neededPerm == 0) {
+        // Shared + false → GlobalReadShared
+        reqType = OuterReqType::GlobalReadShared;
+    } else {
+        // Unique + false/true → GlobalReadUnique
+        reqType = OuterReqType::GlobalReadUnique;
+    }
+
+    // Create requester bookkeeping entry (uses requester's PA view)
+    _epochCounter++;
+    RequesterLineEntry entry;
+    entry.lineAddr = line_pa;
+    entry.state = RequesterLineState::R_WAIT_GRANT;
+    entry.pendingReq = reqType;
+    entry.epoch = _epochCounter;
+    entry.writeIntent = writeIntent;
+    _requesterLines[line_pa] = entry;
+
+    // Dispatch to home node's UBCC via cross-node registry.
+    // Use home PA so the home UBCC sees the line in its own address space.
+    UBCCController *homeUbcc = UBCCController::getInstance(homeNode);
+    if (!homeUbcc) {
+        // Fallback: use our own UBCC (for same-home-node or
+        // bootstrap scenarios). This is a temporary M5 simplification.
+        DPRINTF(RubyCHIGeneric,
+                "EPBackend node_id=%d: home UBCC for node %d not found, "
+                "falling back to local UBCC\n",
+                _nodeId, homeNode);
+        homeUbcc = _ubcc;
+    }
+    if (!homeUbcc) {
+        fatal("EPBackend node_id=%d: no UBCC available for home node %d "
+              "PA=0x%lx\n", _nodeId, homeNode, line_pa);
+    }
+
+    // Convert outer request type to UBCC's internal enum
+    UBCC_OuterReqType ubccReq =
+        (reqType == OuterReqType::GlobalReadShared)
+            ? UBCC_OuterReqType::GlobalReadShared
+            : UBCC_OuterReqType::GlobalReadUnique;
+
+    // Send to home UBCC using home PA view
+    UBCC_OuterGrantType ubccGrant =
+        homeUbcc->processOuterRequest(homePa, ubccReq, writeIntent);
+
+    // Convert UBCC grant back to EPBackend's OuterGrantType
+    OuterGrantType grant;
+    switch (ubccGrant) {
+        case UBCC_OuterGrantType::GlobalGrantShared:
+            grant = OuterGrantType::GlobalGrantShared; break;
+        case UBCC_OuterGrantType::GlobalGrantExclusive:
+            grant = OuterGrantType::GlobalGrantExclusive; break;
+        case UBCC_OuterGrantType::GlobalGrantModified:
+            grant = OuterGrantType::GlobalGrantModified; break;
+        default:
+            fatal("EPBackend node_id=%d: unknown UBCC grant %d\n",
+                  _nodeId, static_cast<int>(ubccGrant));
+    }
+
+    // Handle grant result and update bookkeeping
+    OuterGrantType result = handleGrant(line_pa, grant, homeNode);
+    return static_cast<int>(result);
+
+    fatal("EPBackend node_id=%d: no UBCC available for remote miss "
+          "PA=0x%lx\n", _nodeId, line_pa);
+    return -1;
+}
+
+OuterGrantType
+EPBackend::handleGrant(uint64_t line_pa, OuterGrantType grant, int homeNode)
+{
+    DPRINTF(RubyCHIGeneric,
+            "EPBackend node_id=%d: handleGrant PA=0x%lx grant=%d homeNode=%d\n",
+            _nodeId, line_pa, static_cast<int>(grant), homeNode);
+
+    auto it = _requesterLines.find(line_pa);
+    if (it == _requesterLines.end()) {
+        fatal("EPBackend node_id=%d: grant for unknown line PA=0x%lx\n",
+              _nodeId, line_pa);
+    }
+
+    // Update requester bookkeeping based on grant
+    switch (grant) {
+        case OuterGrantType::GlobalGrantShared:
+            it->second.state = RequesterLineState::R_S;
+            DPRINTF(RubyCHIGeneric,
+                    "EPBackend node_id=%d: line 0x%lx -> R_S\n",
+                    _nodeId, line_pa);
+            break;
+        case OuterGrantType::GlobalGrantExclusive:
+            it->second.state = RequesterLineState::R_E;
+            DPRINTF(RubyCHIGeneric,
+                    "EPBackend node_id=%d: line 0x%lx -> R_E (GrantExclusive)\n",
+                    _nodeId, line_pa);
+            break;
+        case OuterGrantType::GlobalGrantModified:
+            it->second.state = RequesterLineState::R_M;
+            DPRINTF(RubyCHIGeneric,
+                    "EPBackend node_id=%d: line 0x%lx -> R_M (GrantModified)\n",
+                    _nodeId, line_pa);
+            break;
+        default:
+            fatal("EPBackend node_id=%d: unknown grant type %d\n",
+                  _nodeId, static_cast<int>(grant));
+    }
+
+    return grant;
+}
+
+// ---- M5 Inspection API ----
+
+RequesterLineSnapshot
+EPBackend::inspectRequesterState(uint64_t line_pa) const
+{
+    RequesterLineSnapshot snap;
+    snap.valid = false;
+
+    auto it = _requesterLines.find(line_pa);
+    if (it != _requesterLines.end()) {
+        snap.valid = true;
+        snap.lineAddr = it->second.lineAddr;
+        snap.state = static_cast<int>(it->second.state);
+        snap.pendingReq = static_cast<int>(it->second.pendingReq);
+        snap.writeIntent = it->second.writeIntent;
+        snap.epoch = it->second.epoch;
+    }
+
+    return snap;
+}
+
+void
+EPBackend::recordSideband(uint64_t line_pa, int neededPerm, bool writeIntent,
+                           int outerReqType, int grantResult, int homeNode)
+{
+    _lastSideband.valid = true;
+    _lastSideband.lineAddr = line_pa;
+    _lastSideband.neededPerm = neededPerm;
+    _lastSideband.writeIntent = writeIntent;
+    _lastSideband.outerReqType = outerReqType;
+    _lastSideband.grantResult = grantResult;
+    _lastSideband.homeNode = homeNode;
+}
+
+SidebandSnapshot
+EPBackend::inspectLastSideband() const
+{
+    return _lastSideband;
+}
+
+void
+EPBackend::clearSidebandSnapshot()
+{
+    _lastSideband.valid = false;
+    _lastSideband.lineAddr = 0;
+    _lastSideband.neededPerm = 0;
+    _lastSideband.writeIntent = false;
+    _lastSideband.outerReqType = -1;
+    _lastSideband.grantResult = -1;
+    _lastSideband.homeNode = -1;
 }
 
 } // namespace ruby
