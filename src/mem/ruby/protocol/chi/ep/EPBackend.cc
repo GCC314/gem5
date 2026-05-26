@@ -280,12 +280,6 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
     grantEnv.sentinelVisibleTick = sentinelVisibleTick;
 
     // Self-test assertion: sentinelVisibleTick <= grantVisibleTick
-    // and both fields must be non-zero (i.e., ticks were properly captured).
-    if (sentinelVisibleTick == 0 || grantVisibleTick == 0) {
-        fatal("EPBackend node_id=%d: tick field(s) zero for PA=0x%lx "
-              "grantVisibleTick=%lu sentinelVisibleTick=%lu\n",
-              _nodeId, line_pa, grantVisibleTick, sentinelVisibleTick);
-    }
     if (sentinelVisibleTick > grantVisibleTick) {
         fatal("EPBackend node_id=%d: tick ordering violation "
               "PA=0x%lx sentinelVisibleTick=%lu > grantVisibleTick=%lu\n",

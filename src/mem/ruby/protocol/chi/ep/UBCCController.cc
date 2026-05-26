@@ -211,8 +211,9 @@ UBCCController::processOuterRequest(
     // Validate: requesterNode must fit within sharersMask bit width (64 bits).
     // Allow requesterNode=-1 (callers may not know the node); the internal
     // "if (requesterNode >= 0)" guards already prevent invalid shifts.
-    if (requesterNode >= 64) {
-        fatal("UBCC node_id=%d: requesterNode=%d out of range [0, 63] "
+    // Negative values below -1 are also invalid.
+    if (requesterNode < -1 || requesterNode >= 64) {
+        fatal("UBCC node_id=%d: requesterNode=%d out of range [-1, 63] "
               "for PA=0x%lx\n",
               _nodeId, requesterNode, line_pa);
     }
