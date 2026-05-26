@@ -4,6 +4,7 @@
 
 #include "base/logging.hh"
 #include "debug/RubyCHIGeneric.hh"
+#include "debug/RubyEP.hh"
 #include "mem/ruby/protocol/chi/ep/UBCCController.hh"
 #include "mem/ruby/system/RubySystem.hh"
 #include "params/EPBackend.hh"
@@ -14,20 +15,36 @@ namespace gem5
 namespace ruby
 {
 
+// Static registry for cross-node EPBackend routing (M6)
+std::map<int, EPBackend*> EPBackend::_backendInstances;
+
+EPBackend* EPBackend::getBackendInstance(int node_id)
+{
+    auto it = _backendInstances.find(node_id);
+    return (it != _backendInstances.end()) ? it->second : nullptr;
+}
+
 EPBackend::EPBackend(const Params &p)
   : SimObject(p),
     _nodeId(p.node_id),
     _addrMap(3, 128ULL * 1024 * 1024),
-    _lastSideband{false, 0, 0, false, -1, -1, -1}
+    _lastSideband{false, 0, 0, false, -1, -1, -1},
+    _recallReceivedCount(0),
+    _recallResponseSentCount(0)
 {
     // Pass RubySystem to UBCCController for SentinelHelper init
     // RubySystem is available via the params
     auto *ruby_system = p.ruby_system;
     _ubcc = new UBCCController(_nodeId, ruby_system);
+
+    // M6: Register this EPBackend in the static cross-node routing registry
+    _backendInstances[_nodeId] = this;
 }
 
 EPBackend::~EPBackend()
 {
+    // M6: Deregister from cross-node routing registry
+    _backendInstances.erase(_nodeId);
     delete _ubcc;
 }
 
@@ -41,6 +58,11 @@ void m4SelfTest_run(EPBackend*);
  */
 void m5SelfTest_run(EPBackend*);
 
+/**
+ * Forward declare the M6 self-test entry point (defined in M6SelfTest.cc).
+ */
+void m6SelfTest_run(EPBackend*);
+
 
 void
 EPBackend::init()
@@ -48,12 +70,15 @@ EPBackend::init()
     SimObject::init();
 
     // ---- M4 Sentinel Registration Self-Test ----
+    // ---- M5 Sideband Self-Test ----
+    // ---- M6 UBCC Directory + EP_RNF Self-Test ----
     // Runs during instantiation; results printed to stdout.
     // Python test harness parses the output.
     // Only one node (node 0) runs the self-tests to avoid duplicate output.
     if (_nodeId == 0 && _ubcc) {
         m4SelfTest_run(this);
         m5SelfTest_run(this);
+        m6SelfTest_run(this);
     }
 }
 
@@ -262,13 +287,80 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
             ? UBCC_OuterReqType::GlobalReadShared
             : UBCC_OuterReqType::GlobalReadUnique;
 
+    // ---- M6: Mark outer txn pending before dispatching ----
+    // Inform local EP_RNF that an outer transaction is in flight
+    // for this line, so HN snoop responses are delayed until completion.
+    if (_epRnfCtrl) {
+        _epRnfCtrl->setOuterTxnPending(line_pa, true);
+    }
+
     // Send to home UBCC using home PA view and requesterNode
     // M5 Phase 2: capture grant/sentinel visible ticks for envelope
     Tick grantVisibleTick = 0;
     Tick sentinelVisibleTick = 0;
+    // ---- M6: Recall detection ----
+    bool recallNeeded = false;
+    int recallOwnerNode = -1;
     UBCC_OuterGrantType ubccGrant =
         homeUbcc->processOuterRequest(homePa, ubccReq, writeIntent, _nodeId,
-                                      &grantVisibleTick, &sentinelVisibleTick);
+                                      &grantVisibleTick, &sentinelVisibleTick,
+                                      &recallNeeded, &recallOwnerNode);
+
+    // ---- M6: Handle recall path ----
+    // If the home UBCC signals that a recall is needed, we must
+    // route the recall through the owner node's EPBackend
+    // (not bypass it with a direct processRecallResponse call).
+    if (recallNeeded && recallOwnerNode >= 0) {
+        DPRINTF(RubyEP,
+                "EPBackend node_id=%d: M6 recall needed PA=0x%lx "
+                "ownerNode=%d requesterNode=%d\n",
+                _nodeId, line_pa, recallOwnerNode, _nodeId);
+
+        // Build recall message
+        OuterRecallMsg recallMsg;
+        recallMsg.linePa = homePa;
+        recallMsg.ownerNode = recallOwnerNode;
+        recallMsg.homeNode = homeNode;
+        recallMsg.epoch = entry.epoch;
+        // Recall triggered by read: owner downgrades to shared
+        // Recall triggered by unique/write: owner invalidates
+        recallMsg.isReadRequest = (reqType == OuterReqType::GlobalReadShared);
+        // Data is needed if the owner was dirty (G_M state)
+        recallMsg.dataNeeded = true; // conservative: always request data
+
+        _lastRecallMsg = recallMsg;
+
+        // M6: Route recall through the owner node's EPBackend.
+        // The owner EPBackend processes the recall (handleRecallRequest)
+        // and sends the response back to the home UBCC via
+        // sendRecallResponse -> processRecallResponse.
+        // This eliminates the direct shortcut and ensures proper
+        // owner-node recall semantics.
+        EPBackend *ownerBackend = EPBackend::getBackendInstance(recallOwnerNode);
+        if (ownerBackend) {
+            DPRINTF(RubyEP,
+                    "EPBackend node_id=%d: routing recall to owner "
+                    "EPBackend node %d\n",
+                    _nodeId, recallOwnerNode);
+            bool recallOk = ownerBackend->handleRecallRequest(recallMsg);
+            if (!recallOk) {
+                DPRINTF(RubyEP,
+                        "EPBackend node_id=%d: owner EPBackend node %d "
+                        "rejected recall\n",
+                        _nodeId, recallOwnerNode);
+            }
+        } else {
+            // Fallback: if the owner EPBackend is not found in the
+            // registry (e.g., single-node tests), fall back to
+            // direct recall response. This path should only be
+            // exercised in single-node self-tests.
+            DPRINTF(RubyEP,
+                    "EPBackend node_id=%d: owner EPBackend for node %d "
+                    "not found in registry, using direct fallback\n",
+                    _nodeId, recallOwnerNode);
+            homeUbcc->processRecallResponse(homePa, recallOwnerNode, true);
+        }
+    }
 
     // ---- M5 Phase 2: Outer Grant Envelope ----
     // Capture grant decision into structured envelope
@@ -316,6 +408,15 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
 
     // Handle grant result and update bookkeeping
     OuterGrantType result = handleGrant(line_pa, grant, homeNode);
+
+    // ---- M6: Clear outer txn pending and signal completion ----
+    // The outer transaction is now complete; notify local EP_RNF
+    // so any delayed HN snoop responses can be sent.
+    if (_epRnfCtrl) {
+        _epRnfCtrl->setOuterTxnPending(line_pa, false);
+        _epRnfCtrl->signalOuterTxnComplete(line_pa);
+    }
+
     return static_cast<int>(result);
 
     fatal("EPBackend node_id=%d: no UBCC available for remote miss "
@@ -436,6 +537,99 @@ EPBackend::diagnoseExpectedGrant(int neededPerm, bool writeIntent) const
             return "Exclusive";
         }
     }
+}
+
+// ---- M6: Recall Management ----
+
+bool
+EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
+{
+    DPRINTF(RubyEP,
+            "EPBackend node_id=%d: handleRecallRequest "
+            "PA=0x%lx ownerNode=%d homeNode=%d epoch=%lu "
+            "isRead=%d dataNeeded=%d\n",
+            _nodeId, recallMsg.linePa, recallMsg.ownerNode,
+            recallMsg.homeNode, recallMsg.epoch,
+            recallMsg.isReadRequest, recallMsg.dataNeeded);
+
+    // Validate: this node must be the recall target
+    if (recallMsg.ownerNode != _nodeId) {
+        warn("EPBackend node_id=%d: recall target mismatch "
+             "expected=%d got=%d\n",
+             _nodeId, recallMsg.ownerNode, _nodeId);
+        // Still process for now (single-process simulation)
+    }
+
+    // Store recall message for inspection
+    _lastRecallMsg = recallMsg;
+    _recallReceivedCount++;
+
+    // In the single-gem5 prototype, the recall is processed immediately:
+    // The owner node's EPBackend receives the recall and needs to:
+    //   1. Trigger local HN coherent access (not yet wired in M6)
+    //   2. Gather data from local cache/memory (simulated)
+    //   3. Send response back to home UBCC
+    //
+    // For M6, we simulate the data path:
+    //   - If dataNeeded is true (dirty owner), we mark dataReturned=true
+    //   - The actual data content is currently dummy (zero) until
+    //     the real CHI HN path is integrated (M7+)
+
+    // Build the recall response
+    OuterRecallResponse response;
+    response.linePa = recallMsg.linePa;
+    response.ownerNode = _nodeId;
+    response.homeNode = recallMsg.homeNode;
+    response.epoch = recallMsg.epoch;
+    // For recall triggered by read: owner keeps shared copy
+    // (data returned to requester via home)
+    response.dataReturned = recallMsg.dataNeeded;
+    response.ackReceived = true;
+
+    // Send recall response back to home UBCC
+    return sendRecallResponse(response);
+}
+
+bool
+EPBackend::sendRecallResponse(const OuterRecallResponse &response)
+{
+    DPRINTF(RubyEP,
+            "EPBackend node_id=%d: sendRecallResponse "
+            "PA=0x%lx homeNode=%d dataReturned=%d\n",
+            _nodeId, response.linePa, response.homeNode,
+            response.dataReturned);
+
+    // Store for inspection
+    _lastRecallResponse = response;
+    _recallResponseSentCount++;
+
+    // Route response to home node's UBCC
+    UBCCController *homeUbcc = UBCCController::getInstance(response.homeNode);
+    if (!homeUbcc) {
+        // Fallback: use our own UBCC if home node's UBCC not found
+        DPRINTF(RubyEP,
+                "EPBackend node_id=%d: home UBCC for node %d not found\n",
+                _nodeId, response.homeNode);
+        homeUbcc = _ubcc;
+    }
+
+    if (!homeUbcc) {
+        warn("EPBackend node_id=%d: no UBCC available for recall response "
+             "homeNode=%d PA=0x%lx\n",
+             _nodeId, response.homeNode, response.linePa);
+        return false;
+    }
+
+    // Complete the recall at the home UBCC
+    bool ok = homeUbcc->processRecallResponse(
+        response.linePa, response.ownerNode, response.dataReturned);
+
+    if (!ok) {
+        warn("EPBackend node_id=%d: home UBCC rejected recall response "
+             "PA=0x%lx\n", _nodeId, response.linePa);
+    }
+
+    return ok;
 }
 
 } // namespace ruby

@@ -171,6 +171,58 @@ class EPRNFController : public EPController
     /** M4: get EPBackend for test hook access from Python */
     EPBackend* getBackend() const { return _backend; }
 
+    // ---- M6: Delayed HN Response Management ----
+    /**
+     * Pending HN response context: when EP_RNF receives a snoop from HN
+     * but must wait for outer txn completion, the response is queued here.
+     */
+    struct PendingHnResponse {
+        bool valid;                         // True if there's a pending response
+        uint64_t linePa;                    // Address of the snooped line
+        CHI::CHIResponseType respType;      // Response type to send
+        MachineID destMachine;              // Destination (HN that sent the snoop)
+        Tick snoopTick;                     // Tick when snoop was received
+        bool outerTxnComplete;             // True when outer txn is done
+
+        PendingHnResponse() : valid(false), linePa(0),
+            respType(CHI::CHIResponseType_SnpResp_I),
+            snoopTick(0), outerTxnComplete(false) {}
+    };
+
+    /**
+     * Check if there's a pending HN response for a given line.
+     */
+    bool hasPendingHnResponse(uint64_t linePa) const;
+
+    /**
+     * Signal that the outer transaction for a line has completed.
+     * This triggers sending the delayed HN response.
+     */
+    void signalOuterTxnComplete(uint64_t linePa);
+
+    /**
+     * Get the pending HN response count (for test observation).
+     */
+    int getPendingHnResponseCount() const { return _pendingHnResponseCount; }
+    void resetPendingHnResponseCount() { _pendingHnResponseCount = 0; }
+
+    /**
+     * Get count of delayed HN responses that have been sent (resolve count).
+     */
+    int getDelayedResponseResolvedCount() const { return _delayedResolvedCount; }
+    void resetDelayedResponseResolvedCount() { _delayedResolvedCount = 0; }
+
+    /**
+     * M6: Access the outer txn pending flag for test verification.
+     */
+    bool isOuterTxnPending(uint64_t linePa) const;
+
+    /**
+     * M6: Mark a line as having an outer transaction in progress.
+     * Used by EPBackend to signal EP_RNF about in-flight recall.
+     */
+    void setOuterTxnPending(uint64_t linePa, bool pending);
+
   protected:
     bool recvRequestMsg(const CHIRequestMsg *msg) override;
     bool recvSnoopMsg(const CHIRequestMsg *msg) override;
@@ -178,6 +230,20 @@ class EPRNFController : public EPController
     bool recvDataMsg(const CHIDataMsg *msg) override;
 
     EPBackend *_backend = nullptr;
+
+  private:
+    // ---- M6: Pending HN response tracking ----
+    // Map from line PA to pending HN response context.
+    std::map<uint64_t, PendingHnResponse> _pendingHnResponses;
+
+    // ---- M6: Outer txn pending tracking ----
+    // Map from line PA to outer-txn-in-progress flag.
+    // When true, EP_RNF must not send final HN response.
+    std::map<uint64_t, bool> _outerTxnPending;
+
+    // ---- M6: Counters for test verification ----
+    int _pendingHnResponseCount;
+    int _delayedResolvedCount;
 };
 
 } // namespace ruby

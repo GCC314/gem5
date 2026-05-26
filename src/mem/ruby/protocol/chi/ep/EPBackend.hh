@@ -17,6 +17,7 @@ namespace ruby
 {
 
 class UBCCController;
+class EPRNFController;
 class RubySystem;
 
 // ---- M5 Outer Protocol Types ----
@@ -31,6 +32,33 @@ enum class OuterGrantType {
     GlobalGrantShared,     // Shared read granted (result code 0)
     GlobalGrantExclusive,  // Clean exclusive owner granted (result code 1)
     GlobalGrantModified    // Dirty modified owner granted (result code 2)
+};
+
+// ---- M6: Outer Recall Message Types ----
+// Recall request sent from home UBCC to the owner node's EPBackend.
+struct OuterRecallMsg {
+    uint64_t linePa;         // Physical address (home node's view)
+    int ownerNode;           // Node being recalled
+    int homeNode;            // Node that initiated the recall
+    uint64_t epoch;          // Per-transaction epoch
+    bool isReadRequest;      // True if recall triggered by read (downgrade to shared)
+    bool dataNeeded;         // True if dirty data must be returned
+
+    OuterRecallMsg() : linePa(0), ownerNode(-1), homeNode(-1),
+                       epoch(0), isReadRequest(false), dataNeeded(false) {}
+};
+
+// Recall response sent from owner node's EPBackend back to home UBCC.
+struct OuterRecallResponse {
+    uint64_t linePa;         // Physical address (home node's view)
+    int ownerNode;           // Node that was recalled
+    int homeNode;            // Home node that initiated the recall
+    uint64_t epoch;          // Per-transaction epoch
+    bool dataReturned;       // True if dirty data was returned
+    bool ackReceived;        // True if recall completed
+
+    OuterRecallResponse() : linePa(0), ownerNode(-1), homeNode(-1),
+                            epoch(0), dataReturned(false), ackReceived(false) {}
 };
 
 // ---- M5 Phase 2: Outer Message Envelope ----
@@ -132,11 +160,48 @@ class EPBackend : public SimObject
     OuterGrantType handleGrant(uint64_t line_pa, OuterGrantType grant,
                                 int homeNode);
 
+    // ---- M6: Recall Management ----
+    /**
+     * Handle an incoming recall request from a home UBCC.
+     * This is called on the owner node's EPBackend when the home
+     * UBCC needs to recall the line.
+     *
+     * @param recallMsg  Recall message from home UBCC
+     * @return          True if recall was accepted/processed
+     */
+    bool handleRecallRequest(const OuterRecallMsg &recallMsg);
+
+    /**
+     * Send a recall response back to the home UBCC.
+     * Called after the owner node has completed the recall (data gathered,
+     * permissions downgraded).
+     *
+     * @param response  Recall response to send to home UBCC
+     * @return          True if response was routed successfully
+     */
+    bool sendRecallResponse(const OuterRecallResponse &response);
+
+    /**
+     * Get the count of recall requests received by this EPBackend.
+     */
+    uint64_t getRecallReceivedCount() const { return _recallReceivedCount; }
+    void resetRecallReceivedCount() { _recallReceivedCount = 0; }
+
+    /**
+     * Get the count of recall responses sent by this EPBackend.
+     */
+    uint64_t getRecallResponseSentCount() const { return _recallResponseSentCount; }
+    void resetRecallResponseSentCount() { _recallResponseSentCount = 0; }
+
     // ---- M5 Phase 2: Outer Message Envelope Accessors ----
     // Returns the last outer request envelope for test inspection.
     const OuterReqEnvelope& lastOuterReqEnvelope() const { return _lastReqEnv; }
     // Returns the last outer grant envelope for test inspection.
     const OuterGrantEnvelope& lastOuterGrantEnvelope() const { return _lastGrantEnv; }
+
+    // ---- M6: Recall envelope accessors ----
+    const OuterRecallMsg& lastRecallMsg() const { return _lastRecallMsg; }
+    const OuterRecallResponse& lastRecallResponse() const { return _lastRecallResponse; }
 
     /**
      * Diagnose the expected grant for a given sideband combination
@@ -186,10 +251,29 @@ class EPBackend : public SimObject
     /** Clear the last sideband snapshot (for test reset). */
     void clearSidebandSnapshot();
 
+    // ---- M6: EP_RNF delayed response hook ----
+    /**
+     * Register the EPRNFController for delayed HN response support.
+     */
+    void setEpRnfController(EPRNFController *ctrl) { _epRnfCtrl = ctrl; }
+
+    /**
+     * Get the registered EPRNFController (may be nullptr).
+     */
+    EPRNFController* getEpRnfController() const { return _epRnfCtrl; }
+
+    // ---- M6: Cross-Node EPBackend Routing Registry ----
+    /**
+     * Static registry of EPBackend instances keyed by node ID.
+     * Used to route recall requests to the owner node's EPBackend.
+     */
+    static EPBackend* getBackendInstance(int node_id);
+
   private:
     const int _nodeId;
     NodeAddressMap _addrMap;
     UBCCController *_ubcc = nullptr;
+    EPRNFController *_epRnfCtrl = nullptr;
 
     // ---- M5: Requester-Side Bookkeeping ----
     // Per-line entries tracking global permissions for remote DSM lines.
@@ -205,6 +289,17 @@ class EPBackend : public SimObject
     // Last outer request and grant envelopes for test inspection.
     OuterReqEnvelope _lastReqEnv;
     OuterGrantEnvelope _lastGrantEnv;
+
+    // ---- M6: Recall message envelopes ----
+    OuterRecallMsg _lastRecallMsg;
+    OuterRecallResponse _lastRecallResponse;
+
+    // ---- M6: Recall counters ----
+    uint64_t _recallReceivedCount;
+    uint64_t _recallResponseSentCount;
+
+    // ---- M6: Cross-Node EPBackend Routing Registry ----
+    static std::map<int, EPBackend*> _backendInstances;
 };
 
 } // namespace ruby

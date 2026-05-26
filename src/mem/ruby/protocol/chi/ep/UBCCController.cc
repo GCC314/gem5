@@ -33,7 +33,9 @@ UBCCController::getInstance(int node_id)
 }
 
 UBCCController::UBCCController(int node_id, RubySystem *ruby_system)
-  : _nodeId(node_id)
+  : _nodeId(node_id),
+    _recallCount(0),
+    _recallResponseCount(0)
 {
     if (ruby_system) {
         _sentinelHelper = new SentinelHelper(ruby_system, node_id);
@@ -188,13 +190,18 @@ UBCC_OuterGrantType
 UBCCController::processOuterRequest(
     uint64_t line_pa, UBCC_OuterReqType reqType, bool writeIntent,
     int requesterNode,
-    Tick *outGrantVisibleTick, Tick *outSentinelVisibleTick)
+    Tick *outGrantVisibleTick, Tick *outSentinelVisibleTick,
+    bool *outRecallNeeded, int *outRecallOwnerNode)
 {
     DPRINTF(RubyCHIGeneric,
             "UBCC node_id=%d: processOuterRequest PA=0x%lx req=%d write=%d "
             "requesterNode=%d\n",
             _nodeId, line_pa, static_cast<int>(reqType), writeIntent,
             requesterNode);
+
+    // Initialize M6 recall outputs
+    if (outRecallNeeded)   *outRecallNeeded = false;
+    if (outRecallOwnerNode) *outRecallOwnerNode = -1;
 
     // Validate: only DSM addresses for this home node
     if (!isDsmAddr(line_pa)) {
@@ -220,6 +227,19 @@ UBCCController::processOuterRequest(
 
     ensureDirEntry(line_pa);
     DirEntry &entry = _directory[line_pa];
+
+    // ---- M6: Busy check (strict) ----
+    // If the line is already busy with an in-flight recall, reject
+    // ALL requests — no exceptions. Self-requester reentry is also
+    // a protocol violation in M6.
+    if (entry.pendingOp > 0) {
+        fatal("UBCC node_id=%d: M6 busy-check PA=0x%lx pendingOp=%d "
+              "pendingRequester=%d pendingRecallTarget=%d "
+              "requesterNode=%d — strict rejection\n",
+              _nodeId, line_pa, entry.pendingOp,
+              entry.pendingRequester, entry.pendingRecallTarget,
+              requesterNode);
+    }
 
     // Record grant-visible tick BEFORE sentinel install,
     // so we can assert sentinel_visible_tick <= grant_visible_tick
@@ -274,8 +294,8 @@ UBCCController::processOuterRequest(
                 entry.dirty = false;
             } else {
                 // Unique request on shared line → requires invalidation
-                // For M5, we handle the simple case of upgrading
-                // (full invalidation logic comes in M6/M8)
+                // For M5/M6, we handle the simple case of upgrading
+                // (full invalidation logic comes in M8)
                 if (!writeIntent) {
                     grant = UBCC_OuterGrantType::GlobalGrantExclusive;
                     entry.state = MESIState::G_E;
@@ -295,28 +315,95 @@ UBCCController::processOuterRequest(
 
         case MESIState::G_E:
         case MESIState::G_M: {
-            // Line has an owner → recall required (M6)
-            // For M5, treat as owner transfer without full recall path
-            if (reqType == UBCC_OuterReqType::GlobalReadShared) {
-                // Read on owned line → recall owner, downgrade to shared
-                grant = UBCC_OuterGrantType::GlobalGrantShared;
-                entry.state = MESIState::G_S;
-                if (requesterNode >= 0)
-                    entry.sharersMask |= (1ULL << requesterNode);
-                entry.ownerNode = -1;
-                entry.dirty = false;
+            // ---- M6: Line has an owner → recall path ----
+            // If the current owner is a remote node (not the requester),
+            // we need to recall the owner first.
+            // In single-gem5 prototype, ownerNode is always different
+            // from requesterNode when the state is G_E or G_M (unless
+            // requester is re-requesting -- self-request path for testing).
+            int existingOwner = entry.ownerNode;
+
+            if (existingOwner >= 0 &&
+                existingOwner != requesterNode) {
+                // ---- Recall Needed ----
+                // Initiate recall instead of immediately resolving.
+                bool recallStarted = initiateRecall(
+                    line_pa, entry, reqType, writeIntent, requesterNode);
+
+                DPRINTF(RubyEP,
+                        "UBCC node_id=%d: M6 recall initiated PA=0x%lx "
+                        "existingOwner=%d requester=%d recallStarted=%d\n",
+                        _nodeId, line_pa, existingOwner,
+                        requesterNode, recallStarted);
+
+                if (recallStarted) {
+                    _recallCount++;
+                    // Signal to caller that recall is needed
+                    if (outRecallNeeded)
+                        *outRecallNeeded = true;
+                    if (outRecallOwnerNode)
+                        *outRecallOwnerNode = existingOwner;
+
+                    // Return a provisional grant type based on the request
+                    // (the final grant is determined after recall completes).
+                    if (reqType == UBCC_OuterReqType::GlobalReadShared) {
+                        grant = UBCC_OuterGrantType::GlobalGrantShared;
+                    } else if (!writeIntent) {
+                        grant = UBCC_OuterGrantType::GlobalGrantExclusive;
+                    } else {
+                        grant = UBCC_OuterGrantType::GlobalGrantModified;
+                    }
+                } else {
+                    // Recall failed to initiate, fall back to direct state
+                    // change (backward compatibility with M5 behavior).
+                    DPRINTF(RubyEP,
+                            "UBCC node_id=%d: recall initiation failed, "
+                            "falling back to direct state change\n", _nodeId);
+                    if (reqType == UBCC_OuterReqType::GlobalReadShared) {
+                        grant = UBCC_OuterGrantType::GlobalGrantShared;
+                        entry.state = MESIState::G_S;
+                        if (requesterNode >= 0)
+                            entry.sharersMask |= (1ULL << requesterNode);
+                        entry.ownerNode = -1;
+                        entry.dirty = false;
+                        entry.pendingOp = 0;
+                    } else if (!writeIntent) {
+                        grant = UBCC_OuterGrantType::GlobalGrantExclusive;
+                        entry.state = MESIState::G_E;
+                        entry.ownerNode = requesterNode;
+                        entry.dirty = false;
+                        entry.pendingOp = 0;
+                    } else {
+                        grant = UBCC_OuterGrantType::GlobalGrantModified;
+                        entry.state = MESIState::G_M;
+                        entry.ownerNode = requesterNode;
+                        entry.dirty = true;
+                        entry.pendingOp = 0;
+                    }
+                }
             } else {
-                // Unique on owned line → owner transfer
-                if (!writeIntent) {
-                    grant = UBCC_OuterGrantType::GlobalGrantExclusive;
-                    entry.state = MESIState::G_E;
-                    entry.ownerNode = requesterNode;
+                // Same owner or no existing owner → direct state change
+                if (reqType == UBCC_OuterReqType::GlobalReadShared) {
+                    // Read on owned line → downgrade to shared
+                    grant = UBCC_OuterGrantType::GlobalGrantShared;
+                    entry.state = MESIState::G_S;
+                    if (requesterNode >= 0)
+                        entry.sharersMask |= (1ULL << requesterNode);
+                    entry.ownerNode = -1;
                     entry.dirty = false;
                 } else {
-                    grant = UBCC_OuterGrantType::GlobalGrantModified;
-                    entry.state = MESIState::G_M;
-                    entry.ownerNode = requesterNode;
-                    entry.dirty = true;
+                    // Unique on owned line → owner transfer or keep
+                    if (!writeIntent) {
+                        grant = UBCC_OuterGrantType::GlobalGrantExclusive;
+                        entry.state = MESIState::G_E;
+                        entry.ownerNode = requesterNode;
+                        entry.dirty = false;
+                    } else {
+                        grant = UBCC_OuterGrantType::GlobalGrantModified;
+                        entry.state = MESIState::G_M;
+                        entry.ownerNode = requesterNode;
+                        entry.dirty = true;
+                    }
                 }
             }
             break;
@@ -414,8 +501,16 @@ UBCCController::inspectUbccDirForTest(uint64_t line_pa)
         << "\"ownerNode\":" << e.ownerNode << ","
         << "\"dirty\":" << (e.dirty ? "true" : "false") << ","
         << "\"epoch\":" << e.epoch << ","
-        << "\"pendingOp\":" << e.pendingOp
-        << "}";
+        << "\"pendingOp\":" << e.pendingOp << ","
+        << "\"pendingRequester\":" << e.pendingRequester << ","
+        << "\"pendingRecallTarget\":" << e.pendingRecallTarget;
+    // M6: Only include if available
+    if (e.pendingOp > 0) {
+        oss << ","
+            << "\"pendingReqType\":" << static_cast<int>(e.pendingReqType) << ","
+            << "\"pendingWriteIntent\":" << (e.pendingWriteIntent ? "true" : "false");
+    }
+    oss << "}";
     return oss.str();
 }
 
@@ -434,6 +529,169 @@ UBCCController::getUbccDirFieldsForTest(uint64_t line_pa,
     outSharersMask = e.sharersMask;
     outDirty = e.dirty;
     return true;
+}
+
+// ---- M6: Extended Directory Field Access (includes recall context) ----
+
+bool
+UBCCController::getUbccDirFieldsExtendedForTest(uint64_t line_pa,
+    MESIState &outState, int &outOwnerNode,
+    uint64_t &outSharersMask, bool &outDirty, bool &outBusy,
+    int &outPendingRequester, int &outPendingRecallTarget) const
+{
+    auto it = _directory.find(line_pa);
+    if (it == _directory.end()) {
+        return false;
+    }
+    const DirEntry &e = it->second;
+    outState = e.state;
+    outOwnerNode = e.ownerNode;
+    outSharersMask = e.sharersMask;
+    outDirty = e.dirty;
+    outBusy = (e.pendingOp > 0);
+    outPendingRequester = e.pendingRequester;
+    outPendingRecallTarget = e.pendingRecallTarget;
+    return true;
+}
+
+// ---- M6: Recall Management ----
+
+bool
+UBCCController::initiateRecall(uint64_t line_pa, DirEntry &entry,
+    UBCC_OuterReqType reqType, bool writeIntent, int requesterNode)
+{
+    // Mark the line as busy (pendingOp = 1 = recall-in-progress)
+    entry.pendingOp = 1;
+    entry.pendingRequester = requesterNode;
+    entry.pendingRecallTarget = entry.ownerNode;
+    entry.pendingReqType = reqType;
+    entry.pendingWriteIntent = writeIntent;
+
+    DPRINTF(RubyEP,
+            "UBCC node_id=%d: initiateRecall PA=0x%lx "
+            "ownerNode=%d requester=%d state=%s dirty=%d\n",
+            _nodeId, line_pa, entry.ownerNode, requesterNode,
+            mesiStateName(entry.state), entry.dirty);
+
+    return true;
+}
+
+bool
+UBCCController::processRecallResponse(uint64_t line_pa, int ownerNode,
+                                       bool dataReceived)
+{
+    auto it = _directory.find(line_pa);
+    if (it == _directory.end()) {
+        DPRINTF(RubyEP,
+                "UBCC node_id=%d: processRecallResponse PA=0x%lx "
+                "entry not found\n", _nodeId, line_pa);
+        return false;
+    }
+
+    DirEntry &entry = it->second;
+
+    // Verify this is a pending recall
+    if (entry.pendingOp != 1) {
+        DPRINTF(RubyEP,
+                "UBCC node_id=%d: processRecallResponse PA=0x%lx "
+                "no pending recall (pendingOp=%d)\n",
+                _nodeId, line_pa, entry.pendingOp);
+        return false;
+    }
+
+    // Verify the recall target matches — strict protocol check.
+    if (entry.pendingRecallTarget >= 0 &&
+        entry.pendingRecallTarget != ownerNode) {
+        fatal("UBCC node_id=%d: recall owner mismatch PA=0x%lx "
+              "expected=%d got=%d — protocol violation\n",
+              _nodeId, line_pa, entry.pendingRecallTarget, ownerNode);
+    }
+
+    int requesterNode = entry.pendingRequester;
+    UBCC_OuterReqType reqType = entry.pendingReqType;
+    bool writeIntent = entry.pendingWriteIntent;
+    MESIState prevState = entry.state;
+    bool wasDirty = entry.dirty;
+
+    DPRINTF(RubyEP,
+            "UBCC node_id=%d: processRecallResponse PA=0x%lx "
+            "ownerNode=%d dataReceived=%d requester=%d reqType=%d "
+            "prevState=%s dirty=%d\n",
+            _nodeId, line_pa, ownerNode, dataReceived,
+            requesterNode, static_cast<int>(reqType),
+            mesiStateName(prevState), wasDirty);
+
+    // ---- Complete the directory transition ----
+    // Based on the recall result and request type, determine the new state.
+    if (reqType == UBCC_OuterReqType::GlobalReadShared) {
+        // Read on owned line → old owner downgraded to shared
+        // Add requester and existing owner to sharers
+        entry.state = MESIState::G_S;
+        if (requesterNode >= 0)
+            entry.sharersMask |= (1ULL << requesterNode);
+        if (ownerNode >= 0)
+            entry.sharersMask |= (1ULL << ownerNode);
+        entry.ownerNode = -1;
+        if (dataReceived && wasDirty) {
+            // Dirty data was written back through recall
+            // No persistent data storage here (metadata-only)
+        }
+        entry.dirty = false;
+    } else {
+        // Unique/write request → new requester becomes owner
+        if (!writeIntent) {
+            entry.state = MESIState::G_E;
+            entry.dirty = false;
+        } else {
+            entry.state = MESIState::G_M;
+            entry.dirty = true;
+        }
+        entry.ownerNode = requesterNode;
+        entry.sharersMask = 0; // old owner invalidated
+    }
+
+    // Clear pending recall context
+    entry.pendingOp = 0;
+    entry.pendingRequester = -1;
+    entry.pendingRecallTarget = -1;
+
+    _recallResponseCount++;
+
+    DPRINTF(RubyEP,
+            "UBCC node_id=%d: recall completed PA=0x%lx "
+            "prevState=%s newState=%s newOwner=%d\n",
+            _nodeId, line_pa,
+            mesiStateName(prevState), mesiStateName(entry.state),
+            entry.ownerNode);
+
+    return true;
+}
+
+bool
+UBCCController::isLineBusy(uint64_t line_pa) const
+{
+    auto it = _directory.find(line_pa);
+    if (it == _directory.end())
+        return false;
+    return it->second.pendingOp > 0;
+}
+
+int
+UBCCController::getPendingRequester(uint64_t line_pa) const
+{
+    auto it = _directory.find(line_pa);
+    if (it == _directory.end())
+        return -1;
+    return it->second.pendingRequester;
+}
+
+int
+UBCCController::getPendingRecallTarget(uint64_t line_pa) const
+{
+    auto it = _directory.find(line_pa);
+    if (it == _directory.end())
+        return -1;
+    return it->second.pendingRecallTarget;
 }
 
 } // namespace ruby

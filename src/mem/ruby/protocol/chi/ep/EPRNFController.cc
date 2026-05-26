@@ -204,8 +204,14 @@ EPController::functionalReadBuffers(PacketPtr& pkt, WriteMask &mask)
 }
 
 EPRNFController::EPRNFController(const Params &p)
-  : EPController(p), _backend(p.ep_backend)
+  : EPController(p), _backend(p.ep_backend),
+    _pendingHnResponseCount(0),
+    _delayedResolvedCount(0)
 {
+    // Register EP_RNF with EPBackend for delayed response support
+    if (_backend) {
+        _backend->setEpRnfController(this);
+    }
 }
 
 void
@@ -275,6 +281,40 @@ EPRNFController::recvSnoopMsg(const CHIRequestMsg *msg)
         _backend->checkAddr(msg->m_addr);
     }
 
+    // ---- M6: Check if outer txn is pending ----
+    // If there is an in-flight outer transaction for this line,
+    // we must delay the HN response until the outer txn completes.
+    bool outerPending = isOuterTxnPending(msg->m_addr);
+
+    if (outerPending) {
+        DPRINTF(RubyCHIGeneric,
+                "EP_RNF node_id=%d: M6 delaying HN response for PA=0x%lx "
+                "(outer txn pending)\n",
+                _nodeId, msg->m_addr);
+
+        // Allocate pending response context
+        PendingHnResponse pending;
+        pending.valid = true;
+        pending.linePa = msg->m_addr;
+        pending.respType = CHIResponseType_SnpResp_I;
+        pending.destMachine = msg->m_requestor;
+        pending.snoopTick = curTick();
+        pending.outerTxnComplete = false;
+
+        _pendingHnResponses[msg->m_addr] = pending;
+        _pendingHnResponseCount++;
+
+        // Do NOT immediately respond to HN. The response will be
+        // sent when signalOuterTxnComplete() is called.
+        DPRINTF(RubyCHIGeneric,
+                "EP_RNF node_id=%d: M6 pending HN response queued "
+                "PA=0x%lx (count=%d)\n",
+                _nodeId, msg->m_addr, _pendingHnResponseCount);
+
+        return true; // message consumed, response delayed
+    }
+
+    // ---- Immediate response (no outer txn pending) ----
     NetDest dest;
     dest.add(msg->m_requestor);
     auto rsp = std::make_shared<CHIResponseMsg>(
@@ -298,6 +338,73 @@ EPRNFController::recvDataMsg(const CHIDataMsg *msg)
 {
     DPRINTF(RubyCHIGeneric, "EP_RNF node_id=%d recvDataMsg\n", _nodeId);
     return true;
+}
+
+// ---- M6: Delayed HN Response Management ----
+
+bool
+EPRNFController::hasPendingHnResponse(uint64_t linePa) const
+{
+    auto it = _pendingHnResponses.find(linePa);
+    return (it != _pendingHnResponses.end() && it->second.valid &&
+            !it->second.outerTxnComplete);
+}
+
+void
+EPRNFController::signalOuterTxnComplete(uint64_t linePa)
+{
+    auto it = _pendingHnResponses.find(linePa);
+    if (it == _pendingHnResponses.end() || !it->second.valid) {
+        // No pending response for this line
+        return;
+    }
+
+    if (it->second.outerTxnComplete) {
+        // Already resolved
+        return;
+    }
+
+    DPRINTF(RubyCHIGeneric,
+            "EP_RNF node_id=%d: M6 outer txn complete for PA=0x%lx "
+            "-- sending delayed HN response\n",
+            _nodeId, linePa);
+
+    // Mark as complete
+    it->second.outerTxnComplete = true;
+
+    // Send the delayed HN response
+    NetDest dest;
+    dest.add(it->second.destMachine);
+    auto rsp = std::make_shared<CHIResponseMsg>(
+        curTick(), cacheLineSize, m_ruby_system,
+        linePa, it->second.respType,
+        m_machineID, dest,
+        false, false, 0, 0, MessageSizeType_Control);
+    sendResponseMsg(rsp);
+
+    _delayedResolvedCount++;
+
+    DPRINTF(RubyCHIGeneric,
+            "EP_RNF node_id=%d: M6 delayed HN response sent "
+            "PA=0x%lx (resolved=%d)\n",
+            _nodeId, linePa, _delayedResolvedCount);
+}
+
+bool
+EPRNFController::isOuterTxnPending(uint64_t linePa) const
+{
+    auto it = _outerTxnPending.find(linePa);
+    return (it != _outerTxnPending.end() && it->second);
+}
+
+void
+EPRNFController::setOuterTxnPending(uint64_t linePa, bool pending)
+{
+    if (pending) {
+        _outerTxnPending[linePa] = true;
+    } else {
+        _outerTxnPending.erase(linePa);
+    }
 }
 
 } // namespace ruby
