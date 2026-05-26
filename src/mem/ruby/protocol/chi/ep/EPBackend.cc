@@ -33,7 +33,9 @@ EPBackend::EPBackend(const Params &p)
     _recallReceivedCount(0),
     _recallResponseSentCount(0),
     _writebackCount(0),
-    _evictCount(0)
+    _evictCount(0),
+    _invalidationReceivedCount(0),
+    _invalidationAckSentCount(0)
 {
     // Pass RubySystem to UBCCController for SentinelHelper init
     // RubySystem is available via the params
@@ -71,6 +73,11 @@ void m6SelfTest_run(EPBackend*);
  */
 void m7SelfTest_run(EPBackend*);
 
+/**
+ * Forward declare the M8 self-test entry point (defined in M8SelfTest.cc).
+ */
+void m8SelfTest_run(EPBackend*);
+
 
 void
 EPBackend::init()
@@ -88,6 +95,7 @@ EPBackend::init()
         m5SelfTest_run(this);
         m6SelfTest_run(this);
         m7SelfTest_run(this);
+        m8SelfTest_run(this);
     }
 }
 
@@ -374,6 +382,72 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
                   "not found in registry for recall PA=0x%lx - "
                   "cannot bypass recall path\n",
                   _nodeId, recallOwnerNode, line_pa);
+        }
+    }
+
+    // ---- M8: Global Invalidation Routing ----
+    // Check if the home UBCC has pending invalidations from this
+    // request (e.g., G_S upgrade to unique with external sharers).
+    {
+        int pendingInvCount = homeUbcc->getPendingInvalidationCount(homePa);
+        if (pendingInvCount > 0) {
+            uint64_t pendingInvMask = homeUbcc->getPendingInvalidationMask(homePa);
+            // P0-1: Use home UBCC's line epoch (not requester's local epoch)
+            // so that processInvalidationAck's checkEpochForLine() matches.
+            uint64_t homeEpoch = homeUbcc->getEpochForLine(homePa);
+            DPRINTF(RubyEP,
+                    "EPBackend node_id=%d: M8 routing invalidations "
+                    "PA=0x%lx homePa=0x%lx invCount=%d invMask=0x%lx "
+                    "homeEpoch=%lu\n",
+                    _nodeId, line_pa, homePa,
+                    pendingInvCount, pendingInvMask, homeEpoch);
+
+            // For each sharer node in the pending invalidation mask,
+            // send an invalidation request through that node's EPBackend.
+            for (int s = 0; s < 64 && pendingInvMask != 0; s++) {
+                uint64_t sBit = (1ULL << s);
+                if (pendingInvMask & sBit) {
+                    pendingInvMask &= ~sBit; // Clear as we process
+
+                    OuterInvalidateMsg invMsg;
+                    invMsg.linePa = homePa;
+                    // Compute sharer's local PA
+                    invMsg.sharerLocalPa = _addrMap.buildDsmPA(
+                        s, homeNode, offset);
+                    invMsg.sharerNode = s;
+                    invMsg.homeNode = homeNode;
+                    invMsg.epoch = homeEpoch; // P0-1: use home epoch
+
+                    _lastInvalidateMsg = invMsg;
+
+                    // Route invalidation to the sharer node's EPBackend
+                    EPBackend *sharerBackend = EPBackend::getBackendInstance(s);
+                    if (sharerBackend) {
+                        DPRINTF(RubyEP,
+                                "EPBackend node_id=%d: routing invalidation "
+                                "to node %d\n", _nodeId, s);
+                        bool invOk = sharerBackend->handleInvalidationRequest(invMsg);
+                        if (!invOk) {
+                            fatal("EPBackend node_id=%d: sharer node %d "
+                                  "rejected invalidation for PA=0x%lx\n",
+                                  _nodeId, s, line_pa);
+                        }
+                    } else {
+                        // In single-gem5 prototype with cross-node EPBackend
+                        // registry, all nodes' EPBackends should be registered.
+                        // If a sharer's EPBackend is missing (maybe it hasn't
+                        // been instantiated yet in a real multi-gem5 scenario),
+                        // we can issue a direct ack for prototype purposes.
+                        DPRINTF(RubyEP,
+                                "EPBackend node_id=%d: sharer EPBackend for "
+                                "node %d not found — issuing direct ack\n",
+                                _nodeId, s);
+
+                        // Direct ack through home UBCC (use home epoch)
+                        homeUbcc->processInvalidationAck(homePa, s, homeEpoch);
+                    }
+                }
+            }
         }
     }
 
@@ -854,6 +928,86 @@ EPBackend::resetOwnerMismatchRejectedCount()
 {
     if (_ubcc)
         _ubcc->resetOwnerMismatchRejectedCount();
+}
+
+// ---- M8: Global Invalidation Management ----
+
+bool
+EPBackend::handleInvalidationRequest(const OuterInvalidateMsg &invMsg)
+{
+    DPRINTF(RubyEP,
+            "EPBackend node_id=%d: handleInvalidationRequest "
+            "PA=0x%lx sharerNode=%d homeNode=%d epoch=%lu\n",
+            _nodeId, invMsg.linePa, invMsg.sharerNode,
+            invMsg.homeNode, invMsg.epoch);
+
+    // M8 P0-1: Validate — this node must be the invalidation target.
+    if (invMsg.sharerNode != _nodeId) {
+        fatal("EPBackend node_id=%d: invalidation target mismatch "
+              "expected=%d got=%d\n",
+              _nodeId, invMsg.sharerNode, _nodeId);
+    }
+
+    // Store invalidation message for inspection
+    _lastInvalidateMsg = invMsg;
+    _invalidationReceivedCount++;
+
+    // In the single-gem5 prototype, invalidate the requester-side
+    // bookkeeping immediately.
+    // P1-4: Use sharerLocalPa (sharer's local PA) for _requesterLines lookup.
+    uint64_t lookupPa = (invMsg.sharerLocalPa != 0)
+                           ? invMsg.sharerLocalPa
+                           : invMsg.linePa;
+    {
+        auto it = _requesterLines.find(lookupPa);
+        if (it != _requesterLines.end()) {
+            // Invalidation: line is downgraded to invalid
+            it->second.state = RequesterLineState::R_I;
+        }
+    }
+
+    // Build invalidation ack
+    OuterInvalidationAck ack;
+    ack.linePa = invMsg.linePa;
+    ack.ackNode = _nodeId;
+    ack.homeNode = invMsg.homeNode;
+    ack.epoch = invMsg.epoch;
+    ack.success = true;
+
+    // Send ack back to home UBCC
+    return sendInvalidationAck(ack);
+}
+
+bool
+EPBackend::sendInvalidationAck(const OuterInvalidationAck &ack)
+{
+    DPRINTF(RubyEP,
+            "EPBackend node_id=%d: sendInvalidationAck "
+            "PA=0x%lx ackNode=%d homeNode=%d epoch=%lu\n",
+            _nodeId, ack.linePa, ack.ackNode,
+            ack.homeNode, ack.epoch);
+
+    // Store for inspection
+    _lastInvalidationAck = ack;
+    _invalidationAckSentCount++;
+
+    // Route ack to home node's UBCC
+    UBCCController *homeUbcc = UBCCController::getInstance(ack.homeNode);
+    if (!homeUbcc) {
+        fatal("EPBackend node_id=%d: home UBCC for node %d not found "
+              "for invalidation ack PA=0x%lx\n",
+              _nodeId, ack.homeNode, ack.linePa);
+    }
+
+    bool ok = homeUbcc->processInvalidationAck(
+        ack.linePa, ack.ackNode, ack.epoch);
+
+    if (!ok) {
+        warn("EPBackend node_id=%d: home UBCC rejected invalidation ack "
+             "PA=0x%lx\n", _nodeId, ack.linePa);
+    }
+
+    return ok;
 }
 
 } // namespace ruby

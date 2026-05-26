@@ -20,6 +20,7 @@ Source('M4SelfTest.cc')
 Source('M5SelfTest.cc')
 Source('M6SelfTest.cc')
 Source('M7SelfTest.cc')
+Source('M8SelfTest.cc')
 
 DebugFlag('RubyEP')
 DebugFlag('RubyEPVerbose')

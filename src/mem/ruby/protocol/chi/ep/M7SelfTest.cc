@@ -612,7 +612,9 @@ void runSelfTest(EPBackend *backend, int home_node)
     // Test 7: TC-M7-2 extension — Dirty owner cannot evict
     // ===========================================================
     {
-        uint64_t offset = 0x380;
+        // M8: changed from 0x380 to 0x4C0 to avoid collision with
+        // M7-6b which also uses offset 0x380 (owner=1 after recall)
+        uint64_t offset = 0x4C0;
         uint64_t pa = addrMap.buildDsmPA(0, 0, offset);
 
         // Make node 0 dirty owner (G_M)
@@ -666,7 +668,8 @@ void runSelfTest(EPBackend *backend, int home_node)
     // Test 7c: TC-M7-P0-2 — Sharer Evict Preserves Owner Dirty Flag
     // ===========================================================
     {
-        uint64_t offset = 0x3C0;
+        uint64_t offset = 0x440; // M8: changed from 0x3C0 to avoid collision
+                                  // with M6's pa_busy (dsm_pa_base + 0x2C0)
         uint64_t pa = addrMap.buildDsmPA(0, 0, offset);
 
         // Make node 0 dirty owner (G_M) and node 2 a sharer

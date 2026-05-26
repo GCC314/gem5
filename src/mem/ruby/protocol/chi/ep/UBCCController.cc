@@ -39,7 +39,9 @@ UBCCController::UBCCController(int node_id, RubySystem *ruby_system)
     _writebackCount(0),
     _evictCount(0),
     _staleRejectedCount(0),
-    _ownerMismatchRejectedCount(0)
+    _ownerMismatchRejectedCount(0),
+    _invalidationCount(0),
+    _invalidationAckCount(0)
 {
     if (ruby_system) {
         _sentinelHelper = new SentinelHelper(ruby_system, node_id);
@@ -232,17 +234,59 @@ UBCCController::processOuterRequest(
     ensureDirEntry(line_pa);
     DirEntry &entry = _directory[line_pa];
 
-    // ---- M6: Busy check (strict) ----
-    // If the line is already busy with an in-flight recall, reject
-    // ALL requests — no exceptions. Self-requester reentry is also
-    // a protocol violation in M6.
+    // ---- M6/M8: Busy check (strict) ----
+    // If the line is already busy with an in-flight recall (pendingOp==1)
+    // or invalidation (pendingOp==2), reject ALL requests.
+    // Self-requester reentry is also a protocol violation.
     if (entry.pendingOp > 0) {
-        fatal("UBCC node_id=%d: M6 busy-check PA=0x%lx pendingOp=%d "
-              "pendingRequester=%d pendingRecallTarget=%d "
-              "requesterNode=%d — strict rejection\n",
-              _nodeId, line_pa, entry.pendingOp,
-              entry.pendingRequester, entry.pendingRecallTarget,
-              requesterNode);
+        const char *opName = (entry.pendingOp == 1) ? "recall" :
+                             (entry.pendingOp == 2) ? "invalidation" : "unknown";
+        // M8: Accept reentry on same requester for line that is busy with
+        // invalidation (the requester already has the grant; this is a
+        // redundant or diagnostic access).  Everything else is fatal.
+        if (entry.pendingOp == 2 && entry.pendingRequester == requesterNode) {
+            // P0-2: True no-op early return.  The grant was already issued
+            // when the invalidation was initiated; the requester is just
+            // re-checking.  Do NOT advance epoch/state/sentinel.
+            DPRINTF(RubyEP,
+                    "UBCC node_id=%d: M8 reentry no-op PA=0x%lx "
+                    "pendingOp=invalidation requesterNode=%d matches — "
+                    "returning current grant without state mutation\n",
+                    _nodeId, line_pa, requesterNode);
+
+            UBCC_OuterGrantType currentGrant =
+                UBCC_OuterGrantType::GlobalGrantShared;
+            switch (entry.state) {
+                case MESIState::G_E:
+                    currentGrant = UBCC_OuterGrantType::GlobalGrantExclusive;
+                    break;
+                case MESIState::G_M:
+                    currentGrant = UBCC_OuterGrantType::GlobalGrantModified;
+                    break;
+                case MESIState::G_S:
+                    currentGrant = UBCC_OuterGrantType::GlobalGrantShared;
+                    break;
+                default:
+                    // G_I with pendingOp==2 is impossible
+                    currentGrant = UBCC_OuterGrantType::GlobalGrantShared;
+                    break;
+            }
+
+            Tick now = curTick();
+            if (outGrantVisibleTick)
+                *outGrantVisibleTick = now;
+            if (outSentinelVisibleTick)
+                *outSentinelVisibleTick = now;
+
+            return currentGrant;
+        } else {
+            fatal("UBCC node_id=%d: M6/M8 busy-check PA=0x%lx pendingOp=%d (%s) "
+                  "pendingRequester=%d pendingRecallTarget=%d "
+                  "requesterNode=%d — strict rejection\n",
+                  _nodeId, line_pa, entry.pendingOp, opName,
+                  entry.pendingRequester, entry.pendingRecallTarget,
+                  requesterNode);
+        }
     }
 
     // Record grant-visible tick BEFORE sentinel install,
@@ -297,21 +341,67 @@ UBCCController::processOuterRequest(
                     entry.sharersMask |= (1ULL << requesterNode);
                 entry.dirty = false;
             } else {
-                // Unique request on shared line → requires invalidation
-                // For M5/M6, we handle the simple case of upgrading
-                // (full invalidation logic comes in M8)
-                if (!writeIntent) {
-                    grant = UBCC_OuterGrantType::GlobalGrantExclusive;
-                    entry.state = MESIState::G_E;
-                    entry.sharersMask = 0; // all sharers invalidated
-                    entry.ownerNode = requesterNode;
-                    entry.dirty = false;
-                } else {
-                    grant = UBCC_OuterGrantType::GlobalGrantModified;
-                    entry.state = MESIState::G_M;
+                // ---- M8: Unique request on shared line → invalidation flow ----
+                // Identify external sharers that must be invalidated.
+                // The requester (if already a sharer upgrading to unique)
+                // is kept; all other sharers must be wiped.
+                uint64_t otherSharers = entry.sharersMask;
+                if (requesterNode >= 0)
+                    otherSharers &= ~(1ULL << requesterNode);
+
+                if (otherSharers != 0) {
+                    // ---- M8: Pending invalidation flow ----
+                    // There are other sharers that must be invalidated
+                    // before the unique grant is truly valid.
+                    // Mark the line busy with invalidation-in-progress (pendingOp=2).
+                    DPRINTF(RubyEP,
+                            "UBCC node_id=%d: M8 initiating invalidation "
+                            "PA=0x%lx otherSharers=0x%lx requester=%d\n",
+                            _nodeId, line_pa, otherSharers, requesterNode);
+
+                    entry.pendingOp = 2; // invalidation-in-progress
+                    entry.pendingInvalidationMask = otherSharers;
+                    entry.invalidatedAckMask = 0;
+                    // Count bits in otherSharers
+                    entry.pendingInvalidationCount = __builtin_popcountll(otherSharers);
+                    entry.pendingRequester = requesterNode;
+                    entry.pendingReqType = reqType;
+                    entry.pendingWriteIntent = writeIntent;
+                    entry.pendingRecallTarget = -1;
+
+                    // Advance state to G_E/G_M immediately (grant is prepared),
+                    // but sharersMask is cleared (the requester is now the
+                    // exclusive owner, not a sharer).
                     entry.sharersMask = 0;
-                    entry.ownerNode = requesterNode;
-                    entry.dirty = true;
+
+                    if (!writeIntent) {
+                        grant = UBCC_OuterGrantType::GlobalGrantExclusive;
+                        entry.state = MESIState::G_E;
+                        entry.ownerNode = requesterNode;
+                        entry.dirty = false;
+                    } else {
+                        grant = UBCC_OuterGrantType::GlobalGrantModified;
+                        entry.state = MESIState::G_M;
+                        entry.ownerNode = requesterNode;
+                        entry.dirty = true;
+                    }
+
+                    _invalidationCount++;
+                } else {
+                    // No other sharers — immediate upgrade without invalidation
+                    if (!writeIntent) {
+                        grant = UBCC_OuterGrantType::GlobalGrantExclusive;
+                        entry.state = MESIState::G_E;
+                        entry.sharersMask = 0; // exclusive owner, not a sharer
+                        entry.ownerNode = requesterNode;
+                        entry.dirty = false;
+                    } else {
+                        grant = UBCC_OuterGrantType::GlobalGrantModified;
+                        entry.state = MESIState::G_M;
+                        entry.sharersMask = 0;
+                        entry.ownerNode = requesterNode;
+                        entry.dirty = true;
+                    }
                 }
             }
             break;
@@ -520,6 +610,16 @@ UBCCController::inspectUbccDirForTest(uint64_t line_pa)
         << "\"evictCount\":" << _evictCount << ","
         << "\"staleRejectedCount\":" << _staleRejectedCount << ","
         << "\"ownerMismatchRejectedCount\":" << _ownerMismatchRejectedCount;
+    // M8: Invalidation fields
+    if (e.pendingOp == 2) {
+        oss << ","
+            << "\"pendingInvalidationCount\":" << e.pendingInvalidationCount << ","
+            << "\"pendingInvalidationMask\":" << e.pendingInvalidationMask << ","
+            << "\"invalidatedAckMask\":" << e.invalidatedAckMask;
+    }
+    oss << ","
+        << "\"invalidationCount\":" << _invalidationCount << ","
+        << "\"invalidationAckCount\":" << _invalidationAckCount;
     oss << "}";
     return oss.str();
 }
@@ -713,6 +813,132 @@ UBCCController::getPendingRecallTarget(uint64_t line_pa) const
     if (it == _directory.end())
         return -1;
     return it->second.pendingRecallTarget;
+}
+
+// ---- M8: Global Invalidation Management ----
+
+bool
+UBCCController::processInvalidationAck(uint64_t line_pa, int ackNode,
+                                        uint64_t responseEpoch)
+{
+    auto it = _directory.find(line_pa);
+    if (it == _directory.end()) {
+        DPRINTF(RubyEP,
+                "UBCC node_id=%d: processInvalidationAck PA=0x%lx "
+                "entry not found\n", _nodeId, line_pa);
+        return false;
+    }
+
+    DirEntry &entry = it->second;
+
+    // ---- Stale epoch check ----
+    if (!checkEpochForLine(line_pa, responseEpoch)) {
+        DPRINTF(RubyEP,
+                "UBCC node_id=%d: processInvalidationAck PA=0x%lx "
+                "STALE epoch: response=%lu directory=%lu — REJECTED\n",
+                _nodeId, line_pa, responseEpoch, entry.epoch);
+        _staleRejectedCount++;
+        return false;
+    }
+
+    // Verify this is a pending invalidation
+    if (entry.pendingOp != 2) {
+        // If invalidation already completed (pendingOp==0), accept
+        // as idempotent duplicate ack without error.
+        if (entry.pendingOp == 0) {
+            DPRINTF(RubyEP,
+                    "UBCC node_id=%d: processInvalidationAck PA=0x%lx "
+                    "invalidation already completed — idempotent, ignoring\n",
+                    _nodeId, line_pa);
+            return true;
+        }
+        DPRINTF(RubyEP,
+                "UBCC node_id=%d: processInvalidationAck PA=0x%lx "
+                "no pending invalidation (pendingOp=%d)\n",
+                _nodeId, line_pa, entry.pendingOp);
+        return false;
+    }
+
+    // P1-4: Validate ackNode boundaries before any bit shift.
+    // ackNode must be in [0, 63] to safely compute (1ULL << ackNode).
+    if (ackNode < 0 || ackNode >= 64) {
+        DPRINTF(RubyEP,
+                "UBCC node_id=%d: processInvalidationAck PA=0x%lx "
+                "ackNode=%d out of range [0, 63] — REJECTED\n",
+                _nodeId, line_pa, ackNode);
+        return false;
+    }
+
+    // Verify the ack node is in the pending invalidation mask
+    uint64_t nodeBit = (1ULL << ackNode);
+    if (!(entry.pendingInvalidationMask & nodeBit)) {
+        DPRINTF(RubyEP,
+                "UBCC node_id=%d: processInvalidationAck PA=0x%lx "
+                "ackNode=%d not in pendingInvalidationMask=0x%lx\n",
+                _nodeId, line_pa, ackNode, entry.pendingInvalidationMask);
+        return false;
+    }
+
+    // Check for duplicate ack
+    if (entry.invalidatedAckMask & nodeBit) {
+        DPRINTF(RubyEP,
+                "UBCC node_id=%d: processInvalidationAck PA=0x%lx "
+                "duplicate ack from node %d — ignoring\n",
+                _nodeId, line_pa, ackNode);
+        return true; // Idempotent: accept duplicate without error
+    }
+
+    // Record the ack
+    entry.invalidatedAckMask |= nodeBit;
+    entry.pendingInvalidationCount--;
+    // Clear the sharer bit now that invalidation is confirmed
+    entry.sharersMask &= ~nodeBit;
+
+    DPRINTF(RubyEP,
+            "UBCC node_id=%d: invalidation ack PA=0x%lx ackNode=%d "
+            "remaining=%d ackMask=0x%lx pendingMask=0x%lx\n",
+            _nodeId, line_pa, ackNode,
+            entry.pendingInvalidationCount,
+            entry.invalidatedAckMask, entry.pendingInvalidationMask);
+
+    _invalidationAckCount++;
+
+    // Check if all invalidations are complete
+    if (entry.pendingInvalidationCount == 0) {
+        // All sharers have acked — clear pending invalidation state
+        DPRINTF(RubyEP,
+                "UBCC node_id=%d: all invalidations complete PA=0x%lx "
+                "state=%s ownerNode=%d\n",
+                _nodeId, line_pa,
+                mesiStateName(entry.state), entry.ownerNode);
+
+        entry.pendingOp = 0;
+        entry.pendingInvalidationMask = 0;
+        entry.invalidatedAckMask = 0;
+        entry.pendingRequester = -1;
+    }
+
+    return true;
+}
+
+int
+UBCCController::getPendingInvalidationCount(uint64_t line_pa) const
+{
+    auto it = _directory.find(line_pa);
+    if (it == _directory.end())
+        return -1;
+    return (it->second.pendingOp == 2)
+        ? it->second.pendingInvalidationCount
+        : -1;
+}
+
+uint64_t
+UBCCController::getPendingInvalidationMask(uint64_t line_pa) const
+{
+    auto it = _directory.find(line_pa);
+    if (it == _directory.end())
+        return 0;
+    return it->second.pendingInvalidationMask;
 }
 
 // ---- M7: Epoch / Stale Protection ----

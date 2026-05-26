@@ -68,6 +68,31 @@ struct OuterAckMsg {
     OuterAckMsg() : linePa(0), homeNode(-1), epoch(0), success(false) {}
 };
 
+// ---- M8: Global Invalidation Message Types ----
+// Invalidation request sent from home UBCC to a sharer node's EPBackend.
+struct OuterInvalidateMsg {
+    uint64_t linePa;           // Physical address (home node's view)
+    uint64_t sharerLocalPa;    // PA in sharer node's local view
+    int sharerNode;            // Node being invalidated
+    int homeNode;              // Home node that sent the invalidation
+    uint64_t epoch;            // Per-transaction epoch
+
+    OuterInvalidateMsg() : linePa(0), sharerLocalPa(0),
+        sharerNode(-1), homeNode(-1), epoch(0) {}
+};
+
+// Invalidation acknowledgment sent from sharer node back to home UBCC.
+struct OuterInvalidationAck {
+    uint64_t linePa;         // Physical address (home node's view)
+    int ackNode;             // Node that completed invalidation
+    int homeNode;            // Home node that initiated the invalidation
+    uint64_t epoch;          // Per-transaction epoch
+    bool success;            // True if invalidation succeeded
+
+    OuterInvalidationAck() : linePa(0), ackNode(-1), homeNode(-1),
+                              epoch(0), success(false) {}
+};
+
 // ---- M6: Outer Recall Message Types ----
 // Recall request sent from home UBCC to the owner node's EPBackend.
 struct OuterRecallMsg {
@@ -288,6 +313,41 @@ class EPBackend : public SimObject
     const OuterEvictMsg& lastEvictMsg() const { return _lastEvictMsg; }
     const OuterAckMsg& lastAckMsg() const { return _lastAckMsg; }
 
+    // ---- M8: Global Invalidation Management ----
+    /**
+     * Handle an incoming invalidation request from a home UBCC.
+     * Called on the sharer node's EPBackend when the home UBCC
+     * needs to invalidate a shared line.
+     *
+     * @param invMsg  Invalidation message from home UBCC
+     * @return        True if invalidation was accepted/processed
+     */
+    bool handleInvalidationRequest(const OuterInvalidateMsg &invMsg);
+
+    /**
+     * Send an invalidation acknowledgment back to the home UBCC.
+     *
+     * @param ack  Invalidation ack to send to home UBCC
+     * @return     True if ack was routed successfully
+     */
+    bool sendInvalidationAck(const OuterInvalidationAck &ack);
+
+    /**
+     * Get the count of invalidation requests received by this EPBackend.
+     */
+    uint64_t getInvalidationReceivedCount() const { return _invalidationReceivedCount; }
+    void resetInvalidationReceivedCount() { _invalidationReceivedCount = 0; }
+
+    /**
+     * Get the count of invalidation acks sent by this EPBackend.
+     */
+    uint64_t getInvalidationAckSentCount() const { return _invalidationAckSentCount; }
+    void resetInvalidationAckSentCount() { _invalidationAckSentCount = 0; }
+
+    // M8: Envelope accessors for invalidation
+    const OuterInvalidateMsg& lastInvalidateMsg() const { return _lastInvalidateMsg; }
+    const OuterInvalidationAck& lastInvalidationAck() const { return _lastInvalidationAck; }
+
     /**
      * Diagnose the expected grant for a given sideband combination
      * without actually issuing the request.  Used by ARM_SYNC tests
@@ -389,6 +449,12 @@ class EPBackend : public SimObject
     OuterWritebackMsg _lastWritebackMsg;
     OuterEvictMsg _lastEvictMsg;
     OuterAckMsg _lastAckMsg;
+
+    // ---- M8: Invalidation counters and envelopes ----
+    uint64_t _invalidationReceivedCount;
+    uint64_t _invalidationAckSentCount;
+    OuterInvalidateMsg _lastInvalidateMsg;
+    OuterInvalidationAck _lastInvalidationAck;
 
     // ---- M6: Cross-Node EPBackend Routing Registry ----
     static std::map<int, EPBackend*> _backendInstances;

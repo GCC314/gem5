@@ -25,7 +25,8 @@ enum class UBCC_OuterReqType {
     GlobalReadShared,
     GlobalReadUnique,
     GlobalWriteback,   // M7: dirty owner writeback
-    GlobalEvict        // M7: clean sharer/owner eviction
+    GlobalEvict,       // M7: clean sharer/owner eviction
+    GlobalInvalidate   // M8: invalidate sharers for exclusive upgrade
 };
 
 enum class UBCC_OuterGrantType {
@@ -171,6 +172,42 @@ class UBCCController
      */
     int getPendingRecallTarget(uint64_t line_pa) const;
 
+    // ---- M8: Global Invalidation Management ----
+    /**
+     * Process an invalidation acknowledgment from a sharer node.
+     * Called when a sharer completes its invalidation.
+     *
+     * @param line_pa        Physical address (home node's view)
+     * @param ackNode        Node that has completed invalidation
+     * @param responseEpoch  Epoch from the ack message (stale check)
+     * @return               True if ack accepted and processed
+     */
+    bool processInvalidationAck(uint64_t line_pa, int ackNode,
+                                uint64_t responseEpoch);
+
+    /**
+     * Get the pending invalidation count for a busy line.
+     * Returns -1 if line not found or no pending invalidations.
+     */
+    int getPendingInvalidationCount(uint64_t line_pa) const;
+
+    /**
+     * Get the mask of nodes still waiting for invalidation ack.
+     */
+    uint64_t getPendingInvalidationMask(uint64_t line_pa) const;
+
+    /**
+     * Get the invalidation count (for test observation).
+     */
+    uint64_t getInvalidationCount() const { return _invalidationCount; }
+    void resetInvalidationCount() { _invalidationCount = 0; }
+
+    /**
+     * Get the invalidation ack count (for test observation).
+     */
+    uint64_t getInvalidationAckCount() const { return _invalidationAckCount; }
+    void resetInvalidationAckCount() { _invalidationAckCount = 0; }
+
     // ---- M6: Recall log/observability ----
     /**
      * Get the count of recall operations initiated by this home UBCC.
@@ -288,12 +325,23 @@ class UBCCController
         // Original write intent that triggered the recall
         bool pendingWriteIntent;
 
+        // ---- M8: Sharer invalidation tracking ----
+        // When upgrading from G_S to unique, we must invalidate all
+        // existing sharers (except the requester, if it is a sharer).
+        // These fields track the pending invalidation state.
+        int pendingInvalidationCount;  // Number of sharers awaiting invalidate ack
+        uint64_t pendingInvalidationMask; // Mask of nodes that need invalidation
+        uint64_t invalidatedAckMask;      // Mask of nodes that have acked
+
         DirEntry() : lineAddr(0), state(MESIState::G_I),
                      sharersMask(0), ownerNode(-1),
                      dirty(false), epoch(0), pendingOp(0),
                      pendingRequester(-1), pendingRecallTarget(-1),
                      pendingReqType(UBCC_OuterReqType::GlobalReadShared),
-                     pendingWriteIntent(false) {}
+                     pendingWriteIntent(false),
+                     pendingInvalidationCount(0),
+                     pendingInvalidationMask(0),
+                     invalidatedAckMask(0) {}
     };
 
   private:
@@ -312,6 +360,10 @@ class UBCCController
     uint64_t _evictCount;
     uint64_t _staleRejectedCount;
     uint64_t _ownerMismatchRejectedCount;
+
+    // ---- M8: Invalidation counters ----
+    uint64_t _invalidationCount;
+    uint64_t _invalidationAckCount;
 
     // ---- Legacy M4 structures (retained for compatibility) ----
     struct OuterEntry {
