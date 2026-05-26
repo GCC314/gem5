@@ -114,6 +114,15 @@ class AbstractController : public ClockedObject, public Consumer
     virtual AccessPermission getAccessPermission(const Addr &addr) = 0;
 
     virtual void print(std::ostream & out) const = 0;
+
+    /**
+     * Sentinel/EP test-only: get HN directory storage pointer.
+     * Returns nullptr for controllers without an HN directory.
+     * Only Cache_Controller (HN) instances override this to return
+     * a non-null pointer. Used by SentinelHelper for M4/M5
+     * sentinel registration test hooks.
+     */
+    virtual void* getDirectoryPtr() const { return nullptr; }
     virtual void wakeup() = 0;
     virtual void resetStats() = 0;
     virtual void regStats();

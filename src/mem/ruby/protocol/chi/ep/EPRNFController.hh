@@ -61,6 +61,10 @@ class EPController : public AbstractController
 
     int nodeId() const { return _nodeId; }
 
+    /** EP_RNF snoop counter for test verification (M4) */
+    uint64_t snoopCount() const { return _snoopCount; }
+    void resetSnoopCount() { _snoopCount = 0; }
+
   protected:
     MessageBuffer* const reqOut;
     MessageBuffer* const snpOut;
@@ -109,6 +113,7 @@ class EPController : public AbstractController
 
   protected:
     const int _nodeId;
+    uint64_t _snoopCount;
 
     virtual bool recvRequestMsg(const CHIRequestMsg *msg) = 0;
     virtual bool recvSnoopMsg(const CHIRequestMsg *msg) = 0;
@@ -162,6 +167,9 @@ class EPRNFController : public EPController
     void print(std::ostream& out) const override;
 
     void selfTest();
+
+    /** M4: get EPBackend for test hook access from Python */
+    EPBackend* getBackend() const { return _backend; }
 
   protected:
     bool recvRequestMsg(const CHIRequestMsg *msg) override;

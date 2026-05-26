@@ -432,6 +432,25 @@ class $c_ident : public AbstractController
     bool isPossible(${ident}_State state, ${ident}_Event event);
     uint64_t getTransitionCount(${ident}_State state, ${ident}_Event event);
 
+"""
+        )
+
+        # M4 Sentinel: if this machine has a 'directory' object,
+        # generate a getDirectoryPtr() override for test-only HN
+        # directory access (see SentinelHelper.cc).
+        # 'directory' is declared as an object inside the machine
+        # body (e.g. "PerfectCacheMemory directory, template=...")
+        # rather than as a config parameter.
+        has_directory = any(
+            obj.ident == "directory" for obj in self.objects
+        )
+        if has_directory:
+            code("""
+    /** \\brief Sentinel/EP test-only HN directory accessor. */
+    void* getDirectoryPtr() const override { return m_directory_ptr; }
+""")
+
+        code("""
 private:
 """
         )

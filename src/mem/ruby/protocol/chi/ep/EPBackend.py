@@ -10,3 +10,4 @@ class EPBackend(SimObject):
     cxx_class = "gem5::ruby::EPBackend"
 
     node_id = Param.Int(0, "Node ID for this backend")
+    ruby_system = Param.RubySystem("")

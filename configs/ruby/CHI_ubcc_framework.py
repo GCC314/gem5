@@ -109,7 +109,7 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
         all_cntrls.extend(nd['dl_snf'].getAllControllers())
         mem_backstores.append(nd['dl_memctrl'])
 
-        ep_backend = EPBackend(node_id=node_id)
+        ep_backend = EPBackend(node_id=node_id, ruby_system=ruby_system)
 
         nd['ep_rnf_cntrl'] = EPRNFController(
             version=chi_defs.Versions.getVersion(chi_defs.CHI_Cache_Controller),

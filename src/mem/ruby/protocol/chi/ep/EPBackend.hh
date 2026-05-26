@@ -2,6 +2,7 @@
 #define __MEM_RUBY_PROTOCOL_CHI_EP_EPBACKEND_HH__
 
 #include <cstdint>
+#include <string>
 #include <vector>
 
 #include "mem/ruby/protocol/chi/ep/NodeAddressMap.hh"
@@ -15,6 +16,7 @@ namespace ruby
 {
 
 class UBCCController;
+class RubySystem;
 
 class EPBackend : public SimObject
 {
@@ -31,6 +33,22 @@ class EPBackend : public SimObject
     bool checkAddr(uint64_t pa) const;
     bool checkDsmAddr(uint64_t pa) const;
     const NodeAddressMap& addrMap() const { return _addrMap; }
+
+    // ---- M4 Sentinel Registration Test Hooks ----
+    // These are exposed to Python via gem5's Swig/SWIG bindings.
+
+    bool installSentinelForTest(uint64_t line_pa, bool as_owner);
+    bool removeSentinelForTest(uint64_t line_pa);
+    std::string inspectDirEntryForTest(uint64_t line_pa);
+    bool isDsmAddr(uint64_t pa) const;
+
+    /** EP_RNF snoop counter for test verification */
+    uint64_t getEpRnfSnoopCount() const;
+    void resetEpRnfSnoopCount();
+    void incrementEpRnfSnoopCount();
+
+    /** Access to UBCCController for Python inspection */
+    UBCCController* getUBCC() const { return _ubcc; }
 
   private:
     const int _nodeId;
