@@ -17,6 +17,7 @@ Source('EPBackend.cc')
 Source('UBCCController.cc')
 Source('SentinelHelper.cc')
 Source('M4SelfTest.cc')
+Source('M5SelfTest.cc')
 
 DebugFlag('RubyEP')
 DebugFlag('RubyEPVerbose')
