@@ -6,9 +6,8 @@
  *
  * Accesses HN directory via `getDirectoryPtr()` virtual accessor
  * (SLICC generated, see AbstractController.hh and StateMachine.py).
- * No '#define private public' trick needed — the SLICC code generator
- * emits the override for all controllers with a 'directory' config
- * parameter.
+ * The SLICC code generator emits the override for all controllers
+ * with a 'directory' config parameter, providing clean public access.
  *
  * This header is ONLY included from SentinelHelper.cc and is never
  * exposed to production protocol paths.

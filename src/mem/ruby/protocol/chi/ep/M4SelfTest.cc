@@ -8,8 +8,9 @@
  *   - EP_RNF snoop counter
  *   - HN directory native format
  *
- * All checks perform real semantic verification. NO check is a
- * trivially-true statement.
+ * All checks perform real semantic verification. Checks that cannot
+ * be verified at M4 level (e.g. require M5 protocol paths) are
+ * explicitly marked SKIP rather than using trivially-true conditions.
  *
  * The full end-to-end sentinel registration (insert via HN grant
  * path with correct timing) will be exercised through actual
@@ -17,9 +18,11 @@
  *
  * Scoring model: PASS / FAIL / SKIP (ternary).
  *   - FAIL:   assertion explicitly false, exits non-zero
- *   - SKIP:   preconditions not met (e.g. no dir access); does NOT
- *             count as PASS.  Required checks (install/remove/inspect/
- *             snoop) that are SKIP'ed are promoted to FAIL.
+ *   - SKIP:   preconditions not met (e.g. no dir access, requires
+ *             M5+ infrastructure); does NOT count as PASS.
+ *             Required groups (install/remove/inspect/snoop) that
+ *             are entirely SKIP'ed get promoted: the first SKIP
+ *             becomes FAIL via promoteRequiredSkipIfAllSkipped().
  *   - PASS:   assertion confirmed true
  *
  * Final output: "M4 Self-Test: X/Y PASS, Z FAIL, W SKIP"
@@ -108,12 +111,13 @@ static void check(const char *name, bool cond, const std::string &detail = "")
 }
 
 /**
- * Promote a SKIP to FAIL for required (must-test) categories.
- * M4 requirements: install, remove, inspect, snoop are mandatory checks.
- * If any of these group tests all SKIP, the first one gets promoted to FAIL.
+ * Promote the first SKIP to FAIL when an entire required group
+ * (install / remove / inspect / snoop) ends up all-SKIP.
  *
- * @param group Name prefix for logging (e.g. "TC-Sharer", "TC-Owner",
- *              "TC-Remove", "SNOOP")
+ * Only _skipped and _failed are adjusted; _passed is never touched
+ * because a SKIP was never counted as a PASS.
+ *
+ * @param group   Name prefix for logging
  * @param skipCount How many checks in this group were SKIP
  * @param totalInGroup Total checks in the group
  */
@@ -121,8 +125,9 @@ static void promoteRequiredSkipIfAllSkipped(
     const char *group, int skipCount, int totalInGroup)
 {
     if (totalInGroup > 0 && skipCount == totalInGroup) {
+        _skipped--;
         _failed++;
-        _passed--;  // undo the M4_CHECK PASScount that triggered the SKIP
+        _any_failure = true;
         printf("  M4 %s-REQUIRED: PROMOTED SKIP->FAIL "
                "(all %d checks in group skipped, but this is a required "
                "test category)\n",
@@ -192,28 +197,26 @@ void runSelfTest(UBCCController *ubcc, int home_node)
                 (snap.find("\"epRnfInSharers\":true") != std::string::npos);
 
             M4_CHECK("M4-TC-Sharer-1: install S_SHARER succeeded",
-                     true, "");
+                     ok, "");
             tcSharerTotal++;
             M4_CHECK("M4-TC-Sharer-2: EP_RNF found in sharers after install",
                      ep_in_sharers, snap);
             tcSharerTotal++;
         } else {
-            // install failed — mark as FAIL, not SKIP, because this is
-            // a mandatory (must-test) structural check.
-            // Reason for install failure is captured in detail.
+            // install failed — mark as SKIP (precondition not met),
+            // group promotion will convert first SKIP to FAIL.
             printf("  M4 NOTE: installSentinelForTest(shared) returned false\n");
             printf("  M4 NOTE: HN directory write requires M5 protocol path\n");
 
-            M4_CHECK("M4-TC-Sharer-1: install S_SHARER FAILED",
+            M4_CHECK("M4-TC-Sharer-1: install S_SHARER",
                      false,
-                     "installSentinelForTest returned false — "
+                     "SKIP:installSentinelForTest returned false — "
                      "directory not accessible");
-            tcSharerTotal++;
-            M4_CHECK("M4-TC-Sharer-2: EP_RNF sharer verification FAILED",
+            tcSharerTotal++; tcSharerSkip++;
+            M4_CHECK("M4-TC-Sharer-2: EP_RNF sharer verification",
                      false,
-                     "install failed, cannot verify sharer presence");
-            tcSharerTotal++;
-            tcSharerSkip += 2; // track for promotion logic
+                     "SKIP:install failed, cannot verify sharer presence");
+            tcSharerTotal++; tcSharerSkip++;
         }
 
         // --- 3b: Install EP_RNF as S_OWNER on a different line ---
@@ -225,7 +228,7 @@ void runSelfTest(UBCCController *ubcc, int home_node)
                 (snap2.find("\"epRnfIsOwner\":true") != std::string::npos);
 
             M4_CHECK("M4-TC-Owner-1: install S_OWNER succeeded",
-                     true, "");
+                     ok_owner, "");
             tcOwnerTotal++;
             M4_CHECK("M4-TC-Owner-2: EP_RNF is directory owner after install",
                      ep_is_owner, snap2);
@@ -240,20 +243,19 @@ void runSelfTest(UBCCController *ubcc, int home_node)
         } else {
             printf("  M4 NOTE: installSentinelForTest(owner) returned false\n");
 
-            M4_CHECK("M4-TC-Owner-1: install S_OWNER FAILED",
+            M4_CHECK("M4-TC-Owner-1: install S_OWNER",
                      false,
-                     "installSentinelForTest(owner) returned false — "
+                     "SKIP:installSentinelForTest(owner) returned false — "
                      "directory not accessible");
-            tcOwnerTotal++;
-            M4_CHECK("M4-TC-Owner-2: EP_RNF owner verification FAILED",
+            tcOwnerTotal++; tcOwnerSkip++;
+            M4_CHECK("M4-TC-Owner-2: EP_RNF owner verification",
                      false,
-                     "install failed, cannot verify owner presence");
-            tcOwnerTotal++;
-            M4_CHECK("M4-TC-Owner-3: owner coexistence check FAILED",
+                     "SKIP:install failed, cannot verify owner presence");
+            tcOwnerTotal++; tcOwnerSkip++;
+            M4_CHECK("M4-TC-Owner-3: owner coexistence check",
                      false,
-                     "install failed, cannot verify coexistence");
-            tcOwnerTotal++;
-            tcOwnerSkip += 3;
+                     "SKIP:install failed, cannot verify coexistence");
+            tcOwnerTotal++; tcOwnerSkip++;
         }
 
         // --- 3c: Remove sentinel and verify it's gone ---
@@ -272,7 +274,7 @@ void runSelfTest(UBCCController *ubcc, int home_node)
                 (snap_after.find("\"error\"") != std::string::npos);
 
             M4_CHECK("M4-TC-Remove-1: remove S_SHARER succeeded",
-                     true, "");
+                     ok_rm, "");
             tcRemoveTotal++;
             M4_CHECK("M4-TC-Remove-2: EP_RNF no longer in directory "
                      "after remove",
@@ -281,15 +283,14 @@ void runSelfTest(UBCCController *ubcc, int home_node)
         } else {
             printf("  M4 NOTE: removeSentinelForTest returned false\n");
 
-            M4_CHECK("M4-TC-Remove-1: remove S_SHARER FAILED",
+            M4_CHECK("M4-TC-Remove-1: remove S_SHARER",
                      false,
-                     "removeSentinelForTest returned false");
-            tcRemoveTotal++;
-            M4_CHECK("M4-TC-Remove-2: EP_RNF gone verification FAILED",
+                     "SKIP:removeSentinelForTest returned false");
+            tcRemoveTotal++; tcRemoveSkip++;
+            M4_CHECK("M4-TC-Remove-2: EP_RNF gone verification",
                      false,
-                     "remove failed, cannot verify absence");
-            tcRemoveTotal++;
-            tcRemoveSkip += 2;
+                     "SKIP:remove failed, cannot verify absence");
+            tcRemoveTotal++; tcRemoveSkip++;
         }
 
         // Promote entire group if all checks skipped
@@ -352,8 +353,9 @@ void runSelfTest(UBCCController *ubcc, int home_node)
                      has_sharer_count && has_owner_exists && has_state,
                      "sharerCount+ownerExists+state must be present");
             M4_CHECK("M4-FMT-2: no parallel shadow structure used",
-                     true,
-                     "All state in HN native Cache_DirEntry, not parallel map");
+                     false,
+                     "SKIP:EP_RNF state in HN native Cache_DirEntry format "
+                     "(structural, verified by DirEntrySnapshot)");
 
             ubcc->removeSentinelForTest(dsm_pa3);
         } else {
@@ -381,22 +383,19 @@ void runSelfTest(UBCCController *ubcc, int home_node)
     // snoop) requires M5 message injection infrastructure.
     {
         // M4-4-a: Verify EP_RNF can be discovered by SentinelHelper
-        MachineID ep_rnf_id;
-        // We test the discovery indirectly: if install succeeded,
-        // discovery worked. Otherwise, check via the sentinel helper.
+        // The full end-to-end discovery requires M5 protocol paths.
         M4_CHECK("M4-4-a: EP_RNF MachineID discoverable",
-                 true, // structural: findEpRnfMachineID exists and is called
+                 false,
+                 "SKIP:requires M5 protocol path for full verification; "
                  "SentinelHelper::findEpRnfMachineID is integrated");
 
-        // M4-4-b: If EP_RNF is in dir_sharers, HN will snoop it
-        // on local unique requests. This is verified by the M4-TC-Sharer
-        // checks above — when EP_RNF is in sharers, the HN protocol
-        // (CHI-cache-actions.sm) naturally includes it in snoop targets
-        // via `SendSnpUnique/SendSnpCleanInvalid` which iterate dir_sharers.
+        // M4-4-b: If EP_RNF is in dir_sharers, HN will snoop it.
+        // The actual protocol path (SendSnpUnique/SendSnpCleanInvalid)
+        // verification requires M5 message injection.
         M4_CHECK("M4-4-b: HN snoop path uses dir_sharers",
-                 true,
-                 "CHI-cache-actions.sm SendSnpUnique/CleanInvalid "
-                 "iterates tbe.dir_sharers — EP_RNF in sharers => snooped");
+                 false,
+                 "SKIP:requires M5 protocol message injection to verify "
+                 "snoop-path integration");
 
         // M4-4-c: The actual end-to-end test (install sentinel -> inject
         // unique request -> observe snoop) requires M5 protocol message
@@ -426,12 +425,16 @@ void runSelfTest(UBCCController *ubcc, int home_node)
     //   3. Permission-to-sentinel-state mapping
     {
         M4_CHECK("M4-5-a: sentinel install function exists",
-                 true,
+                 false,
+                 "SKIP:requires M5 SLICC modification to "
+                 "CHI-cache-actions.sm grant-completion path; "
                  "SentinelHelper::installSentinelForTest is integrated "
                  "in UBCCController");
 
         M4_CHECK("M4-5-b: UBCCController dir snapshot API exists",
-                 true,
+                 false,
+                 "SKIP:requires M5 SLICC modification to "
+                 "CHI-cache-actions.sm grant-completion path; "
                  "UBCCController::getDirEntrySnapshot and "
                  "inspectDirEntryForTest are integrated");
 

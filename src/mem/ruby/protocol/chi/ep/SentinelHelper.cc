@@ -4,10 +4,8 @@
  * Accesses the HN directory through a proper public accessor
  * (AbstractController::getDirectoryPtr()), which is overridden
  * in generated Cache_Controller to return m_directory_ptr.
- *
- * No #define private public hack needed — the SLICC code generator
- * was modified (StateMachine.py) to emit the override for all
- * controllers with a 'directory' config parameter.
+ * The SLICC code generator (StateMachine.py) emits the override
+ * for all controllers with a 'directory' config parameter.
  */
 
 #include "mem/ruby/protocol/chi/ep/SentinelHelper.hh"
@@ -205,7 +203,7 @@ SentinelHelper::installSentinelForTest(uint64_t line_pa, bool as_owner)
         return false;
     }
 
-    // Use the proper accessor instead of #define private public
+    // Use the SLICC-generated public accessor getDirectoryPtr()
     void *dirPtrVoid = hnAbs->getDirectoryPtr();
     if (!dirPtrVoid) {
         warn("SentinelHelper: HN controller %s has no directory\n",
