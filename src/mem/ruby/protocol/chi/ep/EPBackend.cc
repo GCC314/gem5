@@ -5,6 +5,7 @@
 #include "base/logging.hh"
 #include "debug/RubyCHIGeneric.hh"
 #include "debug/RubyEP.hh"
+#include "mem/ruby/protocol/chi/ep/EPRNFController.hh"
 #include "mem/ruby/protocol/chi/ep/UBCCController.hh"
 #include "mem/ruby/system/RubySystem.hh"
 #include "params/EPBackend.hh"
@@ -30,7 +31,9 @@ EPBackend::EPBackend(const Params &p)
     _addrMap(3, 128ULL * 1024 * 1024),
     _lastSideband{false, 0, 0, false, -1, -1, -1},
     _recallReceivedCount(0),
-    _recallResponseSentCount(0)
+    _recallResponseSentCount(0),
+    _writebackCount(0),
+    _evictCount(0)
 {
     // Pass RubySystem to UBCCController for SentinelHelper init
     // RubySystem is available via the params
@@ -63,6 +66,11 @@ void m5SelfTest_run(EPBackend*);
  */
 void m6SelfTest_run(EPBackend*);
 
+/**
+ * Forward declare the M7 self-test entry point (defined in M7SelfTest.cc).
+ */
+void m7SelfTest_run(EPBackend*);
+
 
 void
 EPBackend::init()
@@ -79,6 +87,7 @@ EPBackend::init()
         m4SelfTest_run(this);
         m5SelfTest_run(this);
         m6SelfTest_run(this);
+        m7SelfTest_run(this);
     }
 }
 
@@ -319,6 +328,9 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
         // Build recall message
         OuterRecallMsg recallMsg;
         recallMsg.linePa = homePa;
+        // P1-4: Compute owner's local PA for _requesterLines lookup
+        recallMsg.ownerLocalPa = _addrMap.buildDsmPA(
+            recallOwnerNode, homeNode, offset);
         recallMsg.ownerNode = recallOwnerNode;
         recallMsg.homeNode = homeNode;
         recallMsg.epoch = entry.epoch;
@@ -568,6 +580,28 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
     _lastRecallMsg = recallMsg;
     _recallReceivedCount++;
 
+    // ---- M7: Update requester-side bookkeeping ----
+    // Recall result split:
+    //   - Read recall → old owner downgrades to shared (R_S)
+    //   - Unique/write recall → old owner invalidates (R_I)
+    // P1-4: Use ownerLocalPa (owner's local PA) for _requesterLines lookup.
+    // linePa is the home-node PA view and may not match the owner's local PA.
+    {
+        uint64_t lookupPa = (recallMsg.ownerLocalPa != 0)
+                               ? recallMsg.ownerLocalPa
+                               : recallMsg.linePa;
+        auto it = _requesterLines.find(lookupPa);
+        if (it != _requesterLines.end()) {
+            if (recallMsg.isReadRequest) {
+                // Downgrade to shared
+                it->second.state = RequesterLineState::R_S;
+            } else {
+                // Invalidate
+                it->second.state = RequesterLineState::R_I;
+            }
+        }
+    }
+
     // In the single-gem5 prototype, the recall is processed immediately:
     // The owner node's EPBackend receives the recall and needs to:
     //   1. Trigger local HN coherent access (not yet wired in M6)
@@ -621,7 +655,8 @@ EPBackend::sendRecallResponse(const OuterRecallResponse &response)
 
     // Complete the recall at the home UBCC
     bool ok = homeUbcc->processRecallResponse(
-        response.linePa, response.ownerNode, response.dataReturned);
+        response.linePa, response.ownerNode, response.dataReturned,
+        response.epoch);
 
     if (!ok) {
         warn("EPBackend node_id=%d: home UBCC rejected recall response "
@@ -629,6 +664,196 @@ EPBackend::sendRecallResponse(const OuterRecallResponse &response)
     }
 
     return ok;
+}
+
+// ---- M7: Writeback / Evict ----
+
+bool
+EPBackend::handleWriteback(uint64_t line_pa, bool keepAsClean)
+{
+    DPRINTF(RubyEP,
+            "EPBackend node_id=%d: handleWriteback PA=0x%lx "
+            "keepAsClean=%d\n",
+            _nodeId, line_pa, keepAsClean);
+
+    if (!_addrMap.isDsm(_nodeId, line_pa)) {
+        fatal("EPBackend node_id=%d: non-DSM address on writeback path "
+              "PA=0x%lx\n", _nodeId, line_pa);
+    }
+
+    int homeNode = _addrMap.homeNode(_nodeId, line_pa);
+    if (homeNode < 0) {
+        fatal("EPBackend node_id=%d: invalid home node for writeback "
+              "PA=0x%lx\n", _nodeId, line_pa);
+    }
+
+    // Translate PA to home node's view
+    uint64_t offset = _addrMap.dsmOffset(line_pa);
+    uint64_t homePa = _addrMap.buildDsmPA(homeNode, homeNode, offset);
+
+    // Look up requester entry to get epoch
+    uint64_t epochVal = 0;
+    auto it = _requesterLines.find(line_pa);
+    if (it != _requesterLines.end()) {
+        epochVal = it->second.epoch;
+    } else {
+        // Use epoch counter if no entry exists
+        _epochCounter++;
+        epochVal = _epochCounter;
+    }
+
+    // Build writeback message envelope
+    _lastWritebackMsg.linePa = homePa;
+    _lastWritebackMsg.requesterNode = _nodeId;
+    _lastWritebackMsg.homeNode = homeNode;
+    _lastWritebackMsg.epoch = epochVal;
+    _lastWritebackMsg.keepAsClean = keepAsClean;
+
+    // Route to home UBCC
+    UBCCController *homeUbcc = UBCCController::getInstance(homeNode);
+    if (!homeUbcc) {
+        DPRINTF(RubyEP,
+                "EPBackend node_id=%d: home UBCC for node %d not found, "
+                "falling back to local UBCC\n", _nodeId, homeNode);
+        homeUbcc = _ubcc;
+    }
+    if (!homeUbcc) {
+        fatal("EPBackend node_id=%d: no UBCC available for writeback "
+              "PA=0x%lx\n", _nodeId, line_pa);
+    }
+
+    bool ok = homeUbcc->processWriteback(homePa, _nodeId, epochVal, keepAsClean);
+
+    // Build ack envelope
+    _lastAckMsg.linePa = homePa;
+    _lastAckMsg.homeNode = homeNode;
+    _lastAckMsg.epoch = epochVal;
+    _lastAckMsg.success = ok;
+
+    // Update requester bookkeeping based on result
+    if (ok) {
+        _writebackCount++;
+        if (it != _requesterLines.end()) {
+            if (keepAsClean) {
+                // Owner retains clean exclusive (G_E)
+                it->second.state = RequesterLineState::R_E;
+            } else {
+                // Owner drops the line (R_I)
+                it->second.state = RequesterLineState::R_I;
+            }
+        }
+    }
+
+    DPRINTF(RubyEP,
+            "EPBackend node_id=%d: handleWriteback PA=0x%lx complete "
+            "ok=%d keepAsClean=%d\n",
+            _nodeId, line_pa, ok, keepAsClean);
+
+    return ok;
+}
+
+bool
+EPBackend::handleEvict(uint64_t line_pa)
+{
+    DPRINTF(RubyEP,
+            "EPBackend node_id=%d: handleEvict PA=0x%lx\n",
+            _nodeId, line_pa);
+
+    if (!_addrMap.isDsm(_nodeId, line_pa)) {
+        fatal("EPBackend node_id=%d: non-DSM address on evict path "
+              "PA=0x%lx\n", _nodeId, line_pa);
+    }
+
+    int homeNode = _addrMap.homeNode(_nodeId, line_pa);
+    if (homeNode < 0) {
+        fatal("EPBackend node_id=%d: invalid home node for evict "
+              "PA=0x%lx\n", _nodeId, line_pa);
+    }
+
+    // Translate PA to home node's view
+    uint64_t offset = _addrMap.dsmOffset(line_pa);
+    uint64_t homePa = _addrMap.buildDsmPA(homeNode, homeNode, offset);
+
+    // Look up requester entry to get epoch
+    uint64_t epochVal = 0;
+    auto it = _requesterLines.find(line_pa);
+    if (it != _requesterLines.end()) {
+        epochVal = it->second.epoch;
+    } else {
+        _epochCounter++;
+        epochVal = _epochCounter;
+    }
+
+    // Build evict message envelope
+    _lastEvictMsg.linePa = homePa;
+    _lastEvictMsg.evictingNode = _nodeId;
+    _lastEvictMsg.homeNode = homeNode;
+    _lastEvictMsg.epoch = epochVal;
+
+    // Route to home UBCC
+    UBCCController *homeUbcc = UBCCController::getInstance(homeNode);
+    if (!homeUbcc) {
+        DPRINTF(RubyEP,
+                "EPBackend node_id=%d: home UBCC for node %d not found, "
+                "falling back to local UBCC\n", _nodeId, homeNode);
+        homeUbcc = _ubcc;
+    }
+    if (!homeUbcc) {
+        fatal("EPBackend node_id=%d: no UBCC available for evict "
+              "PA=0x%lx\n", _nodeId, line_pa);
+    }
+
+    bool ok = homeUbcc->processEvict(homePa, _nodeId, epochVal);
+
+    // Build ack envelope
+    _lastAckMsg.linePa = homePa;
+    _lastAckMsg.homeNode = homeNode;
+    _lastAckMsg.epoch = epochVal;
+    _lastAckMsg.success = ok;
+
+    if (ok) {
+        _evictCount++;
+        if (it != _requesterLines.end()) {
+            // Evict means the line is dropped from this node
+            it->second.state = RequesterLineState::R_I;
+        }
+    }
+
+    DPRINTF(RubyEP,
+            "EPBackend node_id=%d: handleEvict PA=0x%lx complete ok=%d\n",
+            _nodeId, line_pa, ok);
+
+    return ok;
+}
+
+uint64_t
+EPBackend::getStaleRejectedCount() const
+{
+    if (!_ubcc)
+        return 0;
+    return _ubcc->getStaleEpochRejectedCount();
+}
+
+void
+EPBackend::resetStaleRejectedCount()
+{
+    if (_ubcc)
+        _ubcc->resetStaleEpochRejectedCount();
+}
+
+uint64_t
+EPBackend::getOwnerMismatchRejectedCount() const
+{
+    if (!_ubcc)
+        return 0;
+    return _ubcc->getOwnerMismatchRejectedCount();
+}
+
+void
+EPBackend::resetOwnerMismatchRejectedCount()
+{
+    if (_ubcc)
+        _ubcc->resetOwnerMismatchRejectedCount();
 }
 
 } // namespace ruby

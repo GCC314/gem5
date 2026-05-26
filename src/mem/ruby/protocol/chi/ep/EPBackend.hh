@@ -34,17 +34,52 @@ enum class OuterGrantType {
     GlobalGrantModified    // Dirty modified owner granted (result code 2)
 };
 
+// ---- M7: Outer Writeback / Evict Message Types ----
+// Writeback request sent from requester node to home UBCC.
+struct OuterWritebackMsg {
+    uint64_t linePa;         // Physical address (home node's view)
+    int requesterNode;       // Node performing the writeback
+    int homeNode;            // Home node for this line
+    uint64_t epoch;          // Per-transaction epoch
+    bool keepAsClean;        // True if owner retains clean exclusive after writeback
+
+    OuterWritebackMsg() : linePa(0), requesterNode(-1), homeNode(-1),
+                          epoch(0), keepAsClean(false) {}
+};
+
+// Evict request sent from requester node to home UBCC.
+struct OuterEvictMsg {
+    uint64_t linePa;         // Physical address (home node's view)
+    int evictingNode;        // Node performing the eviction
+    int homeNode;            // Home node for this line
+    uint64_t epoch;          // Per-transaction epoch
+
+    OuterEvictMsg() : linePa(0), evictingNode(-1), homeNode(-1),
+                      epoch(0) {}
+};
+
+// Ack response from home UBCC after writeback/evict.
+struct OuterAckMsg {
+    uint64_t linePa;         // Physical address (home node's view)
+    int homeNode;            // Home node that sent the ack
+    uint64_t epoch;          // Per-transaction epoch
+    bool success;            // True if operation succeeded
+
+    OuterAckMsg() : linePa(0), homeNode(-1), epoch(0), success(false) {}
+};
+
 // ---- M6: Outer Recall Message Types ----
 // Recall request sent from home UBCC to the owner node's EPBackend.
 struct OuterRecallMsg {
     uint64_t linePa;         // Physical address (home node's view)
+    uint64_t ownerLocalPa;   // Physical address in owner node's local view
     int ownerNode;           // Node being recalled
     int homeNode;            // Node that initiated the recall
     uint64_t epoch;          // Per-transaction epoch
     bool isReadRequest;      // True if recall triggered by read (downgrade to shared)
     bool dataNeeded;         // True if dirty data must be returned
 
-    OuterRecallMsg() : linePa(0), ownerNode(-1), homeNode(-1),
+    OuterRecallMsg() : linePa(0), ownerLocalPa(0), ownerNode(-1), homeNode(-1),
                        epoch(0), isReadRequest(false), dataNeeded(false) {}
 };
 
@@ -203,6 +238,56 @@ class EPBackend : public SimObject
     const OuterRecallMsg& lastRecallMsg() const { return _lastRecallMsg; }
     const OuterRecallResponse& lastRecallResponse() const { return _lastRecallResponse; }
 
+    // ---- M7: Writeback / Evict ----
+    /**
+     * Handle a writeback from a dirty owner (requester→home).
+     * Called by EPSNFController when HN sends a writeback.
+     *
+     * @param line_pa     Physical address (requester's view)
+     * @param keepAsClean True if owner wants to keep clean exclusive copy
+     * @return            True if writeback was accepted by home
+     */
+    bool handleWriteback(uint64_t line_pa, bool keepAsClean);
+
+    /**
+     * Handle a clean evict from a sharer or clean owner (requester→home).
+     * Called by EPSNFController when HN sends an eviction.
+     *
+     * @param line_pa     Physical address (requester's view)
+     * @return            True if evict was accepted by home
+     */
+    bool handleEvict(uint64_t line_pa);
+
+    /**
+     * Get writeback count for test observation.
+     */
+    uint64_t getWritebackCount() const { return _writebackCount; }
+    void resetWritebackCount() { _writebackCount = 0; }
+
+    /**
+     * Get evict count for test observation.
+     */
+    uint64_t getEvictCount() const { return _evictCount; }
+    void resetEvictCount() { _evictCount = 0; }
+
+    /**
+     * Get stale-epoch-rejected count for test observation.
+     */
+    uint64_t getStaleRejectedCount() const;
+    void resetStaleRejectedCount();
+
+    /**
+     * Get owner-mismatch-rejected count for test observation (P0-1).
+     * Writeback from a node that is not the current owner is rejected.
+     */
+    uint64_t getOwnerMismatchRejectedCount() const;
+    void resetOwnerMismatchRejectedCount();
+
+    // M7: Envelope accessors for test inspection
+    const OuterWritebackMsg& lastWritebackMsg() const { return _lastWritebackMsg; }
+    const OuterEvictMsg& lastEvictMsg() const { return _lastEvictMsg; }
+    const OuterAckMsg& lastAckMsg() const { return _lastAckMsg; }
+
     /**
      * Diagnose the expected grant for a given sideband combination
      * without actually issuing the request.  Used by ARM_SYNC tests
@@ -297,6 +382,13 @@ class EPBackend : public SimObject
     // ---- M6: Recall counters ----
     uint64_t _recallReceivedCount;
     uint64_t _recallResponseSentCount;
+
+    // ---- M7: Writeback / Evict counters and envelopes ----
+    uint64_t _writebackCount;
+    uint64_t _evictCount;
+    OuterWritebackMsg _lastWritebackMsg;
+    OuterEvictMsg _lastEvictMsg;
+    OuterAckMsg _lastAckMsg;
 
     // ---- M6: Cross-Node EPBackend Routing Registry ----
     static std::map<int, EPBackend*> _backendInstances;

@@ -324,7 +324,9 @@ void runSelfTest(EPBackend *backend, int home_node)
 
             // Step 3: Process the recall response (from node 1)
             uint64_t respCountBefore = node1Ubcc->getRecallResponseCount();
-            bool ok = node1Ubcc->processRecallResponse(pa_recall_n1, 1, true);
+            uint64_t epoch_n1 = node1Ubcc->getEpochForLine(pa_recall_n1);
+            bool ok = node1Ubcc->processRecallResponse(pa_recall_n1, 1, true,
+                                                       epoch_n1);
             uint64_t respCountAfter = node1Ubcc->getRecallResponseCount();
 
             M6_CHECK("M6-2-5: recall response processed successfully",
@@ -391,8 +393,9 @@ void runSelfTest(EPBackend *backend, int home_node)
                  recallNeeded && recallOwnerNode == 0,
                  "Recall should be needed and target node 0");
 
-        // Complete the recall
-        ubcc->processRecallResponse(pa_simple, 0, false);
+        // Complete the recall (M7 P1-5: explicit epoch required)
+        uint64_t epoch_simple = ubcc->getEpochForLine(pa_simple);
+        ubcc->processRecallResponse(pa_simple, 0, false, epoch_simple);
 
         UBCCController::MESIState state;
         int ownerNode;
@@ -511,8 +514,9 @@ void runSelfTest(EPBackend *backend, int home_node)
                      std::string("pendingRecallTarget=") +
                          std::to_string(pendingTarget));
 
-            // Complete the recall
-            ubcc->processRecallResponse(pa_busy, 0, false);
+            // Complete the recall (M7 P1-5: explicit epoch required)
+            uint64_t epoch_busy = ubcc->getEpochForLine(pa_busy);
+            ubcc->processRecallResponse(pa_busy, 0, false, epoch_busy);
 
             // Line should no longer be busy
             bool busy3 = ubcc->isLineBusy(pa_busy);

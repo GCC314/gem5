@@ -35,7 +35,11 @@ UBCCController::getInstance(int node_id)
 UBCCController::UBCCController(int node_id, RubySystem *ruby_system)
   : _nodeId(node_id),
     _recallCount(0),
-    _recallResponseCount(0)
+    _recallResponseCount(0),
+    _writebackCount(0),
+    _evictCount(0),
+    _staleRejectedCount(0),
+    _ownerMismatchRejectedCount(0)
 {
     if (ruby_system) {
         _sentinelHelper = new SentinelHelper(ruby_system, node_id);
@@ -510,6 +514,12 @@ UBCCController::inspectUbccDirForTest(uint64_t line_pa)
             << "\"pendingReqType\":" << static_cast<int>(e.pendingReqType) << ","
             << "\"pendingWriteIntent\":" << (e.pendingWriteIntent ? "true" : "false");
     }
+    // M7: Counters for test observation
+    oss << ","
+        << "\"writebackCount\":" << _writebackCount << ","
+        << "\"evictCount\":" << _evictCount << ","
+        << "\"staleRejectedCount\":" << _staleRejectedCount << ","
+        << "\"ownerMismatchRejectedCount\":" << _ownerMismatchRejectedCount;
     oss << "}";
     return oss.str();
 }
@@ -578,7 +588,7 @@ UBCCController::initiateRecall(uint64_t line_pa, DirEntry &entry,
 
 bool
 UBCCController::processRecallResponse(uint64_t line_pa, int ownerNode,
-                                       bool dataReceived)
+                                       bool dataReceived, uint64_t responseEpoch)
 {
     auto it = _directory.find(line_pa);
     if (it == _directory.end()) {
@@ -589,6 +599,17 @@ UBCCController::processRecallResponse(uint64_t line_pa, int ownerNode,
     }
 
     DirEntry &entry = it->second;
+
+    // ---- M7: Stale epoch check ----
+    // M7 P1-5: Remove epoch==0 bypass — all paths must pass epoch check.
+    if (!checkEpochForLine(line_pa, responseEpoch)) {
+        DPRINTF(RubyEP,
+                "UBCC node_id=%d: processRecallResponse PA=0x%lx "
+                "STALE epoch: response=%lu directory=%lu — REJECTED\n",
+                _nodeId, line_pa, responseEpoch, entry.epoch);
+        _staleRejectedCount++;
+        return false;
+    }
 
     // Verify this is a pending recall
     if (entry.pendingOp != 1) {
@@ -692,6 +713,213 @@ UBCCController::getPendingRecallTarget(uint64_t line_pa) const
     if (it == _directory.end())
         return -1;
     return it->second.pendingRecallTarget;
+}
+
+// ---- M7: Epoch / Stale Protection ----
+
+bool
+UBCCController::checkEpochForLine(uint64_t line_pa, uint64_t responseEpoch) const
+{
+    auto it = _directory.find(line_pa);
+    if (it == _directory.end())
+        return true; // No entry yet — accept (first miss creates entry)
+    return responseEpoch == it->second.epoch;
+}
+
+uint64_t
+UBCCController::getEpochForLine(uint64_t line_pa) const
+{
+    auto it = _directory.find(line_pa);
+    if (it == _directory.end())
+        return 0;
+    return it->second.epoch;
+}
+
+// ---- M7: GlobalWriteback ----
+
+bool
+UBCCController::processWriteback(uint64_t line_pa, int requesterNode,
+                                  uint64_t epochVal, bool keepAsClean)
+{
+    DPRINTF(RubyEP,
+            "UBCC node_id=%d: processWriteback PA=0x%lx "
+            "requesterNode=%d epoch=%lu keepAsClean=%d\n",
+            _nodeId, line_pa, requesterNode, epochVal, keepAsClean);
+
+    auto it = _directory.find(line_pa);
+    if (it == _directory.end()) {
+        // No directory entry — accept writeback (first registration)
+        // This handles the case where data was cached with stale/incomplete metadata.
+        ensureDirEntry(line_pa);
+        it = _directory.find(line_pa);
+    }
+
+    DirEntry &entry = it->second;
+
+    // ---- M7: Stale epoch check ----
+    if (!checkEpochForLine(line_pa, epochVal)) {
+        DPRINTF(RubyEP,
+                "UBCC node_id=%d: processWriteback PA=0x%lx "
+                "STALE epoch: msg=%lu directory=%lu — REJECTED\n",
+                _nodeId, line_pa, epochVal, entry.epoch);
+        _staleRejectedCount++;
+        return false;
+    }
+
+    // ---- M7: Owner match check ----
+    // Writeback must come from the current owner (or -1 if no entry).
+    // Reject if the requesting node is not the current owner.
+    if (entry.ownerNode >= 0 && entry.ownerNode != requesterNode) {
+        DPRINTF(RubyEP,
+                "UBCC node_id=%d: processWriteback PA=0x%lx "
+                "OWNER MISMATCH: requesterNode=%d != ownerNode=%d — REJECTED\n",
+                _nodeId, line_pa, requesterNode, entry.ownerNode);
+        _ownerMismatchRejectedCount++;
+        return false;
+    }
+
+    // ---- M7: Process writeback ----
+    // Dirty data is written back — clear dirty flag.
+    // If keepAsClean, the owner retains exclusive clean ownership (G_E).
+    // Otherwise, the owner drops the line entirely (G_I).
+    if (keepAsClean && requesterNode >= 0) {
+        // Owner writes back but retains clean exclusive
+        entry.state = MESIState::G_E;
+        entry.ownerNode = requesterNode;
+        entry.sharersMask = 0;
+        entry.dirty = false;
+    } else {
+        // Owner drops the line completely
+        entry.state = MESIState::G_I;
+        entry.ownerNode = -1;
+        entry.sharersMask = 0;
+        entry.dirty = false;
+    }
+    entry.pendingOp = 0; // Clear any pending ops
+
+    _writebackCount++;
+
+    DPRINTF(RubyEP,
+            "UBCC node_id=%d: processWriteback PA=0x%lx complete "
+            "newState=%s ownerNode=%d dirty=%d\n",
+            _nodeId, line_pa, mesiStateName(entry.state),
+            entry.ownerNode, entry.dirty);
+
+    return true;
+}
+
+// ---- M7: GlobalEvict (Clean Evict) ----
+
+bool
+UBCCController::processEvict(uint64_t line_pa, int evictingNode,
+                              uint64_t epochVal)
+{
+    DPRINTF(RubyEP,
+            "UBCC node_id=%d: processEvict PA=0x%lx "
+            "evictingNode=%d epoch=%lu\n",
+            _nodeId, line_pa, evictingNode, epochVal);
+
+    auto it = _directory.find(line_pa);
+    if (it == _directory.end()) {
+        // No entry — nothing to evict, accept as no-op
+        DPRINTF(RubyEP,
+                "UBCC node_id=%d: processEvict PA=0x%lx "
+                "no entry — no-op\n", _nodeId, line_pa);
+        return true;
+    }
+
+    DirEntry &entry = it->second;
+
+    // ---- M7: Stale epoch check ----
+    if (!checkEpochForLine(line_pa, epochVal)) {
+        DPRINTF(RubyEP,
+                "UBCC node_id=%d: processEvict PA=0x%lx "
+                "STALE epoch: msg=%lu directory=%lu — REJECTED\n",
+                _nodeId, line_pa, epochVal, entry.epoch);
+        _staleRejectedCount++;
+        return false;
+    }
+
+    // ---- M7: Line busy check ----
+    // Cannot evict while line is busy with in-flight transaction.
+    if (entry.pendingOp > 0) {
+        DPRINTF(RubyEP,
+                "UBCC node_id=%d: processEvict PA=0x%lx "
+                "line busy (pendingOp=%d) — rejected\n",
+                _nodeId, line_pa, entry.pendingOp);
+        return false;
+    }
+
+    // ---- M7: Process evict based on current state ----
+    bool removedFromSharer = false;
+    bool removedFromOwner = false;
+
+    // Remove from sharer mask if present
+    if (evictingNode >= 0) {
+        uint64_t nodeBit = (1ULL << evictingNode);
+        if (entry.sharersMask & nodeBit) {
+            entry.sharersMask &= ~nodeBit;
+            removedFromSharer = true;
+        }
+    }
+
+    // If the evicting node is the current owner (clean owner, G_E),
+    // clear ownership.
+    if (entry.ownerNode >= 0 && entry.ownerNode == evictingNode) {
+        // Only clean owners (G_E) can evict without writeback.
+        // Dirty owners (G_M) must writeback first.
+        if (entry.dirty) {
+            DPRINTF(RubyEP,
+                    "UBCC node_id=%d: processEvict PA=0x%lx "
+                    "dirty owner evict not allowed — must writeback first\n",
+                    _nodeId, line_pa);
+            return false;
+        }
+        entry.ownerNode = -1;
+        entry.sharersMask = 0; // Exclusive owner has no sharers
+        removedFromOwner = true;
+    }
+
+    // ---- M7 P0-3: Reject evict if node is neither owner nor sharer ----
+    if (!removedFromSharer && !removedFromOwner) {
+        DPRINTF(RubyEP,
+                "UBCC node_id=%d: processEvict PA=0x%lx "
+                "evictingNode=%d is neither owner (ownerNode=%d) nor sharer "
+                "(sharersMask=0x%lx) — REJECTED\n",
+                _nodeId, line_pa, evictingNode,
+                entry.ownerNode, entry.sharersMask);
+        return false;
+    }
+
+    // ---- Determine new state ----
+    if (entry.sharersMask == 0 && entry.ownerNode < 0) {
+        // No sharers, no owner → G_I
+        entry.state = MESIState::G_I;
+    } else if (entry.ownerNode >= 0) {
+        // Exclusive owner remains (different from evicting node)
+        // State stays G_E or G_M — unchanged
+    } else {
+        // Share-only line
+        entry.state = MESIState::G_S;
+    }
+
+    // M7 P0-2: Only clear dirty if we removed a clean owner.
+    // Sharer-only eviction must not touch dirty (owner's dirty state preserved).
+    // Dirty owner eviction was already rejected above.
+    if (removedFromOwner) {
+        entry.dirty = false;
+    }
+    _evictCount++;
+
+    DPRINTF(RubyEP,
+            "UBCC node_id=%d: processEvict PA=0x%lx complete "
+            "removedSharer=%d removedOwner=%d newState=%s "
+            "sharersMask=0x%lx ownerNode=%d\n",
+            _nodeId, line_pa, removedFromSharer, removedFromOwner,
+            mesiStateName(entry.state),
+            entry.sharersMask, entry.ownerNode);
+
+    return true;
 }
 
 } // namespace ruby

@@ -23,7 +23,9 @@ struct DirEntrySnapshot;
 // These mirror the enums in EPBackend.hh but are used internally.
 enum class UBCC_OuterReqType {
     GlobalReadShared,
-    GlobalReadUnique
+    GlobalReadUnique,
+    GlobalWriteback,   // M7: dirty owner writeback
+    GlobalEvict        // M7: clean sharer/owner eviction
 };
 
 enum class UBCC_OuterGrantType {
@@ -85,14 +87,79 @@ class UBCCController
      * @param line_pa           Physical address (home node's view)
      * @param ownerNode         Node that was recalled
      * @param dataReceived      True if dirty data was returned
+     * @param responseEpoch     Epoch from the response message (M7: stale check)
      * @return                  True if recall completed successfully
      */
-    bool processRecallResponse(uint64_t line_pa, int ownerNode, bool dataReceived);
+    bool processRecallResponse(uint64_t line_pa, int ownerNode,
+                               bool dataReceived, uint64_t responseEpoch = 0);
 
     /**
      * Check if a line is currently busy (recall or other op in progress).
      */
     bool isLineBusy(uint64_t line_pa) const;
+
+    // ---- M7: Writeback / Evict ----
+    /**
+     * Process a GlobalWriteback from a dirty owner.
+     * The owner writes back dirty data and may keep or drop the line.
+     *
+     * @param line_pa        Physical address (home node's view)
+     * @param requesterNode  Node performing the writeback
+     * @param epochVal       Epoch from the writeback message (stale check)
+     * @param keepAsClean    If true, owner retains clean exclusive (G_E);
+     *                       if false, owner drops the line (G_I)
+     * @return               True if writeback accepted (epoch matched)
+     */
+    bool processWriteback(uint64_t line_pa, int requesterNode,
+                          uint64_t epochVal, bool keepAsClean);
+
+    /**
+     * Process a GlobalEvict from a clean sharer or clean owner.
+     * Removes the node from the directory.
+     *
+     * @param line_pa        Physical address (home node's view)
+     * @param evictingNode   Node performing the eviction
+     * @param epochVal       Epoch from the evict message (stale check)
+     * @return               True if evict accepted (epoch matched)
+     */
+    bool processEvict(uint64_t line_pa, int evictingNode,
+                      uint64_t epochVal);
+
+    /**
+     * Check whether a response epoch is valid for the current line epoch.
+     * Returns true if epoch matches, false if stale (must be dropped).
+     */
+    bool checkEpochForLine(uint64_t line_pa, uint64_t responseEpoch) const;
+
+    /**
+     * Get the current epoch for a line (-1 if line not found).
+     */
+    uint64_t getEpochForLine(uint64_t line_pa) const;
+
+    /**
+     * Get the writeback count (for test observation).
+     */
+    uint64_t getWritebackCount() const { return _writebackCount; }
+    void resetWritebackCount() { _writebackCount = 0; }
+
+    /**
+     * Get the evict count (for test observation).
+     */
+    uint64_t getEvictCount() const { return _evictCount; }
+    void resetEvictCount() { _evictCount = 0; }
+
+    /**
+     * Get the stale-epoch-rejected count (for test observation).
+     */
+    uint64_t getStaleEpochRejectedCount() const { return _staleRejectedCount; }
+    void resetStaleEpochRejectedCount() { _staleRejectedCount = 0; }
+
+    /**
+     * Get the owner-mismatch-rejected count for writeback (for test observation).
+     * P0-1: Writeback from a node that is not the current owner is rejected.
+     */
+    uint64_t getOwnerMismatchRejectedCount() const { return _ownerMismatchRejectedCount; }
+    void resetOwnerMismatchRejectedCount() { _ownerMismatchRejectedCount = 0; }
 
     /**
      * Get the pending requester node for a busy line (-1 if not found).
@@ -239,6 +306,12 @@ class UBCCController
     // ---- M6: Recall counters ----
     uint64_t _recallCount;
     uint64_t _recallResponseCount;
+
+    // ---- M7: Writeback / Evict / Stale counters ----
+    uint64_t _writebackCount;
+    uint64_t _evictCount;
+    uint64_t _staleRejectedCount;
+    uint64_t _ownerMismatchRejectedCount;
 
     // ---- Legacy M4 structures (retained for compatibility) ----
     struct OuterEntry {
