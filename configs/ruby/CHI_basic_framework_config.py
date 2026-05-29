@@ -105,6 +105,14 @@ class NodeConfig:
         return AddrRange(2 * seg_size, size=3 * seg_size)
 
     @staticmethod
+    def dsm_local_range(node_id, seg_size=DEFAULT_SEG_SIZE, phy_base=0):
+        """DSM range for lines homed at this node, in the node's own PA view.
+        Each node homes DSM_<node_id> at PhyBase + (2+node_id)*SEG_SIZE.
+        """
+        base = phy_base + (2 + node_id) * seg_size
+        return AddrRange(base, size=seg_size)
+
+    @staticmethod
     def dsm_range_for(node_id, seg_size=DEFAULT_SEG_SIZE, phy_base=0):
         """DSM_k range in the caller's node PA space."""
         base = phy_base + (2 + node_id) * seg_size

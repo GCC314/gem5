@@ -2,6 +2,7 @@
 
 #include "base/logging.hh"
 #include "debug/RubyCHIGeneric.hh"
+#include "mem/ruby/common/DataBlock.hh"
 #include "mem/ruby/protocol/CHI/CHIDataMsg.hh"
 #include "mem/ruby/protocol/CHI/CHIRequestMsg.hh"
 #include "mem/ruby/protocol/CHI/CHIResponseMsg.hh"
@@ -131,8 +132,7 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
                               grantResult, homeNode);
 
     // Respond to HN with RespSepData + CompData
-    // For M5, we send dummy/zero data since the data path through
-    // DL_SNF is not yet implemented (M6/M7 will add recall/writeback).
+    // Q1: Use real grant data from EPBackend/lastGrantData instead of dummy zero.
     NetDest dest;
     dest.add(msg->m_requestor);
 
@@ -143,11 +143,25 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
         false, false, 0, 0, MessageSizeType_Control);
     sendResponseMsg(rsp);
 
+    // Build CompData with real data from the grant path.
+    DataBlock db(cacheLineSize);
+    const uint8_t *gdata = _backend->lastGrantData();
+    if (gdata && _backend->lastGrantDataSize() >= cacheLineSize) {
+        db.setData(gdata, 0, cacheLineSize);
+        DPRINTF(RubyCHIGeneric,
+                "EP_SNF node_id=%d: CompData populated with grant data "
+                "first_byte=0x%02x\n", _nodeId, gdata[0]);
+    } else {
+        DPRINTF(RubyCHIGeneric,
+                "EP_SNF node_id=%d: CompData fallback to zeros "
+                "(grant data not available)\n", _nodeId);
+    }
+
     auto dat = std::make_shared<CHIDataMsg>(
         curTick(), cacheLineSize, m_ruby_system,
         msg->m_addr, CHIDataType_CompData_I,
         m_machineID, dest,
-        DataBlock(cacheLineSize),
+        db,
         WriteMask(cacheLineSize),
         false, 0, MessageSizeType_Data);
     sendDataMsg(dat);

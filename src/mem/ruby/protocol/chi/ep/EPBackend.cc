@@ -1,10 +1,14 @@
 #include "mem/ruby/protocol/chi/ep/EPBackend.hh"
 
+#include <cstring>
 #include <sstream>
 
 #include "base/logging.hh"
 #include "debug/RubyCHIGeneric.hh"
 #include "debug/RubyEP.hh"
+#include "mem/packet.hh"
+#include "mem/request.hh"
+#include "mem/simple_mem.hh"
 #include "mem/ruby/protocol/chi/ep/EPRNFController.hh"
 #include "mem/ruby/protocol/chi/ep/UBCCController.hh"
 #include "mem/ruby/system/RubySystem.hh"
@@ -29,6 +33,9 @@ EPBackend::EPBackend(const Params &p)
   : SimObject(p),
     _nodeId(p.node_id),
     _addrMap(3, 128ULL * 1024 * 1024),
+    _ruby_system(p.ruby_system),
+    _lastGrantDataBlock(64),  // cache line size = 64 bytes
+    _lastGrantDataValid(false),
     _lastSideband{false, 0, 0, false, -1, -1, -1},
     _recallReceivedCount(0),
     _recallResponseSentCount(0),
@@ -498,6 +505,12 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
     // Handle grant result and update bookkeeping
     OuterGrantType result = handleGrant(line_pa, grant, homeNode);
 
+    // ---- Q1: Populate grant data buffer for CompData response ----
+    // After the grant is processed, read the actual data from the home
+    // node's DL_SNF memory so EPSNFController can send real data in
+    // the CompData response (not dummy zero).
+    populateGrantData(homePa, homeNode);
+
     // ---- M6: Clear outer txn pending and signal completion ----
     // The outer transaction is now complete; notify local EP_RNF
     // so any delayed HN snoop responses can be sent.
@@ -552,6 +565,68 @@ EPBackend::handleGrant(uint64_t line_pa, OuterGrantType grant, int homeNode)
     }
 
     return grant;
+}
+
+// ---- Q1: Grant Data Accessor ----
+
+void
+EPBackend::populateGrantData(uint64_t homePa, int homeNode)
+{
+    static const int lineSize = 64; // cache line size
+
+    // Start with zeros (valid for uninitialized DSM memory)
+    uint8_t zero_buf[64] = {};
+    _lastGrantDataBlock.setData(zero_buf, 0, lineSize);
+
+    if (!_ruby_system) {
+        DPRINTF(RubyCHIGeneric,
+                "EPBackend node_id=%d: no ruby_system, grant data is zeros\n",
+                _nodeId);
+        _lastGrantDataValid = true;
+        return;
+    }
+
+    // ---- Try phys_mem functional access (requires --access-backing-store) ----
+    // This is safe to call at any time (SimpleMemory is always available).
+    auto *phys_mem = _ruby_system->getPhysMem();
+    if (phys_mem) {
+        RequestPtr req = std::make_shared<Request>(
+            homePa, lineSize, 0, RequestorID(0));
+        req->setFlags(Request::PHYSICAL);
+        Packet pkt(req, MemCmd::ReadReq);
+        uint8_t pkt_buf[64] = {};
+        pkt.dataStatic(pkt_buf);
+        phys_mem->functionalAccess(&pkt);
+        _lastGrantDataBlock.setData(pkt_buf, 0, lineSize);
+        _lastGrantDataValid = true;
+        DPRINTF(RubyCHIGeneric,
+                "EPBackend node_id=%d: grant data populated via phys_mem "
+                "PA=0x%lx homeNode=%d first_word=0x%08x\n",
+                _nodeId, homePa, homeNode,
+                *(reinterpret_cast<const uint32_t*>(pkt_buf)));
+        return;
+    }
+
+    // ---- No phys_mem available ----
+    // Without --access-backing-store, phys_mem is unavailable.
+    // Grant data must come from actual backing store; silent zero
+    // fallback is a correctness hazard.
+    fatal("EPBackend: populateGrantData requires --access-backing-store "
+          "node_id=%d PA=0x%lx\n", _nodeId, homePa);
+}
+
+const uint8_t*
+EPBackend::lastGrantData() const
+{
+    if (!_lastGrantDataValid)
+        return nullptr;
+    return _lastGrantDataBlock.getData(0, 64);
+}
+
+int
+EPBackend::lastGrantDataSize() const
+{
+    return _lastGrantDataValid ? 64 : 0;
 }
 
 // ---- M5 Inspection API ----

@@ -2,6 +2,9 @@
 Creates N=3, L=2, D=2 topology with EP endpoints.
 HN_i routes by address classification to L_SNF_i / DL_SNF_i / EP_SNF_i.
 RN-F downstream: same-node HN only (TC-TOPO-2).
+
+Q1: DSM VA Mapping helper — call setup_dsm_va_mapping() from test scripts
+    after Process creation to map DSM_VA_BASE + k*SEG to PA for each node.
 """
 import math
 
@@ -25,6 +28,69 @@ def _make_hnf(ruby_system, addr_ranges, llcache_type, node_id):
     wrapper.connectController(hnf_cntrl)
     wrapper._node_id = node_id
     return wrapper, hnf_cntrl
+
+
+# ---- Q1: DSM VA Mapping Helper ----
+# Call this from test scripts AFTER creating Process objects but BEFORE
+# m5.instantiate().  Maps DSM_VA_BASE + k*SEG_SIZE → node-k's DSM PA base.
+# This ensures ARM workload ldr/str to DSM VA addresses correctly traverse
+# the page table to the CHI Ruby physical address space.
+
+def setup_dsm_va_mapping(processes, num_nodes=DEFAULT_N, seg_size=DEFAULT_SEG_SIZE):
+    """Install VA→PA mappings for DSM regions on all processes.
+
+    Each process gets VA range [DSM_VA_BASE + k*SEG, DSM_VA_BASE + (k+1)*SEG)
+    mapped to the corresponding home node k's DSM PA base.
+
+    Args:
+        processes: List of Process objects (one per CPU thread).
+        num_nodes: Number of nodes (default 3).
+        seg_size: Segment size in bytes (default 128MB).
+
+    Usage in test script:
+        from ruby.CHI_ubcc_framework import setup_dsm_va_mapping
+        setup_dsm_va_mapping([proc for cpu in cpus for proc in cpu.workload])
+    """
+    addr_map = NodeAddressMap(num_nodes, seg_size)
+
+    # DSM_VA_BASE = MaxAddr - 4 * SEG_SIZE
+    # Each node k's DSM_k window is at DSM_VA_BASE + k * SEG_SIZE
+    dsm_va_base = 0xFFFFFFFFFFFF - 4 * seg_size
+
+    for proc in processes:
+        if proc is None:
+            continue
+        for nid in range(num_nodes):
+            dsm_pa_base = addr_map.dsmLocalBase(nid)
+            dsm_va = dsm_va_base + nid * seg_size
+            proc.map(dsm_va, dsm_pa_base, seg_size, cacheable=True)
+
+    print(f"[Q1-DSM-MAP] Installed DSM VA→PA mappings for {num_nodes} nodes, "
+          f"base VA=0x{dsm_va_base:x}, {len(processes)} processes")
+
+
+# ---- Q1: L3 Allocation / Deallocation Policy ----
+# These configure the HN-F (L3) cache controller's allocation behavior
+# to ensure DSM lines are cached correctly and invalidated on UBCC recall.
+
+def configure_l3_dsm_policy(hnf_cntrl):
+    """Configure HN-F L3 alloc/dealloc for DSM line handling.
+
+    Sets alloc_on_* and dealloc_on_* parameters to ensure:
+    - DSM lines entering L3 are correctly cached (alloc_on_readshared/readunique)
+    - DSM lines are invalidated on UBCC recall/invalidate (dealloc_on_*)
+    - Writeback into L3 is allocated (alloc_on_writeback) for eviction data
+    """
+    # Enable allocation for DSM lines entering L3
+    hnf_cntrl.alloc_on_readshared     = True   # Shared DSM reads cache in L3
+    hnf_cntrl.alloc_on_readunique     = True   # Unique DSM reads cache in L3
+    hnf_cntrl.alloc_on_readonce       = True   # One-time reads cache in L3
+    hnf_cntrl.alloc_on_writeback      = True   # Writeback data goes into L3
+    hnf_cntrl.alloc_on_atomic         = False  # Atomics skip L3 (pass through)
+
+    # Enable deallocation to keep L3 coherent with UBCC directory
+    hnf_cntrl.dealloc_on_unique       = True   # Invalidate L3 on unique snoop
+    hnf_cntrl.dealloc_on_shared       = False  # Keep shared copies in L3
 
 
 def _make_snf(ruby_system, addr_ranges):
@@ -80,8 +146,13 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
 
         nd['hnf_wrapper'], nd['hnf_cntrl'] = _make_hnf(
             ruby_system,
-            [cfg.local_private_range, cfg.ubcc_exclusive_range],
+            [cfg.local_private_range,
+             cfg.ubcc_exclusive_range,
+             NodeConfig.dsm_local_range(node_id, seg_size, cfg.phy_base)],
             HNFCache, node_id)
+
+        # Q1: Configure L3 alloc/dealloc policy for DSM cache coherence
+        configure_l3_dsm_policy(nd['hnf_cntrl'])
 
         setattr(ruby_system, f"hnf_node{node_id}", nd['hnf_wrapper'])
         network_nodes.append(nd['hnf_wrapper'])
@@ -192,5 +263,11 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
         topology = create_topology(network_cntrls, options)
     else:
         m5.fatal(f"{options.topology} not supported!")
+
+    # ---- Q1: DSM VA mapping for processes ----
+    # Collect all Process objects across all CPUs and map DSM VA regions
+    # to the corresponding home node's DSM PA base for each node.
+    processes = [proc for cpu in cpus for proc in cpu.workload]
+    setup_dsm_va_mapping(processes, num_nodes, seg_size)
 
     return (cpu_sequencers, [], topology)

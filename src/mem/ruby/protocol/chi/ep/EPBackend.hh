@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 
+#include "mem/ruby/common/DataBlock.hh"
 #include "mem/ruby/protocol/chi/ep/NodeAddressMap.hh"
 #include "params/EPBackend.hh"
 #include "sim/sim_object.hh"
@@ -359,6 +360,22 @@ class EPBackend : public SimObject
      */
     std::string diagnoseExpectedGrant(int neededPerm, bool writeIntent) const;
 
+    // ---- Q1: Grant Data Accessor ----
+    /**
+     * Return the data block for the last grant.
+     * Populated by handleRemoteMiss() after the home UBCC grant decision.
+     * Used by EPSNFController to construct a real CompData response.
+     *
+     * @return Pointer to the grant data buffer (cache line size bytes),
+     *         or nullptr if no grant has been processed.
+     */
+    const uint8_t* lastGrantData() const;
+
+    /**
+     * Return the size of the last grant data buffer in bytes.
+     */
+    int lastGrantDataSize() const;
+
     // ---- M4 Sentinel Registration Test Hooks ----
     // These are exposed to Python via gem5's Swig/SWIG bindings.
 
@@ -419,6 +436,22 @@ class EPBackend : public SimObject
     NodeAddressMap _addrMap;
     UBCCController *_ubcc = nullptr;
     EPRNFController *_epRnfCtrl = nullptr;
+    RubySystem *_ruby_system = nullptr;
+
+    // ---- Q1: Grant Data Buffer ----
+    // Cache-line-sized buffer populated after each grant decision.
+    // Used by EPSNFController to construct CompData response payload.
+    DataBlock _lastGrantDataBlock;
+    bool _lastGrantDataValid = false;
+
+    /**
+     * Populate the grant data buffer by reading from the home node's
+     * DL_SNF memory via functional access.
+     *
+     * @param homePa  Physical address in home node's PA view
+     * @param homeNode Node ID of the home node
+     */
+    void populateGrantData(uint64_t homePa, int homeNode);
 
     // ---- M5: Requester-Side Bookkeeping ----
     // Per-line entries tracking global permissions for remote DSM lines.
