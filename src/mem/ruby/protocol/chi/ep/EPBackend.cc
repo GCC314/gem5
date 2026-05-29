@@ -44,8 +44,6 @@ EPBackend::EPBackend(const Params &p)
     _invalidationReceivedCount(0),
     _invalidationAckSentCount(0)
 {
-    // Pass RubySystem to UBCCController for SentinelHelper init
-    // RubySystem is available via the params
     auto *ruby_system = p.ruby_system;
     _ubcc = new UBCCController(_nodeId, ruby_system);
 
@@ -140,37 +138,6 @@ EPBackend::checkDsmAddr(uint64_t pa) const
     fatal("EPBackend node_id=%d: non-DSM address on EP path PA=0x%lx",
           _nodeId, pa);
     return false;
-}
-
-// ---- M4 Sentinel Registration Test Hooks ----
-
-bool
-EPBackend::installSentinelForTest(uint64_t line_pa, bool as_owner)
-{
-    if (!_ubcc) {
-        warn("EPBackend node_id=%d: UBCC not available\n", _nodeId);
-        return false;
-    }
-    return _ubcc->installSentinelForTest(line_pa, as_owner);
-}
-
-bool
-EPBackend::removeSentinelForTest(uint64_t line_pa)
-{
-    if (!_ubcc) {
-        warn("EPBackend node_id=%d: UBCC not available\n", _nodeId);
-        return false;
-    }
-    return _ubcc->removeSentinelForTest(line_pa);
-}
-
-std::string
-EPBackend::inspectDirEntryForTest(uint64_t line_pa)
-{
-    if (!_ubcc) {
-        return "{\"error\": \"UBCC not available\"}";
-    }
-    return _ubcc->inspectDirEntryForTest(line_pa);
 }
 
 bool

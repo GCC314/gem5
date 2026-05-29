@@ -16,8 +16,6 @@
  *   - PASS: assertion confirmed true
  */
 
-#include "mem/ruby/protocol/chi/ep/SentinelHelper.hh"
-
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>

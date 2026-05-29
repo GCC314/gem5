@@ -6,7 +6,7 @@
 #include "base/logging.hh"
 #include "debug/RubyCHIGeneric.hh"
 #include "debug/RubyEP.hh"
-#include "mem/ruby/protocol/chi/ep/SentinelHelper.hh"
+#include "mem/ruby/protocol/chi/ep/NodeAddressMap.hh"
 #include "mem/ruby/system/RubySystem.hh"
 #include "sim/cur_tick.hh"
 
@@ -41,18 +41,25 @@ UBCCController::UBCCController(int node_id, RubySystem *ruby_system)
     _staleRejectedCount(0),
     _ownerMismatchRejectedCount(0),
     _invalidationCount(0),
-    _invalidationAckCount(0)
+    _invalidationAckCount(0),
+    _epRnfSnoopCount(0),
+    _dsmLocalBase(0),
+    _dsmSegSize(0)
 {
-    if (ruby_system) {
-        _sentinelHelper = new SentinelHelper(ruby_system, node_id);
-    }
+    // Precompute DSM local range for isDsmAddr()
+    // Hardcoded prototype constants: num_nodes=3, segSize=128MB, NODE_ADDR_SHIFT=40
+    constexpr uint64_t kSegSize = 128ULL * 1024 * 1024;
+    constexpr int kNodeAddrShift = 40;
+    uint64_t nodeBase = static_cast<uint64_t>(node_id) << kNodeAddrShift;
+    _dsmLocalBase = nodeBase + 2 * kSegSize + node_id * kSegSize;
+    _dsmSegSize = kSegSize;
+
     registerInstance(node_id, this);
 }
 
 UBCCController::~UBCCController()
 {
     _instances.erase(_nodeId);
-    delete _sentinelHelper;
 }
 
 void
@@ -70,102 +77,12 @@ UBCCController::wakeup()
     }
 }
 
-// ---- M4 Sentinel Registration Test Hooks ----
-
-bool
-UBCCController::installSentinelForTest(uint64_t line_pa, bool as_owner)
-{
-    if (!_sentinelHelper) {
-        warn("UBCCController node_id=%d: SentinelHelper not available\n",
-             _nodeId);
-        return false;
-    }
-
-    bool ok = _sentinelHelper->installSentinelForTest(line_pa, as_owner);
-    if (ok) {
-        _sentinelStates[line_pa] = as_owner ? SS_OWNER : SS_SHARER;
-    }
-    return ok;
-}
-
-bool
-UBCCController::removeSentinelForTest(uint64_t line_pa)
-{
-    if (!_sentinelHelper) {
-        warn("UBCCController node_id=%d: SentinelHelper not available\n",
-             _nodeId);
-        return false;
-    }
-
-    bool ok = _sentinelHelper->removeSentinelForTest(line_pa);
-    if (ok) {
-        _sentinelStates.erase(line_pa);
-    }
-    return ok;
-}
-
-std::string
-UBCCController::inspectDirEntryForTest(uint64_t line_pa)
-{
-    DirEntrySnapshot snap;
-    if (!getDirEntrySnapshot(line_pa, snap)) {
-        return "{\"error\": \"entry not found\"}";
-    }
-
-    std::ostringstream oss;
-    oss << "{"
-        << "\"sharerCount\":" << snap.sharerCount << ","
-        << "\"ownerExists\":" << (snap.ownerExists ? "true" : "false") << ","
-        << "\"ownerIsExcl\":" << (snap.ownerIsExcl ? "true" : "false") << ","
-        << "\"ownerVersion\":" << snap.ownerVersion << ","
-        << "\"ownerStr\":\"" << snap.ownerStr << "\","
-        << "\"state\":" << snap.state << ","
-        << "\"epRnfInSharers\":" << (snap.epRnfInSharers ? "true" : "false") << ","
-        << "\"epRnfIsOwner\":" << (snap.epRnfIsOwner ? "true" : "false") << ","
-        << "\"epRnfLookupFailed\":" << (snap.epRnfLookupFailed ? "true" : "false")
-        << "}";
-    return oss.str();
-}
-
-bool
-UBCCController::getDirEntrySnapshot(uint64_t line_pa, DirEntrySnapshot &snap)
-{
-    if (!_sentinelHelper) {
-        warn("UBCCController node_id=%d: SentinelHelper not available\n",
-             _nodeId);
-        return false;
-    }
-    return _sentinelHelper->inspectDirEntryForTest(line_pa, snap);
-}
+// ---- isDsmAddr (pure computation, no SentinelHelper) ----
 
 bool
 UBCCController::isDsmAddr(uint64_t pa) const
 {
-    if (!_sentinelHelper)
-        return false;
-    return _sentinelHelper->isDsmAddr(pa);
-}
-
-uint64_t
-UBCCController::getEpRnfSnoopCount() const
-{
-    if (!_sentinelHelper)
-        return 0;
-    return _sentinelHelper->getEpRnfSnoopCount();
-}
-
-void
-UBCCController::resetEpRnfSnoopCount()
-{
-    if (_sentinelHelper)
-        _sentinelHelper->resetEpRnfSnoopCount();
-}
-
-void
-UBCCController::incrementEpRnfSnoopCount()
-{
-    if (_sentinelHelper)
-        _sentinelHelper->incrementEpRnfSnoopCount();
+    return pa >= _dsmLocalBase && pa < _dsmLocalBase + _dsmSegSize;
 }
 
 // ---- M5: Home UBCC MESI Grant Decision ----
@@ -504,72 +421,20 @@ UBCCController::processOuterRequest(
         }
     }
 
-    // ---- M4 Backfill: Sentinel Registration in Grant Path ----
-    // Per plan/00-terminology.md §3.2.1, sentinel registration must
-    // complete before the grant becomes visible to the requester.
-    // We install the sentinel here, immediately after grant decision
-    // and before returning control to the requester.
-    //
-    // M5 Phase 2: Add timing assertion that
-    //   sentinel_visible_tick <= grant_visible_tick
-    // Since both occur in the same simulation tick (curTick()),
-    // and sentinel install is synchronous, this invariant is
-    // satisfied by construction. We record and verify it.
-    bool sentinelOk = false;
-    SentinelState sentMode = SentinelState::SS_SHARER;
-
-    if (grant == UBCC_OuterGrantType::GlobalGrantShared) {
-        // Requester gets shared → EP_RNF is a sharer
-        sentinelOk = installSentinelForTest(line_pa, false); // as_owner=false
-        sentMode = SentinelState::SS_SHARER;
-    } else {
-        // Requester gets exclusive/modified → EP_RNF is owner
-        sentinelOk = installSentinelForTest(line_pa, true); // as_owner=true
-        sentMode = SentinelState::SS_OWNER;
-    }
-
-    // M5 Phase 2: Timing assertion
-    // sentinel install completes synchronously within the same tick,
-    // so sentinel_visible_tick == grant_visible_tick == curTick().
-    // The spec requires sentinel_visible_tick <= grant_visible_tick.
-    // We log both ticks for verification, and assert the ordering.
+    // ---- Grant timing ----
+    // UBCC directory (sharersMask/ownerNode) is the authoritative
+    // registration — no separate sentinel install needed.
+    // sentinelVisibleTick == grantVisibleTick by construction.
     Tick sentinelVisibleTick = curTick();
-    DPRINTF(RubyEP,
-            "UBCC node_id=%d: sentinel timing PA=0x%lx "
-            "sentinel_visible_tick=%lu grant_visible_tick=%lu\n",
-            _nodeId, line_pa,
-            sentinelVisibleTick, grantVisibleTick);
-
-    // Hard assertion: sentinel must be visible no later than grant
-    if (sentinelVisibleTick > grantVisibleTick) {
-        fatal("UBCC node_id=%d: sentinel registration timing violation "
-              "PA=0x%lx sentinel_tick=%lu > grant_tick=%lu\n",
-              _nodeId, line_pa, sentinelVisibleTick, grantVisibleTick);
-    }
-
-    if (!sentinelOk) {
-        // Sentinel install failure is non-fatal for M5 first-miss scenarios
-        // (may fail if HN directory is unavailable). In production, this
-        // would be a hard failure requiring retry.
-        warn("UBCC node_id=%d: sentinel install for PA=0x%lx "
-             "returned false (may be non-fatal for first-miss test)\n",
-             _nodeId, line_pa);
-    } else {
-        // Update test mirror
-        _sentinelStates[line_pa] = sentMode;
-    }
 
     DPRINTF(RubyEP,
             "UBCC node_id=%d: grant decision PA=0x%lx "
-            "prev=%s next=%s grant=%d ownerNode=%d sentinel=%s\n",
+            "prev=%s next=%s grant=%d ownerNode=%d\n",
             _nodeId, line_pa,
             mesiStateName(prevState), mesiStateName(entry.state),
-            static_cast<int>(grant), entry.ownerNode,
-            sentinelOk ? "installed" : "FAILED");
+            static_cast<int>(grant), entry.ownerNode);
 
-    // ---- M5 Phase 2: Propagate tick values to caller ----
-    // Write back grantVisibleTick and sentinelVisibleTick so that
-    // EPBackend::handleRemoteMiss can populate the OuterGrantEnvelope.
+    // Propagate tick values to caller
     if (outGrantVisibleTick)
         *outGrantVisibleTick = grantVisibleTick;
     if (outSentinelVisibleTick)

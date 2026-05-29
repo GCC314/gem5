@@ -376,12 +376,6 @@ class EPBackend : public SimObject
      */
     int lastGrantDataSize() const;
 
-    // ---- M4 Sentinel Registration Test Hooks ----
-    // These are exposed to Python via gem5's Swig/SWIG bindings.
-
-    bool installSentinelForTest(uint64_t line_pa, bool as_owner);
-    bool removeSentinelForTest(uint64_t line_pa);
-    std::string inspectDirEntryForTest(uint64_t line_pa);
     bool isDsmAddr(uint64_t pa) const;
 
     /** EP_RNF snoop counter for test verification */

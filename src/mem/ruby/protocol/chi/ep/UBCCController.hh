@@ -16,8 +16,6 @@ namespace ruby
 {
 
 class RubySystem;
-class SentinelHelper;
-struct DirEntrySnapshot;
 
 // Forward declarations for M5 outer protocol types.
 // These mirror the enums in EPBackend.hh but are used internally.
@@ -256,50 +254,18 @@ class UBCCController
                                           int &outPendingRequester,
                                           int &outPendingRecallTarget) const;
 
-    // ---- M4 Sentinel Registration Test Hooks ----
-
-    /**
-     * Install EP_RNF as a sentinel in the HN-F directory.
-     * S_SHARER if as_owner=false, S_OWNER if as_owner=true.
-     * Must be called on a DSM address belonging to this home node.
-     */
-    bool installSentinelForTest(uint64_t line_pa, bool as_owner);
-
-    /**
-     * Remove EP_RNF sentinel from the HN-F directory.
-     */
-    bool removeSentinelForTest(uint64_t line_pa);
-
-    /**
-     * Inspect the HN-F directory entry for a given line.
-     * Returns a JSON-like string representation for Python consumption.
-     */
-    std::string inspectDirEntryForTest(uint64_t line_pa);
-
-    /**
-     * Get the raw DirEntrySnapshot for programmatic inspection.
-     */
-    bool getDirEntrySnapshot(uint64_t line_pa, DirEntrySnapshot &snap);
-
     /**
      * Check whether a PA is a DSM home address for this node.
+     * Pure computation using NodeAddressMap — no external dependency.
      */
     bool isDsmAddr(uint64_t pa) const;
 
     /**
-     * EP_RNF snoop counter accessors.
+     * EP_RNF snoop counter accessors (local, no SentinelHelper needed).
      */
-    uint64_t getEpRnfSnoopCount() const;
-    void resetEpRnfSnoopCount();
-    void incrementEpRnfSnoopCount();
-
-    // Sentinel semantic state per line
-    enum SentinelState {
-        SS_NONE    = 0,
-        SS_SHARER  = 1,
-        SS_OWNER   = 2,
-        SS_PENDING = 3
-    };
+    uint64_t getEpRnfSnoopCount() const { return _epRnfSnoopCount; }
+    void resetEpRnfSnoopCount() { _epRnfSnoopCount = 0; }
+    void incrementEpRnfSnoopCount() { _epRnfSnoopCount++; }
 
     // ---- M5/M6: Home directory entry ----
     struct DirEntry {
@@ -380,23 +346,12 @@ class UBCCController
     };
     std::queue<OuterQueueEntry> _outerQueue;
 
-    /**
-     * TEST-ONLY, NOT authoritative: a cache of sentinel states for
-     * Python test harness convenience.
-     *
-     * The authoritative sentinel state lives in the HN native
-     * Cache_DirEntry (sharers/owner). This map is a convenience
-     * mirror used only by installSentinelForTest/removeSentinelForTest
-     * so the test harness can query state without reading the full
-     * HN directory.
-     *
-     * NOT used by any production protocol decision path.
-     * Rely on HN directory (inspectDirEntryForTest) for authoritative state.
-     */
-    std::map<uint64_t, SentinelState> _sentinelStates;
+    // EP_RNF snoop counter (local, test-only)
+    uint64_t _epRnfSnoopCount = 0;
 
-    // SentinelHelper for HN directory access (test-only)
-    SentinelHelper *_sentinelHelper = nullptr;
+    // Precomputed DSM local base and segment size for isDsmAddr range check
+    uint64_t _dsmLocalBase = 0;
+    uint64_t _dsmSegSize = 0;
 
     // ---- Cross-Node Routing Registry ----
     static std::map<int, UBCCController*> _instances;
