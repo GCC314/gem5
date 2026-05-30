@@ -208,6 +208,8 @@ class EPBackend : public SimObject
 
     bool checkAddr(uint64_t pa) const;
     bool checkDsmAddr(uint64_t pa) const;
+    bool isDsmAddrCrossNode(uint64_t pa) const;
+    int homeNodeCrossNode(uint64_t pa) const;
     const NodeAddressMap& addrMap() const { return _addrMap; }
 
     // ---- M5: Remote Miss Request Dispatch ----

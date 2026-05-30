@@ -783,6 +783,11 @@ DRAMInterface::init()
 void
 DRAMInterface::startup()
 {
+    // Q2 FIX: Guard against null system() when DDR4 DRAMs are not
+    // registered in system.memories (common in multi-node Ruby configs).
+    if (!system())
+        return;
+
     if (system()->isTimingMode()) {
         // timestamp offset should be in clock cycles for DRAMPower
         timeStampOffset = divCeil(curTick(), tCK);

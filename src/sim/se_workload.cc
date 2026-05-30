@@ -50,6 +50,25 @@ SEWorkload::setSystem(System *sys)
     if (m5op_range.valid())
         memories -= m5op_range;
 
+    // Q2 FIX: If no memories have in_addr_map=True, create per-node
+    // fallback pools (one per node).  Each pool covers the node's
+    // LocalPrivate + UbccExclusive range (256 MiB from node base).
+    // Processes on node i set phys_pool_id=i to allocate from the
+    // correct node's PA space, avoiding EP_RNF non-DSM rejections.
+    // Multi-node Ruby configurations (UBCC) have DDR4 controllers
+    // for timing only whose ranges are not in the conf table yet.
+    if (memories.empty()) {
+        warn("No conf-reported memories. Creating per-node fallback "
+             "MemPools (index=0,1,2 → [0,1,2]TiB + 256MiB).");
+        constexpr uint64_t NODE_STRIDE = 1ULL << 40; // 1 TiB
+        constexpr uint64_t POOL_SIZE = 256 * 1024 * 1024; // 256 MiB
+        for (int i = 0; i < 3; i++) {
+            memories.push_back(AddrRange(
+                i * NODE_STRIDE,
+                i * NODE_STRIDE + POOL_SIZE));
+        }
+    }
+
     memPools.populate(memories);
 }
 

@@ -315,7 +315,7 @@ EPRNFController::recvSnoopMsg(const CHIRequestMsg *msg)
     }
 
     // ---- Immediate response (no outer txn pending) ----
-    NetDest dest;
+    NetDest dest(m_ruby_system);
     dest.add(msg->m_requestor);
     auto rsp = std::make_shared<CHIResponseMsg>(
         curTick(), cacheLineSize, m_ruby_system,
@@ -373,7 +373,7 @@ EPRNFController::signalOuterTxnComplete(uint64_t linePa)
     it->second.outerTxnComplete = true;
 
     // Send the delayed HN response
-    NetDest dest;
+    NetDest dest(m_ruby_system);
     dest.add(it->second.destMachine);
     auto rsp = std::make_shared<CHIResponseMsg>(
         curTick(), cacheLineSize, m_ruby_system,

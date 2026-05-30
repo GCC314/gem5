@@ -40,10 +40,17 @@ def setup_dsm_va_mapping(processes, num_nodes=DEFAULT_N, seg_size=DEFAULT_SEG_SI
     """Install VA→PA mappings for DSM regions on all processes.
 
     Each process gets VA range [DSM_VA_BASE + k*SEG, DSM_VA_BASE + (k+1)*SEG)
-    mapped to the corresponding home node k's DSM PA base.
+    mapped to the REQUESTING NODE's DSM PA base for home node k.
+
+    For process on node i accessing DSM data homed at node k,
+    the PA must be in node i's DSM_k range:
+        PA = (i << 40) + (2 + k) * seg_size
+
+    This ensures the local RNF recognizes the address as DSM and
+    forwards it correctly through the CHI EP layer.
 
     Args:
-        processes: List of Process objects (one per CPU thread).
+        processes: List of Process objects (ordered by CPU index, one per CPU).
         num_nodes: Number of nodes (default 3).
         seg_size: Segment size in bytes (default 128MB).
 
@@ -53,20 +60,34 @@ def setup_dsm_va_mapping(processes, num_nodes=DEFAULT_N, seg_size=DEFAULT_SEG_SI
     """
     addr_map = NodeAddressMap(num_nodes, seg_size)
 
-    # DSM_VA_BASE = MaxAddr - 4 * SEG_SIZE
+    # DSM_VA_BASE = (MaxAddr + 1) - 4 * SEG_SIZE
+    # Must be page-aligned for EmulationPageTable::map() assertion.
+    # (0xFFFFFFFFFFFF + 1) = 0x1000000000000 for 48-bit VA max.
     # Each node k's DSM_k window is at DSM_VA_BASE + k * SEG_SIZE
-    dsm_va_base = 0xFFFFFFFFFFFF - 4 * seg_size
+    dsm_va_base = (0xFFFFFFFFFFFF + 1) - 4 * seg_size
 
-    for proc in processes:
+    # Compute CPUs per node for node_id assignment.
+    # Processes are ordered by CPU index: proc[i] belongs to CPU i.
+    # CPU i belongs to node i // cpus_per_node.
+    _cpus_per_node = len(processes) // num_nodes if num_nodes > 0 else 1
+
+    for _proc_idx, proc in enumerate(processes):
         if proc is None:
             continue
+        # Determine which node this process/CPU is on
+        _req_node_id = _proc_idx // _cpus_per_node
+        _req_node_base = _req_node_id << addr_map.node_shift
+
         for nid in range(num_nodes):
-            dsm_pa_base = addr_map.dsmLocalBase(nid)
+            # PA must be in the REQUESTOR node's DSM_k range:
+            #   req_node_base + (2 + nid) * seg_size
+            dsm_pa_base = _req_node_base + (2 + nid) * seg_size
             dsm_va = dsm_va_base + nid * seg_size
             proc.map(dsm_va, dsm_pa_base, seg_size, cacheable=True)
 
     print(f"[Q1-DSM-MAP] Installed DSM VA→PA mappings for {num_nodes} nodes, "
-          f"base VA=0x{dsm_va_base:x}, {len(processes)} processes")
+           f"base VA=0x{dsm_va_base:x}, {len(processes)} processes "
+           f"({_cpus_per_node} CPUs/node)")
 
 
 # ---- Q1: L3 Allocation / Deallocation Policy ----
@@ -99,9 +120,23 @@ def _make_snf(ruby_system, addr_ranges):
     return snf
 
 
-def _make_dram_memctrl(addr_range):
+def _make_dram_memctrl(addr_range, system=None, name=None):
+    """Create a MemCtrl/DDR4_2400_8x8 and optionally parent it under System.
+
+    gem5 v25.1 requires AbstractMemory (and its parent MemCtrl) to be
+    reachable from System for MemStats::regStats().  Without proper
+    parentage, m5.instantiate() will trigger a fatal assertion.
+
+    Args:
+        addr_range: Address range for the DRAM controller.
+        system: If provided, parent the MemCtrl under this System SimObject.
+        name: Child name under system (required when system is provided).
+    """
     dram = DDR4_2400_8x8(range=addr_range)
-    return MemCtrl(dram=dram)
+    mc = MemCtrl(dram=dram)
+    if system and name:
+        system.add_child(name, mc)
+    return mc
 
 
 def _make_ep_node(ruby_system, ep_cntrl, node_id):
@@ -116,6 +151,10 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
                         ruby_system, cpus):
     if buildEnv["PROTOCOL"] != "CHI":
         m5.panic("UBCC framework requires CHI protocol build")
+
+    # Q2 FIX: RubySystem needs a clock domain to schedule network events.
+    # In older gem5 versions this was inherited; v25.1 requires explicit set.
+    ruby_system.clk_domain = system.clk_domain
 
     num_nodes = DEFAULT_N
     seg_size = DEFAULT_SEG_SIZE
@@ -159,23 +198,23 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
         all_cntrls.append(nd['hnf_cntrl'])
 
         l_backstore_range = AddrRange(cfg.local_private_base, size=2 * seg_size)
-        nd['l_memctrl'] = _make_dram_memctrl(l_backstore_range)
+        nd['l_memctrl'] = _make_dram_memctrl(l_backstore_range, system,
+                                             f"l_mc_n{node_id}")
         nd['l_snf'] = chi_defs.CHI_SNF_MainMem(ruby_system, None, nd['l_memctrl'])
         nd['l_snf']._cntrl.addr_ranges = [cfg.local_private_range,
                                           cfg.ubcc_exclusive_range]
         setattr(ruby_system, f"l_snf_node{node_id}", nd['l_snf'])
-        setattr(system, f"l_snf_memctrl_node{node_id}", nd['l_memctrl'])
         network_nodes.append(nd['l_snf'])
         all_cntrls.extend(nd['l_snf'].getAllControllers())
         mem_backstores.append(nd['l_memctrl'])
 
         dl_range = NodeConfig.dsm_range_for(node_id, seg_size, cfg.phy_base)
-        nd['dl_memctrl'] = _make_dram_memctrl(dl_range)
+        nd['dl_memctrl'] = _make_dram_memctrl(dl_range, system,
+                                              f"dl_mc_n{node_id}")
         nd['dl_snf'] = chi_defs.CHI_SNF_MainMem(ruby_system, None,
                                                 nd['dl_memctrl'])
         nd['dl_snf']._cntrl.addr_ranges = [dl_range]
         setattr(ruby_system, f"dl_snf_node{node_id}", nd['dl_snf'])
-        setattr(system, f"dl_snf_memctrl_node{node_id}", nd['dl_memctrl'])
         network_nodes.append(nd['dl_snf'])
         all_cntrls.extend(nd['dl_snf'].getAllControllers())
         mem_backstores.append(nd['dl_memctrl'])

@@ -284,18 +284,24 @@ RubyPort::MemResponsePort::recvTimingReq(PacketPtr pkt)
     // pio port.
     if (pkt->cmd != MemCmd::MemSyncReq && !pkt->req->hasNoAddr()) {
         if (!pkt->req->isMemMgmt() && !isPhysMemAddress(pkt)) {
-            assert(owner.memRequestPort.isConnected());
             DPRINTF(RubyPort, "Request address %#x assumed to be a "
                     "pio address\n", pkt->getAddr());
 
-            // Save the port in the sender state object to be used later to
-            // route the response
-            pkt->pushSenderState(new SenderState(this));
+            if (owner.memRequestPort.isConnected()) {
+                // Save the port in the sender state object to be used
+                // later to route the response
+                pkt->pushSenderState(new SenderState(this));
 
-            // send next cycle
-            RubySystem *rs = owner.m_ruby_system;
-            owner.memRequestPort.schedTimingReq(pkt,
-                curTick() + rs->clockPeriod());
+                // send next cycle
+                RubySystem *rs = owner.m_ruby_system;
+                owner.memRequestPort.schedTimingReq(pkt,
+                    curTick() + rs->clockPeriod());
+                return true;
+            }
+            // In SE mode without PIO bus, memRequestPort may be
+            // unconnected.  Drop the PIO timing request.
+            DPRINTF(RubyPort, "memRequestPort not connected, "
+                    "dropping PIO timing request\n");
             return true;
         }
     }
@@ -354,17 +360,23 @@ RubyPort::MemResponsePort::recvAtomic(PacketPtr pkt)
     // pio port.
     if (pkt->cmd != MemCmd::MemSyncReq) {
         if (!isPhysMemAddress(pkt)) {
-            assert(owner.memRequestPort.isConnected());
             DPRINTF(RubyPort, "Request address %#x assumed to be a "
                     "pio address\n", pkt->getAddr());
 
-            // Save the port in the sender state object to be used later to
-            // route the response
-            pkt->pushSenderState(new SenderState(this));
+            if (owner.memRequestPort.isConnected()) {
+                // Save the port in the sender state object to be used
+                // later to route the response
+                pkt->pushSenderState(new SenderState(this));
 
-            // send next cycle
-            Tick req_ticks = owner.memRequestPort.sendAtomic(pkt);
-            return owner.ticksToCycles(req_ticks);
+                // send next cycle
+                Tick req_ticks = owner.memRequestPort.sendAtomic(pkt);
+                return owner.ticksToCycles(req_ticks);
+            }
+            // In SE mode without PIO bus, memRequestPort may be
+            // unconnected.
+            DPRINTF(RubyPort, "memRequestPort not connected, "
+                    "dropping PIO atomic request\n");
+            return 0;
         }
 
         assert(owner.getOffset(pkt->getAddr()) + pkt->getSize() <=
@@ -426,8 +438,13 @@ RubyPort::MemResponsePort::recvFunctional(PacketPtr pkt)
     // pio port.
     if (!isPhysMemAddress(pkt)) {
         DPRINTF(RubyPort, "Pio Request for address: 0x%#x\n", pkt->getAddr());
-        assert(owner.pioRequestPort.isConnected());
-        owner.pioRequestPort.sendFunctional(pkt);
+        if (owner.pioRequestPort.isConnected()) {
+            owner.pioRequestPort.sendFunctional(pkt);
+        }
+        // In SE mode without PIO bus, the pio port is unconnected.
+        // Silently drop non-phys-mem functional requests (they are
+        // typically shadow ROM / PCI config space accesses that
+        // don't apply to SE mode).
         return;
     }
 

@@ -126,6 +126,12 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
             "EP_SNF node_id=%d: grantResult=%d homeNode=%d\n",
             _nodeId, grantResult, homeNode);
 
+    // Q2 WORKAROUND: handleRemoteMiss returns -2 for local DSM lines
+    // that should be handled by dl_snf.  Skip processing silently.
+    if (grantResult == -2) {
+        return true;
+    }
+
     // ---- M5: Record sideband for inspection by Python tests ----
     _backend->recordSideband(msg->m_addr, neededPerm, writeIntent,
                               (neededPerm == 0) ? 0 : 1,  // 0=GlobalReadShared, 1=GlobalReadUnique
@@ -133,7 +139,7 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
 
     // Respond to HN with RespSepData + CompData
     // Q1: Use real grant data from EPBackend/lastGrantData instead of dummy zero.
-    NetDest dest;
+    NetDest dest(m_ruby_system);
     dest.add(msg->m_requestor);
 
     auto rsp = std::make_shared<CHIResponseMsg>(

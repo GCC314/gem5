@@ -153,6 +153,13 @@ AbstractMemory::MemStats::regStats()
     statistics::Group::regStats();
 
     System *sys = mem.system();
+    // v25.1 compat: _system may be NULL for memories parented after
+    // System construction (e.g., DDR4 inside MemCtrl from UBCC).
+    // Fall back to the global systemList.
+    if (!sys) {
+        if (!System::systemList.empty())
+            sys = System::systemList[0];
+    }
     assert(sys);
     const auto max_requestors = sys->maxRequestors();
 

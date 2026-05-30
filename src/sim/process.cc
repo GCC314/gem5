@@ -301,12 +301,66 @@ Process::initState()
 
     pTable->initState();
 
+    const auto page_size = pTable->pageSize();
+
+    // Set up the virtual memory proxy used by argsInit to write
+    // stack contents (argv, envp, auxv).  Needed for ArmProcess64.
     initVirtMem.reset(new SETranslatingPortProxy(
                 tc, SETranslatingPortProxy::Always));
 
-    // load object file into target memory
-    image.write(*initVirtMem);
-    interpImage.write(*initVirtMem);
+    // Helper: write a MemoryImage segment-by-segment, translating
+    // virtual addresses through the page table and using the
+    // system physProxy (which routes through RubyPortProxy to
+    // phys_mem) to avoid the CPU sequencer functional-port path
+    // that can fail in Ruby/CHI configurations.
+    auto writeImagePhys = [&](const loader::MemoryImage &img) {
+        for (const auto &seg : img.segments()) {
+            if (seg.size == 0)
+                continue;
+
+            // Ensure all pages touching this segment are allocated.
+            const Addr va_start = roundDown(seg.base, page_size);
+            const Addr va_end =
+                roundUp(seg.base + seg.size, page_size);
+            for (Addr va = va_start; va < va_end; va += page_size) {
+                Addr pa_unused;
+                if (!pTable->translate(va, pa_unused))
+                    allocateMem(va, page_size);
+            }
+
+            // Write segment data to physical memory through
+            // system->physProxy, translating VA→PA page by page.
+            Addr rem = seg.size;
+            Addr cur_va = seg.base;
+            const uint8_t *cur_data = seg.data;
+
+            while (rem > 0) {
+                Addr pa;
+                if (!pTable->translate(cur_va, pa)) {
+                    fatal("%s: no translation for VA 0x%x\n",
+                          __func__, cur_va);
+                }
+
+                Addr page_off = cur_va & (page_size - 1);
+                uint64_t chunk =
+                    std::min(rem, page_size - page_off);
+
+                if (seg.data) {
+                    system->physProxy.writeBlob(pa, cur_data, chunk);
+                    cur_data += chunk;
+                } else {
+                    system->physProxy.memsetBlob(pa, 0, chunk);
+                }
+
+                rem -= chunk;
+                cur_va += chunk;
+            }
+        }
+    };
+
+    // load object file into target memory via system physProxy
+    writeImagePhys(image);
+    writeImagePhys(interpImage);
 }
 
 DrainState
