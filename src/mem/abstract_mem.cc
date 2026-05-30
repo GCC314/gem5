@@ -362,6 +362,11 @@ AbstractMemory::checkLockedAddrList(PacketPtr pkt)
 static inline void
 tracePacket(System *sys, const char *label, PacketPtr pkt)
 {
+    if (!sys) {
+        DPRINTF(MemoryAccess, "%s on address %#x (no system)\n",
+                label, pkt->getAddr());
+        return;
+    }
     int size = pkt->getSize();
     if (size == 1 || size == 2 || size == 4 || size == 8) {
         ByteOrder byte_order = sys->getGuestByteOrder();
