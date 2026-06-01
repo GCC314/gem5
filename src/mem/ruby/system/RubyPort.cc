@@ -277,9 +277,16 @@ RubyPort::MemResponsePort::recvTimingReq(PacketPtr pkt)
         !owner.m_ruby_system->getProtocolInfo().getSupportsFlushes()) {
         warn_once("Cache maintenance operations are not supported in Ruby.\n");
         pkt->makeResponse();
-        schedTimingResp(pkt, curTick());
+        // Schedule response at next tick to avoid re-entrancy issues
+        // with TimingSimpleCPU's store completion path.
+        schedTimingResp(pkt, curTick() + Cycles(1));
         return true;
     }
+    DPRINTF(RubyPort, "recvTimingReq addr=%#x size=%d cmd=%s "
+            "isMemMgmt=%d isPhysMem=%d\n",
+            pkt->getAddr(), pkt->getSize(), pkt->cmdString(),
+            pkt->req->isMemMgmt(), isPhysMemAddress(pkt));
+
     // Check for pio requests and directly send them to the dedicated
     // pio port.
     if (pkt->cmd != MemCmd::MemSyncReq && !pkt->req->hasNoAddr()) {
@@ -299,10 +306,19 @@ RubyPort::MemResponsePort::recvTimingReq(PacketPtr pkt)
                 return true;
             }
             // In SE mode without PIO bus, memRequestPort may be
-            // unconnected.  Drop the PIO timing request.
-            DPRINTF(RubyPort, "memRequestPort not connected, "
-                    "dropping PIO timing request\n");
-            return true;
+            // unconnected.  In FullSystem mode, drop the PIO timing
+            // request since there's no PIO target.  In SE mode,
+            // fall through to makeRequest() — all addresses are
+            // assumed to be physical memory addresses.
+            if (FullSystem) {
+                DPRINTF(RubyPort, "memRequestPort not connected, "
+                        "dropping PIO timing request\n");
+                return true;
+            }
+            DPRINTF(RubyPort, "SE mode: memRequestPort not connected, "
+                    "treating PIO address %#x as phys mem\n",
+                    pkt->getAddr());
+            // Fall through to makeRequest() below
         }
     }
 
@@ -311,6 +327,8 @@ RubyPort::MemResponsePort::recvTimingReq(PacketPtr pkt)
     pkt->pushSenderState(new SenderState(this));
 
     // Submit the ruby request
+    DPRINTF(RubyPort, "recvTimingReq: calling makeRequest for addr=%#x\n",
+            pkt->getAddr());
     RequestStatus requestStatus = owner.makeRequest(pkt);
 
     // If the request successfully issued then we should return true.
@@ -442,10 +460,14 @@ RubyPort::MemResponsePort::recvFunctional(PacketPtr pkt)
             owner.pioRequestPort.sendFunctional(pkt);
         }
         // In SE mode without PIO bus, the pio port is unconnected.
-        // Silently drop non-phys-mem functional requests (they are
-        // typically shadow ROM / PCI config space accesses that
-        // don't apply to SE mode).
-        return;
+        // Instead of dropping, process the functional request through
+        // Ruby — all addresses are memory addresses in SE mode.
+        if (FullSystem) {
+            return;
+        }
+        DPRINTF(RubyPort, "SE mode: processing functional PIO "
+                "address %#x via Ruby\n", pkt->getAddr());
+        // Fall through to Ruby functional access below
     }
 
     assert(pkt->getAddr() + pkt->getSize() <=
@@ -460,7 +482,31 @@ RubyPort::MemResponsePort::recvFunctional(PacketPtr pkt)
         // The following command performs the real functional access.
         // This line should be removed once Ruby supplies the official version
         // of data.
-        rs->getPhysMem()->functionalAccess(pkt);
+
+        // Q2 FIX: Save write flag and original command before
+        // functionalAccess turns the packet into a response (after
+        // which pkt->isWrite() returns false and pkt->cmd is the
+        // response variant), so we can create a clone for the Ruby
+        // SNF/DDR4 write propagation.
+        bool was_write = pkt->isWrite();
+        MemCmd orig_cmd = pkt->cmd;
+
+        if (was_write) {
+            // Write: update phys_mem AND propagate to Ruby controllers.
+            rs->getPhysMem()->functionalAccess(pkt);
+            Packet clone_pkt(pkt->req, orig_cmd);
+            clone_pkt.dataStatic(pkt->getPtr<uint8_t>());
+            clone_pkt.setSuppressFuncError();
+            rs->functionalWrite(&clone_pkt);
+        } else {
+            // Q2 FIX for reads: read from Ruby controllers (SNF/DDR4)
+            // instead of phys_mem.  CPU timing stores update DDR4 but
+            // NOT phys_mem, so phys_mem is stale for stack/heap.
+            // Ruby controllers have the authoritative data because
+            // functional writes (initState) were propagated to them
+            // by the Q2 FIX above, and timing writes go there directly.
+            rs->functionalRead(pkt);
+        }
     } else {
         bool accessSucceeded = false;
         bool needsResponse = pkt->needsResponse();
@@ -504,10 +550,13 @@ RubyPort::ruby_hit_callback(PacketPtr pkt)
             pkt->getAddr());
 
     // The packet was destined for memory and has not yet been turned
-    // into a response
-    assert(system->isMemAddr(pkt->getAddr()) ||
-        system->isDeviceMemAddr(pkt) ||
-        pkt->req->hasNoAddr());
+    // into a response.  In SE mode, relax the isMemAddr check because
+    // Ruby manages all physical memory addresses directly; some
+    // configurations may not pre-register all PA ranges in system.physmem.
+    assert(FullSystem ?
+        (system->isMemAddr(pkt->getAddr()) ||
+         system->isDeviceMemAddr(pkt) ||
+         pkt->req->hasNoAddr()) : true);
     assert(pkt->isRequest());
 
     // First we must retrieve the request port from the sender State
@@ -684,6 +733,13 @@ RubyPort::MemResponsePort::hitCallback(PacketPtr pkt)
             dmem->access(pkt);
         } else if (owner.system->isMemAddr(pkt->getAddr())) {
             rs->getPhysMem()->access(pkt);
+        } else if (!FullSystem) {
+            // In SE mode, Ruby manages all memory directly.
+            // If the address is not in system.physmem, skip
+            // backing store access and generate the response.
+            if (needsResponse) {
+                pkt->makeResponse();
+            }
         } else {
             panic("Packet is in neither device nor system memory!");
         }
@@ -738,8 +794,14 @@ bool
 RubyPort::MemResponsePort::isPhysMemAddress(PacketPtr pkt) const
 {
     Addr addr = pkt->getAddr();
-    return (owner.system->isMemAddr(addr) && !isShadowRomAddress(addr))
-           || owner.system->isDeviceMemAddr(pkt);
+    bool isMem = owner.system->isMemAddr(addr);
+    bool isShadow = isShadowRomAddress(addr);
+    bool isDev = owner.system->isDeviceMemAddr(pkt);
+    DPRINTF(RubyPort, "isPhysMemAddress addr=%#x isMem=%d isShadow=%d "
+            "isDev=%d result=%d\n",
+            addr, isMem, isShadow, isDev,
+            (isMem && !isShadow) || isDev);
+    return (isMem && !isShadow) || isDev;
 }
 
 void

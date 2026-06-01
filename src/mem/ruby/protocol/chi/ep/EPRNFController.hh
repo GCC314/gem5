@@ -223,6 +223,22 @@ class EPRNFController : public EPController
      */
     void setOuterTxnPending(uint64_t linePa, bool pending);
 
+    // ---- Q2: Local Snoop for Cross-Node Invalidation ----
+    /**
+     * Send a CHI snoop request to local L1/L2 caches to invalidate
+     * a cache line.  Called by EPBackend::handleInvalidationRequest()
+     * when a home UBCC requests invalidation of a shared line.
+     *
+     * The snoop is broadcast to all Cache-type controllers on the
+     * CHI network (including L1/L2 and itself).  Each receiving
+     * cache controller processes the snoop according to the CHI
+     * state machine (e.g., invalidates the line and sends SnpResp).
+     *
+     * @param linePa    Physical address of the cache line
+     * @param snoopType CHI snoop request type (typically SnpCleanInvalid)
+     */
+    void sendLocalSnoop(uint64_t linePa, CHI::CHIRequestType snoopType);
+
   protected:
     bool recvRequestMsg(const CHIRequestMsg *msg) override;
     bool recvSnoopMsg(const CHIRequestMsg *msg) override;

@@ -97,21 +97,18 @@ def setup_dsm_va_mapping(processes, num_nodes=DEFAULT_N, seg_size=DEFAULT_SEG_SI
 def configure_l3_dsm_policy(hnf_cntrl):
     """Configure HN-F L3 alloc/dealloc for DSM line handling.
 
-    Sets alloc_on_* and dealloc_on_* parameters to ensure:
-    - DSM lines entering L3 are correctly cached (alloc_on_readshared/readunique)
-    - DSM lines are invalidated on UBCC recall/invalidate (dealloc_on_*)
-    - Writeback into L3 is allocated (alloc_on_writeback) for eviction data
+    Q2 FIX: Disable L3 caching for DSM lines.  With L3 caching of DSM
+    lines, the HN-F serves subsequent reads/writes from L3 without
+    forwarding to EP_SNF, which bypasses the UBCC recall path (M6).
+    Stale L3 data then causes cross-node coherence failures (TC3 fails).
     """
-    # Enable allocation for DSM lines entering L3
-    hnf_cntrl.alloc_on_readshared     = True   # Shared DSM reads cache in L3
-    hnf_cntrl.alloc_on_readunique     = True   # Unique DSM reads cache in L3
-    hnf_cntrl.alloc_on_readonce       = True   # One-time reads cache in L3
-    hnf_cntrl.alloc_on_writeback      = True   # Writeback data goes into L3
-    hnf_cntrl.alloc_on_atomic         = False  # Atomics skip L3 (pass through)
-
-    # Enable deallocation to keep L3 coherent with UBCC directory
-    hnf_cntrl.dealloc_on_unique       = True   # Invalidate L3 on unique snoop
-    hnf_cntrl.dealloc_on_shared       = False  # Keep shared copies in L3
+    hnf_cntrl.alloc_on_readshared     = False  # No L3 caching for DSM
+    hnf_cntrl.alloc_on_readunique     = False  # No L3 caching for DSM
+    hnf_cntrl.alloc_on_readonce       = False
+    hnf_cntrl.alloc_on_writeback      = False
+    hnf_cntrl.alloc_on_atomic         = False
+    hnf_cntrl.dealloc_on_unique       = False
+    hnf_cntrl.dealloc_on_shared       = False
 
 
 def _make_snf(ruby_system, addr_ranges):
@@ -183,26 +180,18 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
         nd = per_node[node_id]
         cfg = NodeConfig(node_id, num_nodes, seg_size)
 
-        nd['hnf_wrapper'], nd['hnf_cntrl'] = _make_hnf(
-            ruby_system,
-            [cfg.local_private_range,
-             cfg.ubcc_exclusive_range,
-             NodeConfig.dsm_local_range(node_id, seg_size, cfg.phy_base)],
-            HNFCache, node_id)
-
-        # Q1: Configure L3 alloc/dealloc policy for DSM cache coherence
-        configure_l3_dsm_policy(nd['hnf_cntrl'])
-
-        setattr(ruby_system, f"hnf_node{node_id}", nd['hnf_wrapper'])
-        network_nodes.append(nd['hnf_wrapper'])
-        all_cntrls.append(nd['hnf_cntrl'])
-
+        # ── Create SNFs FIRST (before HN-F) ─────────────────────────
+        # Q2 FIX: SNF controllers must be added to the SimObject tree
+        # BEFORE the HN-F so their C++ objects exist when HN-F's
+        # downstream_destinations param is resolved during instantiation.
         l_backstore_range = AddrRange(cfg.local_private_base, size=2 * seg_size)
         nd['l_memctrl'] = _make_dram_memctrl(l_backstore_range, system,
                                              f"l_mc_n{node_id}")
-        nd['l_snf'] = chi_defs.CHI_SNF_MainMem(ruby_system, None, nd['l_memctrl'])
-        nd['l_snf']._cntrl.addr_ranges = [cfg.local_private_range,
-                                          cfg.ubcc_exclusive_range]
+        nd['l_snf'] = chi_defs.CHI_SNF_MainMem(
+            ruby_system, None, nd['l_memctrl'],
+            # Q2 FIX: Pass explicit addr_ranges instead of relying on
+            # getMemRange which may return a single value not a list.
+            addr_ranges=[cfg.local_private_range, cfg.ubcc_exclusive_range])
         setattr(ruby_system, f"l_snf_node{node_id}", nd['l_snf'])
         network_nodes.append(nd['l_snf'])
         all_cntrls.extend(nd['l_snf'].getAllControllers())
@@ -212,14 +201,27 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
         nd['dl_memctrl'] = _make_dram_memctrl(dl_range, system,
                                               f"dl_mc_n{node_id}")
         nd['dl_snf'] = chi_defs.CHI_SNF_MainMem(ruby_system, None,
-                                                nd['dl_memctrl'])
-        nd['dl_snf']._cntrl.addr_ranges = [dl_range]
+                                                nd['dl_memctrl'],
+                                                addr_ranges=[dl_range])
         setattr(ruby_system, f"dl_snf_node{node_id}", nd['dl_snf'])
         network_nodes.append(nd['dl_snf'])
         all_cntrls.extend(nd['dl_snf'].getAllControllers())
         mem_backstores.append(nd['dl_memctrl'])
 
         ep_backend = EPBackend(node_id=node_id, ruby_system=ruby_system)
+
+        nd['ep_snf_cntrl'] = EPSNFController(
+            version=chi_defs.Versions.getVersion(chi_defs.CHI_Cache_Controller),
+            ruby_system=ruby_system, node_id=node_id,
+            data_channel_size=params.data_width,
+            ep_backend=ep_backend,
+            addr_ranges=[NodeConfig.dsm_range_for(nid, seg_size, cfg.phy_base)
+                         for nid in range(num_nodes)])
+        nd['ep_snf_wrapper'] = _make_ep_node(
+            ruby_system, nd['ep_snf_cntrl'], node_id)
+        setattr(ruby_system, f"ep_snf_node{node_id}", nd['ep_snf_wrapper'])
+        network_nodes.append(nd['ep_snf_wrapper'])
+        all_cntrls.append(nd['ep_snf_cntrl'])
 
         nd['ep_rnf_cntrl'] = EPRNFController(
             version=chi_defs.Versions.getVersion(chi_defs.CHI_Cache_Controller),
@@ -234,19 +236,20 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
         network_nodes.append(nd['ep_rnf_wrapper'])
         all_cntrls.append(nd['ep_rnf_cntrl'])
 
-        nd['ep_snf_cntrl'] = EPSNFController(
-            version=chi_defs.Versions.getVersion(chi_defs.CHI_Cache_Controller),
-            ruby_system=ruby_system, node_id=node_id,
-            data_channel_size=params.data_width,
-            ep_backend=ep_backend,
-            addr_ranges=[NodeConfig.dsm_range_for(nid, seg_size, cfg.phy_base)
-                         for nid in range(num_nodes)
-                         if nid != node_id])
-        nd['ep_snf_wrapper'] = _make_ep_node(
-            ruby_system, nd['ep_snf_cntrl'], node_id)
-        setattr(ruby_system, f"ep_snf_node{node_id}", nd['ep_snf_wrapper'])
-        network_nodes.append(nd['ep_snf_wrapper'])
-        all_cntrls.append(nd['ep_snf_cntrl'])
+        # ── Create HN-F AFTER SNFs ─────────────────────────────────
+        hnf_ranges = [
+            cfg.local_private_range,
+            cfg.ubcc_exclusive_range,
+        ]
+        for nid in range(num_nodes):
+            hnf_ranges.append(
+                NodeConfig.dsm_range_for(nid, seg_size, cfg.phy_base))
+        nd['hnf_wrapper'], nd['hnf_cntrl'] = _make_hnf(
+            ruby_system, hnf_ranges, HNFCache, node_id)
+        configure_l3_dsm_policy(nd['hnf_cntrl'])
+        setattr(ruby_system, f"hnf_node{node_id}", nd['hnf_wrapper'])
+        network_nodes.append(nd['hnf_wrapper'])
+        all_cntrls.append(nd['hnf_cntrl'])
 
         nd['clusters'] = []
         for cluster_i in range(DEFAULT_D):
@@ -266,6 +269,20 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
             all_cntrls.extend(cluster.getAllControllers())
             cpu_sequencers.extend(cluster.getSequencers())
 
+        # Q2 Fix B: Set L1/L2 addr_ranges to include DSM PA ranges so
+        # functionalRead() in populateGrantData() can find cached data
+        # in L1/L2 caches.  Without explicit DSM ranges, L1/L2
+        # controllers' respondTo() returns false for DSM addresses,
+        # causing RubySystem::functionalRead() to skip them.
+        dsm_ranges = [NodeConfig.dsm_range_for(nid, seg_size, cfg.phy_base)
+                      for nid in range(num_nodes)]
+        for cluster in nd['clusters']:
+            for cntrl in cluster.getAllControllers():
+                cntrl.addr_ranges = [
+                    cfg.local_private_range,
+                    cfg.ubcc_exclusive_range,
+                ] + dsm_ranges
+
     for node_id in range(num_nodes):
         nd = per_node[node_id]
         hnf_c_list = [nd['hnf_cntrl']]
@@ -276,9 +293,16 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
         nd = per_node[node_id]
         snf_dests = []
         snf_dests.extend(nd['l_snf'].getAllControllers())
-        snf_dests.extend(nd['dl_snf'].getAllControllers())
+        # Q2 FIX: Route ALL DSM through EP_SNF first so UBCC directory
+        # is consulted before local DDR4.  EP_SNF handles recalls when
+        # another node owns the line modified/exclusive.
         snf_dests.append(nd['ep_snf_cntrl'])
+        snf_dests.extend(nd['dl_snf'].getAllControllers())
         nd['hnf_wrapper'].setDownstream(snf_dests)
+        # Q2 FIX: Force re-evaluation of downstream_destinations param
+        # after the Python list was updated, so the C++ params struct
+        # picks up the correct values during m5.instantiate().
+        nd['hnf_cntrl'].unproxyParams()
 
     for cntrl in all_cntrls:
         cntrl.data_channel_size = params.data_width

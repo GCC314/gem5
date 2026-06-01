@@ -107,7 +107,10 @@ in_port(datInPort, CHIDataMsg, datIn, rank=9,
     peek(datInPort, CHIDataMsg) {
       // We don't have any transactions that use data requests
       assert(!in_msg.usesTxnId);
-      assert((in_msg.bitMask.count() <= data_channel_size) && (in_msg.bitMask.count() > 0));
+      // Q2 FIX: Allow empty bitMask (count==0) through, and allow
+      // count up to block_size (64) instead of data_channel_size (32).
+      // EPSNF sends a single 64B CompData with fillMask().
+      assert(in_msg.bitMask.count() <= blockSize);
       trigger(dataToEvent(in_msg.type), in_msg.addr,
               getCacheEntry(in_msg.addr), getCurrentActiveTBE(in_msg.addr));
     }

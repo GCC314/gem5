@@ -368,8 +368,7 @@ machine(MachineType:Memory, "Memory controller interface") :
     if (datInPort.isReady(clockEdge())) {
       printResources();
       peek(datInPort, CHIDataMsg) {
-        assert((in_msg.bitMask.count() <= data_channel_size)
-                && (in_msg.bitMask.count() > 0));
+        assert(in_msg.bitMask.count() <= blockSize);
         trigger(dataToEvent(in_msg.type), in_msg.addr, TBEs[in_msg.addr]);
       }
     }

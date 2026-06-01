@@ -182,6 +182,16 @@ struct RequesterLineSnapshot {
     int homeNode;   // Home node for this remote line (-1 if none)
 };
 
+// ---- Q2: Grant Data Provenance ----
+// Tracks which PA view produced the grant data populated by
+// populateGrantData().  Used for debugging data-path issues
+// without relying on content-based heuristics.
+enum class GrantDataProvenance {
+    None,     // No grant data has been populated
+    ReqPA,    // Data read from requester's local PA view
+    HomePA,   // Data read from home node's PA view
+};
+
 // Snapshot of the last UBCC sideband observed by EP_SNF on a recvRequestMsg.
 // Used for Python test inspection of HN→EP_SNF sideband field values.
 struct SidebandSnapshot {
@@ -378,6 +388,12 @@ class EPBackend : public SimObject
      */
     int lastGrantDataSize() const;
 
+    /**
+     * Return the provenance of the last grant data.
+     * Indicates which PA view was used to populate the buffer.
+     */
+    GrantDataProvenance lastGrantDataProvenance() const { return _lastGrantDataProvenance; }
+
     bool isDsmAddr(uint64_t pa) const;
 
     /** EP_RNF snoop counter for test verification */
@@ -420,6 +436,14 @@ class EPBackend : public SimObject
      */
     EPRNFController* getEpRnfController() const { return _epRnfCtrl; }
 
+    /**
+     * Get the RubySystem pointer for cross-node phys_mem access.
+     * Used by recall handlers to write owner data to the home node's
+     * backing store so that populateGrantData() on the requester side
+     * can find it.
+     */
+    RubySystem* getRubySystem() const { return _ruby_system; }
+
     // ---- M6: Cross-Node EPBackend Routing Registry ----
     /**
      * Static registry of EPBackend instances keyed by node ID.
@@ -439,15 +463,22 @@ class EPBackend : public SimObject
     // Used by EPSNFController to construct CompData response payload.
     DataBlock _lastGrantDataBlock;
     bool _lastGrantDataValid = false;
+    GrantDataProvenance _lastGrantDataProvenance = GrantDataProvenance::None;
 
     /**
      * Populate the grant data buffer by reading from the home node's
      * DL_SNF memory via functional access.
      *
-     * @param homePa  Physical address in home node's PA view
+     * Tries multiple PA views to find the data:
+     *   1) requester's PA view (reqPa) — where CPU timing stores
+     *      write to phys_mem via hitCallback
+     *   2) home node's PA view (homePa) — where DDR4 controller stores
+     *
+     * @param reqPa    Physical address in requester node's PA view
+     * @param homePa   Physical address in home node's PA view
      * @param homeNode Node ID of the home node
      */
-    void populateGrantData(uint64_t homePa, int homeNode);
+    void populateGrantData(uint64_t reqPa, uint64_t homePa, int homeNode);
 
     // ---- M5: Requester-Side Bookkeeping ----
     // Per-line entries tracking global permissions for remote DSM lines.

@@ -734,7 +734,7 @@ class CHI_SNF_Base(CHI_Node):
 
     # The CHI controller can be a child of this object or another if
     # 'parent' if specified
-    def __init__(self, ruby_system, parent):
+    def __init__(self, ruby_system, parent, addr_ranges=None):
         super().__init__(ruby_system)
 
         self._cntrl = CHI_Memory_Controller(
@@ -745,6 +745,7 @@ class CHI_SNF_Base(CHI_Node):
             requestToMemory=MemCtrlMessageBuffer(),
             reqRdy=TriggerMessageBuffer(),
             transitions_per_cycle=1024,
+            addr_ranges=(addr_ranges if addr_ranges else []),
         )
 
         # The Memory_Controller implementation deallocates the TBE for
@@ -792,11 +793,14 @@ class CHI_SNF_MainMem(CHI_SNF_Base):
     Create the SNF for a list main memory controllers
     """
 
-    def __init__(self, ruby_system, parent, mem_ctrl=None):
-        super().__init__(ruby_system, parent)
+    def __init__(self, ruby_system, parent, mem_ctrl=None, addr_ranges=None):
+        if addr_ranges is not None:
+            ranges = addr_ranges
+        else:
+            ranges = self.getMemRange(mem_ctrl) if mem_ctrl else None
+        super().__init__(ruby_system, parent, addr_ranges=ranges)
         if mem_ctrl:
             self._cntrl.memory_out_port = mem_ctrl.port
-            self._cntrl.addr_ranges = self.getMemRange(mem_ctrl)
         # else bind ports and range later
 
 

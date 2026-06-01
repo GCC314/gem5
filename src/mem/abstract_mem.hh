@@ -228,6 +228,9 @@ class AbstractMemory : public ClockedObject
 
     void initState() override;
 
+    /** Q2: Ensure pmemAddr is set before any functional access is needed. */
+    void init() override;
+
     /**
      * See if this is a null memory that should never store data and
      * always return zero.

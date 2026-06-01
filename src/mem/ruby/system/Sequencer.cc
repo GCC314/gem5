@@ -1026,6 +1026,21 @@ Sequencer::makeRequest(PacketPtr pkt)
         primary_type = secondary_type = RubyRequestType_hasNoAddr;
     } else {
         //
+        // Q2: Check for uncacheable requests (e.g., device memory,
+        // non-cacheable pages mapped with cacheable=False).  These use
+        // the same LD/ST/IFETCH types as cacheable requests so they
+        // flow through the CHI protocol for correct address routing.
+        // The CHI protocol's alloc_on_* parameters on each cache
+        // controller control whether uncacheable data is cached.
+        //
+        bool uncacheable = pkt->req->isUncacheable();
+
+        if (uncacheable) {
+            DPRINTF(RubySequencer, "UNCACHEABLE request for addr %#x\n",
+                    pkt->getAddr());
+        }
+
+        //
         // To support SwapReq, we need to check isWrite() first: a SwapReq
         // should always be treated like a write, but since a SwapReq implies
         // both isWrite() and isRead() are true, check isWrite() first here.

@@ -1,6 +1,8 @@
 #ifndef __MEM_RUBY_PROTOCOL_CHI_EP_EPSNFCONTROLLER_HH__
 #define __MEM_RUBY_PROTOCOL_CHI_EP_EPSNFCONTROLLER_HH__
 
+#include <map>
+
 #include "mem/ruby/protocol/chi/ep/EPBackend.hh"
 #include "mem/ruby/protocol/chi/ep/EPRNFController.hh"
 #include "params/EPSNFController.hh"
@@ -30,6 +32,11 @@ class EPSNFController : public EPController
     bool recvDataMsg(const CHIDataMsg *msg) override;
 
     EPBackend *_backend = nullptr;
+
+    // Q2: Pending write tracking — maps address → HN-F requestor.
+    // WriteNoSnp request stores the HN-F MachineID; when NCBWrData
+    // arrives, CompDBIDResp is sent back to the stored destination.
+    std::map<Addr, MachineID> _pendingWrites;
 };
 
 } // namespace ruby

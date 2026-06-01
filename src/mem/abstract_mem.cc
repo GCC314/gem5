@@ -41,6 +41,7 @@
 #include "mem/abstract_mem.hh"
 
 #include <vector>
+#include <sys/mman.h>
 
 #include "base/loader/memory_image.hh"
 #include "base/loader/object_file.hh"
@@ -69,6 +70,39 @@ AbstractMemory::AbstractMemory(const Params &p) :
     panic_if(!range.valid() || !range.size(),
              "Memory range %s must be valid with non-zero size.",
              range.to_string());
+}
+
+void
+AbstractMemory::init()
+{
+    ClockedObject::init();
+
+    // Q2 FIX: If PhysicalMemory constructor didn't set a backing store
+    // (e.g. because system.memories resolved to [] during early unproxy),
+    // allocate one here so functional+temporal accesses work.
+    // init() runs before initState() (and before ELF loading).
+    // Use setBackingStore() so backdoor state stays synchronized with pmemAddr.
+    if (!pmemAddr) {
+        uint64_t sz = size();
+        uint8_t *new_addr = nullptr;
+        if (sz <= (1ULL << 30)) {  // <= 1 GiB: use heap
+            new_addr = new uint8_t[sz];
+            memset(new_addr, 0, sz);
+        } else {
+            // Large ranges (e.g. phys_mem 2 TiB): use mmap
+            new_addr = (uint8_t*)mmap(nullptr, sz,
+                                       PROT_READ | PROT_WRITE,
+                                       MAP_ANON | MAP_PRIVATE | MAP_NORESERVE,
+                                       -1, 0);
+            if (new_addr == MAP_FAILED) {
+                fatal("%s: Could not mmap %llu bytes for backing store",
+                      name(), sz);
+            }
+        }
+        setBackingStore(new_addr);
+        warn("%s: Allocated private backing store (%llu bytes) because "
+             "PhysicalMemory did not provide one.", name(), sz);
+    }
 }
 
 void
@@ -105,6 +139,7 @@ AbstractMemory::initState()
 void
 AbstractMemory::setBackingStore(uint8_t* pmem_addr)
 {
+    // Q2 FIX: Restore backdoor invalidation + pointer update semantics.
     // If there was an existing backdoor, let everybody know it's going away.
     if (backdoor.ptr())
         backdoor.invalidate();

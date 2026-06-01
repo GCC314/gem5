@@ -253,6 +253,22 @@ def create_system(
     if cpus is None:
         cpus = system.cpu
 
+    # Q2 FIX: Create phys_mem BEFORE create_system so protocol-specific
+    # builders can connect SNF memory_out_port to this shared backing
+    # store, eliminating the DDR4/phys_mem data separation problem.
+    # Merge all system.mem_ranges into a single contiguous range so
+    # phys_mem covers every segment (local private, UBCC exclusive, DSM).
+    if options.access_backing_store:
+        ruby.access_backing_store = True
+        # Compute the overall span of all memory ranges
+        all_starts = [r.start for r in system.mem_ranges]
+        all_ends = [r.end for r in system.mem_ranges]
+        phys_start = min(all_starts)
+        phys_end = max(all_ends)
+        ruby.phys_mem = SimpleMemory(
+            range=AddrRange(phys_start, phys_end), in_addr_map=False
+        )
+
     try:
         (cpu_sequencers, dir_cntrls, topology) = import_module(
             f"ruby.{buildEnv['PROTOCOL']}"
@@ -303,12 +319,8 @@ def create_system(
     ruby._cpu_ports = cpu_sequencers
     ruby.num_of_sequencers = len(cpu_sequencers)
 
-    # Create a backing copy of physical memory in case required
-    if options.access_backing_store:
-        ruby.access_backing_store = True
-        ruby.phys_mem = SimpleMemory(
-            range=system.mem_ranges[0], in_addr_map=False
-        )
+    # NOTE: phys_mem was created above (before create_system) so the
+    # protocol can wire SNF memory_out_port to it.  Nothing to do here.
 
 
 def create_directories(options, bootmem, ruby_system, system):

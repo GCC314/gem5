@@ -6,6 +6,9 @@
 #include "mem/ruby/protocol/CHI/CHIDataMsg.hh"
 #include "mem/ruby/protocol/CHI/CHIRequestMsg.hh"
 #include "mem/ruby/protocol/CHI/CHIResponseMsg.hh"
+#include "mem/simple_mem.hh"
+#include "mem/packet.hh"
+#include "mem/request.hh"
 #include "params/EPSNFController.hh"
 
 namespace gem5
@@ -70,22 +73,38 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
 {
     DPRINTF(RubyCHIGeneric, "EP_SNF node_id=%d recvRequestMsg type=%s addr=0x%lx\n",
             _nodeId, msg->m_type, msg->m_addr);
+    warn("EP_SNF node_id=%d recvRequestMsg type=%d addr=0x%lx "
+         "dataToFwdReq=%d\n",
+         _nodeId, msg->m_type, msg->m_addr, msg->m_dataToFwdRequestor);
+
+    // Q2: Handle WriteNoSnp / WriteNoSnpPtl — forward to DDR4 directly.
+    // No UBCC directory involvement needed for writes.
+    // Store pending write requestor; CompDBIDResp sent after NCBWrData
+    // arrives via recvDataMsg.
+    if (msg->m_type == CHIRequestType_WriteNoSnp ||
+        msg->m_type == CHIRequestType_WriteNoSnpPtl) {
+
+        if (!_backend) {
+            fatal("EP_SNF node_id=%d: no backend for write\n", _nodeId);
+        }
+        _backend->checkDsmAddr(msg->m_addr);
+
+        // Store pending write: addr → requestor (HN-F)
+        _pendingWrites[msg->m_addr] = msg->m_requestor;
+
+        DPRINTF(RubyCHIGeneric,
+                "EP_SNF node_id=%d: WriteNoSnp pending, "
+                "addr=0x%lx requestor=0x%x\n",
+                _nodeId, msg->m_addr, msg->m_requestor);
+        return true;
+    }
 
     // ---- M5 R1: Request type gate ----
     // EP_SNF only services ReadNoSnp (and ReadNoSnpSep) requests.
-    // All other request types (Load, Store, DVM, Snoop variants, etc.)
-    // are not valid on the EP_SNF receive path and must be rejected
-    // or deferred to the base class.
+    // All other request types are rejected.
     if (msg->m_type != CHIRequestType_ReadNoSnp &&
         msg->m_type != CHIRequestType_ReadNoSnpSep) {
-        // This is a protocol violation — only ReadNoSnp[Sep] should
-        // arrive at EP_SNF.  Warn and return unhandled; production
-        // code would trigger a protocol-level error response.
-        DPRINTF(RubyCHIGeneric,
-                "EP_SNF node_id=%d: unsupported request type %s addr=0x%lx "
-                "-- returning false (unhandled)\n",
-                _nodeId, msg->m_type, msg->m_addr);
-        fatal("EP_SNF node_id=%d: received non-ReadNoSnp request type "
+        fatal("EP_SNF node_id=%d: received unsupported request type "
               "msg_type=%d for PA=0x%lx\n", _nodeId, msg->m_type, msg->m_addr);
         return false;
     }
@@ -126,34 +145,38 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
             "EP_SNF node_id=%d: grantResult=%d homeNode=%d\n",
             _nodeId, grantResult, homeNode);
 
-    // Q2 WORKAROUND: handleRemoteMiss returns -2 for local DSM lines
-    // that should be handled by dl_snf.  Skip processing silently.
-    if (grantResult == -2) {
-        return true;
-    }
-
     // ---- M5: Record sideband for inspection by Python tests ----
     _backend->recordSideband(msg->m_addr, neededPerm, writeIntent,
                               (neededPerm == 0) ? 0 : 1,  // 0=GlobalReadShared, 1=GlobalReadUnique
                               grantResult, homeNode);
 
-    // Respond to HN with RespSepData + CompData
-    // Q1: Use real grant data from EPBackend/lastGrantData instead of dummy zero.
-    NetDest dest(m_ruby_system);
-    dest.add(msg->m_requestor);
+    // ---- Q2 FIX: DMT-aware routing ----
+    // If dataToFwdRequestor is set, the HN-F expects CompData to go
+    // directly to the fwdRequestor (original L2) and only a response
+    // (ReadReceipt for ReadNoSnpSep, nothing for plain ReadNoSnp) to
+    // come back to the HN-F.
+    NetDest hnDest(m_ruby_system);
+    hnDest.add(msg->m_requestor);
 
-    auto rsp = std::make_shared<CHIResponseMsg>(
-        curTick(), cacheLineSize, m_ruby_system,
-        msg->m_addr, CHIResponseType_RespSepData,
-        m_machineID, dest,
-        false, false, 0, 0, MessageSizeType_Control);
-    sendResponseMsg(rsp);
+    NetDest dataDest(m_ruby_system);
+    if (msg->m_dataToFwdRequestor) {
+        dataDest.add(msg->m_fwdRequestor);
+    } else {
+        dataDest.add(msg->m_requestor);
+    }
 
-    // Build CompData with real data from the grant path.
-    DataBlock db(cacheLineSize);
+    // For ReadNoSnpSep (early-dealloc DMT), send ReadReceipt to HN-F.
+    if (msg->m_type == CHIRequestType_ReadNoSnpSep) {
+        auto rsp = std::make_shared<CHIResponseMsg>(
+            curTick(), cacheLineSize, m_ruby_system,
+            msg->m_addr, CHIResponseType_ReadReceipt,
+            m_machineID, hnDest,
+            false, false, 0, 0, MessageSizeType_Control);
+        sendResponseMsg(rsp);
+    }
+
     const uint8_t *gdata = _backend->lastGrantData();
     if (gdata && _backend->lastGrantDataSize() >= cacheLineSize) {
-        db.setData(gdata, 0, cacheLineSize);
         DPRINTF(RubyCHIGeneric,
                 "EP_SNF node_id=%d: CompData populated with grant data "
                 "first_byte=0x%02x\n", _nodeId, gdata[0]);
@@ -163,14 +186,40 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
                 "(grant data not available)\n", _nodeId);
     }
 
-    auto dat = std::make_shared<CHIDataMsg>(
-        curTick(), cacheLineSize, m_ruby_system,
-        msg->m_addr, CHIDataType_CompData_I,
-        m_machineID, dest,
-        db,
-        WriteMask(cacheLineSize),
-        false, 0, MessageSizeType_Data);
-    sendDataMsg(dat);
+    // ---- Q2 FIX: Splitting CompData into data-channel-sized chunks ----
+    // The L2/HN-F's ExpectedMap counts data responses in CHUNKS
+    // (blockSize / data_channel_size).  Generalize the chunk loop
+    // using dataChannelSize (bytes per data message) and
+    // dataMsgsPerLine (number of data messages per cache line).
+    // P1-1: Replace hardcoded halfSize = cacheLineSize/2 with
+    // dataChannelSize and dataMsgsPerLine from EPController params.
+    //
+    // With dataChannelSize=32 and cacheLineSize=64, dataMsgsPerLine=2.
+    // With dataChannelSize=64 and cacheLineSize=64, dataMsgsPerLine=1.
+    for (int i = 0; i < dataMsgsPerLine; i++) {
+        int offset = i * dataChannelSize;
+        int chunkSize = (i == dataMsgsPerLine - 1) ?
+            (cacheLineSize - offset) : dataChannelSize;
+
+        WriteMask wm(cacheLineSize);
+        wm.setMask(offset, chunkSize);
+
+        DataBlock db(cacheLineSize);
+        // P0-1: Guard against nullptr to avoid memcpy crash.
+        // P0-2: Use correct destination offset (offset, not 0).
+        if (gdata != nullptr) {
+            db.setData(gdata + offset, offset, chunkSize);
+        }
+        // else db keeps default zeros
+
+        auto dat = std::make_shared<CHIDataMsg>(
+            curTick(), cacheLineSize, m_ruby_system,
+            msg->m_addr, CHIDataType_CompData_UC,
+            m_machineID, dataDest,
+            db, wm,
+            false, 0, MessageSizeType_Data);
+        sendDataMsg(dat);
+    }
 
     return true;
 }
@@ -194,7 +243,70 @@ EPSNFController::recvResponseMsg(const CHIResponseMsg *msg)
 bool
 EPSNFController::recvDataMsg(const CHIDataMsg *msg)
 {
-    DPRINTF(RubyCHIGeneric, "EP_SNF node_id=%d recvDataMsg\n", _nodeId);
+    DPRINTF(RubyCHIGeneric, "EP_SNF node_id=%d recvDataMsg type=%d addr=0x%lx\n",
+            _nodeId, msg->m_type, msg->m_addr);
+
+    // Q2: Write NCBWrData to DDR4 (SimpleMemory) via functionalAccess
+    if (msg->m_type == CHIDataType_NCBWrData ||
+        msg->m_type == CHIDataType_CBWrData_UC ||
+        msg->m_type == CHIDataType_CBWrData_UD_PD ||
+        msg->m_type == CHIDataType_CBWrData_SC ||
+        msg->m_type == CHIDataType_CBWrData_SD_PD ||
+        msg->m_type == CHIDataType_CBWrData_I) {
+
+        auto *phys_mem = m_ruby_system->getPhysMem();
+        if (phys_mem) {
+            const DataBlock &db = msg->m_dataBlk;
+            const WriteMask &wm = msg->m_bitMask;
+            uint8_t buf[64];
+
+            // Read current line from DDR4, then apply write mask
+            RequestPtr req = std::make_shared<Request>(
+                msg->m_addr, cacheLineSize, 0, RequestorID(0));
+            req->setFlags(Request::PHYSICAL);
+            Packet rdPkt(req, MemCmd::ReadReq);
+            rdPkt.dataStatic(buf);
+            phys_mem->functionalAccess(&rdPkt);
+
+            // Overwrite with incoming data at masked positions
+            for (int i = 0; i < cacheLineSize; i++) {
+                if (wm.test(i)) {
+                    buf[i] = db.getByte(i);
+                }
+            }
+
+            // Write back to DDR4
+            Packet wrPkt(req, MemCmd::WriteReq);
+            wrPkt.dataStatic(buf);
+            phys_mem->functionalAccess(&wrPkt);
+
+            DPRINTF(RubyCHIGeneric,
+                    "EP_SNF node_id=%d: wrote data to DDR4 "
+                    "addr=0x%lx type=%d\n",
+                    _nodeId, msg->m_addr, msg->m_type);
+        }
+
+        // Send CompDBIDResp if there's a pending write for this address
+        auto it = _pendingWrites.find(msg->m_addr);
+        if (it != _pendingWrites.end()) {
+            NetDest hnDest(m_ruby_system);
+            hnDest.add(it->second);  // requestor = HN-F
+
+            auto rsp = std::make_shared<CHIResponseMsg>(
+                curTick(), cacheLineSize, m_ruby_system,
+                msg->m_addr, CHIResponseType_CompDBIDResp,
+                m_machineID, hnDest,
+                false, false, 0, 0, MessageSizeType_Control);
+            sendResponseMsg(rsp);
+
+            DPRINTF(RubyCHIGeneric,
+                    "EP_SNF node_id=%d: CompDBIDResp sent for write "
+                    "addr=0x%lx\n", _nodeId, msg->m_addr);
+            _pendingWrites.erase(it);
+        }
+        return true;
+    }
+
     return true;
 }
 

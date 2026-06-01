@@ -392,7 +392,7 @@ $klass ${{self.c_ident}}$parent
 
                     for dm in self.data_members.values():
                         if dm.real_c_type in ("DataBlock", "WriteMask"):
-                            code(f"\t\t, m_{dm.ident}(blockSize)")
+                            code(f"\t\t, m_{dm.ident}(local_{dm.ident})")
                 else:
                     code('    : ${{self["interface"]}}()')
 

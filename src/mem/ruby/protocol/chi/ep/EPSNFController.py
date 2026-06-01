@@ -11,5 +11,4 @@ class EPSNFController(EPController):
     cxx_class = "gem5::ruby::EPSNFController"
     abstract = False
 
-    addr_ranges = VectorParam.AddrRange([], "Address ranges served (remote DSM)")
     ep_backend = Param.EPBackend(NULL, "EPBackend for this endpoint")

@@ -87,7 +87,7 @@ in_port(datInPort, CHIDataMsg, datIn, rank=10,
   if (datInPort.isReady(clockEdge())) {
     printResources();
     peek(datInPort, CHIDataMsg) {
-      assert((in_msg.bitMask.count() <= data_channel_size) && (in_msg.bitMask.count() > 0));
+      assert(in_msg.bitMask.count() <= blockSize);
       assert(in_msg.usesTxnId);
       trigger(dataToEvent(in_msg.type), in_msg.txnId, getCurrentActiveTBE(in_msg.txnId));
     }

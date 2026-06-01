@@ -148,14 +148,25 @@ void
 EPController::functionalRead(
     const Addr& param_addr, Packet* param_pkt, WriteMask& param_mask)
 {
-    panic("EPController doesn't expect functionalRead");
+    // No-op: EP_RNF's getAccessPermission returns NotPresent,
+    // so it should never be asked for semantic data.  However,
+    // RubySystem::partialFunctionalRead calls functionalRead on
+    // ALL controllers (including NotPresent ones as "ctrl_others"),
+    // so we must not panic here.
+    DPRINTF(RubyCHIGeneric,
+            "EPController node_id=%d: functionalRead called on "
+            "addr=0x%lx (NotPresent, no-op)\n",
+            _nodeId, param_addr);
 }
 
 int
 EPController::functionalWrite(
     const Addr& param_addr, Packet* param_pkt)
 {
-    panic("EPController doesn't expect functionalRead");
+    DPRINTF(RubyCHIGeneric,
+            "EPController node_id=%d: functionalWrite called on "
+            "addr=0x%lx (no-op)\n",
+            _nodeId, param_addr);
     return 0;
 }
 
@@ -405,6 +416,38 @@ EPRNFController::setOuterTxnPending(uint64_t linePa, bool pending)
     } else {
         _outerTxnPending.erase(linePa);
     }
+}
+
+// ---- Q2: Local Snoop for Cross-Node Invalidation ----
+void
+EPRNFController::sendLocalSnoop(uint64_t linePa, CHIRequestType snoopType)
+{
+    DPRINTF(RubyCHIGeneric,
+            "EP_RNF node_id=%d: sendLocalSnoop PA=0x%lx type=%s\n",
+            _nodeId, linePa, CHIRequestType_to_string(snoopType));
+
+    // Create a CHI snoop request message
+    auto snp = std::make_shared<CHIRequestMsg>(
+        curTick(), cacheLineSize, m_ruby_system);
+    snp->m_addr = linePa;
+    snp->m_type = snoopType;
+    snp->m_requestor = m_machineID;
+
+    // Broadcast to all Cache-type machines on the CHI network.
+    // This ensures the snoop reaches L1/L2 caches which will
+    // invalidate the line per the CHI protocol state machine.
+    snp->m_Destination.broadcast(MachineType_Cache);
+
+    // Send on snpOut → CHI_SNP virtual channel → other caches' snpIn
+    sendSnoopMsg(snp);
+
+    _snoopCount++;
+    if (_backend)
+        _backend->incrementEpRnfSnoopCount();
+
+    DPRINTF(RubyCHIGeneric,
+            "EP_RNF node_id=%d: sendLocalSnoop PA=0x%lx sent (snoopCount=%lu)\n",
+            _nodeId, linePa, _snoopCount);
 }
 
 } // namespace ruby

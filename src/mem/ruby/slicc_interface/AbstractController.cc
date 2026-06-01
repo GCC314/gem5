@@ -40,6 +40,7 @@
 
 #include "mem/ruby/slicc_interface/AbstractController.hh"
 
+#include "debug/Ruby.hh"
 #include "debug/RubyQueue.hh"
 #include "mem/ruby/network/Network.hh"
 #include "mem/ruby/protocol/MemoryMsg.hh"
@@ -97,6 +98,7 @@ AbstractController::init()
     // different types. If this is the case, mapAddressToDownstreamMachine
     // needs to specify the machine type
     downstreamDestinations.resize();
+    int dd_count = params().downstream_destinations.size();
     for (auto abs_cntrl : params().downstream_destinations) {
         MachineID mid = abs_cntrl->getMachineID();
         const AddrRangeList &ranges = abs_cntrl->getAddrRanges();
@@ -117,6 +119,23 @@ AbstractController::init()
     upstreamDestinations.resize();
     for (auto abs_cntrl : params().upstream_destinations) {
         upstreamDestinations.add(abs_cntrl->getMachineID());
+    }
+
+    // Q2 diagnostic: log downstream_destinations and addr_ranges for
+    // each downstream controller to debug SNF addr_ranges propagation.
+    // Use cprintf to bypass debug-flag enable timing issues.
+    // Note: gem5 cprintf does not support %zu; use %lu with cast.
+    cprintf("Controller %s: downstream_destinations=%lu\n",
+            name(), (unsigned long)params().downstream_destinations.size());
+    for (auto *ctrl : params().downstream_destinations) {
+        auto ranges = ctrl->getAddrRanges();
+        cprintf("  downstream %s (type=%s): addr_ranges=%lu\n",
+                ctrl->name(), MachineType_to_string(ctrl->getType()),
+                (unsigned long)ranges.size());
+        for (auto &r : ranges) {
+            cprintf("    range [%#x, %#x) -> %s\n",
+                    r.start(), r.end(), r.to_string());
+        }
     }
 }
 
@@ -436,10 +455,19 @@ const
 {
     if (mtype == MachineType_NUM) {
         // map to the first match
+        warn("%s: mapAddressToDownstreamMachine(0x%x, NUM): "
+             "downstreamAddrMap has %d type(s)\n",
+             name(), addr, (int)downstreamAddrMap.size());
         for (const auto &i : downstreamAddrMap) {
+            warn("  type %d has %d entries\n",
+                 (int)i.first, (int)i.second.size());
             const auto mapping = i.second.contains(addr);
-            if (mapping != i.second.end())
+            if (mapping != i.second.end()) {
+                warn("  MATCH: type %d node %d\n",
+                     (int)mapping->second.getType(),
+                     (int)mapping->second.getNum());
                 return mapping->second;
+            }
         }
     }
     else {

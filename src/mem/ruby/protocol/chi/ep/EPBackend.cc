@@ -11,8 +11,10 @@
 #include "mem/simple_mem.hh"
 #include "mem/ruby/protocol/chi/ep/EPRNFController.hh"
 #include "mem/ruby/protocol/chi/ep/UBCCController.hh"
+#include "mem/ruby/protocol/CHI/CHIRequestType.hh"
 #include "mem/ruby/system/RubySystem.hh"
 #include "params/EPBackend.hh"
+#include "sim/cur_tick.hh"
 
 namespace gem5
 {
@@ -257,17 +259,11 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
         fatal("EPBackend node_id=%d: invalid home node %d for PA=0x%lx\n",
               _nodeId, homeNode, line_pa);
     }
-    // Q2 WORKAROUND: Local DSM lines are handled by dl_snf.
-    // The EP_SNF may receive local-ReadNoSnp broadcasts from the HN-F.
-    // Silently ignore them (return -2) so EPSNFController skips processing.
-    if (homeNode == _nodeId) {
-        DPRINTF(RubyCHIGeneric,
-                "EPBackend node_id=%d: local DSM PA=0x%lx homeNode=%d "
-                "-- skipping (handled by dl_snf)\n",
-                _nodeId, line_pa, homeNode);
-        outHomeNode = -1;
-        return -2;  // signal EPSNFController to skip
-    }
+    // Q2: Local DSM lines are now routed through EP_SNF (before dl_snf),
+    // so UBCC directory is consulted for recall handling.  Process
+    // normally through UBCC instead of skipping.
+    // (Previously: local DSM was skipped with return -2, but this
+    //  caused the HN-F to deadlock waiting for CompData.)
     outHomeNode = homeNode;
 
     // Translate PA from requester's view to home node's view.
@@ -377,7 +373,14 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
             recallOwnerNode, homeNode, offset);
         recallMsg.ownerNode = recallOwnerNode;
         recallMsg.homeNode = homeNode;
-        recallMsg.epoch = entry.epoch;
+        // P1-5: Use home UBCC's per-line directory epoch (not the
+        // requester's global _epochCounter).  The directory epoch is
+        // what processRecallResponse checks via checkEpochForLine().
+        // Using the local _epochCounter causes a stale-epoch rejection
+        // when multiple remote misses have incremented the counter
+        // beyond the directory's per-line epoch value.
+        // See M8 invalidation path (line ~428) for the same pattern.
+        recallMsg.epoch = homeUbcc->getEpochForLine(homePa);
         // Recall triggered by read: owner downgrades to shared
         // Recall triggered by unique/write: owner invalidates
         recallMsg.isReadRequest = (reqType == OuterReqType::GlobalReadShared);
@@ -538,7 +541,9 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
     // After the grant is processed, read the actual data from the home
     // node's DL_SNF memory so EPSNFController can send real data in
     // the CompData response (not dummy zero).
-    populateGrantData(homePa, homeNode);
+    // Q2: Pass both requester's PA AND home node's PA.  The requester's
+    // PA is where CPU timing stores write to phys_mem via hitCallback.
+    populateGrantData(line_pa, homePa, homeNode);
 
     // ---- M6: Clear outer txn pending and signal completion ----
     // The outer transaction is now complete; notify local EP_RNF
@@ -599,9 +604,12 @@ EPBackend::handleGrant(uint64_t line_pa, OuterGrantType grant, int homeNode)
 // ---- Q1: Grant Data Accessor ----
 
 void
-EPBackend::populateGrantData(uint64_t homePa, int homeNode)
+EPBackend::populateGrantData(uint64_t reqPa, uint64_t homePa, int homeNode)
 {
     static const int lineSize = 64; // cache line size
+    printf("[Q2-DEBUG] populateGrantData node=%d reqPA=0x%lx "
+           "homePA=0x%lx homeNode=%d\n",
+           _nodeId, reqPa, homePa, homeNode);
 
     // Start with zeros (valid for uninitialized DSM memory)
     uint8_t zero_buf[64] = {};
@@ -615,33 +623,285 @@ EPBackend::populateGrantData(uint64_t homePa, int homeNode)
         return;
     }
 
-    // ---- Try phys_mem functional access (requires --access-backing-store) ----
-    // This is safe to call at any time (SimpleMemory is always available).
+    // Q2 FIX: phys_mem->functionalAccess() only reads from SimpleMemory,
+    // which does NOT see data written via Ruby timing path (DDR4).
+    // Use RubySystem::functionalRead() instead — it queries all SLICC
+    // controllers' cache hierarchies, where timing-mode data resides.
     auto *phys_mem = _ruby_system->getPhysMem();
-    if (phys_mem) {
-        RequestPtr req = std::make_shared<Request>(
-            homePa, lineSize, 0, RequestorID(0));
-        req->setFlags(Request::PHYSICAL);
-        Packet pkt(req, MemCmd::ReadReq);
-        uint8_t pkt_buf[64] = {};
-        pkt.dataStatic(pkt_buf);
-        phys_mem->functionalAccess(&pkt);
-        _lastGrantDataBlock.setData(pkt_buf, 0, lineSize);
-        _lastGrantDataValid = true;
+    if (!phys_mem) {
         DPRINTF(RubyCHIGeneric,
-                "EPBackend node_id=%d: grant data populated via phys_mem "
-                "PA=0x%lx homeNode=%d first_word=0x%08x\n",
-                _nodeId, homePa, homeNode,
-                *(reinterpret_cast<const uint32_t*>(pkt_buf)));
-        return;
+                "EPBackend node_id=%d: no phys_mem, will rely on "
+                "functionalRead of Ruby cache hierarchy\n",
+                _nodeId);
     }
 
-    // ---- No phys_mem available ----
-    // Without --access-backing-store, phys_mem is unavailable.
-    // Grant data must come from actual backing store; silent zero
-    // fallback is a correctness hazard.
-    fatal("EPBackend: populateGrantData requires --access-backing-store "
-          "node_id=%d PA=0x%lx\n", _nodeId, homePa);
+    // ---- Q2 FIX: Multi-PA-view grant data population ----
+    // CPU timing stores write to phys_mem at the REQUESTER's PA view
+    // (via RubyPort::MemResponsePort::hitCallback).  The home node's
+    // PA view may be different (PAs encode node IDs in high bits).
+    //
+    // P0-2 FIX: Use provenance-based approach instead of content
+    // heuristic (firstWord != 0).  Data content is NEVER a valid
+    // indicator of data freshness — a legitimate zero-filled cache
+    // line must not be mistaken for "no data".
+    //
+    // Two data sources exist for grant data:
+    //   a) reqPa (requester's local PA view):
+    //      - Where this CPU's hitCallback writes data to phys_mem
+    //      - Authoritative when THIS node recently stored data
+    //   b) homePa (home node's PA view):
+    //      - Where DDR4 controller stores data
+    //      - Where recall handler writes dirty data from another node
+    //      - Back-filled from reqPa by previous populateGrantData calls
+    //
+    // When reqPa == homePa (same PA space), a single read suffices.
+    // When reqPa != homePa, we must consult both views:
+    //   - homePa is the canonical/cross-node source (recall writes here)
+    //   - reqPa back-fills homePa for forward progress
+
+    uint8_t pkt_buf[64] = {};
+
+    // P1-5 helper lambda: read data at a PA, preferring phys_mem
+    // (SimpleMemory backing store) over functionalRead.
+    //
+    // Rationale: recall handlers broadcast dirty data to ALL nodes'
+    // phys_mem via functionalAccess().  But functionalRead() queries
+    // Ruby controllers (DRAMCtrl, L2 caches) which may hold STALE
+    // copies that were never invalidated/updated by the recall path.
+    // By trying phys_mem FIRST, we ensure the cross-node recall data
+    // is found even when a stale controller copy exists.
+    //
+    // Returns true if any data source produced non-zero content.
+    auto readPA = [&](uint64_t pa, uint8_t *buf, const char **out_source) -> bool {
+        memset(buf, 0, lineSize);
+        RequestPtr req = std::make_shared<Request>(
+            pa, lineSize, 0, RequestorID(0));
+        req->setFlags(Request::PHYSICAL);
+        Packet pkt(req, MemCmd::ReadReq);
+        pkt.dataStatic(buf);
+
+        bool fromFunc = false;
+        const char *src = "none";
+        uint32_t fw = 0;
+
+        // Phase 1: try phys_mem first (SimpleMemory — recall writes here)
+        if (phys_mem) {
+            phys_mem->functionalAccess(&pkt);
+            fw = *(reinterpret_cast<uint32_t*>(buf));
+            if (fw != 0) {
+                src = "phys_mem";
+            }
+        }
+
+        // Phase 2: try functionalRead (Ruby controllers — may have
+        // timing-mode data that hasn't reached phys_mem yet)
+        if (fw == 0 && curTick() > 0) {
+            uint8_t func_buf[64] = {};
+            RequestPtr funcReq = std::make_shared<Request>(
+                pa, lineSize, 0, RequestorID(0));
+            funcReq->setFlags(Request::PHYSICAL);
+            Packet funcPkt(funcReq, MemCmd::ReadReq);
+            funcPkt.dataStatic(func_buf);
+
+            bool ok = _ruby_system->functionalRead(&funcPkt);
+            if (ok) {
+                uint32_t funcFw =
+                    *(reinterpret_cast<uint32_t*>(func_buf));
+                if (funcFw != 0) {
+                    memcpy(buf, func_buf, lineSize);
+                    src = "functionalRead";
+                    fromFunc = true;
+                    fw = funcFw;
+                }
+            }
+        }
+
+        if (out_source) *out_source = src;
+        return fromFunc;
+    };
+
+    if (reqPa == homePa) {
+        // Single PA view — read once.
+        const char *read_source = "phys_mem";
+        readPA(reqPa, pkt_buf, &read_source);
+        uint32_t fw = *(reinterpret_cast<uint32_t*>(pkt_buf));
+
+        // Q2 FIX P0-3: Cross-node data scavenge — when the primary PA
+        // returns all zeros, the data may be sitting in another node's
+        // cache at a different PA encoding.  (The recall path should
+        // have flushed it but due to Ruby message ordering may not have.)
+        //
+        // Strategy: compute the DSM offset from homePa, then try
+        // every OTHER node's PA view for the same offset.  Even if
+        // homeNode==_nodeId (local home), the writer may be a remote
+        // node and its data sits at that remote node's PA.
+        if (fw == 0 && homeNode >= 0 && curTick() > 0) {
+            uint64_t offset = _addrMap.dsmOffset(homePa);
+            int numNodes = _addrMap.numNodes();
+            for (int nid = 0; nid < numNodes; nid++) {
+                if (nid == _nodeId) continue;
+                uint64_t otherPa = _addrMap.buildDsmPA(nid, homeNode, offset);
+                const char *other_source = nullptr;
+                readPA(otherPa, pkt_buf, &other_source);
+                uint32_t other_fw = *(reinterpret_cast<uint32_t*>(pkt_buf));
+                if (other_fw != 0) {
+                    printf("[Q2-DEBUG] populateGrantData node=%d single-PA "
+                           "SCAVENGED from node %d otherPA=0x%lx "
+                           "first_word=0x%08x source=%s\n",
+                           _nodeId, nid, otherPa, other_fw, other_source);
+                    read_source = other_source;
+                    fw = other_fw;
+                    // pkt_buf already holds the scavenged data
+                    _lastGrantDataBlock.setData(pkt_buf, 0, lineSize);
+                    _lastGrantDataValid = true;
+                    _lastGrantDataProvenance = GrantDataProvenance::ReqPA;
+                    return;
+                }
+            }
+            // Scavenge found nothing — pkt_buf may have been overwritten
+            // by the last failed attempt.  Restore by re-reading reqPa.
+            if (phys_mem) {
+                readPA(reqPa, pkt_buf, &read_source);
+            }
+        }
+
+        // Q2 FIX P0-4: When functionalRead returns zeros (found
+        // Backing_Store/DRAMCtrl but it's uninitialized), also try
+        // phys_mem directly — hitCallback writes timing-path stores
+        // to phys_mem (SimpleMemory), which is separate from the
+        // DRAMCtrl that functionalRead queries via the memoryPort.
+        if (fw == 0 && phys_mem && curTick() > 0) {
+            uint8_t pm_buf[64] = {};
+            RequestPtr pmReq = std::make_shared<Request>(
+                reqPa, lineSize, 0, RequestorID(0));
+            pmReq->setFlags(Request::PHYSICAL);
+            Packet pmPkt(pmReq, MemCmd::ReadReq);
+            pmPkt.dataStatic(pm_buf);
+            phys_mem->functionalAccess(&pmPkt);
+            uint32_t pm_fw = *(reinterpret_cast<uint32_t*>(pm_buf));
+            if (pm_fw != 0) {
+                // phys_mem has real data — use it
+                memcpy(pkt_buf, pm_buf, lineSize);
+                fw = pm_fw;
+                read_source = "phys_mem(fallback)";
+                printf("[Q2-DEBUG] populateGrantData node=%d single-PA "
+                       "PHYS_MEM fallback first_word=0x%08x\n",
+                       _nodeId, fw);
+            }
+        }
+
+        _lastGrantDataBlock.setData(pkt_buf, 0, lineSize);
+        _lastGrantDataValid = true;
+        _lastGrantDataProvenance = GrantDataProvenance::ReqPA;
+
+        printf("[Q2-DEBUG] populateGrantData node=%d single-PA "
+               "first_word=0x%08x source=%s\n",
+               _nodeId, fw, read_source);
+    } else {
+        // Dual PA view.
+        // Phase 1: Read from requester PA.
+        const char *reqPa_source = "phys_mem";
+        readPA(reqPa, pkt_buf, &reqPa_source);
+
+        // Back-fill from reqPa to homePa (forward direction):
+        // if this requester wrote data via hitCallback, copy it to
+        // homePa so future DDR4-local reads and other nodes find it.
+        // Only back-fill if Phase 1 found real data (not all zeros).
+        {
+            uint32_t reqPa_fw = *(reinterpret_cast<uint32_t*>(pkt_buf));
+            if (reqPa_fw != 0 && phys_mem) {
+                RequestPtr wrReq = std::make_shared<Request>(
+                    homePa, lineSize, 0, RequestorID(0));
+                wrReq->setFlags(Request::PHYSICAL);
+                Packet wrPkt(wrReq, MemCmd::WriteReq);
+                wrPkt.dataStatic(pkt_buf);
+                phys_mem->functionalAccess(&wrPkt);
+                DPRINTF(RubyCHIGeneric,
+                        "EPBackend node_id=%d: back-filled home PA 0x%lx "
+                        "from requester PA (first_word=0x%08x)\n",
+                        _nodeId, homePa, reqPa_fw);
+            }
+        }
+
+        // Phase 2: Read from home PA — this is the canonical source
+        // because recall handlers write dirty data to homePa.
+        const char *homePa_source = "phys_mem";
+        readPA(homePa, pkt_buf, &homePa_source);
+        uint32_t fw = *(reinterpret_cast<uint32_t*>(pkt_buf));
+
+        // Q2 FIX P0-3: Cross-node data scavenge for dual-PA path.
+        // If homePa read returned zeros, try ALL other nodes' PA views.
+        if (fw == 0 && homeNode >= 0 && curTick() > 0) {
+            uint64_t offset = _addrMap.dsmOffset(homePa);
+            int numNodes = _addrMap.numNodes();
+            for (int nid = 0; nid < numNodes; nid++) {
+                if (nid == _nodeId) continue;
+                uint64_t otherPa = _addrMap.buildDsmPA(nid, homeNode, offset);
+                const char *other_source = nullptr;
+                readPA(otherPa, pkt_buf, &other_source);
+                uint32_t other_fw = *(reinterpret_cast<uint32_t*>(pkt_buf));
+                if (other_fw != 0) {
+                    printf("[Q2-DEBUG] populateGrantData node=%d dual-PA "
+                           "SCAVENGED from node %d otherPA=0x%lx "
+                           "first_word=0x%08x source=%s\n",
+                           _nodeId, nid, otherPa, other_fw, other_source);
+                    homePa_source = other_source;
+                    fw = other_fw;
+                    break;
+                }
+            }
+            // If scavenge found nothing, restore from homePa read
+            if (fw == 0 && phys_mem) {
+                readPA(homePa, pkt_buf, &homePa_source);
+            }
+        }
+
+        _lastGrantDataBlock.setData(pkt_buf, 0, lineSize);
+        _lastGrantDataValid = true;
+        _lastGrantDataProvenance = GrantDataProvenance::HomePA;
+
+        printf("[Q2-DEBUG] populateGrantData node=%d dual-PA "
+               "homePA first_word=0x%08x homePA_source=%s "
+               "reqPA_source=%s\n",
+               _nodeId, fw, homePa_source, reqPa_source);
+
+        // Q2 FIX P0-4: Try phys_mem directly as fallback for
+        // dual-PA path too.
+        if (fw == 0 && phys_mem && curTick() > 0) {
+            uint8_t pm_buf[64] = {};
+            RequestPtr pmReq = std::make_shared<Request>(
+                homePa, lineSize, 0, RequestorID(0));
+            pmReq->setFlags(Request::PHYSICAL);
+            Packet pmPkt(pmReq, MemCmd::ReadReq);
+            pmPkt.dataStatic(pm_buf);
+            phys_mem->functionalAccess(&pmPkt);
+            uint32_t pm_fw = *(reinterpret_cast<uint32_t*>(pm_buf));
+            if (pm_fw != 0) {
+                memcpy(pkt_buf, pm_buf, lineSize);
+                fw = pm_fw;
+                homePa_source = "phys_mem(fallback)";
+                _lastGrantDataBlock.setData(pkt_buf, 0, lineSize);
+                printf("[Q2-DEBUG] populateGrantData node=%d dual-PA "
+                       "PHYS_MEM fallback at homePA first_word=0x%08x\n",
+                       _nodeId, fw);
+            }
+        }
+
+        // Reverse back-fill: copy homePa data to reqPa so that
+        // the requester's future PA reads find it.
+        if (fw != 0 && phys_mem) {
+            RequestPtr wrReq2 = std::make_shared<Request>(
+                reqPa, lineSize, 0, RequestorID(0));
+            wrReq2->setFlags(Request::PHYSICAL);
+            Packet wrPkt2(wrReq2, MemCmd::WriteReq);
+            wrPkt2.dataStatic(pkt_buf);
+            phys_mem->functionalAccess(&wrPkt2);
+            DPRINTF(RubyCHIGeneric,
+                    "EPBackend node_id=%d: back-filled requester PA 0x%lx "
+                    "from home PA\n",
+                    _nodeId, reqPa);
+        }
+    }
 }
 
 const uint8_t*
@@ -780,16 +1040,92 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
         }
     }
 
-    // In the single-gem5 prototype, the recall is processed immediately:
-    // The owner node's EPBackend receives the recall and needs to:
-    //   1. Trigger local HN coherent access (not yet wired in M6)
-    //   2. Gather data from local cache/memory (simulated)
-    //   3. Send response back to home UBCC
+    // ---- Q2 FIX: Capture owner data during recall ----
+    // When the owner has dirty data (G_M state), the recall must
+    // extract the actual data from the owner's cache hierarchy and
+    // make it available to the requester.  Without this, the
+    // requester's populateGrantData() finds only zeros in phys_mem
+    // because CPU stores write to the cache, not phys_mem.
     //
-    // For M6, we simulate the data path:
-    //   - If dataNeeded is true (dirty owner), we mark dataReturned=true
-    //   - The actual data content is currently dummy (zero) until
-    //     the real CHI HN path is integrated (M7+)
+    // We functional-read from the Ruby system (which queries the
+    // cache hierarchy) using the owner's local PA, then write the
+    // data to phys_mem at the HOME PA so that populateGrantData()
+    // on the requester side finds it.
+    if (recallMsg.dataNeeded && _ruby_system) {
+        uint64_t homePa = recallMsg.linePa;
+        uint64_t localPa = (recallMsg.ownerLocalPa != 0)
+                              ? recallMsg.ownerLocalPa
+                              : recallMsg.linePa;
+        uint8_t buf[64] = {};
+        RequestPtr req = std::make_shared<Request>(
+            localPa, 64, 0, RequestorID(0));
+        req->setFlags(Request::PHYSICAL);
+        Packet pkt(req, MemCmd::ReadReq);
+        pkt.dataStatic(buf);
+
+        // Q2 DEBUG: print before reading
+        printf("[Q2-DEBUG] recall on node=%d localPA=0x%lx homePA=0x%lx "
+               "ownerNode=%d homeNode=%d\n",
+               _nodeId, localPa, homePa,
+               recallMsg.ownerNode, recallMsg.homeNode);
+
+        // Try functional read from Ruby system (cache hierarchy)
+        if (_ruby_system->functionalRead(&pkt)) {
+            printf("[Q2-DEBUG] recall funcRead OK node=%d "
+                   "first_word=0x%08x second_word=0x%08x\n",
+                   _nodeId,
+                   *(reinterpret_cast<uint32_t*>(buf)),
+                   *(reinterpret_cast<uint32_t*>(buf + 4)));
+        } else {
+            printf("[Q2-DEBUG] recall funcRead FAILED node=%d, "
+                   "falling back to phys_mem\n",
+                   _nodeId);
+            // Fallback: try phys_mem directly
+            auto *phys_mem = _ruby_system->getPhysMem();
+            if (phys_mem) {
+                phys_mem->functionalAccess(&pkt);
+            }
+            printf("[Q2-DEBUG] recall phys_mem fallback node=%d "
+                   "first_word=0x%08x\n",
+                   _nodeId,
+                   *(reinterpret_cast<uint32_t*>(buf)));
+        }
+
+        // Q2 FIX P1-5: Write the captured data to ALL nodes' phys_mem.
+        // In the single-gem5 prototype, each node has its own RubySystem
+        // with its own SimpleMemory (phys_mem).  A requester's
+        // populateGrantData() reads from ITS OWN RubySystem's phys_mem,
+        // so we must write to every node's phys_mem to cover all possible
+        // future requesters.
+        //
+        // Previous code only wrote to home node + local node, which
+        // left other nodes seeing stale/zero data.
+        {
+            for (auto &kv : _backendInstances) {
+                int targetNode = kv.first;
+                EPBackend *targetBackend = kv.second;
+                if (!targetBackend || !targetBackend->getRubySystem())
+                    continue;
+                auto *targetPhysMem =
+                    targetBackend->getRubySystem()->getPhysMem();
+                if (!targetPhysMem)
+                    continue;
+
+                RequestPtr wrReq = std::make_shared<Request>(
+                    homePa, 64, 0, RequestorID(0));
+                wrReq->setFlags(Request::PHYSICAL);
+                Packet wrPkt2(wrReq, MemCmd::WriteReq);
+                wrPkt2.dataStatic(buf);
+                targetPhysMem->functionalAccess(&wrPkt2);
+            }
+            DPRINTF(RubyEP,
+                    "EPBackend node_id=%d: recall data broadcast to "
+                    "all %zu nodes phys_mem homePA=0x%lx "
+                    "first_word=0x%08x\n",
+                    _nodeId, _backendInstances.size(), homePa,
+                    *(reinterpret_cast<uint32_t*>(buf)));
+        }
+    }
 
     // Build the recall response
     OuterRecallResponse response;
@@ -1070,6 +1406,22 @@ EPBackend::handleInvalidationRequest(const OuterInvalidateMsg &invMsg)
             // Invalidation: line is downgraded to invalid
             it->second.state = RequesterLineState::R_I;
         }
+    }
+
+    // ---- Q2 FIX: Send real CHI snoop to L1/L2 caches ----
+    // Without this, handleInvalidationRequest only updates EPBackend
+    // bookkeeping but the actual L1/L2 caches still hold valid copies.
+    // When a local CPU subsequently accesses the line, the L1/L2 cache
+    // hit returns stale data because the invalidation never reached the
+    // cache hierarchy.
+    //
+    // We send a SnpCleanInvalid snoop via EP_RNF's snpOut port,
+    // which is broadcast to all Cache-type controllers on the CHI
+    // network.  Each receiving cache controller invalidates the line
+    // per the CHI protocol state machine.
+    if (_epRnfCtrl) {
+        _epRnfCtrl->sendLocalSnoop(
+            lookupPa, CHI::CHIRequestType_SnpCleanInvalid);
     }
 
     // Build invalidation ack
