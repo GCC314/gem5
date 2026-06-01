@@ -216,6 +216,7 @@ EPController::functionalReadBuffers(PacketPtr& pkt, WriteMask &mask)
 
 EPRNFController::EPRNFController(const Params &p)
   : EPController(p), _backend(p.ep_backend),
+    _numCacheControllers(0),
     _pendingHnResponseCount(0),
     _delayedResolvedCount(0)
 {
@@ -252,6 +253,14 @@ EPRNFController::init()
 {
     EPController::init();
     fatal_if(!_backend, "EP_RNF node_id=%d: no backend attached", _nodeId);
+
+    // Compute count of other Cache-type controllers for reference
+    _numCacheControllers = m_ruby_system->m_num_controllers[MachineType_Cache];
+
+    DPRINTF(RubyCHIGeneric,
+            "EP_RNF node_id=%d: init done, cacheControllers=%d\n",
+            _nodeId, _numCacheControllers);
+
     selfTest();
 }
 
@@ -259,6 +268,10 @@ void
 EPRNFController::wakeup()
 {
     EPController::wakeup();
+
+    // Retry any pending CompAck sends
+    retryPendingCompAcks();
+
     if (_backend)
         _backend->wakeup();
 }
@@ -340,14 +353,128 @@ EPRNFController::recvSnoopMsg(const CHIRequestMsg *msg)
 bool
 EPRNFController::recvResponseMsg(const CHIResponseMsg *msg)
 {
-    DPRINTF(RubyCHIGeneric, "EP_RNF node_id=%d recvResponseMsg\n", _nodeId);
+    DPRINTF(RubyCHIGeneric,
+            "EP_RNF node_id=%d recvResponseMsg type=%s addr=0x%lx\n",
+            _nodeId, CHIResponseType_to_string(msg->m_type), msg->m_addr);
+
+    // CompAck from HN-F or other agents: ignore (not tracking req responses)
+    if (msg->m_type == CHIResponseType_CompAck) {
+        return true;
+    }
+
+    // ---- Q3: Comp_UC → CleanUnique completion ----
+    if (msg->m_type == CHIResponseType_Comp_UC) {
+        auto it = _pendingChiTxns.find(msg->m_addr);
+        if (it != _pendingChiTxns.end() &&
+            it->second.type == PendingChiTxn::TXN_CLEANUNIQUE) {
+
+            // Use msg->m_responder: the HN-F that sent Comp_UC to us
+            it->second.hnfDest = msg->m_responder;
+
+            // Build CompAck and try to send
+            NetDest destNet(m_ruby_system);
+            destNet.add(msg->m_responder);
+            auto ack = std::make_shared<CHIResponseMsg>(
+                curTick(), cacheLineSize, m_ruby_system,
+                msg->m_addr, CHIResponseType_CompAck,
+                m_machineID, destNet,
+                false, false, 0, 0, MessageSizeType_Control);
+
+            if (sendResponseMsg(ack)) {
+                // CompAck sent successfully
+                DPRINTF(RubyCHIGeneric,
+                        "EP_RNF node_id=%d: CleanUnique complete for "
+                        "PA=0x%lx -- invoking callback\n",
+                        _nodeId, msg->m_addr);
+
+                auto cb = it->second.onComplete;
+                _pendingChiTxns.erase(it);
+                if (cb) cb(true);
+            } else {
+                // CompAck failed — will retry
+                it->second.needsCompAck = true;
+                scheduleEvent(Cycles(1));
+                DPRINTF(RubyCHIGeneric,
+                        "EP_RNF node_id=%d: CleanUnique complete for "
+                        "PA=0x%lx but CompAck failed, will retry\n",
+                        _nodeId, msg->m_addr);
+            }
+
+            return true;
+        }
+
+        DPRINTF(RubyCHIGeneric,
+                "EP_RNF node_id=%d: Comp_UC for PA=0x%lx but no pending "
+                "CleanUnique txn\n",
+                _nodeId, msg->m_addr);
+        return true;
+    }
+
+    DPRINTF(RubyCHIGeneric,
+            "EP_RNF node_id=%d recvResponseMsg unhandled type=%s\n",
+            _nodeId, CHIResponseType_to_string(msg->m_type));
     return true;
 }
 
 bool
 EPRNFController::recvDataMsg(const CHIDataMsg *msg)
 {
-    DPRINTF(RubyCHIGeneric, "EP_RNF node_id=%d recvDataMsg\n", _nodeId);
+    DPRINTF(RubyCHIGeneric,
+            "EP_RNF node_id=%d recvDataMsg addr=0x%lx type=%s\n",
+            _nodeId, msg->m_addr, CHIDataType_to_string(msg->m_type));
+
+    // ---- Q3: CompData → ReadShared completion ----
+    // Only accept CompData response types
+    if (msg->m_type != CHIDataType_CompData_I &&
+        msg->m_type != CHIDataType_CompData_SC &&
+        msg->m_type != CHIDataType_CompData_UC &&
+        msg->m_type != CHIDataType_CompData_UD_PD &&
+        msg->m_type != CHIDataType_CompData_SD_PD) {
+        return true;
+    }
+
+    auto it = _pendingChiTxns.find(msg->m_addr);
+    if (it != _pendingChiTxns.end() &&
+        it->second.type == PendingChiTxn::TXN_READSHARED) {
+
+        // Use msg->m_responder: the HN-F that sent CompData to us
+        it->second.hnfDest = msg->m_responder;
+
+        // Build CompAck message and try to send
+        NetDest destNet(m_ruby_system);
+        destNet.add(msg->m_responder);
+        auto ack = std::make_shared<CHIResponseMsg>(
+            curTick(), cacheLineSize, m_ruby_system,
+            msg->m_addr, CHIResponseType_CompAck,
+            m_machineID, destNet,
+            false, false, 0, 0, MessageSizeType_Control);
+
+        if (sendResponseMsg(ack)) {
+            // CompAck sent successfully — invoke callback
+            DPRINTF(RubyCHIGeneric,
+                    "EP_RNF node_id=%d: ReadShared complete for PA=0x%lx "
+                    "-- invoking callback\n",
+                    _nodeId, msg->m_addr);
+
+            auto cb = it->second.onComplete;
+            _pendingChiTxns.erase(it);
+            if (cb) cb(true);
+        } else {
+            // CompAck failed — will retry
+            it->second.needsCompAck = true;
+            scheduleEvent(Cycles(1));
+            DPRINTF(RubyCHIGeneric,
+                    "EP_RNF node_id=%d: ReadShared complete for PA=0x%lx "
+                    "but CompAck failed, will retry\n",
+                    _nodeId, msg->m_addr);
+        }
+
+        return true;
+    }
+
+    DPRINTF(RubyCHIGeneric,
+            "EP_RNF node_id=%d recvDataMsg unhandled addr=0x%lx type=%s\n",
+            _nodeId, msg->m_addr, CHIDataType_to_string(msg->m_type));
     return true;
 }
 
@@ -418,6 +545,192 @@ EPRNFController::setOuterTxnPending(uint64_t linePa, bool pending)
     }
 }
 
+// ---- Q3: CHI Request to HN-F ----
+bool
+EPRNFController::sendChiRequest(uint64_t linePa, CHIRequestType reqType)
+{
+    DPRINTF(RubyCHIGeneric,
+            "EP_RNF node_id=%d: sendChiRequest addr=0x%lx type=%s\n",
+            _nodeId, linePa, CHIRequestType_to_string(reqType));
+
+    // Create CHI request message
+    auto req = std::make_shared<CHIRequestMsg>(
+        curTick(), cacheLineSize, m_ruby_system);
+    req->m_addr = linePa;
+    req->m_type = reqType;
+    req->m_requestor = m_machineID;
+    req->m_allowRetry = true;
+    req->m_MessageSize = MessageSizeType_Control;
+
+    // Find HN-F MachineID via address-based routing
+    // downstream_destinations is set via Python config to include
+    // the local HN-F controller, so mapAddressToDownstreamMachine
+    // returns the HN-F's MachineID for addresses it manages.
+    MachineID hnfId = mapAddressToDownstreamMachine(linePa);
+    req->m_Destination.clear();
+    req->m_Destination.add(hnfId);
+
+    // Send on reqOut → HN-F's reqIn
+    bool sent = sendRequestMsg(req);
+    if (!sent) {
+        warn("EP_RNF node_id=%d: sendChiRequest failed for addr=0x%lx "
+             "(reqOut full)\n", _nodeId, linePa);
+    }
+
+    DPRINTF(RubyCHIGeneric,
+            "EP_RNF node_id=%d: sendChiRequest addr=0x%lx type=%s "
+            "dest=(type=%d num=%d) sent=%d\n",
+            _nodeId, linePa, CHIRequestType_to_string(reqType),
+            hnfId.getType(), hnfId.getNum(), sent);
+
+    return sent;
+}
+
+void
+EPRNFController::sendCompAck(uint64_t linePa, MachineID dest)
+{
+    DPRINTF(RubyCHIGeneric,
+            "EP_RNF node_id=%d: sendCompAck addr=0x%lx\n",
+            _nodeId, linePa);
+
+    NetDest destNet(m_ruby_system);
+    destNet.add(dest);
+    auto ack = std::make_shared<CHIResponseMsg>(
+        curTick(), cacheLineSize, m_ruby_system,
+        linePa, CHIResponseType_CompAck,
+        m_machineID, destNet,
+        false, false, 0, 0, MessageSizeType_Control);
+
+    if (!sendResponseMsg(ack)) {
+        warn("EP_RNF node_id=%d: sendCompAck failed for addr=0x%lx "
+             "(rspOut full)\n", _nodeId, linePa);
+    }
+}
+
+void
+EPRNFController::retryPendingCompAcks()
+{
+    bool needRetry = false;
+    for (auto it = _pendingChiTxns.begin();
+         it != _pendingChiTxns.end(); ) {
+        if (!it->second.needsCompAck) {
+            ++it;
+            continue;
+        }
+
+        // Try to send pending CompAck
+        NetDest destNet(m_ruby_system);
+        destNet.add(it->second.hnfDest);
+        auto ack = std::make_shared<CHIResponseMsg>(
+            curTick(), cacheLineSize, m_ruby_system,
+            it->second.linePa, CHIResponseType_CompAck,
+            m_machineID, destNet,
+            false, false, 0, 0, MessageSizeType_Control);
+
+        if (sendResponseMsg(ack)) {
+            // CompAck sent — invoke callback
+            DPRINTF(RubyCHIGeneric,
+                    "EP_RNF node_id=%d: retryPendingCompAcks "
+                    "succeeded for PA=0x%lx -- invoking callback\n",
+                    _nodeId, it->second.linePa);
+
+            auto cb = it->second.onComplete;
+            auto eraseIt = it;
+            ++it;
+            _pendingChiTxns.erase(eraseIt);
+            if (cb) cb(true);
+        } else {
+            needRetry = true;
+            ++it;
+        }
+    }
+
+    if (needRetry) {
+        scheduleEvent(Cycles(1));
+    }
+}
+
+void
+EPRNFController::startReadShared(uint64_t linePa,
+                                 std::function<void(bool)> onComplete)
+{
+    DPRINTF(RubyCHIGeneric,
+            "EP_RNF node_id=%d: startReadShared addr=0x%lx\n",
+            _nodeId, linePa);
+
+    // Check for duplicate pending transaction on this line
+    if (_pendingChiTxns.find(linePa) != _pendingChiTxns.end()) {
+        DPRINTF(RubyCHIGeneric,
+                "EP_RNF node_id=%d: startReadShared addr=0x%lx "
+                "already has pending txn\n",
+                _nodeId, linePa);
+        // Caller must ensure no overlap; reject gracefully
+        if (onComplete) onComplete(false);
+        return;
+    }
+
+    // Create pending transaction entry
+    PendingChiTxn txn;
+    txn.linePa = linePa;
+    txn.type = PendingChiTxn::TXN_READSHARED;
+    txn.completed = false;
+    txn.startTick = curTick();
+    txn.onComplete = onComplete;
+    _pendingChiTxns[linePa] = txn;
+
+    // Send ReadShared to HN-F via reqOut
+    bool sent = sendChiRequest(linePa, CHIRequestType_ReadShared);
+    if (!sent) {
+        // Send failed — clean up pending txn and notify caller
+        _pendingChiTxns.erase(linePa);
+        DPRINTF(RubyCHIGeneric,
+                "EP_RNF node_id=%d: startReadShared addr=0x%lx "
+                "send failed, notifying caller\n",
+                _nodeId, linePa);
+        if (onComplete) onComplete(false);
+    }
+}
+
+void
+EPRNFController::startCleanUnique(uint64_t linePa,
+                                  std::function<void(bool)> onComplete)
+{
+    DPRINTF(RubyCHIGeneric,
+            "EP_RNF node_id=%d: startCleanUnique addr=0x%lx\n",
+            _nodeId, linePa);
+
+    // Check for duplicate pending transaction on this line
+    if (_pendingChiTxns.find(linePa) != _pendingChiTxns.end()) {
+        DPRINTF(RubyCHIGeneric,
+                "EP_RNF node_id=%d: startCleanUnique addr=0x%lx "
+                "already has pending txn\n",
+                _nodeId, linePa);
+        if (onComplete) onComplete(false);
+        return;
+    }
+
+    // Create pending transaction entry
+    PendingChiTxn txn;
+    txn.linePa = linePa;
+    txn.type = PendingChiTxn::TXN_CLEANUNIQUE;
+    txn.completed = false;
+    txn.startTick = curTick();
+    txn.onComplete = onComplete;
+    _pendingChiTxns[linePa] = txn;
+
+    // Send CleanUnique to HN-F via reqOut
+    bool sent = sendChiRequest(linePa, CHIRequestType_CleanUnique);
+    if (!sent) {
+        // Send failed — clean up pending txn and notify caller
+        _pendingChiTxns.erase(linePa);
+        DPRINTF(RubyCHIGeneric,
+                "EP_RNF node_id=%d: startCleanUnique addr=0x%lx "
+                "send failed, notifying caller\n",
+                _nodeId, linePa);
+        if (onComplete) onComplete(false);
+    }
+}
+
 // ---- Q2: Local Snoop for Cross-Node Invalidation ----
 void
 EPRNFController::sendLocalSnoop(uint64_t linePa, CHIRequestType snoopType)
@@ -432,6 +745,7 @@ EPRNFController::sendLocalSnoop(uint64_t linePa, CHIRequestType snoopType)
     snp->m_addr = linePa;
     snp->m_type = snoopType;
     snp->m_requestor = m_machineID;
+    snp->m_allowRetry = false;
 
     // Broadcast to all Cache-type machines on the CHI network.
     // This ensures the snoop reaches L1/L2 caches which will

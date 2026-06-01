@@ -1,7 +1,10 @@
 #ifndef __MEM_RUBY_PROTOCOL_CHI_EP_EPRNFCONTROLLER_HH__
 #define __MEM_RUBY_PROTOCOL_CHI_EP_EPRNFCONTROLLER_HH__
 
+#include <functional>
 #include <iostream>
+#include <map>
+#include <queue>
 
 #include "mem/ruby/network/MessageBuffer.hh"
 #include "mem/ruby/protocol/AccessPermission.hh"
@@ -223,21 +226,68 @@ class EPRNFController : public EPController
      */
     void setOuterTxnPending(uint64_t linePa, bool pending);
 
-    // ---- Q2: Local Snoop for Cross-Node Invalidation ----
+    // ---- Q2 (deprecated): Local Snoop for Cross-Node Invalidation ----
     /**
-     * Send a CHI snoop request to local L1/L2 caches to invalidate
-     * a cache line.  Called by EPBackend::handleInvalidationRequest()
-     * when a home UBCC requests invalidation of a shared line.
-     *
-     * The snoop is broadcast to all Cache-type controllers on the
-     * CHI network (including L1/L2 and itself).  Each receiving
-     * cache controller processes the snoop according to the CHI
-     * state machine (e.g., invalidates the line and sends SnpResp).
-     *
-     * @param linePa    Physical address of the cache line
-     * @param snoopType CHI snoop request type (typically SnpCleanInvalid)
+     * Legacy: broadcast SnpCleanInvalid to all Cache-type controllers.
+     * Replaced by Q3 `startCleanUnique` which sends CleanUnique to HN-F
+     * for native snoop generation.  Kept as fallback for backward compat
+     * when EP-RNF has no HN-F downstream (unlikely in normal config).
      */
     void sendLocalSnoop(uint64_t linePa, CHI::CHIRequestType snoopType);
+
+    // ---- Q3: CHI Request-Based Snoop to HN-F ----
+    /**
+     * Pending CHI transaction context.  Tracks an in-flight request
+     * sent to HN-F (ReadShared for recall, CleanUnique for invalidation).
+     * When the HN-F response (CompData or Comp_UC) arrives, the
+     * callback is invoked and the transaction is removed from the map.
+     */
+    struct PendingChiTxn {
+        uint64_t linePa;
+        enum Type { TXN_READSHARED, TXN_CLEANUNIQUE } type;
+        bool completed;
+        /** True if the HN-F response (CompData/Comp_UC) has been received
+         *  but CompAck has not yet been successfully sent. */
+        bool needsCompAck;
+        /** The HN-F MachineID to send CompAck to. */
+        MachineID hnfDest;
+        Tick startTick;
+        std::function<void(bool)> onComplete;
+
+        PendingChiTxn()
+            : linePa(0), type(TXN_READSHARED), completed(false),
+              needsCompAck(false), startTick(0) {}
+    };
+
+    /**
+     * Initiate a ReadShared to the local HN-F.
+     * HN-F processes natively — if the line has a dirty owner, HN-F
+     * sends SnpShared to that owner (downgrade UD→SC, collect data),
+     * then returns CompData to EP-RNF.  If no owner exists, HN-F
+     * serves from L3 or fetches from SNF.
+     *
+     * On CompData receipt, sendCompAck() is called automatically and
+     * onComplete is invoked.
+     *
+     * @param linePa     Physical address in local PA view
+     * @param onComplete Called when the CHI transaction completes
+     */
+    void startReadShared(uint64_t linePa,
+                         std::function<void(bool)> onComplete);
+
+    /**
+     * Initiate a CleanUnique to the local HN-F.
+     * HN-F processes natively — if sharers exist, it sends
+     * SnpCleanInvalid to them, then returns Comp_UC to EP-RNF.
+     *
+     * On Comp_UC receipt, sendCompAck() is called automatically and
+     * onComplete is invoked.
+     *
+     * @param linePa     Physical address in local PA view
+     * @param onComplete Called when the CHI transaction completes
+     */
+    void startCleanUnique(uint64_t linePa,
+                          std::function<void(bool)> onComplete);
 
   protected:
     bool recvRequestMsg(const CHIRequestMsg *msg) override;
@@ -248,6 +298,24 @@ class EPRNFController : public EPController
     EPBackend *_backend = nullptr;
 
   private:
+    // ---- Q3: CHI Request to HN-F ----
+    /** Send a CHI request (ReadShared/CleanUnique) to HN-F via reqOut.
+     *  @return true if the message was enqueued successfully. */
+    bool sendChiRequest(uint64_t linePa, CHI::CHIRequestType reqType);
+
+    /** Send CompAck to HN-F via rspOut after receiving a response. */
+    void sendCompAck(uint64_t linePa, MachineID dest);
+
+    /** Per-cacheline pending CHI transaction tracking. */
+    std::map<uint64_t, PendingChiTxn> _pendingChiTxns;
+
+    /** Retry sending CompAck for pending CHI transactions
+     *  whose CompAck couldn't be sent due to rspOut full. */
+    void retryPendingCompAcks();
+
+    /** Count of Cache-type controllers (for reference). */
+    int _numCacheControllers;
+
     // ---- M6: Pending HN response tracking ----
     // Map from line PA to pending HN response context.
     std::map<uint64_t, PendingHnResponse> _pendingHnResponses;

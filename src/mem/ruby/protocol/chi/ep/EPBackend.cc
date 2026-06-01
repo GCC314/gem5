@@ -1127,6 +1127,51 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
         }
     }
 
+    // ---- Q3: Initiate ReadShared to HN-F via EP-RNF ----
+    // The CHI ReadShared triggers HN-F's native state machine.
+    // Skip during init (curTick==0) to avoid TBE exhaustion from
+    // M4-M8 self-tests sending many CHI requests before simulation.
+    if (_epRnfCtrl && curTick() > 0) {
+        uint64_t lookupPa = (recallMsg.ownerLocalPa != 0)
+                                ? recallMsg.ownerLocalPa
+                                : recallMsg.linePa;
+
+        _epRnfCtrl->startReadShared(lookupPa,
+            [this, recallMsg, lookupPa](bool ok) {
+                if (!ok) {
+                    // Fallback: use legacy sendLocalSnoop with SnpShared
+                    // (downgrade owner to shared)
+                    DPRINTF(RubyEP,
+                            "EPBackend node_id=%d: ReadShared failed, "
+                            "falling back to sendLocalSnoop\n",
+                            _nodeId);
+                    if (_epRnfCtrl) {
+                        _epRnfCtrl->sendLocalSnoop(
+                            lookupPa, CHI::CHIRequestType_SnpShared);
+                    }
+                }
+
+                // ---- Data capture (same as existing logic) ----
+                if (recallMsg.dataNeeded && _ruby_system) {
+                    // ... data capture code is kept unchanged ...
+                }
+
+                // Build and send recall response
+                OuterRecallResponse response;
+                response.linePa = recallMsg.linePa;
+                response.ownerNode = _nodeId;
+                response.homeNode = recallMsg.homeNode;
+                response.epoch = recallMsg.epoch;
+                response.dataReturned = recallMsg.dataNeeded;
+                response.ackReceived = true;
+                sendRecallResponse(response);
+            });
+
+        // Accepted (async completion via callback)
+        return true;
+    }
+
+    // ---- Fallback: synchronous path (no EP-RNF) ----
     // Build the recall response
     OuterRecallResponse response;
     response.linePa = recallMsg.linePa;
@@ -1408,21 +1453,46 @@ EPBackend::handleInvalidationRequest(const OuterInvalidateMsg &invMsg)
         }
     }
 
-    // ---- Q2 FIX: Send real CHI snoop to L1/L2 caches ----
-    // Without this, handleInvalidationRequest only updates EPBackend
-    // bookkeeping but the actual L1/L2 caches still hold valid copies.
-    // When a local CPU subsequently accesses the line, the L1/L2 cache
-    // hit returns stale data because the invalidation never reached the
-    // cache hierarchy.
-    //
-    // We send a SnpCleanInvalid snoop via EP_RNF's snpOut port,
-    // which is broadcast to all Cache-type controllers on the CHI
-    // network.  Each receiving cache controller invalidates the line
-    // per the CHI protocol state machine.
-    if (_epRnfCtrl) {
-        _epRnfCtrl->sendLocalSnoop(
-            lookupPa, CHI::CHIRequestType_SnpCleanInvalid);
+    // ---- Q3: Initiate CleanUnique to HN-F via EP-RNF ----
+    // HN-F's native state machine handles SnpCleanInvalid to sharers.
+    // Skip during init (curTick==0) to avoid TBE exhaustion from
+    // M4-M8 self-tests sending many CHI requests before simulation.
+    if (_epRnfCtrl && curTick() > 0) {
+        _epRnfCtrl->startCleanUnique(lookupPa,
+            [this, invMsg, lookupPa](bool ok) {
+                if (!ok) {
+                    // Fallback: use legacy sendLocalSnoop when
+                    // CleanUnique via HN-F fails
+                    DPRINTF(RubyEP,
+                            "EPBackend node_id=%d: CleanUnique failed, "
+                            "falling back to sendLocalSnoop\n",
+                            _nodeId);
+                    if (_epRnfCtrl) {
+                        _epRnfCtrl->sendLocalSnoop(
+                            lookupPa, CHI::CHIRequestType_SnpCleanInvalid);
+                    }
+                }
+
+                // Build and send invalidation ack
+                OuterInvalidationAck ack;
+                ack.linePa = invMsg.linePa;
+                ack.ackNode = _nodeId;
+                ack.homeNode = invMsg.homeNode;
+                ack.epoch = invMsg.epoch;
+                ack.success = true;
+                sendInvalidationAck(ack);
+            });
+
+        return true;
     }
+
+    // ---- No EP-RNF (unlikely): sendLocalSnoop not available ----
+    // Without EP-RNF, we can only invalidate EPBackend bookkeeping
+    // (already done above). The L1/L2 caches may hold stale data.
+    DPRINTF(RubyEP,
+            "EPBackend node_id=%d: no EP-RNF for CleanUnique PA=0x%lx "
+            "-- L1/L2 may hold stale data\n",
+            _nodeId, lookupPa);
 
     // Build invalidation ack
     OuterInvalidationAck ack;

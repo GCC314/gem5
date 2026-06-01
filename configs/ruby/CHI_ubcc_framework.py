@@ -23,6 +23,15 @@ def _make_hnf(ruby_system, addr_ranges, llcache_type, node_id):
     hnf_cache = llcache_type()
     hnf_cntrl = chi_defs.CHI_HNFController(
         ruby_system, hnf_cache, NULL, addr_ranges)
+    # Q3: Increase TBE counts to handle additional CHI requests
+    # from EP-RNF (ReadShared for recall, CleanUnique for invalidation).
+    # CHI_HNFController.__init__ defaults to 32/1/1/1; we need more.
+    hnf_cntrl.number_of_TBEs = 4096
+    hnf_cntrl.number_of_repl_TBEs = 4096
+    hnf_cntrl.number_of_snoop_TBEs = 4096
+    hnf_cntrl.number_of_DVM_TBEs = 4096
+    hnf_cntrl.number_of_DVM_snoop_TBEs = 4096
+    print(f"[Q3 DEBUG] HN-F node{node_id}: number_of_TBEs = {hnf_cntrl.number_of_TBEs}")
     wrapper = HNNodeWrapper(ruby_system)
     wrapper.setController(hnf_cntrl)
     wrapper.connectController(hnf_cntrl)
@@ -223,20 +232,7 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
         network_nodes.append(nd['ep_snf_wrapper'])
         all_cntrls.append(nd['ep_snf_cntrl'])
 
-        nd['ep_rnf_cntrl'] = EPRNFController(
-            version=chi_defs.Versions.getVersion(chi_defs.CHI_Cache_Controller),
-            ruby_system=ruby_system, node_id=node_id,
-            data_channel_size=params.data_width,
-            ep_backend=ep_backend,
-            addr_ranges=[NodeConfig.dsm_range_for(
-                node_id, seg_size, cfg.phy_base)])
-        nd['ep_rnf_wrapper'] = _make_ep_node(
-            ruby_system, nd['ep_rnf_cntrl'], node_id)
-        setattr(ruby_system, f"ep_rnf_node{node_id}", nd['ep_rnf_wrapper'])
-        network_nodes.append(nd['ep_rnf_wrapper'])
-        all_cntrls.append(nd['ep_rnf_cntrl'])
-
-        # ── Create HN-F AFTER SNFs ─────────────────────────────────
+        # ── Create HN-F BEFORE EP-RNF (needed for downstream_destinations) ──
         hnf_ranges = [
             cfg.local_private_range,
             cfg.ubcc_exclusive_range,
@@ -250,6 +246,21 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
         setattr(ruby_system, f"hnf_node{node_id}", nd['hnf_wrapper'])
         network_nodes.append(nd['hnf_wrapper'])
         all_cntrls.append(nd['hnf_cntrl'])
+
+        nd['ep_rnf_cntrl'] = EPRNFController(
+            version=chi_defs.Versions.getVersion(chi_defs.CHI_Cache_Controller),
+            ruby_system=ruby_system, node_id=node_id,
+            data_channel_size=params.data_width,
+            ep_backend=ep_backend,
+            addr_ranges=[NodeConfig.dsm_range_for(
+                node_id, seg_size, cfg.phy_base)],
+            downstream_destinations=[nd['hnf_cntrl']])
+        nd['ep_rnf_wrapper'] = _make_ep_node(
+            ruby_system, nd['ep_rnf_cntrl'], node_id)
+        setattr(ruby_system, f"ep_rnf_node{node_id}", nd['ep_rnf_wrapper'])
+        network_nodes.append(nd['ep_rnf_wrapper'])
+        all_cntrls.append(nd['ep_rnf_cntrl'])
+
 
         nd['clusters'] = []
         for cluster_i in range(DEFAULT_D):
