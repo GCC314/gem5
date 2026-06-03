@@ -226,16 +226,11 @@ class EPRNFController : public EPController
      */
     void setOuterTxnPending(uint64_t linePa, bool pending);
 
-    // ---- Q2 (deprecated): Local Snoop for Cross-Node Invalidation ----
-    /**
-     * Legacy: broadcast SnpCleanInvalid to all Cache-type controllers.
-     * Replaced by Q3 `startCleanUnique` which sends CleanUnique to HN-F
-     * for native snoop generation.  Kept as fallback for backward compat
-     * when EP-RNF has no HN-F downstream (unlikely in normal config).
-     */
-    void sendLocalSnoop(uint64_t linePa, CHI::CHIRequestType snoopType);
+    // ---- Q2 (deprecated): removed — RN-F should not send snoops ----
+    // Snoops are HN-F's responsibility per CHI spec.  Recall/invalidation
+    // must go through proper CHI Request path: EP-RNF → HN-F → HN-F handles snooping.
 
-    // ---- Q3: CHI Request-Based Snoop to HN-F ----
+    // ---- Q3: CHI Request-Based Coherence to HN-F ----
     /**
      * Pending CHI transaction context.  Tracks an in-flight request
      * sent to HN-F (ReadShared for recall, CleanUnique for invalidation).
@@ -244,7 +239,7 @@ class EPRNFController : public EPController
      */
     struct PendingChiTxn {
         uint64_t linePa;
-        enum Type { TXN_READSHARED, TXN_CLEANUNIQUE } type;
+        enum Type { TXN_READSHARED, TXN_CLEANUNIQUE, TXN_READONCE } type;
         bool completed;
         /** True if the HN-F response (CompData/Comp_UC) has been received
          *  but CompAck has not yet been successfully sent. */
@@ -260,20 +255,13 @@ class EPRNFController : public EPController
     };
 
     /**
-     * Initiate a ReadShared to the local HN-F.
-     * HN-F processes natively — if the line has a dirty owner, HN-F
-     * sends SnpShared to that owner (downgrade UD→SC, collect data),
-     * then returns CompData to EP-RNF.  If no owner exists, HN-F
-     * serves from L3 or fetches from SNF.
-     *
-     * On CompData receipt, sendCompAck() is called automatically and
-     * onComplete is invoked.
-     *
-     * @param linePa     Physical address in local PA view
-     * @param onComplete Called when the CHI transaction completes
+     * Initiate a ReadOnce to the local HN-F.
+     * HN-F processes without owner-tracking or snoop generation —
+     * just fetches data from SNF and returns CompData.
+     * Used for recall where we only need the data, not coherence tracking.
      */
-    void startReadShared(uint64_t linePa,
-                         std::function<void(bool)> onComplete);
+    void startReadOnce(uint64_t linePa,
+                       std::function<void(bool)> onComplete);
 
     /**
      * Initiate a CleanUnique to the local HN-F.
@@ -315,6 +303,9 @@ class EPRNFController : public EPController
 
     /** Count of Cache-type controllers (for reference). */
     int _numCacheControllers;
+
+    /** HN-F controller version number (set from config). */
+    int _hnfVersion;
 
     // ---- M6: Pending HN response tracking ----
     // Map from line PA to pending HN response context.

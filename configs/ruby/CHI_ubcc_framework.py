@@ -23,15 +23,12 @@ def _make_hnf(ruby_system, addr_ranges, llcache_type, node_id):
     hnf_cache = llcache_type()
     hnf_cntrl = chi_defs.CHI_HNFController(
         ruby_system, hnf_cache, NULL, addr_ranges)
-    # Q3: Increase TBE counts to handle additional CHI requests
-    # from EP-RNF (ReadShared for recall, CleanUnique for invalidation).
-    # CHI_HNFController.__init__ defaults to 32/1/1/1; we need more.
+    print(f"[Q3 DEBUG] HN-F node{node_id}: machineID=Cache.{hnf_cntrl.version}")
     hnf_cntrl.number_of_TBEs = 4096
     hnf_cntrl.number_of_repl_TBEs = 4096
     hnf_cntrl.number_of_snoop_TBEs = 4096
     hnf_cntrl.number_of_DVM_TBEs = 4096
     hnf_cntrl.number_of_DVM_snoop_TBEs = 4096
-    print(f"[Q3 DEBUG] HN-F node{node_id}: number_of_TBEs = {hnf_cntrl.number_of_TBEs}")
     wrapper = HNNodeWrapper(ruby_system)
     wrapper.setController(hnf_cntrl)
     wrapper.connectController(hnf_cntrl)
@@ -252,6 +249,7 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
             ruby_system=ruby_system, node_id=node_id,
             data_channel_size=params.data_width,
             ep_backend=ep_backend,
+            hnf_version=nd['hnf_cntrl'].version,
             addr_ranges=[NodeConfig.dsm_range_for(
                 node_id, seg_size, cfg.phy_base)],
             downstream_destinations=[nd['hnf_cntrl']])

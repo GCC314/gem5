@@ -97,6 +97,14 @@ class UBCCController
      */
     bool isLineBusy(uint64_t line_pa) const;
 
+    // ---- Q3: Grant handshake completion callback ----
+    /**
+     * Called by the requester's EPBackend after the CHI CompData/CompAck
+     * handshake completes.  This releases the grantInProgress flag so
+     * subsequent requests for the same line can proceed.
+     */
+    void grantHandshakeComplete(uint64_t line_pa);
+
     // ---- M7: Writeback / Evict ----
     /**
      * Process a GlobalWriteback from a dirty owner.
@@ -281,6 +289,8 @@ class UBCCController
         uint64_t epoch;
         // Pending operation type (0=none, 1=recall-in-progress)
         int pendingOp;
+        // ---- Q3: Tick when grant was issued (for handshake delay) ----
+        Tick grantTick;
         // ---- M6: Pending recall context ----
         // Node ID of the requester waiting for recall completion (-1 if none)
         int pendingRequester;
@@ -302,6 +312,7 @@ class UBCCController
         DirEntry() : lineAddr(0), state(MESIState::G_I),
                      sharersMask(0), ownerNode(-1),
                      dirty(false), epoch(0), pendingOp(0),
+                     grantTick(0),
                      pendingRequester(-1), pendingRecallTarget(-1),
                      pendingReqType(UBCC_OuterReqType::GlobalReadShared),
                      pendingWriteIntent(false),

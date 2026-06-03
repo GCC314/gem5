@@ -546,12 +546,14 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
     populateGrantData(line_pa, homePa, homeNode);
 
     // ---- M6: Clear outer txn pending and signal completion ----
-    // The outer transaction is now complete; notify local EP_RNF
-    // so any delayed HN snoop responses can be sent.
     if (_epRnfCtrl) {
         _epRnfCtrl->setOuterTxnPending(line_pa, false);
         _epRnfCtrl->signalOuterTxnComplete(line_pa);
     }
+
+    // Q3: pendingOp=3 cleared by timer in UBCC, NOT by callback.
+    // grantHandshakeComplete removed — it was clearing pendingOp
+    // immediately, defeating the serialization purpose.
 
     return static_cast<int>(result);
 
@@ -1127,52 +1129,30 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
         }
     }
 
-    // ---- Q3: Initiate ReadShared to HN-F via EP-RNF ----
-    // The CHI ReadShared triggers HN-F's native state machine.
-    // Skip during init (curTick==0) to avoid TBE exhaustion from
-    // M4-M8 self-tests sending many CHI requests before simulation.
-    if (_epRnfCtrl && curTick() > 0) {
-        uint64_t lookupPa = (recallMsg.ownerLocalPa != 0)
-                                ? recallMsg.ownerLocalPa
-                                : recallMsg.linePa;
-
-        _epRnfCtrl->startReadShared(lookupPa,
-            [this, recallMsg, lookupPa](bool ok) {
-                if (!ok) {
-                    // Fallback: use legacy sendLocalSnoop with SnpShared
-                    // (downgrade owner to shared)
-                    DPRINTF(RubyEP,
-                            "EPBackend node_id=%d: ReadShared failed, "
-                            "falling back to sendLocalSnoop\n",
-                            _nodeId);
-                    if (_epRnfCtrl) {
-                        _epRnfCtrl->sendLocalSnoop(
-                            lookupPa, CHI::CHIRequestType_SnpShared);
-                    }
-                }
-
-                // ---- Data capture (same as existing logic) ----
-                if (recallMsg.dataNeeded && _ruby_system) {
-                    // ... data capture code is kept unchanged ...
-                }
-
-                // Build and send recall response
-                OuterRecallResponse response;
-                response.linePa = recallMsg.linePa;
-                response.ownerNode = _nodeId;
-                response.homeNode = recallMsg.homeNode;
-                response.epoch = recallMsg.epoch;
-                response.dataReturned = recallMsg.dataNeeded;
-                response.ackReceived = true;
-                sendRecallResponse(response);
+    // ---- Q3: ReadOnce via HN-F for recall ----
+    // ReadOnce fetches data from SNF without triggering SnpUniqueFwd
+    // to L2, avoiding protocol conflicts. HN-F handles ReadOnce as a
+    // simple miss → ReadNoSnp → return data.
+    uint64_t r_lookupPa = (recallMsg.ownerLocalPa != 0)
+                              ? recallMsg.ownerLocalPa
+                              : recallMsg.linePa;
+    if (_epRnfCtrl) {
+        _epRnfCtrl->startReadOnce(r_lookupPa,
+            [this, recallMsg](bool ok) {
+                // Async completion: send recall response after ReadOnce done
+                OuterRecallResponse resp;
+                resp.linePa = recallMsg.linePa;
+                resp.ownerNode = _nodeId;
+                resp.homeNode = recallMsg.homeNode;
+                resp.epoch = recallMsg.epoch;
+                resp.dataReturned = recallMsg.dataNeeded;
+                resp.ackReceived = true;
+                sendRecallResponse(resp);
             });
-
-        // Accepted (async completion via callback)
         return true;
     }
 
-    // ---- Fallback: synchronous path (no EP-RNF) ----
-    // Build the recall response
+    // Build and send recall response
     OuterRecallResponse response;
     response.linePa = recallMsg.linePa;
     response.ownerNode = _nodeId;
@@ -1453,27 +1433,13 @@ EPBackend::handleInvalidationRequest(const OuterInvalidateMsg &invMsg)
         }
     }
 
-    // ---- Q3: Initiate CleanUnique to HN-F via EP-RNF ----
-    // HN-F's native state machine handles SnpCleanInvalid to sharers.
-    // Skip during init (curTick==0) to avoid TBE exhaustion from
-    // M4-M8 self-tests sending many CHI requests before simulation.
-    if (_epRnfCtrl && curTick() > 0) {
+    // ---- Q3: CleanUnique via HN-F for invalidation ----
+    // CleanUnique makes HN-F check directory and send SnpCleanInvalid
+    // to sharers.  This is the correct CHI path: RN-F requests via
+    // reqOut, HN-F handles snooping as spec-defined.
+    if (_epRnfCtrl) {
         _epRnfCtrl->startCleanUnique(lookupPa,
-            [this, invMsg, lookupPa](bool ok) {
-                if (!ok) {
-                    // Fallback: use legacy sendLocalSnoop when
-                    // CleanUnique via HN-F fails
-                    DPRINTF(RubyEP,
-                            "EPBackend node_id=%d: CleanUnique failed, "
-                            "falling back to sendLocalSnoop\n",
-                            _nodeId);
-                    if (_epRnfCtrl) {
-                        _epRnfCtrl->sendLocalSnoop(
-                            lookupPa, CHI::CHIRequestType_SnpCleanInvalid);
-                    }
-                }
-
-                // Build and send invalidation ack
+            [this, invMsg](bool ok) {
                 OuterInvalidationAck ack;
                 ack.linePa = invMsg.linePa;
                 ack.ackNode = _nodeId;
@@ -1482,17 +1448,8 @@ EPBackend::handleInvalidationRequest(const OuterInvalidateMsg &invMsg)
                 ack.success = true;
                 sendInvalidationAck(ack);
             });
-
         return true;
     }
-
-    // ---- No EP-RNF (unlikely): sendLocalSnoop not available ----
-    // Without EP-RNF, we can only invalidate EPBackend bookkeeping
-    // (already done above). The L1/L2 caches may hold stale data.
-    DPRINTF(RubyEP,
-            "EPBackend node_id=%d: no EP-RNF for CleanUnique PA=0x%lx "
-            "-- L1/L2 may hold stale data\n",
-            _nodeId, lookupPa);
 
     // Build invalidation ack
     OuterInvalidationAck ack;

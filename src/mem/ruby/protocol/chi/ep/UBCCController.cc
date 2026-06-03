@@ -151,17 +151,30 @@ UBCCController::processOuterRequest(
     ensureDirEntry(line_pa);
     DirEntry &entry = _directory[line_pa];
 
-    // ---- M6/M8: Busy check (strict) ----
-    // If the line is already busy with an in-flight recall (pendingOp==1)
-    // or invalidation (pendingOp==2), reject ALL requests.
-    // Self-requester reentry is also a protocol violation.
+    // ---- M6/M8/Q3: Busy check ----
+    bool blocked = false;
     if (entry.pendingOp > 0) {
-        const char *opName = (entry.pendingOp == 1) ? "recall" :
-                             (entry.pendingOp == 2) ? "invalidation" : "unknown";
-        // M8: Accept reentry on same requester for line that is busy with
-        // invalidation (the requester already has the grant; this is a
-        // redundant or diagnostic access).  Everything else is fatal.
-        if (entry.pendingOp == 2 && entry.pendingRequester == requesterNode) {
+        if (entry.pendingOp == 3) {
+            if (entry.pendingRequester == requesterNode) {
+                blocked = false;
+            } else {
+                Tick elapsed = curTick() - entry.grantTick;
+                if (elapsed > 1000000000) {
+                    entry.pendingOp = 0;
+                    blocked = false;
+                } else {
+                    blocked = true;
+                }
+            }
+            if (blocked) {
+                DPRINTF(RubyEP,
+                    "UBCC node_id=%d: Q3 blocked PA=0x%lx elapsed=%lu\n",
+                    _nodeId, line_pa, curTick() - entry.grantTick);
+                if (outRecallNeeded) *outRecallNeeded = false;
+                if (outRecallOwnerNode) *outRecallOwnerNode = -1;
+                return UBCC_OuterGrantType::GlobalGrantShared;
+            }
+        } else if (entry.pendingOp == 2 && entry.pendingRequester == requesterNode) {
             // P0-2: True no-op early return.  The grant was already issued
             // when the invalidation was initiated; the requester is just
             // re-checking.  Do NOT advance epoch/state/sentinel.
@@ -196,11 +209,15 @@ UBCCController::processOuterRequest(
                 *outSentinelVisibleTick = now;
 
             return currentGrant;
+        } else if (blocked) {
+            DPRINTF(RubyEP, "UBCC node_id=%d: Q3 blocked PA=0x%lx elapsed=%lu\n",
+                    _nodeId, line_pa, curTick() - entry.grantTick);
+            return UBCC_OuterGrantType::GlobalGrantShared;
         } else {
-            fatal("UBCC node_id=%d: M6/M8 busy-check PA=0x%lx pendingOp=%d (%s) "
+            fatal("UBCC node_id=%d: M6/M8 busy-check PA=0x%lx pendingOp=%d "
                   "pendingRequester=%d pendingRecallTarget=%d "
                   "requesterNode=%d — strict rejection\n",
-                  _nodeId, line_pa, entry.pendingOp, opName,
+                  _nodeId, line_pa, entry.pendingOp,
                   entry.pendingRequester, entry.pendingRecallTarget,
                   requesterNode);
         }
@@ -433,6 +450,15 @@ UBCCController::processOuterRequest(
             _nodeId, line_pa,
             mesiStateName(prevState), mesiStateName(entry.state),
             static_cast<int>(grant), entry.ownerNode);
+
+    // ---- Q3: Mark grant CHI handshake in progress ----
+    // Only if no recall/invalidation is already in progress.
+    // Only during simulation (curTick > 0); self-tests run at tick 0.
+    if (curTick() > 0 && entry.pendingOp == 0) {
+        entry.pendingOp = 3;
+        entry.pendingRequester = requesterNode;
+        entry.grantTick = curTick();
+    }
 
     // Propagate tick values to caller
     if (outGrantVisibleTick)
@@ -1010,6 +1036,24 @@ UBCCController::processEvict(uint64_t line_pa, int evictingNode,
             entry.sharersMask, entry.ownerNode);
 
     return true;
+}
+
+// ---- Q3: Grant CHI handshake completion callback ----
+void
+UBCCController::grantHandshakeComplete(uint64_t line_pa)
+{
+    auto it = _directory.find(line_pa);
+    if (it == _directory.end())
+        return;
+
+    if (it->second.pendingOp == 3) {
+        DPRINTF(RubyEP,
+                "UBCC node_id=%d: Q3 grantHandshakeComplete PA=0x%lx "
+                "-- releasing pendingOp\n",
+                _nodeId, line_pa);
+        it->second.pendingOp = 0;
+        it->second.pendingRequester = -1;
+    }
 }
 
 } // namespace ruby
