@@ -111,19 +111,6 @@ EPBackend::wakeup()
 {
     if (_ubcc)
         _ubcc->wakeup();
-
-    // ---- Q3: Process delayed grant handshake releases ----
-    Tick now = curTick();
-    for (auto it = _grantHSPending.begin(); it != _grantHSPending.end(); ) {
-        if (now - it->second.second >= 1500) {
-            UBCCController *ubcc = UBCCController::getInstance(it->second.first);
-            if (ubcc)
-                ubcc->grantHandshakeComplete(it->first);
-            it = _grantHSPending.erase(it);
-        } else {
-            ++it;
-        }
-    }
 }
 
 bool
@@ -557,13 +544,6 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
     // Q2: Pass both requester's PA AND home node's PA.  The requester's
     // PA is where CPU timing stores write to phys_mem via hitCallback.
     populateGrantData(line_pa, homePa, homeNode);
-
-    // ---- Q3: Delayed grant handshake release ----
-    // Keep pendingOp=3 in UBCC for 1500 ticks to cover L1D CompAck timing.
-    // The SLICC CompAck handler (SC_RSC, etc.) safely consumes late arrivals.
-    if (homeNode >= 0 && curTick() > 0) {
-        _grantHSPending[homePa] = {homeNode, curTick()};
-    }
 
     // ---- M6: Clear outer txn pending and signal completion ----
     if (_epRnfCtrl) {

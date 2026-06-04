@@ -518,9 +518,6 @@ class EPBackend : public SimObject
 
     // ---- M6: Cross-Node EPBackend Routing Registry ----
     static std::map<int, EPBackend*> _backendInstances;
-
-    // ---- Q3: Grant handshake pending (homePa → {homeNode, grantTick}) ----
-    std::map<uint64_t, std::pair<int, Tick>> _grantHSPending;
 };
 
 } // namespace ruby

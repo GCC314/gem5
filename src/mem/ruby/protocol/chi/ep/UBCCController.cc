@@ -153,18 +153,17 @@ UBCCController::processOuterRequest(
 
     // ---- M6/M8/Q3: Busy check ----
     if (entry.pendingOp > 0) {
-        // Q3: grant handshake in progress — block different req for 1500 ticks
+        // Q3: grant handshake in progress — check timer
         if (entry.pendingOp == 3) {
             Tick elapsed = curTick() - entry.grantTick;
-            if (elapsed > 1500) {
-                entry.pendingOp = 0; // timer expired
-            } else if (entry.pendingRequester != requesterNode) {
-                // Different requester → return dummy grant (will be retried)
+            if (elapsed > 2000000 || entry.pendingRequester == requesterNode) {
+                entry.pendingOp = 0;
+            } else {
+                // Block different requester during handshake window
                 if (outRecallNeeded) *outRecallNeeded = false;
                 if (outRecallOwnerNode) *outRecallOwnerNode = -1;
                 return UBCC_OuterGrantType::GlobalGrantShared;
             }
-            // Same requester or timer expired → proceed
         }
         // M8: invalidation in progress, same requester reentry
         else if (entry.pendingOp == 2 && entry.pendingRequester == requesterNode) {
