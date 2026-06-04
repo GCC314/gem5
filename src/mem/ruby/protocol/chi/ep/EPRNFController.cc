@@ -653,6 +653,41 @@ EPRNFController::retryPendingCompAcks()
 }
 
 void
+EPRNFController::startReadShared(uint64_t linePa,
+                                 std::function<void(bool)> onComplete)
+{
+    DPRINTF(RubyCHIGeneric,
+            "EP_RNF node_id=%d: startReadShared addr=0x%lx\n",
+            _nodeId, linePa);
+
+    if (_pendingChiTxns.find(linePa) != _pendingChiTxns.end()) {
+        DPRINTF(RubyCHIGeneric,
+                "EP_RNF node_id=%d: startReadShared addr=0x%lx "
+                "already has pending txn\n",
+                _nodeId, linePa);
+        if (onComplete) onComplete(false);
+        return;
+    }
+
+    PendingChiTxn txn;
+    txn.linePa = linePa;
+    txn.type = PendingChiTxn::TXN_READSHARED;
+    txn.completed = false;
+    txn.startTick = curTick();
+    txn.onComplete = onComplete;
+    _pendingChiTxns[linePa] = txn;
+
+    bool sent = sendChiRequest(linePa, CHIRequestType_ReadShared);
+    if (!sent) {
+        _pendingChiTxns.erase(linePa);
+        DPRINTF(RubyCHIGeneric,
+                "EP_RNF node_id=%d: startReadShared addr=0x%lx "
+                "send failed\n", _nodeId, linePa);
+        if (onComplete) onComplete(false);
+    }
+}
+
+void
 EPRNFController::startReadOnce(uint64_t linePa,
                                std::function<void(bool)> onComplete)
 {

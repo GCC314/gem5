@@ -24,6 +24,9 @@ def _make_hnf(ruby_system, addr_ranges, llcache_type, node_id):
     hnf_cntrl = chi_defs.CHI_HNFController(
         ruby_system, hnf_cache, NULL, addr_ranges)
     print(f"[Q3 DEBUG] HN-F node{node_id}: machineID=Cache.{hnf_cntrl.version}")
+    # Q3: Keep DCT enabled — non-DCT path asserts dataValid.
+    # DMT disabled to avoid early TBE deallocation timing issues.
+    hnf_cntrl.enable_DMT = False
     hnf_cntrl.number_of_TBEs = 4096
     hnf_cntrl.number_of_repl_TBEs = 4096
     hnf_cntrl.number_of_snoop_TBEs = 4096

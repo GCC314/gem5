@@ -87,6 +87,8 @@ in_port(rspInPort, CHIResponseMsg, rspIn, rank=10,
                 nullCacheEntry(), tbe);
       } else {
         TBE tbe := getCurrentActiveTBE(in_msg.addr);
+        DPRINTF(RubySlicc, "RSPIN: %s type=%s addr=%#x has_tbe=%d\n",
+                machineID, in_msg.type, in_msg.addr, is_valid(tbe));
         trigger(respToEvent(in_msg.type, tbe), in_msg.addr,
                 getCacheEntry(in_msg.addr), tbe);
       }

@@ -1543,12 +1543,23 @@ transition({BUSY_INTR,BUSY_BLKD}, DoRetry_Hazard) {
   Pop_RetryTriggerQueue;
 }
 
-// waiting for completion ack
+ // waiting for completion ack
 transition({BUSY_BLKD,BUSY_INTR}, CompAck) {
   Receive_ReqResp;
   UpdateDirState_FromReqResp;
   Pop_RespInQueue;
   ProcessNextState;
+}
+
+// Q3: Handle unexpected CompAck during compound states that
+// HN-F's SnpSharedFwd leaves the L2 in (SC_RSC, UD_RU).
+// CompAck from L1D arrives when no TBE is active — just consume it.
+// L1D CompAck may arrive when L2 has no active TBE (e.g., after
+// ReadUnique TBE freed, SnpSharedFwd processing, etc.).
+// Safely consume it — no TBE to process.
+transition({SC_RSC,UD_RU,UC_RU,RSC,RUSC,SD_RSC,UD_RSC,UD_RSD,SD_RSD},
+           CompAck) {
+  Pop_RespInQueue;
 }
 
 transition(BUSY_BLKD,

@@ -751,8 +751,11 @@ action(Finish_MakeReadUnique, desc="") {
 action(Initiate_CleanUnique, desc="") {
   tbe.actions.push(Event:ReadMissPipe); // TODO need another latency pipe ??
 
-  // invalidates everyone except requestor
-  if (tbe.dir_sharers.count() > 1) {
+  // invalidates everyone except requestor.
+  // CPU RN-F: requestor is in sharers → need count > 1 (others exist).
+  // EP-RNF: requestor is NOT in sharers → need count > 0 (anyone exists).
+  if (tbe.dir_sharers.count() > 1 ||
+      (tbe.dir_sharers.count() > 0 && !tbe.dir_sharers.isElement(tbe.requestor))) {
     tbe.actions.push(Event:SendSnpCleanInvalidNoReq);
   }
   // auto upgrade if HN
@@ -3221,6 +3224,8 @@ action(Send_CompUD_PD, desc="") {
 
 action(Send_CompAck, desc="") {
   assert(is_valid(tbe));
+  DPRINTF(RubySlicc, "COMPACK: %s addr=%#x txnId=%d reqType=%s\n",
+          machineID, address, tbe.txnId, tbe.reqType);
   enqueue(rspOutPort, CHIResponseMsg, response_latency) {
     out_msg.addr := address;
     out_msg.type := CHIResponseType:CompAck;

@@ -152,32 +152,22 @@ UBCCController::processOuterRequest(
     DirEntry &entry = _directory[line_pa];
 
     // ---- M6/M8/Q3: Busy check ----
-    bool blocked = false;
     if (entry.pendingOp > 0) {
+        // Q3: grant handshake in progress — block different req for 1500 ticks
         if (entry.pendingOp == 3) {
-            if (entry.pendingRequester == requesterNode) {
-                blocked = false;
-            } else {
-                Tick elapsed = curTick() - entry.grantTick;
-                if (elapsed > 1000000000) {
-                    entry.pendingOp = 0;
-                    blocked = false;
-                } else {
-                    blocked = true;
-                }
-            }
-            if (blocked) {
-                DPRINTF(RubyEP,
-                    "UBCC node_id=%d: Q3 blocked PA=0x%lx elapsed=%lu\n",
-                    _nodeId, line_pa, curTick() - entry.grantTick);
+            Tick elapsed = curTick() - entry.grantTick;
+            if (elapsed > 1500) {
+                entry.pendingOp = 0; // timer expired
+            } else if (entry.pendingRequester != requesterNode) {
+                // Different requester → return dummy grant (will be retried)
                 if (outRecallNeeded) *outRecallNeeded = false;
                 if (outRecallOwnerNode) *outRecallOwnerNode = -1;
                 return UBCC_OuterGrantType::GlobalGrantShared;
             }
-        } else if (entry.pendingOp == 2 && entry.pendingRequester == requesterNode) {
-            // P0-2: True no-op early return.  The grant was already issued
-            // when the invalidation was initiated; the requester is just
-            // re-checking.  Do NOT advance epoch/state/sentinel.
+            // Same requester or timer expired → proceed
+        }
+        // M8: invalidation in progress, same requester reentry
+        else if (entry.pendingOp == 2 && entry.pendingRequester == requesterNode) {
             DPRINTF(RubyEP,
                     "UBCC node_id=%d: M8 reentry no-op PA=0x%lx "
                     "pendingOp=invalidation requesterNode=%d matches — "
@@ -197,24 +187,19 @@ UBCCController::processOuterRequest(
                     currentGrant = UBCC_OuterGrantType::GlobalGrantShared;
                     break;
                 default:
-                    // G_I with pendingOp==2 is impossible
                     currentGrant = UBCC_OuterGrantType::GlobalGrantShared;
                     break;
             }
 
             Tick now = curTick();
-            if (outGrantVisibleTick)
-                *outGrantVisibleTick = now;
-            if (outSentinelVisibleTick)
-                *outSentinelVisibleTick = now;
+            if (outGrantVisibleTick) *outGrantVisibleTick = now;
+            if (outSentinelVisibleTick) *outSentinelVisibleTick = now;
 
             return currentGrant;
-        } else if (blocked) {
-            DPRINTF(RubyEP, "UBCC node_id=%d: Q3 blocked PA=0x%lx elapsed=%lu\n",
-                    _nodeId, line_pa, curTick() - entry.grantTick);
-            return UBCC_OuterGrantType::GlobalGrantShared;
-        } else {
-            fatal("UBCC node_id=%d: M6/M8 busy-check PA=0x%lx pendingOp=%d "
+        }
+        // All other busy cases: strict rejection
+        else {
+            fatal("UBCC node_id=%d: M6/M8/Q3 busy-check PA=0x%lx pendingOp=%d "
                   "pendingRequester=%d pendingRecallTarget=%d "
                   "requesterNode=%d — strict rejection\n",
                   _nodeId, line_pa, entry.pendingOp,
@@ -452,8 +437,9 @@ UBCCController::processOuterRequest(
             static_cast<int>(grant), entry.ownerNode);
 
     // ---- Q3: Mark grant CHI handshake in progress ----
-    // Only if no recall/invalidation is already in progress.
-    // Only during simulation (curTick > 0); self-tests run at tick 0.
+    // Short delay to prevent ReadShared from HN-F reaching L2 while
+    // the previous ReadUnique TBE is being freed.  1500 ticks is
+    // sufficient to avoid the SC_RSC crash without blocking invalidation.
     if (curTick() > 0 && entry.pendingOp == 0) {
         entry.pendingOp = 3;
         entry.pendingRequester = requesterNode;

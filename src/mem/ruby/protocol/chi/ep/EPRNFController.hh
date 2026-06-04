@@ -264,6 +264,15 @@ class EPRNFController : public EPController
                        std::function<void(bool)> onComplete);
 
     /**
+     * Initiate a ReadShared to the local HN-F.
+     * HN-F processes with full owner-tracking: sends SnpShared to
+     * downgrade UD→SC and collect data.  Use when directory update
+     * is needed (e.g., recall that must downgrade local L2).
+     */
+    void startReadShared(uint64_t linePa,
+                         std::function<void(bool)> onComplete);
+
+    /**
      * Initiate a CleanUnique to the local HN-F.
      * HN-F processes natively — if sharers exist, it sends
      * SnpCleanInvalid to them, then returns Comp_UC to EP-RNF.
