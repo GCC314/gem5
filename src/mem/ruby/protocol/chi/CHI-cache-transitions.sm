@@ -1554,9 +1554,9 @@ transition({BUSY_BLKD,BUSY_INTR}, CompAck) {
 // Q3: Handle unexpected CompAck during compound states that
 // HN-F's SnpSharedFwd leaves the L2 in (SC_RSC, UD_RU).
 // CompAck from L1D arrives when no TBE is active — just consume it.
-// Q3: CompAck may arrive in compound states from previous transactions.
-// No valid TBE exists — just consume it.
-transition({SC_RSC,UD_RU,UC_RU,RSC,RUSC,SD_RSC,UD_RSC,UD_RSD,SD_RSD},
+// Q3: CompAck may arrive in compound/I states from grant completion
+// notifications or late L1D responses.  Safely consume them.
+transition({I,SC_RSC,UD_RU,UC_RU,RSC,RUSC,SD_RSC,UD_RSC,UD_RSD,SD_RSD},
            CompAck) {
   Pop_RespInQueue;
 }
@@ -1628,12 +1628,12 @@ transition(BUSY_INTR, WriteZero) {
 
 // Finalization transition
 
-transition({BUSY_BLKD,BUSY_INTR}, Final, *) {
-  Pop_TriggerQueue;
-  Finalize_UpdateCacheFromTBE;
-  Finalize_UpdateDirectoryFromTBE;
-  Finalize_DeallocateRequest;
-}
+ transition({BUSY_BLKD,BUSY_INTR}, Final, *) {
+   Pop_TriggerQueue;
+   Finalize_UpdateCacheFromTBE;
+   Finalize_UpdateDirectoryFromTBE;
+   Finalize_DeallocateRequest;
+ }
 
 ////////////////////////////////////////////////////////
 // DVM transitions
