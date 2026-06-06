@@ -151,6 +151,10 @@ TBEStorage::incrementReserved()
 inline void
 TBEStorage::decrementReserved()
 {
+    // P0-1: Underflow is a protocol invariant violation and must
+    // fail fast.  The UBCC pendingOp state machine (P0-2) ensures
+    // that allocateRequestTBE is only called when a matching
+    // AllocateTBE_Request has incremented the reservation.
     assert(m_reserved > 0);
     --m_reserved;
     m_stats.avg_reserved = m_reserved;

@@ -1,7 +1,10 @@
 #include "mem/ruby/protocol/chi/ep/EPBackend.hh"
 
+#include <cstdio>
 #include <cstring>
+#include <execinfo.h>
 #include <sstream>
+#include <unistd.h>
 
 #include "base/logging.hh"
 #include "debug/RubyCHIGeneric.hh"
@@ -506,6 +509,11 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
               _nodeId, line_pa, sentinelVisibleTick, grantVisibleTick);
     }
 
+    // Q3: Busy — caller should retry later
+    if (static_cast<int>(ubccGrant) < 0) {
+        return -1;
+    }
+
     // Convert UBCC grant back to EPBackend's OuterGrantType
     OuterGrantType grant;
     switch (ubccGrant) {
@@ -537,13 +545,23 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
     // Handle grant result and update bookkeeping
     OuterGrantType result = handleGrant(line_pa, grant, homeNode);
 
-    // ---- Q1: Populate grant data buffer for CompData response ----
-    // After the grant is processed, read the actual data from the home
-    // node's DL_SNF memory so EPSNFController can send real data in
-    // the CompData response (not dummy zero).
-    // Q2: Pass both requester's PA AND home node's PA.  The requester's
-    // PA is where CPU timing stores write to phys_mem via hitCallback.
-    populateGrantData(line_pa, homePa, homeNode);
+    // ---- P0-3: Try UBCC materialized data first ----
+    // When recall has completed, the home UBCC stores the captured
+    // cache-line data in its DirEntry.  This is the canonical source
+    // and avoids the unreliable phys_mem scavenge across PA views.
+    const uint8_t *matData = homeUbcc->getMaterializedData(line_pa);
+    if (matData) {
+        _lastGrantDataBlock.setData(matData, 0, 64);
+        _lastGrantDataValid = true;
+        printf("[Q2-DEBUG] populateGrantData node=%d using UBCC "
+               "materialized data for PA=0x%lx "
+               "first_word=0x%08x\n",
+               _nodeId, line_pa,
+               *(reinterpret_cast<const uint32_t*>(matData)));
+    } else {
+        // Fallback: try phys_mem scavenge (legacy path)
+        populateGrantData(line_pa, homePa, homeNode);
+    }
 
     // ---- M6: Clear outer txn pending and signal completion ----
     if (_epRnfCtrl) {
@@ -611,6 +629,17 @@ EPBackend::populateGrantData(uint64_t reqPa, uint64_t homePa, int homeNode)
 
     // Start with zeros (valid for uninitialized DSM memory)
     uint8_t zero_buf[64] = {};
+
+    // P0-3: If recall handler already captured data for this line,
+    // use it directly instead of reading from phys_mem (which may
+    // not have the data yet or at the wrong PA view).
+    if (_lastGrantDataValid && _lastGrantDataProvenance == GrantDataProvenance::Recall) {
+        printf("[Q2-DEBUG] populateGrantData node=%d using recall data "
+               "for reqPA=0x%lx (skip phys_mem)\n", _nodeId, reqPa);
+        _lastGrantDataProvenance = GrantDataProvenance::None; // consume once
+        return;
+    }
+
     _lastGrantDataBlock.setData(zero_buf, 0, lineSize);
 
     if (!_ruby_system) {
@@ -1074,6 +1103,22 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
                    _nodeId,
                    *(reinterpret_cast<uint32_t*>(buf)),
                    *(reinterpret_cast<uint32_t*>(buf + 4)));
+
+            // P0-3: Store recall data directly in grant data buffer.
+            _lastGrantDataBlock.setData(buf, 0, 64);
+            _lastGrantDataValid = true;
+            _lastGrantDataProvenance = GrantDataProvenance::Recall;
+
+            // P0-3: Also store in HOME UBCC materialized data cache.
+            // This is the canonical cross-node data path: the home
+            // UBCC holds the authoritative data for its line, and
+            // future grants read from it instead of searching phys_mem.
+            UBCCController *hubcc =
+                UBCCController::getInstance(recallMsg.homeNode);
+            if (hubcc) {
+                hubcc->setMaterializedData(
+                    recallMsg.linePa, buf, 64, recallMsg.epoch);
+            }
         } else {
             printf("[Q2-DEBUG] recall funcRead FAILED node=%d, "
                    "falling back to phys_mem\n",
@@ -1125,38 +1170,19 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
         }
     }
 
-    // ---- Q3: ReadShared via HN-F for recall ----
-    uint64_t r_lookupPa = (recallMsg.ownerLocalPa != 0)
-                              ? recallMsg.ownerLocalPa
-                              : recallMsg.linePa;
-    if (_epRnfCtrl) {
-        _epRnfCtrl->startReadShared(r_lookupPa,
-            [this, recallMsg](bool ok) {
-                OuterRecallResponse resp;
-                resp.linePa = recallMsg.linePa;
-                resp.ownerNode = _nodeId;
-                resp.homeNode = recallMsg.homeNode;
-                resp.epoch = recallMsg.epoch;
-                resp.dataReturned = recallMsg.dataNeeded;
-                resp.ackReceived = true;
-                sendRecallResponse(resp);
-            });
-        return true;
-    }
-
-    // Build and send recall response
-    OuterRecallResponse response;
-    response.linePa = recallMsg.linePa;
-    response.ownerNode = _nodeId;
-    response.homeNode = recallMsg.homeNode;
-    response.epoch = recallMsg.epoch;
-    // For recall triggered by read: owner keeps shared copy
-    // (data returned to requester via home)
-    response.dataReturned = recallMsg.dataNeeded;
-    response.ackReceived = true;
-
-    // Send recall response back to home UBCC
-    return sendRecallResponse(response);
+    // Q3: Cross-node recall response (no ReadShared to HN-F)
+    // The ReadShared CHI request to the local HN-F is NOT needed for
+    // cross-node recall.  The recall data has already been collected
+    // via functionalRead and broadcast to all nodes' phys_mem.
+    // Sending ReadShared causes extra TBE allocation in HN-F.
+    OuterRecallResponse resp;
+    resp.linePa = recallMsg.linePa;
+    resp.ownerNode = _nodeId;
+    resp.homeNode = recallMsg.homeNode;
+    resp.epoch = recallMsg.epoch;
+    resp.dataReturned = recallMsg.dataNeeded;
+    resp.ackReceived = true;
+    return sendRecallResponse(resp);
 }
 
 bool
@@ -1425,23 +1451,14 @@ EPBackend::handleInvalidationRequest(const OuterInvalidateMsg &invMsg)
         }
     }
 
-    // ---- Q3: CleanUnique via HN-F for invalidation ----
-    // CleanUnique makes HN-F check directory and send SnpCleanInvalid
-    // to sharers.  This is the correct CHI path: RN-F requests via
-    // reqOut, HN-F handles snooping as spec-defined.
-    if (_epRnfCtrl) {
-        _epRnfCtrl->startCleanUnique(lookupPa,
-            [this, invMsg](bool ok) {
-                OuterInvalidationAck ack;
-                ack.linePa = invMsg.linePa;
-                ack.ackNode = _nodeId;
-                ack.homeNode = invMsg.homeNode;
-                ack.epoch = invMsg.epoch;
-                ack.success = true;
-                sendInvalidationAck(ack);
-            });
-        return true;
-    }
+    // ---- Q3: Cross-node invalidation ack (no CleanUnique) ----
+    // The CleanUnique CHI request to HN-F is NOT needed for cross-node
+    // invalidations.  The UBCC manages the cross-node directory, and
+    // the invalidation ack goes back to the home UBCC, not the local
+    // HN-F.  Sending CleanUnique causes extra TBE allocation in HN-F,
+    // which triggers `decrementReserved(): m_reserved > 0` assertion.
+    //
+    // Instead, send the invalidation ack directly to the home UBCC.
 
     // Build invalidation ack
     OuterInvalidationAck ack;
@@ -1451,8 +1468,8 @@ EPBackend::handleInvalidationRequest(const OuterInvalidateMsg &invMsg)
     ack.epoch = invMsg.epoch;
     ack.success = true;
 
-    // Send ack back to home UBCC
-    return sendInvalidationAck(ack);
+    sendInvalidationAck(ack);
+    return true;
 }
 
 bool

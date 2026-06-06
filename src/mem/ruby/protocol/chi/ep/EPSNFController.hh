@@ -1,7 +1,9 @@
 #ifndef __MEM_RUBY_PROTOCOL_CHI_EP_EPSNFCONTROLLER_HH__
 #define __MEM_RUBY_PROTOCOL_CHI_EP_EPSNFCONTROLLER_HH__
 
+#include <deque>
 #include <map>
+#include <set>
 
 #include "mem/ruby/protocol/chi/ep/EPBackend.hh"
 #include "mem/ruby/protocol/chi/ep/EPRNFController.hh"
@@ -34,9 +36,22 @@ class EPSNFController : public EPController
     EPBackend *_backend = nullptr;
 
     // Q2: Pending write tracking — maps address → HN-F requestor.
-    // WriteNoSnp request stores the HN-F MachineID; when NCBWrData
-    // arrives, CompDBIDResp is sent back to the stored destination.
     std::map<Addr, MachineID> _pendingWrites;
+
+    // Q3: Retry queue for blocked grants
+    struct RetryEntry {
+        uint64_t linePa;
+        int neededPerm;
+        bool writeIntent;
+        MachineID hnReq;      // HN-F requestor (for CompData routing)
+        MachineID fwdReq;     // fwdRequestor (if dataToFwdReq)
+        bool dataToFwdReq;
+    };
+    std::deque<RetryEntry> _retryQueue;
+
+    // Q3: Deferred CompData sends (1-tick delay for TBE race fix)
+    std::vector<std::shared_ptr<CHIDataMsg>> _deferredCompData;
+    void processDeferredData();
 };
 
 } // namespace ruby

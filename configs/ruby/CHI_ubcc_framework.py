@@ -24,8 +24,12 @@ def _make_hnf(ruby_system, addr_ranges, llcache_type, node_id):
     hnf_cntrl = chi_defs.CHI_HNFController(
         ruby_system, hnf_cache, NULL, addr_ranges)
     print(f"[Q3 DEBUG] HN-F node{node_id}: machineID=Cache.{hnf_cntrl.version}")
-    # Q3: Keep DCT enabled — non-DCT path asserts dataValid.
-    # DMT disabled to avoid early TBE deallocation timing issues.
+    # DMT disabled — our design requires CompData to return to HN-F
+    # so HN-F can use it to satisfy the local L2's ReadShared.
+    # This is the non-DMT CHI path, which in standard gem5 has
+    # inherent DRAM latency separating the HN-F's state transitions.
+    # With our zero-latency EP-SNF, we must add a minimum delay to
+    # prevent same-tick TBE reservation races.
     hnf_cntrl.enable_DMT = False
     hnf_cntrl.number_of_TBEs = 4096
     hnf_cntrl.number_of_repl_TBEs = 4096
@@ -252,7 +256,6 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
             ruby_system=ruby_system, node_id=node_id,
             data_channel_size=params.data_width,
             ep_backend=ep_backend,
-            hnf_version=nd['hnf_cntrl'].version,
             addr_ranges=[NodeConfig.dsm_range_for(
                 node_id, seg_size, cfg.phy_base)],
             downstream_destinations=[nd['hnf_cntrl']])

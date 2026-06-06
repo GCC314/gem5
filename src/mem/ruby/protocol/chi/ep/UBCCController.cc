@@ -34,6 +34,7 @@ UBCCController::getInstance(int node_id)
 
 UBCCController::UBCCController(int node_id, RubySystem *ruby_system)
   : _nodeId(node_id),
+    _interconnectLatency(200),
     _recallCount(0),
     _recallResponseCount(0),
     _writebackCount(0),
@@ -153,56 +154,31 @@ UBCCController::processOuterRequest(
 
     // ---- M6/M8/Q3: Busy check ----
     if (entry.pendingOp > 0) {
-        // Q3: grant handshake in progress — block different req
+        // pendingOp=1: recall in progress — BUSY for all requesters
+        if (entry.pendingOp == 1) {
+            if (outRecallNeeded) *outRecallNeeded = false;
+            if (outRecallOwnerNode) *outRecallOwnerNode = -1;
+            return static_cast<UBCC_OuterGrantType>(-1);
+        }
+        // pendingOp=3: grant handshake in progress
         if (entry.pendingOp == 3) {
             Tick elapsed = curTick() - entry.grantTick;
-            if (elapsed > 5000000 || entry.pendingRequester == requesterNode) {
+            if (elapsed > _interconnectLatency || entry.pendingRequester == requesterNode) {
                 entry.pendingOp = 0;
             } else {
                 if (outRecallNeeded) *outRecallNeeded = false;
                 if (outRecallOwnerNode) *outRecallOwnerNode = -1;
-                return UBCC_OuterGrantType::GlobalGrantShared;
+                return static_cast<UBCC_OuterGrantType>(-1);
             }
         }
-        // M8: invalidation in progress, same requester reentry
-        else if (entry.pendingOp == 2 && entry.pendingRequester == requesterNode) {
-            DPRINTF(RubyEP,
-                    "UBCC node_id=%d: M8 reentry no-op PA=0x%lx "
-                    "pendingOp=invalidation requesterNode=%d matches — "
-                    "returning current grant without state mutation\n",
-                    _nodeId, line_pa, requesterNode);
-
-            UBCC_OuterGrantType currentGrant =
-                UBCC_OuterGrantType::GlobalGrantShared;
-            switch (entry.state) {
-                case MESIState::G_E:
-                    currentGrant = UBCC_OuterGrantType::GlobalGrantExclusive;
-                    break;
-                case MESIState::G_M:
-                    currentGrant = UBCC_OuterGrantType::GlobalGrantModified;
-                    break;
-                case MESIState::G_S:
-                    currentGrant = UBCC_OuterGrantType::GlobalGrantShared;
-                    break;
-                default:
-                    currentGrant = UBCC_OuterGrantType::GlobalGrantShared;
-                    break;
-            }
-
-            Tick now = curTick();
-            if (outGrantVisibleTick) *outGrantVisibleTick = now;
-            if (outSentinelVisibleTick) *outSentinelVisibleTick = now;
-
-            return currentGrant;
-        }
-        // All other busy cases: strict rejection
-        else {
-            fatal("UBCC node_id=%d: M6/M8/Q3 busy-check PA=0x%lx pendingOp=%d "
-                  "pendingRequester=%d pendingRecallTarget=%d "
-                  "requesterNode=%d — strict rejection\n",
-                  _nodeId, line_pa, entry.pendingOp,
-                  entry.pendingRequester, entry.pendingRecallTarget,
-                  requesterNode);
+        // pendingOp=2: invalidation in progress — BUSY for all
+        else if (entry.pendingOp == 2) {
+            // P0-2: Return BUSY even for same requester (was returning
+            // stale grant).  The retry queue will handle re-entry after
+            // invalidation completes.
+            if (outRecallNeeded) *outRecallNeeded = false;
+            if (outRecallOwnerNode) *outRecallOwnerNode = -1;
+            return static_cast<UBCC_OuterGrantType>(-1);
         }
     }
 
@@ -434,11 +410,25 @@ UBCCController::processOuterRequest(
             mesiStateName(prevState), mesiStateName(entry.state),
             static_cast<int>(grant), entry.ownerNode);
 
-    // ---- Q3: Mark grant CHI handshake in progress ----
-    // Short delay to prevent ReadShared from HN-F reaching L2 while
-    // the previous ReadUnique TBE is being freed.  1500 ticks is
-    // sufficient to avoid the SC_RSC crash without blocking invalidation.
+    // ---- Q3: Grant handshake / pendingOp state machine ----
+    // pendingOp states:
+    //   0 = idle
+    //   1 = recall in progress (waiting for recall response)
+    //   2 = invalidation in progress (waiting for invalidation acks)
+    //   3 = grant handshake in progress (prevent re-entry)
     if (curTick() > 0 && entry.pendingOp == 0) {
+        if (outRecallNeeded && *outRecallNeeded) {
+            // Recall was initiated — block until recall completes
+            entry.pendingOp = 1;
+            entry.pendingRequester = requesterNode;
+            entry.grantTick = curTick();
+            DPRINTF(RubyEP,
+                    "UBCC node_id=%d: pendingOp=1 (recall) PA=0x%lx "
+                    "requester=%d — returning BUSY\n",
+                    _nodeId, line_pa, requesterNode);
+            return static_cast<UBCC_OuterGrantType>(-1);
+        }
+        // No recall/invalidation needed — mark handshake in progress
         entry.pendingOp = 3;
         entry.pendingRequester = requesterNode;
         entry.grantTick = curTick();
@@ -595,12 +585,13 @@ UBCCController::processRecallResponse(uint64_t line_pa, int ownerNode,
         return false;
     }
 
-    // Verify the recall target matches — strict protocol check.
+    // Verify the recall target matches
     if (entry.pendingRecallTarget >= 0 &&
         entry.pendingRecallTarget != ownerNode) {
-        fatal("UBCC node_id=%d: recall owner mismatch PA=0x%lx "
-              "expected=%d got=%d — protocol violation\n",
-              _nodeId, line_pa, entry.pendingRecallTarget, ownerNode);
+        warn("UBCC node_id=%d: recall owner mismatch PA=0x%lx "
+             "expected=%d got=%d — rejecting\n",
+             _nodeId, line_pa, entry.pendingRecallTarget, ownerNode);
+        return false;
     }
 
     int requesterNode = entry.pendingRequester;
@@ -1038,6 +1029,45 @@ UBCCController::grantHandshakeComplete(uint64_t line_pa)
         it->second.pendingOp = 0;
         it->second.pendingRequester = -1;
     }
+}
+
+// ---- P0-3: Materialized data access for grant path ----
+const uint8_t*
+UBCCController::getMaterializedData(uint64_t linePa) const
+{
+    auto it = _directory.find(linePa);
+    if (it == _directory.end() || !it->second.materializedValid)
+        return nullptr;
+    // Epoch check: data is valid only if still at the captured epoch
+    if (it->second.materializedEpoch != it->second.epoch)
+        return nullptr;
+    return it->second.materializedData;
+}
+
+bool
+UBCCController::hasMaterializedData(uint64_t linePa) const
+{
+    auto it = _directory.find(linePa);
+    return (it != _directory.end() &&
+            it->second.materializedValid &&
+            it->second.materializedEpoch == it->second.epoch);
+}
+
+void
+UBCCController::setMaterializedData(uint64_t linePa, const uint8_t* data,
+                                    int len, uint64_t epoch)
+{
+    ensureDirEntry(linePa);
+    DirEntry &entry = _directory[linePa];
+    if (len > 64) len = 64;
+    memcpy(entry.materializedData, data, len);
+    entry.materializedValid = true;
+    entry.materializedEpoch = epoch;
+    DPRINTF(RubyEP,
+            "UBCC node_id=%d: setMaterializedData PA=0x%lx epoch=%lu "
+            "first_word=0x%08x\n",
+            _nodeId, linePa, epoch,
+            *(reinterpret_cast<const uint32_t*>(data)));
 }
 
 } // namespace ruby

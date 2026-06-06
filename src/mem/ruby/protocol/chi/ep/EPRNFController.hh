@@ -316,6 +316,20 @@ class EPRNFController : public EPController
     /** HN-F controller version number (set from config). */
     int _hnfVersion;
 
+    // ---- Q3: Serialization of CHI requests to HN-F ----
+    // Prevents multiple CHI requests being sent to HN-F in the same
+    // event-processing cycle, which can cause TBE reservation exhaustion
+    // and trigger `decrementReserved(): m_reserved > 0` assertion.
+    bool _chiRequestInFlight;
+    // Queue of deferred CHI requests waiting for the current one to complete
+    struct DeferredChiRequest {
+        uint64_t linePa;
+        CHI::CHIRequestType reqType;
+        Tick startTick;
+    };
+    std::deque<DeferredChiRequest> _deferredChiReqs;
+    void processDeferredChiReqs();
+
     // ---- M6: Pending HN response tracking ----
     // Map from line PA to pending HN response context.
     std::map<uint64_t, PendingHnResponse> _pendingHnResponses;

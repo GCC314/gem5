@@ -58,6 +58,54 @@ void
 EPSNFController::wakeup()
 {
     EPController::wakeup();
+
+    // Q3: Send deferred CompData (1-tick delay for TBE race fix)
+    processDeferredData();
+
+    // Q3: Process retry queue — request grants that were previously BUSY
+    if (!_retryQueue.empty()) {
+        bool needWakeup = false;
+        for (auto it = _retryQueue.begin(); it != _retryQueue.end(); ) {
+            int homeNode = -1;
+            int grantResult = _backend->handleRemoteMiss(
+                it->linePa, it->neededPerm, it->writeIntent, homeNode);
+            if (grantResult >= 0) {
+                // Grant succeeded — send CompData (same as normal flow)
+                NetDest hnDest(m_ruby_system);
+                hnDest.add(it->hnReq);
+                NetDest dataDest(m_ruby_system);
+                if (it->dataToFwdReq)
+                    dataDest.add(it->fwdReq);
+                else
+                    dataDest.add(it->hnReq);
+
+                const uint8_t *gdata = _backend->lastGrantData();
+                for (int i = 0; i < dataMsgsPerLine; i++) {
+                    int offset = i * dataChannelSize;
+                    int chunkSize = (i == dataMsgsPerLine - 1) ?
+                        (cacheLineSize - offset) : dataChannelSize;
+                    WriteMask wm(cacheLineSize);
+                    wm.setMask(offset, chunkSize);
+                    DataBlock db(cacheLineSize);
+                    if (gdata != nullptr)
+                        db.setData(gdata + offset, offset, chunkSize);
+                    auto dat = std::make_shared<CHIDataMsg>(
+                        curTick(), cacheLineSize, m_ruby_system,
+                        it->linePa, CHIDataType_CompData_UC,
+                        m_machineID, dataDest, db, wm,
+                        false, 0, MessageSizeType_Data);
+                    sendDataMsg(dat);
+                }
+                it = _retryQueue.erase(it);
+            } else {
+                needWakeup = true;
+                ++it;
+            }
+        }
+        if (needWakeup)
+            scheduleEvent(Cycles(1));
+    }
+
     if (_backend)
         _backend->wakeup();
 }
@@ -136,16 +184,28 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
     }
 
     // Map sideband to outer request and dispatch
-    // GlobalReadShared or GlobalReadUnique
     int homeNode = -1;
     int grantResult = _backend->handleRemoteMiss(
         msg->m_addr, neededPerm, writeIntent, homeNode);
 
-    DPRINTF(RubyCHIGeneric,
-            "EP_SNF node_id=%d: grantResult=%d homeNode=%d\n",
-            _nodeId, grantResult, homeNode);
+    // Q3: If grant blocked, queue for retry instead of sending stale data
+    if (grantResult < 0) {
+        DPRINTF(RubyCHIGeneric,
+                "EP_SNF node_id=%d: grant BUSY for PA=0x%lx, queuing retry\n",
+                _nodeId, msg->m_addr);
+        EPSNFController::RetryEntry entry;
+        entry.linePa = msg->m_addr;
+        entry.neededPerm = neededPerm;
+        entry.writeIntent = writeIntent;
+        entry.hnReq = msg->m_requestor;
+        entry.fwdReq = msg->m_fwdRequestor;
+        entry.dataToFwdReq = msg->m_dataToFwdRequestor;
+        _retryQueue.push_back(entry);
+        scheduleEvent(Cycles(1));
+        return true;
+    }
 
-    // ---- M5: Record sideband for inspection by Python tests ----
+    // ---- Record sideband for inspection ----
     _backend->recordSideband(msg->m_addr, neededPerm, writeIntent,
                               (neededPerm == 0) ? 0 : 1,  // 0=GlobalReadShared, 1=GlobalReadUnique
                               grantResult, homeNode);
@@ -218,10 +278,26 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
             m_machineID, dataDest,
             db, wm,
             false, 0, MessageSizeType_Data);
-        sendDataMsg(dat);
+        // Q3: Defer send by 1 tick to prevent same-tick TBE race
+        // at HN-F (see docs/tbe-race-condition.svg for details).
+        _deferredCompData.push_back(dat);
+    }
+
+    // Schedule deferred sends
+    if (!_deferredCompData.empty()) {
+        scheduleEvent(Cycles(1));
     }
 
     return true;
+}
+
+void
+EPSNFController::processDeferredData()
+{
+    for (auto &dat : _deferredCompData) {
+        sendDataMsg(dat);
+    }
+    _deferredCompData.clear();
 }
 
 bool

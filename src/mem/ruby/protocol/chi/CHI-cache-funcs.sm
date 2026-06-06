@@ -418,7 +418,10 @@ void initializeTBE(TBE tbe, Addr addr, int storSlot) {
 }
 
 TBE allocateRequestTBE(Addr addr, CHIRequestMsg in_msg), return_by_pointer="yes" {
-  // We must have reserved resources for this allocation
+  // We must have reserved resources for this allocation.
+  // P0-1: Protocol invariant — a matching AllocateTBE_Request must
+  // have incremented the reservation before we consume it.
+  assert(storTBEs.reserved() > 0);
   storTBEs.decrementReserved();
   assert(storTBEs.areNSlotsAvailable(1));
 

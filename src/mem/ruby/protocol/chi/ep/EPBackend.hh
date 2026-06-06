@@ -190,6 +190,7 @@ enum class GrantDataProvenance {
     None,     // No grant data has been populated
     ReqPA,    // Data read from requester's local PA view
     HomePA,   // Data read from home node's PA view
+    Recall,   // P0-3: Data captured by recall handler (functionalRead)
 };
 
 // Snapshot of the last UBCC sideband observed by EP_SNF on a recvRequestMsg.

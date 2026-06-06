@@ -217,10 +217,16 @@ EPController::functionalReadBuffers(PacketPtr& pkt, WriteMask &mask)
 EPRNFController::EPRNFController(const Params &p)
   : EPController(p), _backend(p.ep_backend),
     _numCacheControllers(0),
-    _hnfVersion(p.hnf_version),
+    _hnfVersion(-1),
+    _chiRequestInFlight(false),
     _pendingHnResponseCount(0),
     _delayedResolvedCount(0)
 {
+    // Derive HN-F version from the first downstream destination controller
+    if (!p.downstream_destinations.empty()) {
+        _hnfVersion = p.downstream_destinations[0]->getVersion();
+    }
+
     // Register EP_RNF with EPBackend for delayed response support
     if (_backend) {
         _backend->setEpRnfController(this);
@@ -273,6 +279,9 @@ EPRNFController::wakeup()
 
     // Retry any pending CompAck sends
     retryPendingCompAcks();
+
+    // Q3: Process deferred CHI requests (cleanup + safety net)
+    processDeferredChiReqs();
 
     if (_backend)
         _backend->wakeup();
@@ -392,6 +401,10 @@ EPRNFController::recvResponseMsg(const CHIResponseMsg *msg)
                 auto cb = it->second.onComplete;
                 _pendingChiTxns.erase(it);
                 if (cb) cb(true);
+
+                // Q3: Clear in-flight and process deferred requests
+                _chiRequestInFlight = false;
+                processDeferredChiReqs();
             } else {
                 // CompAck failed — will retry
                 it->second.needsCompAck = true;
@@ -462,6 +475,10 @@ EPRNFController::recvDataMsg(const CHIDataMsg *msg)
             auto cb = it->second.onComplete;
             _pendingChiTxns.erase(it);
             if (cb) cb(true);
+
+            // Q3: Clear in-flight and process deferred requests
+            _chiRequestInFlight = false;
+            processDeferredChiReqs();
         } else {
             // CompAck failed — will retry
             it->second.needsCompAck = true;
@@ -552,6 +569,24 @@ EPRNFController::setOuterTxnPending(uint64_t linePa, bool pending)
 bool
 EPRNFController::sendChiRequest(uint64_t linePa, CHIRequestType reqType)
 {
+    // Q3: Serialize CHI requests to prevent TBE reservation exhaustion
+    // in the HN-F.  When the HN-F processes multiple requests in the same
+    // event-processing cycle, allocateRequestTBE can call decrementReserved
+    // twice for a single incrementReserved, triggering assertion failure.
+    if (_chiRequestInFlight) {
+        // Defer: queue the request for later processing
+        DPRINTF(RubyCHIGeneric,
+                "EP_RNF node_id=%d: sendChiRequest addr=0x%lx type=%s "
+                "DEFERRED (request already in flight)\n",
+                _nodeId, linePa, CHIRequestType_to_string(reqType));
+        DeferredChiRequest d;
+        d.linePa = linePa;
+        d.reqType = reqType;
+        d.startTick = curTick();
+        _deferredChiReqs.push_back(d);
+        return true;  // Report success to caller (will be sent later)
+    }
+
     DPRINTF(RubyCHIGeneric,
             "EP_RNF node_id=%d: sendChiRequest addr=0x%lx type=%s\n",
             _nodeId, linePa, CHIRequestType_to_string(reqType));
@@ -574,16 +609,18 @@ EPRNFController::sendChiRequest(uint64_t linePa, CHIRequestType reqType)
 
     // Send on reqOut → HN-F's reqIn
     bool sent = sendRequestMsg(req);
-    if (!sent) {
+    if (sent) {
+        _chiRequestInFlight = true;
+    } else {
         warn("EP_RNF node_id=%d: sendChiRequest failed for addr=0x%lx "
              "(reqOut full)\n", _nodeId, linePa);
     }
 
     DPRINTF(RubyCHIGeneric,
             "EP_RNF node_id=%d: sendChiRequest addr=0x%lx type=%s "
-            "dest=(type=%d num=%d) sent=%d\n",
+            "dest=(type=%d num=%d) sent=%d inFlight=%d\n",
             _nodeId, linePa, CHIRequestType_to_string(reqType),
-            hnfId.getType(), hnfId.getNum(), sent);
+            hnfId.getType(), hnfId.getNum(), sent, _chiRequestInFlight);
 
     return sent;
 }
@@ -641,6 +678,10 @@ EPRNFController::retryPendingCompAcks()
             ++it;
             _pendingChiTxns.erase(eraseIt);
             if (cb) cb(true);
+
+            // Q3: Clear in-flight and process deferred requests
+            _chiRequestInFlight = false;
+            processDeferredChiReqs();
         } else {
             needRetry = true;
             ++it;
@@ -649,6 +690,22 @@ EPRNFController::retryPendingCompAcks()
 
     if (needRetry) {
         scheduleEvent(Cycles(1));
+    }
+}
+
+// ---- Q3: Process deferred CHI requests ----
+void
+EPRNFController::processDeferredChiReqs()
+{
+    while (!_deferredChiReqs.empty() && !_chiRequestInFlight) {
+        DeferredChiRequest d = _deferredChiReqs.front();
+        _deferredChiReqs.pop_front();
+        DPRINTF(RubyCHIGeneric,
+                "EP_RNF node_id=%d: processing deferred CHI request "
+                "addr=0x%lx type=%s (queued at tick=%lu)\n",
+                _nodeId, d.linePa,
+                CHIRequestType_to_string(d.reqType), d.startTick);
+        sendChiRequest(d.linePa, d.reqType);
     }
 }
 

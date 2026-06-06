@@ -2,6 +2,7 @@
 #define __MEM_RUBY_PROTOCOL_CHI_EP_UBCCCONTROLLER_HH__
 
 #include <cstdint>
+#include <cstring>
 #include <map>
 #include <queue>
 #include <set>
@@ -302,12 +303,18 @@ class UBCCController
         bool pendingWriteIntent;
 
         // ---- M8: Sharer invalidation tracking ----
-        // When upgrading from G_S to unique, we must invalidate all
-        // existing sharers (except the requester, if it is a sharer).
-        // These fields track the pending invalidation state.
-        int pendingInvalidationCount;  // Number of sharers awaiting invalidate ack
-        uint64_t pendingInvalidationMask; // Mask of nodes that need invalidation
-        uint64_t invalidatedAckMask;      // Mask of nodes that have acked
+        int pendingInvalidationCount;
+        uint64_t pendingInvalidationMask;
+        uint64_t invalidatedAckMask;
+
+        // ---- P0-3: Epoch-bound materialized data cache ----
+        // When recall completes, the captured cache-line data is stored
+        // here and bound to the current directory epoch.  On the next
+        // write (epoch increment), the cache is invalidated.
+        // This eliminates the phys_mem scavenge for cross-node data.
+        uint8_t materializedData[64];
+        bool materializedValid;
+        uint64_t materializedEpoch;
 
         DirEntry() : lineAddr(0), state(MESIState::G_I),
                      sharersMask(0), ownerNode(-1),
@@ -318,11 +325,30 @@ class UBCCController
                      pendingWriteIntent(false),
                      pendingInvalidationCount(0),
                      pendingInvalidationMask(0),
-                     invalidatedAckMask(0) {}
+                     invalidatedAckMask(0),
+                     materializedValid(false),
+                     materializedEpoch(0)
+        {
+            memset(materializedData, 0, 64);
+        }
     };
 
-  private:
+    // ---- P0-3: Materialized data access for grant path ----
+    // Returns pointer to 64-byte cache-line data if available and
+    // epoch-valid, or nullptr if data must be sourced elsewhere.
+    const uint8_t* getMaterializedData(uint64_t linePa) const;
+    bool hasMaterializedData(uint64_t linePa) const;
+    // Write captured recall data into the directory for this line.
+    void setMaterializedData(uint64_t linePa, const uint8_t* data,
+                             int len, uint64_t epoch);
+
+   private:
     const int _nodeId;
+
+    // Q3: Estimated UBCC-to-remote-UBCC interconnect latency (ticks).
+    // Controls how long pendingOp=3 blocks before grant is released.
+    // Default: 1000 ticks (1μs at 1GHz, approximating CXL.mem + NUMA).
+    Tick _interconnectLatency;
 
     // ---- M5: Home directory ----
     // Per-line directory entries for lines homed at this node.
