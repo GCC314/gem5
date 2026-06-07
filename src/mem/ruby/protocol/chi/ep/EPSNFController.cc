@@ -103,7 +103,7 @@ EPSNFController::wakeup()
             }
         }
         if (needWakeup)
-            scheduleEvent(Cycles(100));
+            scheduleEvent(Cycles(1));
     }
 
     if (_backend)
