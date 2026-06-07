@@ -37,11 +37,30 @@
 
 #include <mem/ruby/structures/TBEStorage.hh>
 
+#include <cassert>
+
 namespace gem5
 {
 
 namespace ruby
 {
+
+void TBEStorage::incrementReserved()
+{
+    ++m_reserved;
+    m_stats.avg_reserved = m_reserved;
+}
+
+void TBEStorage::decrementReserved()
+{
+    // P0-1: Underflow is a protocol invariant violation and must
+    // fail fast.  The UBCC pendingOp/OutstandingRequest state machine
+    // ensures that allocateRequestTBE is only called when a matching
+    // AllocateTBE_Request has incremented the reservation.
+    assert(m_reserved > 0);
+    --m_reserved;
+    m_stats.avg_reserved = m_reserved;
+}
 
 TBEStorage::TBEStorage(statistics::Group *parent, int number_of_TBEs)
     : m_reserved(0), m_stats(parent)

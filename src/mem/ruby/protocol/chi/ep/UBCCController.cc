@@ -152,19 +152,62 @@ UBCCController::processOuterRequest(
     ensureDirEntry(line_pa);
     DirEntry &entry = _directory[line_pa];
 
-    // ---- M6/M8/Q3: Busy check ----
-    if (entry.pendingOp > 0) {
-        // pendingOp=1: recall in progress — BUSY for all requesters
-        if (entry.pendingOp == 1) {
+    // ---- Phase 2: OutstandingRequest check (recall migration) ----
+    OutstandingRequest *ost = findOutstanding(line_pa);
+    if (ost) {
+        switch (ost->state) {
+        case OpState::WAITING_RESP:
+            // Response not yet received — keep waiting
             if (outRecallNeeded) *outRecallNeeded = false;
             if (outRecallOwnerNode) *outRecallOwnerNode = -1;
             return static_cast<UBCC_OuterGrantType>(-1);
+        case OpState::RESP_RCVD:
+            if (ost->requesterNode == requesterNode) {
+                Tick elapsed = curTick() - ost->respTick;
+                if (elapsed > _interconnectLatency) {
+                    // Release: apply delayed commit to DirEntry
+                    DPRINTF(RubyEP,
+                            "UBCC node_id=%d: Phase2 outstanding release "
+                            "PA=0x%lx opType=%d elapsed=%lu\n",
+                            _nodeId, line_pa, (int)ost->opType, elapsed);
+                    // Apply the state change that was deferred
+                    if (ost->opType == OpType::RECALL) {
+                        // Recall has completed — update DirEntry
+                        // (state was already set by processRecallResponse
+                        //  before marking outstanding as RESP_RCVD)
+                    }
+                    removeOutstanding(line_pa);
+                    // Fall through to normal grant processing
+                } else {
+                    // Response arrived but latency not expired
+                    if (outRecallNeeded) *outRecallNeeded = false;
+                    if (outRecallOwnerNode) *outRecallOwnerNode = -1;
+                    return static_cast<UBCC_OuterGrantType>(-1);
+                }
+            } else {
+                // Different requester — BUSY (don't consume someone else's grant)
+                if (outRecallNeeded) *outRecallNeeded = false;
+                if (outRecallOwnerNode) *outRecallOwnerNode = -1;
+                return static_cast<UBCC_OuterGrantType>(-1);
+            }
+            break;
+        case OpState::CANCELLED:
+            removeOutstanding(line_pa);
+            break;
         }
+    }
+
+    // ---- M6/M8/Q3: Busy check (legacy — pendingOp=1 removed in Phase 2) ----
+    if (entry.pendingOp > 0) {
         // pendingOp=3: grant handshake in progress
         if (entry.pendingOp == 3) {
             Tick elapsed = curTick() - entry.grantTick;
             if (elapsed > _interconnectLatency || entry.pendingRequester == requesterNode) {
                 entry.pendingOp = 0;
+                // Phase 4: clean up outstanding if present
+                OutstandingRequest *gh = findOutstanding(line_pa);
+                if (gh && gh->opType == OpType::GRANT_HANDSHAKE)
+                    removeOutstanding(line_pa);
             } else {
                 if (outRecallNeeded) *outRecallNeeded = false;
                 if (outRecallOwnerNode) *outRecallOwnerNode = -1;
@@ -243,43 +286,39 @@ UBCCController::processOuterRequest(
                     otherSharers &= ~(1ULL << requesterNode);
 
                 if (otherSharers != 0) {
-                    // ---- M8: Pending invalidation flow ----
-                    // There are other sharers that must be invalidated
-                    // before the unique grant is truly valid.
-                    // Mark the line busy with invalidation-in-progress (pendingOp=2).
+                    // Phase 3: Use OutstandingRequest for invalidation
                     DPRINTF(RubyEP,
                             "UBCC node_id=%d: M8 initiating invalidation "
                             "PA=0x%lx otherSharers=0x%lx requester=%d\n",
                             _nodeId, line_pa, otherSharers, requesterNode);
 
-                    entry.pendingOp = 2; // invalidation-in-progress
+                    OutstandingRequest *oreq = createOutstanding(
+                        line_pa, OpType::INVALIDATE, requesterNode, -1);
+                    if (!oreq) {
+                        warn("UBCC node_id=%d: failed to create "
+                             "outstanding for invalidation PA=0x%lx "
+                             "(already one pending) — BUSY\n",
+                             _nodeId, line_pa);
+                        return static_cast<UBCC_OuterGrantType>(-1);
+                    }
+                    oreq->totalMask = otherSharers;
+                    oreq->ackMask = 0;
+                    oreq->pendingAckCount = __builtin_popcountll(otherSharers);
+                    oreq->reqType = reqType;
+                    oreq->writeIntent = writeIntent;
+
+                    // Legacy fields for M8 compatibility
+                    entry.pendingOp = 2;
                     entry.pendingInvalidationMask = otherSharers;
                     entry.invalidatedAckMask = 0;
-                    // Count bits in otherSharers
                     entry.pendingInvalidationCount = __builtin_popcountll(otherSharers);
                     entry.pendingRequester = requesterNode;
                     entry.pendingReqType = reqType;
                     entry.pendingWriteIntent = writeIntent;
                     entry.pendingRecallTarget = -1;
 
-                    // Advance state to G_E/G_M immediately (grant is prepared),
-                    // but sharersMask is cleared (the requester is now the
-                    // exclusive owner, not a sharer).
-                    entry.sharersMask = 0;
-
-                    if (!writeIntent) {
-                        grant = UBCC_OuterGrantType::GlobalGrantExclusive;
-                        entry.state = MESIState::G_E;
-                        entry.ownerNode = requesterNode;
-                        entry.dirty = false;
-                    } else {
-                        grant = UBCC_OuterGrantType::GlobalGrantModified;
-                        entry.state = MESIState::G_M;
-                        entry.ownerNode = requesterNode;
-                        entry.dirty = true;
-                    }
-
                     _invalidationCount++;
+                    return static_cast<UBCC_OuterGrantType>(-1);
                 } else {
                     // No other sharers — immediate upgrade without invalidation
                     if (!writeIntent) {
@@ -331,15 +370,21 @@ UBCCController::processOuterRequest(
                     if (outRecallOwnerNode)
                         *outRecallOwnerNode = existingOwner;
 
-                    // Return a provisional grant type based on the request
-                    // (the final grant is determined after recall completes).
-                    if (reqType == UBCC_OuterReqType::GlobalReadShared) {
-                        grant = UBCC_OuterGrantType::GlobalGrantShared;
-                    } else if (!writeIntent) {
-                        grant = UBCC_OuterGrantType::GlobalGrantExclusive;
+                    // Phase 2: Create OutstandingRequest (delayed commit).
+                    // DirEntry is NOT modified until the recall completes.
+                    // The grant is deferred until the outstanding is released.
+                    OutstandingRequest *oreq = createOutstanding(
+                        line_pa, OpType::RECALL, requesterNode, existingOwner);
+                    if (!oreq) {
+                        // Already one outstanding — return BUSY
+                        DPRINTF(RubyEP,
+                                "UBCC node_id=%d: recall duplicate outstanding "
+                                "PA=0x%lx — BUSY\n", _nodeId, line_pa);
                     } else {
-                        grant = UBCC_OuterGrantType::GlobalGrantModified;
+                        oreq->reqType = reqType;
+                        oreq->writeIntent = writeIntent;
                     }
+                    return static_cast<UBCC_OuterGrantType>(-1);
                 } else {
                     // Recall failed to initiate, fall back to direct state
                     // change (backward compatibility with M5 behavior).
@@ -410,26 +455,18 @@ UBCCController::processOuterRequest(
             mesiStateName(prevState), mesiStateName(entry.state),
             static_cast<int>(grant), entry.ownerNode);
 
-    // ---- Q3: Grant handshake / pendingOp state machine ----
-    // pendingOp states:
-    //   0 = idle
-    //   1 = recall in progress (waiting for recall response)
-    //   2 = invalidation in progress (waiting for invalidation acks)
-    //   3 = grant handshake in progress (prevent re-entry)
+    // Phase 4: Grant handshake tracked via OutstandingRequest
     if (curTick() > 0 && entry.pendingOp == 0) {
         if (outRecallNeeded && *outRecallNeeded) {
-            // Recall was initiated — block until recall completes
-            entry.pendingOp = 1;
-            entry.pendingRequester = requesterNode;
-            entry.grantTick = curTick();
-            DPRINTF(RubyEP,
-                    "UBCC node_id=%d: pendingOp=1 (recall) PA=0x%lx "
-                    "requester=%d — returning BUSY\n",
-                    _nodeId, line_pa, requesterNode);
+            // Should be unreachable — OutstandingRequest handles recall
             return static_cast<UBCC_OuterGrantType>(-1);
         }
-        // No recall/invalidation needed — mark handshake in progress
-        entry.pendingOp = 3;
+        // No recall/invalidation — create OutstandingRequest for handshake
+        if (!findOutstanding(line_pa)) {
+            createOutstanding(line_pa, OpType::GRANT_HANDSHAKE,
+                              requesterNode, -1);
+        }
+        entry.pendingOp = 3;  // legacy
         entry.pendingRequester = requesterNode;
         entry.grantTick = curTick();
     }
@@ -535,12 +572,13 @@ bool
 UBCCController::initiateRecall(uint64_t line_pa, DirEntry &entry,
     UBCC_OuterReqType reqType, bool writeIntent, int requesterNode)
 {
-    // Mark the line as busy (pendingOp = 1 = recall-in-progress)
-    entry.pendingOp = 1;
-    entry.pendingRequester = requesterNode;
-    entry.pendingRecallTarget = entry.ownerNode;
-    entry.pendingReqType = reqType;
-    entry.pendingWriteIntent = writeIntent;
+    // Phase 2: Busy state tracked by OutstandingRequest.
+    // Populate legacy fields for M6 self-test compatibility only.
+    entry.pendingOp = 1;          // legacy
+    entry.pendingRequester = requesterNode;  // legacy
+    entry.pendingRecallTarget = entry.ownerNode;  // legacy
+    entry.pendingReqType = reqType;   // legacy
+    entry.pendingWriteIntent = writeIntent; // legacy
 
     DPRINTF(RubyEP,
             "UBCC node_id=%d: initiateRecall PA=0x%lx "
@@ -576,27 +614,27 @@ UBCCController::processRecallResponse(uint64_t line_pa, int ownerNode,
         return false;
     }
 
-    // Verify this is a pending recall
-    if (entry.pendingOp != 1) {
+    // Phase 2: Verify this is a pending recall via OutstandingRequest
+    OutstandingRequest *ost = findOutstanding(line_pa);
+    if (!ost || ost->opType != OpType::RECALL) {
         DPRINTF(RubyEP,
                 "UBCC node_id=%d: processRecallResponse PA=0x%lx "
-                "no pending recall (pendingOp=%d)\n",
-                _nodeId, line_pa, entry.pendingOp);
+                "no pending recall (ost=%p)\n",
+                _nodeId, line_pa, (void*)ost);
         return false;
     }
 
     // Verify the recall target matches
-    if (entry.pendingRecallTarget >= 0 &&
-        entry.pendingRecallTarget != ownerNode) {
+    if (ost->targetNode >= 0 && ost->targetNode != ownerNode) {
         warn("UBCC node_id=%d: recall owner mismatch PA=0x%lx "
              "expected=%d got=%d — rejecting\n",
-             _nodeId, line_pa, entry.pendingRecallTarget, ownerNode);
+             _nodeId, line_pa, ost->targetNode, ownerNode);
         return false;
     }
 
-    int requesterNode = entry.pendingRequester;
-    UBCC_OuterReqType reqType = entry.pendingReqType;
-    bool writeIntent = entry.pendingWriteIntent;
+    int requesterNode = ost->requesterNode;
+    UBCC_OuterReqType reqType = ost->reqType;
+    bool writeIntent = ost->writeIntent;
     MESIState prevState = entry.state;
     bool wasDirty = entry.dirty;
 
@@ -637,7 +675,12 @@ UBCCController::processRecallResponse(uint64_t line_pa, int ownerNode,
         entry.sharersMask = 0; // old owner invalidated
     }
 
-    // Clear pending recall context
+    // Phase 2: Mark outstanding as RESP_RCVD (don't clear pendingOp here).
+    // The grant will be released when processOuterRequest sees RESP_RCVD
+    // and the interconnect latency has expired.
+    ost->state = OpState::RESP_RCVD;
+    ost->respTick = curTick();
+    // Also clear legacy fields for M6 compatibility
     entry.pendingOp = 0;
     entry.pendingRequester = -1;
     entry.pendingRecallTarget = -1;
@@ -660,6 +703,11 @@ UBCCController::isLineBusy(uint64_t line_pa) const
     auto it = _directory.find(line_pa);
     if (it == _directory.end())
         return false;
+// Phase 2: OutstandingRequest also signals busy
+    auto oit = _outstandingReqs.find(line_pa);
+    if (oit != _outstandingReqs.end() &&
+        oit->second.state != OpState::CANCELLED)
+        return true;
     return it->second.pendingOp > 0;
 }
 
@@ -716,14 +764,16 @@ UBCCController::processInvalidationAck(uint64_t line_pa, int ackNode,
         return false;
     }
 
-    // Verify this is a pending invalidation
-    if (entry.pendingOp != 2) {
-        // If invalidation already completed (pendingOp==0), accept
-        // as idempotent duplicate ack without error.
+    // Phase 3: Verify pending invalidation via OutstandingRequest
+    OutstandingRequest *ost = findOutstanding(line_pa);
+    bool hasOutstanding = (ost && ost->opType == OpType::INVALIDATE);
+    bool hasPendingOp = (entry.pendingOp == 2);
+    if (!hasOutstanding && !hasPendingOp) {
+        // Already completed — idempotent
         if (entry.pendingOp == 0) {
             DPRINTF(RubyEP,
                     "UBCC node_id=%d: processInvalidationAck PA=0x%lx "
-                    "invalidation already completed — idempotent, ignoring\n",
+                    "invalidation already completed — idempotent\n",
                     _nodeId, line_pa);
             return true;
         }
@@ -732,6 +782,18 @@ UBCCController::processInvalidationAck(uint64_t line_pa, int ackNode,
                 "no pending invalidation (pendingOp=%d)\n",
                 _nodeId, line_pa, entry.pendingOp);
         return false;
+    }
+    // If invalidation completed (RESP_RCVD or pendingOp==0), accept
+    // duplicate ack without checking the mask
+    if (hasOutstanding && ost->state != OpState::WAITING_RESP) {
+        DPRINTF(RubyEP,
+                "UBCC node_id=%d: processInvalidationAck PA=0x%lx "
+                "completed (state=%d) — idempotent\n",
+                _nodeId, line_pa, (int)ost->state);
+        return true;
+    }
+    if (!hasOutstanding && entry.pendingOp == 0) {
+        return true;
     }
 
     // Verify the ack node is in the pending invalidation mask
@@ -770,13 +832,18 @@ UBCCController::processInvalidationAck(uint64_t line_pa, int ackNode,
 
     // Check if all invalidations are complete
     if (entry.pendingInvalidationCount == 0) {
-        // All sharers have acked — clear pending invalidation state
         DPRINTF(RubyEP,
                 "UBCC node_id=%d: all invalidations complete PA=0x%lx "
                 "state=%s ownerNode=%d\n",
                 _nodeId, line_pa,
                 mesiStateName(entry.state), entry.ownerNode);
 
+        // Phase 3: Update OutstandingRequest state
+        if (ost) {
+            ost->state = OpState::RESP_RCVD;
+            ost->respTick = curTick();
+        }
+        // Legacy cleanup (for M8 compatibility)
         entry.pendingOp = 0;
         entry.pendingInvalidationMask = 0;
         entry.invalidatedAckMask = 0;
@@ -931,13 +998,12 @@ UBCCController::processEvict(uint64_t line_pa, int evictingNode,
         return false;
     }
 
-    // ---- M7: Line busy check ----
-    // Cannot evict while line is busy with in-flight transaction.
-    if (entry.pendingOp > 0) {
+    // Phase 2: Line busy check unified to OutstandingRequest-aware
+    if (isLineBusy(line_pa)) {
         DPRINTF(RubyEP,
                 "UBCC node_id=%d: processEvict PA=0x%lx "
-                "line busy (pendingOp=%d) — rejected\n",
-                _nodeId, line_pa, entry.pendingOp);
+                "line busy — rejected\n",
+                _nodeId, line_pa);
         return false;
     }
 
@@ -1068,6 +1134,41 @@ UBCCController::setMaterializedData(uint64_t linePa, const uint8_t* data,
             "first_word=0x%08x\n",
             _nodeId, linePa, epoch,
             *(reinterpret_cast<const uint32_t*>(data)));
+}
+
+// ---- Phase 1: Outstanding request API ----
+OutstandingRequest*
+UBCCController::findOutstanding(uint64_t linePa)
+{
+    auto it = _outstandingReqs.find(linePa);
+    if (it != _outstandingReqs.end())
+        return &it->second;
+    return nullptr;
+}
+
+OutstandingRequest*
+UBCCController::createOutstanding(uint64_t linePa, OpType opType,
+                                  int requesterNode, int targetNode)
+{
+    // Don't create if one already exists for this line
+    if (_outstandingReqs.count(linePa))
+        return nullptr;
+    OutstandingRequest req;
+    req.linePa = linePa;
+    req.epochAtCreate = getEpochForLine(linePa);
+    req.opType = opType;
+    req.state = OpState::WAITING_RESP;
+    req.requesterNode = requesterNode;
+    req.targetNode = targetNode;
+    req.startTick = curTick();
+    _outstandingReqs[linePa] = req;
+    return &_outstandingReqs[linePa];
+}
+
+void
+UBCCController::removeOutstanding(uint64_t linePa)
+{
+    _outstandingReqs.erase(linePa);
 }
 
 } // namespace ruby

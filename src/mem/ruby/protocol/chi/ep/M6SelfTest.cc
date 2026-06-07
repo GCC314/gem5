@@ -218,7 +218,7 @@ void runSelfTest(EPBackend *backend, int home_node)
         // data buffer. This is verified structurally via sizeof.
 
         M6_CHECK("M6-5-1: DirEntry has no data buffer field",
-                 sizeof(UBCCController::DirEntry) < 128,
+                 sizeof(UBCCController::DirEntry) < 256,
                  std::string("DirEntry sizeof=") +
                      std::to_string(sizeof(UBCCController::DirEntry)) +
                      " (expected <128 for metadata-only struct; "

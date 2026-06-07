@@ -141,24 +141,7 @@ TBEStorage::areNSlotsAvailable(int n, Tick current_time) const
     return slotsAvailable() >= n;
 }
 
-inline void
-TBEStorage::incrementReserved()
-{
-    ++m_reserved;
-    m_stats.avg_reserved = m_reserved;
-}
-
-inline void
-TBEStorage::decrementReserved()
-{
-    // P0-1: Underflow is a protocol invariant violation and must
-    // fail fast.  The UBCC pendingOp state machine (P0-2) ensures
-    // that allocateRequestTBE is only called when a matching
-    // AllocateTBE_Request has incremented the reservation.
-    assert(m_reserved > 0);
-    --m_reserved;
-    m_stats.avg_reserved = m_reserved;
-}
+// Functions implemented in TBEStorage.cc
 
 inline int
 TBEStorage::addEntryToNewSlot()

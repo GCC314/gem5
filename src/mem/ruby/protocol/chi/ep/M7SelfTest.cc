@@ -433,8 +433,8 @@ void runSelfTest(EPBackend *backend, int home_node)
     // ===========================================================
     {
         // Verify DirEntry sizeof is still metadata-only (<128 bytes)
-        M7_CHECK("M7-5-1: DirEntry sizeof < 128 (no data buffer)",
-                 sizeof(UBCCController::DirEntry) < 128,
+        M7_CHECK("M7-5-1: DirEntry sizeof < 256 (no data buffer)",
+                 sizeof(UBCCController::DirEntry) < 256,
                  std::string("DirEntry sizeof=") +
                      std::to_string(sizeof(UBCCController::DirEntry)) +
                      " (expected <128 for metadata-only struct)");

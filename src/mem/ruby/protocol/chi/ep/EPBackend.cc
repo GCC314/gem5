@@ -300,15 +300,15 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
     _requesterLines[line_pa] = entry;
 
     // Dispatch to home node's UBCC via cross-node registry.
-    // Use home PA so the home UBCC sees the line in its own address space.
     UBCCController *homeUbcc = UBCCController::getInstance(homeNode);
     if (!homeUbcc) {
-        // Fallback: use our own UBCC (for same-home-node or
-        // bootstrap scenarios). This is a temporary M5 simplification.
-        DPRINTF(RubyCHIGeneric,
-                "EPBackend node_id=%d: home UBCC for node %d not found, "
-                "falling back to local UBCC\n",
-                _nodeId, homeNode);
+        if (homeNode != _nodeId) {
+            fatal("EPBackend node_id=%d: remote UBCC for homeNode=%d "
+                  "not registered (local UBCC is NOT a valid fallback "
+                  "for cross-node access).  Check UBCC registry.\n",
+                  _nodeId, homeNode);
+        }
+        // Only allow fallback when home IS the local node
         homeUbcc = _ubcc;
     }
     if (!homeUbcc) {

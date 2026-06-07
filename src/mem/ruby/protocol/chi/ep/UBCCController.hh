@@ -41,6 +41,56 @@ enum class UBCC_RecallResult {
     RecallRejected       // Line is busy, request rejected
 };
 
+// ---- Phase 1: Outstanding request state machine ----
+enum class OpType {
+    RECALL,           // Recall owner data before granting access
+    INVALIDATE,       // Invalidate sharers before upgrading to unique
+    GRANT_HANDSHAKE   // Prevent re-entry during grant→CompData→CompAck
+};
+
+enum class OpState {
+    WAITING_RESP,     // Waiting for recall response or invalidation acks
+    RESP_RCVD,        // Response received, waiting for interconnect delay
+    CANCELLED         // Timeout or error
+};
+
+struct OutstandingRequest {
+    uint64_t linePa;          // Associated cache line address
+    uint64_t epochAtCreate;   // Directory epoch when request was created
+    OpType   opType;          // Type of operation
+    OpState  state;           // Current state
+    int      requesterNode;   // Node waiting for completion
+    int      targetNode;      // Recall target or invalidation target node
+    Tick     startTick;       // When the request was created
+    Tick     respTick;        // When the response arrived
+
+    // Recall data buffer (P0-3)
+    uint8_t  dataBuffer[64];
+    bool     dataValid;
+
+    // Original request parameters (for retry)
+    UBCC_OuterReqType reqType;
+    bool              writeIntent;
+
+    // Invalidation tracking (only for INVALIDATE)
+    int      pendingAckCount;
+    uint64_t ackMask;
+    uint64_t totalMask;
+
+    OutstandingRequest()
+        : linePa(0), epochAtCreate(0),
+          opType(OpType::RECALL), state(OpState::WAITING_RESP),
+          requesterNode(-1), targetNode(-1),
+          startTick(0), respTick(0),
+          dataValid(false),
+          reqType(UBCC_OuterReqType::GlobalReadShared),
+          writeIntent(false),
+          pendingAckCount(0), ackMask(0), totalMask(0)
+    {
+        memset(dataBuffer, 0, 64);
+    }
+};
+
 class UBCCController
 {
   public:
@@ -342,6 +392,12 @@ class UBCCController
     void setMaterializedData(uint64_t linePa, const uint8_t* data,
                              int len, uint64_t epoch);
 
+    // ---- Phase 1: Outstanding request API ----
+    OutstandingRequest* findOutstanding(uint64_t linePa);
+    OutstandingRequest* createOutstanding(uint64_t linePa, OpType opType,
+                                          int requesterNode, int targetNode);
+    void removeOutstanding(uint64_t linePa);
+
    private:
     const int _nodeId;
 
@@ -353,6 +409,12 @@ class UBCCController
     // ---- M5: Home directory ----
     // Per-line directory entries for lines homed at this node.
     std::map<uint64_t, DirEntry> _directory;
+
+    // ---- Phase 1: Outstanding request table ----
+    // Per-line in-flight operations (recall/invalidation/grant-handshake).
+    // One active operation per line.  Completed operations are removed
+    // after the grant is delivered to the requester.
+    std::map<uint64_t, OutstandingRequest> _outstandingReqs;
 
     // ---- M6: Recall counters ----
     uint64_t _recallCount;
