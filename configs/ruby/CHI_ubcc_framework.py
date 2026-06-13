@@ -31,6 +31,7 @@ def _make_hnf(ruby_system, addr_ranges, llcache_type, node_id):
     # With our zero-latency EP-SNF, we must add a minimum delay to
     # prevent same-tick TBE reservation races.
     hnf_cntrl.enable_DMT = False
+    hnf_cntrl.epRnfMachineVersion = -1  # v4: default, overridden if EP-RNF exists
     hnf_cntrl.number_of_TBEs = 4096
     hnf_cntrl.number_of_repl_TBEs = 4096
     hnf_cntrl.number_of_snoop_TBEs = 4096
