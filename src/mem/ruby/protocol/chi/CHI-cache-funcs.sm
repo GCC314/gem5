@@ -53,6 +53,7 @@ void set_tbe(TBE b);
 void unset_tbe();
 MachineID mapAddressToDownstreamMachine(Addr addr);
 MachineID mapAddressToMachine(Addr addr, MachineType mtype);
+MachineID createMachineID(MachineType t, NodeID i);
 
 void incomingTransactionStart(Addr, Event, State, bool);
 void incomingTransactionEnd(Addr, State);
@@ -415,6 +416,14 @@ void initializeTBE(TBE tbe, Addr addr, int storSlot) {
   tbe.delayNextAction := intToTick(0);
 
   tbe.is_stale := false;
+
+   // v4: Derive epRnfMachineID from epRnfMachineVersion
+   if (epRnfMachineVersion >= 0) {
+     tbe.epRnfMachineID := createMachineID(MachineType:Cache, intToID(epRnfMachineVersion));
+   }
+
+  // v4: Reset proxy op to no-op; will be set in allocateRequestTBE if needed
+  tbe.epProxyOp := EpProxyOp:NoProxyOp;
 }
 
 TBE allocateRequestTBE(Addr addr, CHIRequestMsg in_msg), return_by_pointer="yes" {
@@ -460,6 +469,9 @@ TBE allocateRequestTBE(Addr addr, CHIRequestMsg in_msg), return_by_pointer="yes"
 
   tbe.use_DMT := false;
   tbe.use_DCT := false;
+
+  // v4: Capture EP proxy op from request message for special completion routing
+  tbe.epProxyOp := in_msg.ep_proxy_op;
 
   tbe.hasUseTimeout := false;
 
@@ -907,6 +919,30 @@ MachineID getMiscNodeMachine() {
   return mapAddressToMachine(intToAddress(0), MachineType:MiscNode);
 }
 
+// v4: pickSharerForSnoop — select snoop target excluding EP-RNF.
+// Used by single-target snoop actions (SnpUnique_RetToSrc,
+// SnpSharedFwd, SnpOnce, SnpOnceFwd) to avoid sending snoops
+// to EP-RNF as the direct target.
+MachineID pickSharerForSnoop(TBE tbe, NetDest sharers) {
+  assert(tbe.dir_sharers.count() > 0);
+
+  // Remove EP-RNF from candidates to prevent local snoop to EP-RNF
+  NetDest candidates := sharers;
+  if (epRnfMachineVersion >= 0) {
+    candidates.remove(tbe.epRnfMachineID);
+  }
+
+  if (candidates.isEmpty()) {
+    // Fallback: no non-EP-RNF sharer available;
+    // return EP-RNF as last resort (callers should DCT-fallback first)
+    return sharers.smallestElement();
+  }
+
+  // TODO: prefer L2 (closest non-EP-RNF sharer);
+  // for now pick smallest element
+  return candidates.smallestElement();
+}
+
 void copyCacheAndDir(CacheEntry cache_entry, DirEntry dir_entry,
                      TBE tbe, State initialState) {
   assert(is_valid(tbe));
@@ -1138,6 +1174,15 @@ State makeFinalStateHelper(State cs, State ds) {
 State makeFinalState(TBE tbe, CacheEntry cache_entry, DirEntry dir_entry) {
   setDataToBeStates(tbe);
   printTBEState(tbe);
+
+  // v4: EP-RNF proxy special completion — converge to I.
+  // For InvalidateOnly and RecallUnique, EP-RNF must not retain
+  // any local owner/sharer rights after completion.
+  if (epRnfMachineVersion >= 0 &&
+      tbe.requestor == tbe.epRnfMachineID &&
+      tbe.epProxyOp != EpProxyOp:NoProxyOp) {
+    return State:I;
+  }
 
   State cache_state := State:I;
   State dir_state := State:I;

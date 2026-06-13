@@ -489,6 +489,12 @@ action(Initiate_ReadShared_Hit, desc="") {
 
 action(Initiate_ReadShared_HitUpstream, desc="") {
   tbe.actions.push(Event:ReadMissPipe);
+  // v4: DCT fallback — if sole sharer is EP-RNF, force non-DCT snoop path
+  if (tbe.use_DCT && epRnfMachineVersion >= 0 &&
+      tbe.dir_sharers.count() == 1 &&
+      tbe.dir_sharers.isElement(tbe.epRnfMachineID)) {
+    tbe.use_DCT := false;
+  }
   if (tbe.use_DCT) {
     tbe.actions.push(Event:SendSnpSharedFwdToOwner);
     tbe.actions.pushNB(Event:WaitCompAck);
@@ -590,6 +596,12 @@ action(Initiate_ReadOnce_Hit, desc="") {
 
 action(Initiate_ReadOnce_HitUpstream, desc="") {
   tbe.actions.push(Event:ReadMissPipe);
+  // v4: DCT fallback — if sole sharer is EP-RNF, force non-DCT snoop path
+  if (tbe.use_DCT && epRnfMachineVersion >= 0 &&
+      tbe.dir_sharers.count() == 1 &&
+      tbe.dir_sharers.isElement(tbe.epRnfMachineID)) {
+    tbe.use_DCT := false;
+  }
   if (tbe.use_DCT) {
     tbe.actions.push(Event:SendSnpOnceFwd);
     tbe.actions.pushNB(Event:WaitCompAck);
@@ -685,6 +697,12 @@ action(Initiate_ReadUnique_HitUpstream, desc="") {
   // requester; so force it off if that's the case
   tbe.use_DCT := tbe.use_DCT && (tbe.dir_sharers.count() == 1) &&
                  (tbe.dir_sharers.isElement(tbe.requestor) == false);
+  // v4: DCT fallback — if sole sharer is EP-RNF, force non-DCT snoop path
+  if (tbe.use_DCT && epRnfMachineVersion >= 0 &&
+      tbe.dir_sharers.count() == 1 &&
+      tbe.dir_sharers.isElement(tbe.epRnfMachineID)) {
+    tbe.use_DCT := false;
+  }
   if (tbe.use_DCT) {
     tbe.actions.push(Event:SendSnpUniqueFwd);
     tbe.actions.pushNB(Event:WaitCompAck);
@@ -1902,13 +1920,18 @@ action(Send_SnpUnique_RetToSrc, desc="") {
   if (tbe.dir_ownerExists) {
     dest := tbe.dir_owner;
   } else {
-    // TODO should be random or the closest one
-    dest := tbe.dir_sharers.smallestElement();
+    // v4: use pickSharerForSnoop to exclude EP-RNF from retToSrc target
+    dest := pickSharerForSnoop(tbe, tbe.dir_sharers);
+  }
+  // v4: EP-RNF must never be retToSrc=true target
+  bool useRetToSrc := true;
+  if (epRnfMachineVersion >= 0 && dest == tbe.epRnfMachineID) {
+    useRetToSrc := false;
   }
   enqueue(snpOutPort, CHIRequestMsg, snoop_latency) {
     prepareRequest(tbe, CHIRequestType:SnpUnique, out_msg);
     out_msg.Destination.add(dest);
-    out_msg.retToSrc := true;
+    out_msg.retToSrc := useRetToSrc;
     out_msg.ns := tbe.ns;
   }
   // if other sharers send with retToSrc=false to others
@@ -2038,8 +2061,8 @@ action(Send_SnpSharedFwd_ToSharer, desc="") {
 
   enqueue(snpOutPort, CHIRequestMsg, snoop_latency) {
     prepareRequest(tbe, CHIRequestType:SnpSharedFwd, out_msg);
-    // TODO should be random or the closest one to the fwd dest
-    out_msg.Destination.add(tbe.dir_sharers.smallestElement());
+    // v4: use pickSharerForSnoop to exclude EP-RNF from fwd target
+    out_msg.Destination.add(pickSharerForSnoop(tbe, tbe.dir_sharers));
     out_msg.retToSrc := retToSrc;
     out_msg.ns := tbe.ns;
   }
@@ -2071,8 +2094,8 @@ action(Send_SnpOnce, desc="") {
     if (tbe.dir_ownerExists) {
       out_msg.Destination.add(tbe.dir_owner);
     } else {
-      // TODO should be random or the closest one
-      out_msg.Destination.add(tbe.dir_sharers.smallestElement());
+      // v4: use pickSharerForSnoop to exclude EP-RNF from snoop target
+      out_msg.Destination.add(pickSharerForSnoop(tbe, tbe.dir_sharers));
     }
     out_msg.retToSrc := true;
     out_msg.ns := tbe.ns;
@@ -2105,8 +2128,8 @@ action(Send_SnpOnceFwd, desc="") {
     if (tbe.dir_ownerExists) {
       out_msg.Destination.add(tbe.dir_owner);
     } else {
-      // TODO should be random or the closest one
-      out_msg.Destination.add(tbe.dir_sharers.smallestElement());
+      // v4: use pickSharerForSnoop to exclude EP-RNF from fwd target
+      out_msg.Destination.add(pickSharerForSnoop(tbe, tbe.dir_sharers));
     }
     out_msg.retToSrc := false;
     out_msg.ns := tbe.ns;
@@ -2395,6 +2418,17 @@ action(UpdateDirState_FromSnpDataResp, desc="") {
   printTBEState(tbe);
 }
 
+// v4: Register EP-RNF in dir_sharers when CompData arrives with m_shared_hint.
+// This ensures EP-RNF is tracked as a sharer for future snoop fanout.
+action(RegisterEPRNF_OnSharedHint, desc="") {
+  peek(datInPort, CHIDataMsg) {
+    if (in_msg.m_shared_hint && epRnfMachineVersion >= 0) {
+      tbe.dir_sharers.add(tbe.epRnfMachineID);
+      tbe.updateDirOnCompAck := true; // ensure dir is persisted
+    }
+  }
+}
+
 action(UpdateDataState_FromReqDataResp, desc="") {
   assert(is_valid(tbe));
   // only perform the update once we received all chunks
@@ -2586,7 +2620,13 @@ action(UpdateDirState_FromReqResp, desc="") {
 
       tbe.dir_sharers.add(in_msg.responder);
 
-      if (tbe.requestorToBeOwner) {
+      // v4: Skip owner promotion when responder is EP-RNF.
+      // For proxy ops (InvalidateOnly/RecallUnique), EP-RNF should
+      // not become the directory owner.
+      bool is_eprnf_responder := epRnfMachineVersion >= 0 &&
+                                   in_msg.responder == tbe.epRnfMachineID;
+
+      if (tbe.requestorToBeOwner && !is_eprnf_responder) {
         assert(tbe.dataMaybeDirtyUpstream);
         assert(tbe.dir_ownerExists == false);
         assert(tbe.requestorToBeExclusiveOwner == false);
@@ -2594,7 +2634,7 @@ action(UpdateDirState_FromReqResp, desc="") {
         tbe.dir_ownerExists := true;
         tbe.dir_ownerIsExcl := false;
 
-      } else if (tbe.requestorToBeExclusiveOwner) {
+      } else if (tbe.requestorToBeExclusiveOwner && !is_eprnf_responder) {
         assert(tbe.dataMaybeDirtyUpstream);
         assert(tbe.dir_ownerExists == false);
         assert(tbe.dir_sharers.count() == 1);
@@ -2800,22 +2840,39 @@ action(Send_CompData, desc="") {
   bool snd_dirty_on_rs := (is_rd_shared && !is_rd_nsd) &&
                           !tbe.dir_ownerExists;
 
+  // v4: When requestor is EP-RNF, force clean-shared semantics.
+  // EP-RNF must always receive CompData_SC, never dirty/unique data.
+  bool is_eprnf_req := epRnfMachineVersion >= 0 &&
+                       tbe.requestor == tbe.epRnfMachineID;
+
   if (is_rd_once || is_rd_no_snp) {
     tbe.snd_msgType := CHIDataType:CompData_I;
   } else if (is_rd_unique || (is_rd_shared && snd_unique_on_rs)) {
     assert(tbe.dataUnique);
-    if (tbe.dataDirty) {
+    if (is_eprnf_req) {
+      // v4: Force SC semantics for EP-RNF; clear dirty/unique flags
+      tbe.snd_msgType := CHIDataType:CompData_SC;
+      tbe.dataDirty := false;
+      tbe.dataUnique := false;
+      tbe.dataMaybeDirtyUpstream := false;
+    } else if (tbe.dataDirty) {
       tbe.snd_msgType := CHIDataType:CompData_UD_PD;
     } else {
       tbe.snd_msgType := CHIDataType:CompData_UC;
     }
   } else if (is_rd_shared) {
-    if (tbe.dataDirty && snd_dirty_on_rs) {
+    if (tbe.dataDirty && snd_dirty_on_rs && !is_eprnf_req) {
       tbe.snd_msgType := CHIDataType:CompData_SD_PD;
     } else {
       // notice the MaintainCoherence will send WriteClean if the line
       // is dirty and we won't be caching the data
       tbe.snd_msgType := CHIDataType:CompData_SC;
+      if (is_eprnf_req) {
+        // v4: Force clean-shared for EP-RNF
+        tbe.dataDirty := false;
+        tbe.dataUnique := false;
+        tbe.dataMaybeDirtyUpstream := false;
+      }
     }
   } else {
     error("Invalid request type");
@@ -3397,6 +3454,45 @@ action(CheckUpgrade_FromCU, desc="") {
   tbe.actions.pushFront(Event:SendCompAck);
 }
 
+
+// v4: EP-RNF proxy special completion scrub_to_I.
+// Cleans TBE directory/data state so Finalize_* assertions pass and
+// the cache line converges to I (no local rights retained).
+// makeFinalState also returns I for these ops, but this scrub ensures
+// dir_sharers/dir_owner/dataValid are clean for the Finalize_* actions.
+// Must execute before Finalize_UpdateCacheFromTBE / Finalize_UpdateDirectoryFromTBE.
+action(ScrubEPRNF_ToI, desc="") {
+  assert(is_valid(tbe));
+  if (epRnfMachineVersion >= 0 &&
+      tbe.requestor == tbe.epRnfMachineID &&
+      tbe.epProxyOp != EpProxyOp:NoProxyOp) {
+
+    // Remove EP-RNF from dir_sharers so dir does not track it post-completion
+    if (tbe.dir_sharers.isElement(tbe.epRnfMachineID)) {
+      tbe.dir_sharers.remove(tbe.epRnfMachineID);
+    }
+
+    // Clear owner state — EP-RNF never becomes local owner on proxy ops
+    tbe.dir_ownerExists := false;
+    tbe.dir_ownerIsExcl := false;
+
+    // Clear dirty/unique/valid flags to ensure clean deallocation
+    tbe.dataMaybeDirtyUpstream := false;
+    tbe.dataDirty := false;
+    tbe.dataUnique := false;
+    tbe.dataValid := false;
+    tbe.dataBlkValid.clear();
+
+    // Ensure cache entry is dropped
+    tbe.dataToBeInvalid := true;
+    tbe.doCacheFill := false;
+
+    // Suppress all directory ownership granting
+    tbe.requestorToBeOwner := false;
+    tbe.requestorToBeExclusiveOwner := false;
+    tbe.updateDirOnCompAck := false;
+  }
+}
 
 action(Finalize_UpdateCacheFromTBE, desc="") {
   assert(is_valid(tbe));

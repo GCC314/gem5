@@ -1475,6 +1475,7 @@ transition({BUSY_BLKD,BUSY_INTR},
   Receive_RespSepDataFromCompData;
   Receive_ReqDataResp;
   UpdateDataState_FromReqDataResp;
+  RegisterEPRNF_OnSharedHint;
   Callback_Miss;
   Profile_OutgoingEnd_DataResp;
   Pop_DataInQueue;
@@ -1630,6 +1631,7 @@ transition(BUSY_INTR, WriteZero) {
 
  transition({BUSY_BLKD,BUSY_INTR}, Final, *) {
    Pop_TriggerQueue;
+   ScrubEPRNF_ToI;
    Finalize_UpdateCacheFromTBE;
    Finalize_UpdateDirectoryFromTBE;
    Finalize_DeallocateRequest;
