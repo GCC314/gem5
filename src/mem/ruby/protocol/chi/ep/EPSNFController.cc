@@ -93,7 +93,7 @@ EPSNFController::wakeup()
                         curTick(), cacheLineSize, m_ruby_system,
                         it->linePa, CHIDataType_CompData_UC,
                         m_machineID, dataDest, db, wm,
-                        false, 0, MessageSizeType_Data);
+                        false, 0, false, MessageSizeType_Data);
                     sendDataMsg(dat);
                 }
                 it = _retryQueue.erase(it);
@@ -277,7 +277,7 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
             msg->m_addr, CHIDataType_CompData_UC,
             m_machineID, dataDest,
             db, wm,
-            false, 0, MessageSizeType_Data);
+            false, 0, false, MessageSizeType_Data);
         // Q3: Defer send by 1 tick to prevent same-tick TBE race
         // at HN-F (see docs/tbe-race-condition.svg for details).
         _deferredCompData.push_back(dat);

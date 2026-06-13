@@ -342,7 +342,7 @@ class CHI_HNFController(Base_CHI_Cache_Controller):
         self.alloc_on_seq_acc = False
         self.alloc_on_seq_line_write = False
         self.alloc_on_readshared = True
-        self.alloc_on_readunique = False
+        self.alloc_on_readunique = True  # v4: enable L3 caching for DSM unique paths
         self.alloc_on_readonce = True
         self.alloc_on_writeback = True
         self.alloc_on_atomic = True

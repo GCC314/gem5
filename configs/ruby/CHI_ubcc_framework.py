@@ -110,14 +110,14 @@ def setup_dsm_va_mapping(processes, num_nodes=DEFAULT_N, seg_size=DEFAULT_SEG_SI
 def configure_l3_dsm_policy(hnf_cntrl):
     """Configure HN-F L3 alloc/dealloc for DSM line handling.
 
-    Q2 FIX: Disable L3 caching for DSM lines.  With L3 caching of DSM
-    lines, the HN-F serves subsequent reads/writes from L3 without
-    forwarding to EP_SNF, which bypasses the UBCC recall path (M6).
-    Stale L3 data then causes cross-node coherence failures (TC3 fails).
+    v4: Enable L3 caching for shared and unique DSM lines so that
+    EP-RNF registration via shared_hint can record dir_sharers properly,
+    and local upgrades (SC→UC) can trigger SnpCleanInvalid to EP-RNF.
+    ReadOnce remains disabled to prevent bypass of the UBCC recall path.
     """
-    hnf_cntrl.alloc_on_readshared     = False  # No L3 caching for DSM
-    hnf_cntrl.alloc_on_readunique     = False  # No L3 caching for DSM
-    hnf_cntrl.alloc_on_readonce       = False
+    hnf_cntrl.alloc_on_readshared     = True   # v4: enable shared DSM caching
+    hnf_cntrl.alloc_on_readunique     = True   # v4: enable unique DSM caching
+    hnf_cntrl.alloc_on_readonce       = False  # v4: disable to prevent UBCC recall bypass
     hnf_cntrl.alloc_on_writeback      = False
     hnf_cntrl.alloc_on_atomic         = False
     hnf_cntrl.dealloc_on_unique       = False
@@ -265,6 +265,9 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
         network_nodes.append(nd['ep_rnf_wrapper'])
         all_cntrls.append(nd['ep_rnf_cntrl'])
 
+        # v4: Inject EP-RNF MachineVersion into HN-F so it can derive
+        # epRnfMachineID in initializeTBE for dir_sharers tracking.
+        nd['hnf_cntrl'].epRnfMachineVersion = nd['ep_rnf_cntrl'].version
 
         nd['clusters'] = []
         for cluster_i in range(DEFAULT_D):
