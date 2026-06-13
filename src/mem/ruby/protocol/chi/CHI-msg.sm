@@ -229,6 +229,11 @@ structure(CHIDataMsg, desc="", interface="Message") {
   bool usesTxnId,       desc="True if using a Transaction ID", default="false";
   Addr txnId,           desc="Transaction ID", default="0";
 
+  // UBCC Sideband: shared hint on CompData.
+  // Set by EP_SNF when UBCC grants shared access to a new node.
+  // HN-F uses this to register EP-RNF in dir_sharers (RegisterEPRNF_OnSharedHint).
+  bool m_shared_hint, desc="UBCC shared hint for EP-RNF registration", default="false";
+
   MessageSizeType MessageSize, default="MessageSizeType_Data";
 
   bool functionalRead(Packet *pkt) {

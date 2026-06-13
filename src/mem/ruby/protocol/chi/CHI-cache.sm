@@ -164,6 +164,12 @@ machine(MachineType:Cache, "Cache coherency protocol") :
   bool dealloc_backinv_unique;
   bool dealloc_backinv_shared;
 
+  // EP-RNF MachineID version for cross-node coherence proxy registration.
+  // Set via CHI_ubcc_framework.py: epRnfMachineVersion.
+  // Used to derive epRnfMachineID in initializeTBE for dir_sharers tracking.
+  int epRnfMachineVersion, default="-1",
+    desc="Machine version of the EP-RNF controller (-1 if none)";
+
   // If the responder has the line in UC or UD state, propagate this state
   // on a ReadShared. Notice data won't be deallocated if dealloc_on_unique is
   // set
