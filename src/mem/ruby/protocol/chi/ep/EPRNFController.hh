@@ -1,11 +1,14 @@
 #ifndef __MEM_RUBY_PROTOCOL_CHI_EP_EPRNFCONTROLLER_HH__
 #define __MEM_RUBY_PROTOCOL_CHI_EP_EPRNFCONTROLLER_HH__
 
+#include <deque>
 #include <functional>
 #include <iostream>
 #include <map>
 #include <queue>
+#include <vector>
 
+#include "mem/ruby/protocol/CHI/EpProxyOp.hh"
 #include "mem/ruby/network/MessageBuffer.hh"
 #include "mem/ruby/protocol/AccessPermission.hh"
 #include "mem/ruby/protocol/chi/ep/EPBackend.hh"
@@ -230,61 +233,103 @@ class EPRNFController : public EPController
     // Snoops are HN-F's responsibility per CHI spec.  Recall/invalidation
     // must go through proper CHI Request path: EP-RNF → HN-F → HN-F handles snooping.
 
+    // ---- v4: EP-RNF proxy operation types (scheme §4.3.2, §7.4) ----
+    /** CHI operation types that EP-RNF can issue to HN-F. */
+    enum class PendingChiOp { ReadShared, CleanUnique, ReadUnique };
+
     // ---- Q3: CHI Request-Based Coherence to HN-F ----
     /**
-     * Pending CHI transaction context.  Tracks an in-flight request
-     * sent to HN-F (ReadShared for recall, CleanUnique for invalidation).
-     * When the HN-F response (CompData or Comp_UC) arrives, the
-     * callback is invoked and the transaction is removed from the map.
+     * Pending CHI transaction context (§7.4).  Tracks an in-flight request
+     * sent to HN-F (ReadShared for recall, CleanUnique for invalidation,
+     * ReadUnique for write recall).  When the HN-F response (CompData or
+     * Comp_UC) arrives, the callback is invoked and the transaction is
+     * removed from the map.
      */
     struct PendingChiTxn {
         uint64_t linePa;
-        enum Type { TXN_READSHARED, TXN_CLEANUNIQUE, TXN_READONCE } type;
-        bool completed;
-        /** True if the HN-F response (CompData/Comp_UC) has been received
-         *  but CompAck has not yet been successfully sent. */
-        bool needsCompAck;
-        /** The HN-F MachineID to send CompAck to. */
-        MachineID hnfDest;
+        uint64_t epoch;          // v4: outer epoch for this transaction
+        uint64_t reqId;          // v4: outer reqId for this transaction
+        PendingChiOp op;         // v4: operation type (replaces 'type')
+        CHI::EpProxyOp proxyOp;       // v4: proxy op for special completion
+        MachineID hnfDest;       // HN-F MachineID to send CompAck to
+        int beatsExpected;       // v4: total data beats expected
+        int beatsReceived;       // v4: data beats received so far
+        bool needsCompAck;       // CompAck not yet successfully sent
+        bool outerTxnPending;    // v4: outer (UBCC) transaction in progress
+        bool callbackPayloadStable; // v4: callback data stabilized
+        // ---- Per-PA 1-entry snoop slot (§4.3.3) ----
+        bool snoopSlotValid;     // v4: queued snoop in 1-entry slot
+        CHI::CHIRequestType queuedSnoopType; // v4: type of queued snoop
+        bool queuedRetToSrc;     // v4: retToSrc for queued snoop
         Tick startTick;
         std::function<void(bool)> onComplete;
 
         PendingChiTxn()
-            : linePa(0), type(TXN_READSHARED), completed(false),
-              needsCompAck(false), startTick(0) {}
+            : linePa(0), epoch(0), reqId(0),
+              op(PendingChiOp::ReadShared),
+              proxyOp(CHI::EpProxyOp_NoProxyOp),
+              beatsExpected(0), beatsReceived(0),
+              needsCompAck(false), outerTxnPending(false),
+              callbackPayloadStable(false),
+              snoopSlotValid(false),
+              queuedSnoopType(CHI::CHIRequestType_null),
+              queuedRetToSrc(false), startTick(0) {}
+    };
+
+    // ---- v4: Retry queue entry (§4.3.4, §7.5) ----
+    /**
+     * Retry entry for deferred outbound CHI requests.
+     * When a new outer request arrives while a CHI txn is in-flight,
+     * the strongest op is preserved.  Stale epochs are discarded.
+     *
+     * Ordering: ReadUnique > CleanUnique > ReadShared
+     */
+    struct RetryEntry {
+        uint64_t linePa;
+        uint64_t epoch;
+        uint64_t reqId;
+        PendingChiOp strongestOp; // strongest op preserved across retries
     };
 
     /**
-     * Initiate a ReadOnce to the local HN-F.
-     * HN-F processes without owner-tracking or snoop generation —
-     * just fetches data from SNF and returns CompData.
-     * Used for recall where we only need the data, not coherence tracking.
+     * v4: Initiate a ReadUnique to the local HN-F for write recall (§4.3.2).
+     * HN-F sends SnpUnique to invalidate the old owner, collects dirty data
+     * if present, and returns CompData + Comp_UC to EP-RNF.
+     * Special completion: scrub_to_I (does NOT retain ownership).
+     *
+     * @param linePa     Physical address in local PA view
+     * @param onComplete Called when the CHI transaction completes
      */
-    void startReadOnce(uint64_t linePa,
-                       std::function<void(bool)> onComplete);
+    void startReadUnique(uint64_t linePa,
+                         std::function<void(bool)> onComplete);
 
     /**
-     * Initiate a ReadShared to the local HN-F.
+     * Initiate a ReadShared to the local HN-F for read recall (§4.3.2).
      * HN-F processes with full owner-tracking: sends SnpShared to
-     * downgrade UD→SC and collect data.  Use when directory update
-     * is needed (e.g., recall that must downgrade local L2).
+     * downgrade UD→SC and collect data.
      */
     void startReadShared(uint64_t linePa,
                          std::function<void(bool)> onComplete);
 
     /**
-     * Initiate a CleanUnique to the local HN-F.
-     * HN-F processes natively — if sharers exist, it sends
-     * SnpCleanInvalid to them, then returns Comp_UC to EP-RNF.
-     *
-     * On Comp_UC receipt, sendCompAck() is called automatically and
-     * onComplete is invoked.
+     * Initiate a CleanUnique to the local HN-F for sharer invalidation
+     * (§4.3.2). HN-F sends SnpCleanInvalid to sharers, returns Comp_UC
+     * as completion token.  Special completion: scrub_to_I.
      *
      * @param linePa     Physical address in local PA view
      * @param onComplete Called when the CHI transaction completes
      */
     void startCleanUnique(uint64_t linePa,
                           std::function<void(bool)> onComplete);
+
+    // ---- v4: Helper ----
+    /**
+     * v4: Return the EpProxyOp for a given PendingChiOp (§4.3.2).
+     * Maps PendingChiOp → EpProxyOp for special completion routing.
+     * ReadShared → NoProxyOp, CleanUnique → InvalidateOnly,
+     * ReadUnique → RecallUnique.
+     */
+    static CHI::EpProxyOp getEpProxyOp(PendingChiOp op);
 
   protected:
     bool recvRequestMsg(const CHIRequestMsg *msg) override;
@@ -296,9 +341,10 @@ class EPRNFController : public EPController
 
   private:
     // ---- Q3: CHI Request to HN-F ----
-    /** Send a CHI request (ReadShared/CleanUnique) to HN-F via reqOut.
+    /** Send a CHI request (ReadShared/CleanUnique/ReadUnique) to HN-F via reqOut.
      *  @return true if the message was enqueued successfully. */
-    bool sendChiRequest(uint64_t linePa, CHI::CHIRequestType reqType);
+    bool sendChiRequest(uint64_t linePa, CHI::CHIRequestType reqType,
+                        CHI::EpProxyOp proxyOp = CHI::EpProxyOp_NoProxyOp);
 
     /** Send CompAck to HN-F via rspOut after receiving a response. */
     void sendCompAck(uint64_t linePa, MachineID dest);
@@ -309,6 +355,72 @@ class EPRNFController : public EPController
     /** Retry sending CompAck for pending CHI transactions
      *  whose CompAck couldn't be sent due to rspOut full. */
     void retryPendingCompAcks();
+
+    // ---- v4: Snoop Dispatch & Queue (§4.3.3) ----
+    /** Process a snoop message immediately (no in-flight CHI txn). */
+    bool processSnoopImmediate(const CHIRequestMsg *msg);
+
+    /** Handle SnpCleanInvalid: non-upgrade immediate SnpResp_I;
+     *  upgrade path OuterUpgradeReq→wait→SnpResp_I (§4.3.3, §5.5). */
+    bool handleSnpCleanInvalid(const CHIRequestMsg *msg);
+
+    /** Handle SnpUnique: globalInvalidate → SnpResp_I / SnpRespData_I(_PD)
+     *  (§4.3.3, §4.6.3). */
+    bool handleSnpUnique(const CHIRequestMsg *msg);
+
+    /** Handle SnpOnce: remoteFetch → SnpRespData_SC (§4.3.3). */
+    bool handleSnpOnce(const CHIRequestMsg *msg);
+
+    /** Send SnpResp_I to HN-F (common helper). */
+    bool sendSnpRespI(const CHIRequestMsg *msg);
+
+    /** Send SnpRespData_SC to HN-F (SnpOnce response). */
+    bool sendSnpRespDataSC(const CHIRequestMsg *msg);
+
+    /** v4: Process the queued snoop after current CHI txn completes.
+     *  Queued snoop has higher priority than deferred CHI requests. */
+    void processQueuedSnoop(uint64_t linePa);
+
+    /** v4: Complete a PendingChiTxn — invoke callback, clean up,
+     *  then process queued snoop or deferred CHI requests. */
+    void finishChiTxn(uint64_t linePa, bool success);
+
+    // ---- v4: Retry Queue (§4.3.4) ----
+    /**
+     * v4: Enqueue or merge a retry entry with strongest-op ordering.
+     * Stale epochs are discarded.  Strongest op wins across retries.
+     */
+    void enqueueRetry(uint64_t linePa, uint64_t epoch, uint64_t reqId,
+                      PendingChiOp op);
+
+    /** v4: Process retry queue entries after CHI txn completes. */
+    void processRetryQueue();
+
+    /** v4: Per-PA retry entries with strongest-op ordering. */
+    std::map<uint64_t, RetryEntry> _retryEntries;
+
+    // ---- v4: Upgrade Path (§5.5) ----
+    /**
+     * v4: Upgrade pending context.  Tracks PA that is undergoing
+     * local upgrade via OuterUpgradeReq/Ack handshake.
+     * SnpResp_I is deferred until OuterUpgradeAck(true) arrives.
+     */
+    struct UpgradePending {
+        bool valid;
+        uint64_t linePa;
+        uint64_t epoch;
+        uint64_t reqId;
+        MachineID hnfDest;      // HN-F that sent SnpCleanInvalid
+        bool ackReceived;       // true when OuterUpgradeAck(true) arrived
+
+        UpgradePending() : valid(false), linePa(0), epoch(0), reqId(0),
+                           ackReceived(false) {}
+    };
+    std::map<uint64_t, UpgradePending> _upgradePending;
+
+    /** v4: Called by EPBackend when OuterUpgradeAck(true) is received.
+     *  Triggers the deferred SnpResp_I to HN-F. */
+    void receiveUpgradeAck(uint64_t linePa);
 
     /** Count of Cache-type controllers (for reference). */
     int _numCacheControllers;
@@ -325,6 +437,7 @@ class EPRNFController : public EPController
     struct DeferredChiRequest {
         uint64_t linePa;
         CHI::CHIRequestType reqType;
+        CHI::EpProxyOp proxyOp;  // v4: proxy op for deferred request
         Tick startTick;
     };
     std::deque<DeferredChiRequest> _deferredChiReqs;

@@ -62,6 +62,9 @@ EPSNFController::wakeup()
     // Q3: Send deferred CompData (1-tick delay for TBE race fix)
     processDeferredData();
 
+    // v4: Send deferred grants (§4.4.2, I10 timing invariant)
+    processDeferredGrants();
+
     // Q3: Process retry queue — request grants that were previously BUSY
     if (!_retryQueue.empty()) {
         bool needWakeup = false;
@@ -79,6 +82,12 @@ EPSNFController::wakeup()
                 else
                     dataDest.add(it->hnReq);
 
+                // v4: Determine CompData type and shared_hint from neededPerm
+                CHIDataType dataType = (it->neededPerm == 0)
+                    ? CHIDataType_CompData_SC
+                    : CHIDataType_CompData_UC;
+                bool sharedHint = (it->neededPerm == 0);
+
                 const uint8_t *gdata = _backend->lastGrantData();
                 for (int i = 0; i < dataMsgsPerLine; i++) {
                     int offset = i * dataChannelSize;
@@ -91,9 +100,11 @@ EPSNFController::wakeup()
                         db.setData(gdata + offset, offset, chunkSize);
                     auto dat = std::make_shared<CHIDataMsg>(
                         curTick(), cacheLineSize, m_ruby_system,
-                        it->linePa, CHIDataType_CompData_UC,
+                        it->linePa, dataType,
                         m_machineID, dataDest, db, wm,
                         false, 0, false, MessageSizeType_Data);
+                    // v4: Set shared_hint for shared grants
+                    dat->m_m_shared_hint = sharedHint;
                     sendDataMsg(dat);
                 }
                 it = _retryQueue.erase(it);
@@ -246,6 +257,13 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
                 "(grant data not available)\n", _nodeId);
     }
 
+    // ---- v4: shared_hint + CompData type for shared grants (§4.4.2, §5.1) ----
+    // Shared grant (neededPerm==0): CompData_SC with m_m_shared_hint=true
+    // Unique grant (neededPerm==1): CompData_UC (baseline unique fill)
+    CHIDataType dataType = (neededPerm == 0) ? CHIDataType_CompData_SC
+                                             : CHIDataType_CompData_UC;
+    bool sharedHint = (neededPerm == 0);  // §4.4.2 item 4: set for shared grants
+
     // ---- Q2 FIX: Splitting CompData into data-channel-sized chunks ----
     // The L2/HN-F's ExpectedMap counts data responses in CHUNKS
     // (blockSize / data_channel_size).  Generalize the chunk loop
@@ -274,10 +292,12 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
 
         auto dat = std::make_shared<CHIDataMsg>(
             curTick(), cacheLineSize, m_ruby_system,
-            msg->m_addr, CHIDataType_CompData_UC,
+            msg->m_addr, dataType,
             m_machineID, dataDest,
             db, wm,
             false, 0, false, MessageSizeType_Data);
+        // v4: Set shared_hint on CompData for shared grants
+        dat->m_m_shared_hint = sharedHint;
         // Q3: Defer send by 1 tick to prevent same-tick TBE race
         // at HN-F (see docs/tbe-race-condition.svg for details).
         _deferredCompData.push_back(dat);
@@ -298,6 +318,72 @@ EPSNFController::processDeferredData()
         sendDataMsg(dat);
     }
     _deferredCompData.clear();
+}
+
+// ---- v4: Deferred Grant Processing (§4.4.2, §7.6) ----
+void
+EPSNFController::processDeferredGrants()
+{
+    while (!_deferredGrants.empty()) {
+        DeferredGrantEntry &entry = _deferredGrants.front();
+
+        // Determine CompData type from grant type and sharedHint
+        CHIDataType dataType;
+        if (entry.sharedHint) {
+            dataType = CHIDataType_CompData_SC;   // §4.4.2 item 4: shared grant
+        } else {
+            switch (entry.grantType) {
+                case OuterGrantType::GlobalGrantShared:
+                    dataType = CHIDataType_CompData_SC;
+                    break;
+                case OuterGrantType::GlobalGrantExclusive:
+                    dataType = CHIDataType_CompData_UC;
+                    break;
+                case OuterGrantType::GlobalGrantModified:
+                    dataType = CHIDataType_CompData_UD_PD;
+                    break;
+                default:
+                    dataType = CHIDataType_CompData_UC;
+                    break;
+            }
+        }
+
+        // Send data chunks
+        for (int i = 0; i < dataMsgsPerLine; i++) {
+            int offset = i * dataChannelSize;
+            int chunkSize = (i == dataMsgsPerLine - 1) ?
+                (cacheLineSize - offset) : dataChannelSize;
+
+            WriteMask wm(cacheLineSize);
+            wm.setMask(offset, chunkSize);
+
+            DataBlock db(cacheLineSize);
+            // Copy grant data into chunk
+            const uint8_t *src = entry.data.getData(offset, chunkSize);
+            if (src) {
+                db.setData(src, offset, chunkSize);
+            }
+
+            auto dat = std::make_shared<CHIDataMsg>(
+                curTick(), cacheLineSize, m_ruby_system,
+                entry.linePa, dataType,
+                m_machineID, NetDest(m_ruby_system),
+                db, wm,
+                false, 0, false, MessageSizeType_Data);
+            // v4: Set shared_hint on CompData for shared grants
+            dat->m_m_shared_hint = entry.sharedHint;
+
+            // Defer by 1 tick for timing invariant (§4.4.2 item 2, I10)
+            _deferredCompData.push_back(dat);
+        }
+
+        DPRINTF(RubyCHIGeneric,
+                "EP_SNF node_id=%d: deferred grant sent for PA=0x%lx "
+                "epoch=%lu reqId=%lu\n",
+                _nodeId, entry.linePa, entry.epoch, entry.reqId);
+
+        _deferredGrants.erase(_deferredGrants.begin());
+    }
 }
 
 bool
@@ -332,13 +418,28 @@ EPSNFController::recvDataMsg(const CHIDataMsg *msg)
 
         auto *phys_mem = m_ruby_system->getPhysMem();
         if (phys_mem) {
+            // ---- v4: Cross-node NCBWrData routing (§4.4.2 item 3) ----
+            // Translate local PA to home PA so data goes to home node's DDR4,
+            // not the local node's memory.
+            uint64_t writePa = msg->m_addr;  // default: local PA
+            if (_backend && _backend->isDsmAddrCrossNode(msg->m_addr)) {
+                auto &addrMap = _backend->addrMap();
+                int homeNode = addrMap.homeNode(_nodeId, msg->m_addr);
+                uint64_t offset = addrMap.dsmOffset(msg->m_addr);
+                writePa = addrMap.buildDsmPA(homeNode, homeNode, offset);
+                DPRINTF(RubyCHIGeneric,
+                        "EP_SNF node_id=%d: NCBWrData PA translation: "
+                        "local=0x%lx → home=0x%lx (homeNode=%d)\n",
+                        _nodeId, msg->m_addr, writePa, homeNode);
+            }
+
             const DataBlock &db = msg->m_dataBlk;
             const WriteMask &wm = msg->m_bitMask;
             uint8_t buf[64];
 
-            // Read current line from DDR4, then apply write mask
+            // Read current line from DDR4 (at home PA), then apply write mask
             RequestPtr req = std::make_shared<Request>(
-                msg->m_addr, cacheLineSize, 0, RequestorID(0));
+                writePa, cacheLineSize, 0, RequestorID(0));
             req->setFlags(Request::PHYSICAL);
             Packet rdPkt(req, MemCmd::ReadReq);
             rdPkt.dataStatic(buf);
@@ -351,7 +452,7 @@ EPSNFController::recvDataMsg(const CHIDataMsg *msg)
                 }
             }
 
-            // Write back to DDR4
+            // Write back to DDR4 (at home PA)
             Packet wrPkt(req, MemCmd::WriteReq);
             wrPkt.dataStatic(buf);
             phys_mem->functionalAccess(&wrPkt);
@@ -359,7 +460,7 @@ EPSNFController::recvDataMsg(const CHIDataMsg *msg)
             DPRINTF(RubyCHIGeneric,
                     "EP_SNF node_id=%d: wrote data to DDR4 "
                     "addr=0x%lx type=%d\n",
-                    _nodeId, msg->m_addr, msg->m_type);
+                    _nodeId, writePa, msg->m_type);
         }
 
         // Send CompDBIDResp if there's a pending write for this address

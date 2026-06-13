@@ -4,7 +4,9 @@
 #include <deque>
 #include <map>
 #include <set>
+#include <vector>
 
+#include "mem/ruby/common/DataBlock.hh"
 #include "mem/ruby/protocol/chi/ep/EPBackend.hh"
 #include "mem/ruby/protocol/chi/ep/EPRNFController.hh"
 #include "params/EPSNFController.hh"
@@ -52,6 +54,25 @@ class EPSNFController : public EPController
     // Q3: Deferred CompData sends (1-tick delay for TBE race fix)
     std::vector<std::shared_ptr<CHIDataMsg>> _deferredCompData;
     void processDeferredData();
+
+    // ---- v4: Deferred Grant Entry (§4.4.2, §7.6) ----
+    /**
+     * v4: Deferred grant data pending send.  Used when CompData
+     * must be deferred by at least 1 tick to satisfy TBE timing
+     * invariant (I10).  Stores epoch/reqId for audit but does NOT
+     * re-check epoch at send time (§4.4.2 item 2).
+     */
+    struct DeferredGrantEntry {
+        uint64_t linePa;
+        int homeNode;
+        uint64_t epoch;
+        uint64_t reqId;
+        OuterGrantType grantType;
+        bool sharedHint;          // true → CompData_SC with m_shared_hint
+        DataBlock data;           // cache-line-sized data payload
+    };
+    std::vector<DeferredGrantEntry> _deferredGrants;
+    void processDeferredGrants();
 };
 
 } // namespace ruby
