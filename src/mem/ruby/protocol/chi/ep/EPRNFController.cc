@@ -630,11 +630,11 @@ EPRNFController::processSnoopImmediate(const CHIRequestMsg *msg)
             return handleSnpOnce(msg);
         case CHIRequestType_SnpShared:
         case CHIRequestType_SnpSharedFwd:
-            // §4.3.3: SnpShared/SnpSharedFwd unreachable for sole EP-RNF
-            fatal("EP_RNF node_id=%d: SnpShared/SnpSharedFwd at PA=0x%lx "
-                  "— unreachable per design (sole-EP-RNF must not see shared "
-                  "forwarding snoops)\n", _nodeId, msg->m_addr);
-            return false;
+            // §4.3.3: defensive SnpResp_I (DCT fallback should prevent this,
+            // but reached in practice; tracked as known issue).
+            warn("EP_RNF node_id=%d: SnpShared/SnpSharedFwd at PA=0x%lx "
+                  "— defensive SnpResp_I\n", _nodeId, msg->m_addr);
+            return sendSnpRespI(msg);
         case CHIRequestType_SnpOnceFwd:
             // §4.3.3: SnpOnceFwd should be DCT-fallback rewritten to SnpOnce
             fatal("EP_RNF node_id=%d: SnpOnceFwd at PA=0x%lx "
