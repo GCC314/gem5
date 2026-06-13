@@ -359,7 +359,7 @@ void runSelfTest(EPBackend *backend, int home_node)
                      "SKIP:UBCC not available — requires M5 infrastructure");
         } else {
             int requester = 0; // self-node for these single-node UBCC tests
-            UBCCController::MESIState state;
+            MESIState state;
             int ownerNode;
             uint64_t sharersMask;
             bool dirty;
@@ -380,7 +380,7 @@ void runSelfTest(EPBackend *backend, int home_node)
                     pa1, state, ownerNode, sharersMask, dirty);
                 M5_CHECK("M5-MESI-1b: G_I+Shared → entry exists", exists, "");
                 M5_CHECK("M5-MESI-1c: G_I+Shared → state == G_S",
-                         exists && state == UBCCController::MESIState::G_S,
+                         exists && state == MESIState::G_S,
                          exists ? std::string("state=") +
                              std::to_string(static_cast<int>(state)) :
                              "entry missing");
@@ -412,7 +412,7 @@ void runSelfTest(EPBackend *backend, int home_node)
                     pa2, state, ownerNode, sharersMask, dirty);
                 M5_CHECK("M5-MESI-2b: G_I+Unique/nowrite → entry exists", exists, "");
                 M5_CHECK("M5-MESI-2c: G_I+Unique/nowrite → state == G_E",
-                         exists && state == UBCCController::MESIState::G_E,
+                         exists && state == MESIState::G_E,
                          exists ? std::string("state=") +
                              std::to_string(static_cast<int>(state)) :
                              "entry missing");
@@ -444,7 +444,7 @@ void runSelfTest(EPBackend *backend, int home_node)
                     pa3, state, ownerNode, sharersMask, dirty);
                 M5_CHECK("M5-MESI-3b: G_I+Unique/write → entry exists", exists, "");
                 M5_CHECK("M5-MESI-3c: G_I+Unique/write → state == G_M",
-                         exists && state == UBCCController::MESIState::G_M,
+                         exists && state == MESIState::G_M,
                          exists ? std::string("state=") +
                              std::to_string(static_cast<int>(state)) :
                              "entry missing");
@@ -481,7 +481,7 @@ void runSelfTest(EPBackend *backend, int home_node)
                     pa4, state, ownerNode, sharersMask, dirty);
                 M5_CHECK("M5-MESI-4b: G_S+Unique/nowrite → entry exists", exists, "");
                 M5_CHECK("M5-MESI-4c: G_S+Unique/nowrite → state == G_E",
-                         exists && state == UBCCController::MESIState::G_E,
+                         exists && state == MESIState::G_E,
                          exists ? std::string("state=") +
                              std::to_string(static_cast<int>(state)) :
                              "entry missing");
@@ -518,7 +518,7 @@ void runSelfTest(EPBackend *backend, int home_node)
                     pa5, state, ownerNode, sharersMask, dirty);
                 M5_CHECK("M5-MESI-5b: G_E+Shared → entry exists", exists, "");
                 M5_CHECK("M5-MESI-5c: G_E+Shared → state == G_S",
-                         exists && state == UBCCController::MESIState::G_S,
+                         exists && state == MESIState::G_S,
                          exists ? std::string("state=") +
                              std::to_string(static_cast<int>(state)) :
                              "entry missing");

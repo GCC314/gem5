@@ -42,10 +42,11 @@ struct OuterWritebackMsg {
     int requesterNode;       // Node performing the writeback
     int homeNode;            // Home node for this line
     uint64_t epoch;          // Per-transaction epoch
+    uint64_t reqId;          // v4: transaction ID (from outer layer)
     bool keepAsClean;        // True if owner retains clean exclusive after writeback
 
     OuterWritebackMsg() : linePa(0), requesterNode(-1), homeNode(-1),
-                          epoch(0), keepAsClean(false) {}
+                          epoch(0), reqId(0), keepAsClean(false) {}
 };
 
 // Evict request sent from requester node to home UBCC.
@@ -54,9 +55,10 @@ struct OuterEvictMsg {
     int evictingNode;        // Node performing the eviction
     int homeNode;            // Home node for this line
     uint64_t epoch;          // Per-transaction epoch
+    uint64_t reqId;          // v4: transaction ID
 
     OuterEvictMsg() : linePa(0), evictingNode(-1), homeNode(-1),
-                      epoch(0) {}
+                      epoch(0), reqId(0) {}
 };
 
 // Ack response from home UBCC after writeback/evict.
@@ -64,9 +66,10 @@ struct OuterAckMsg {
     uint64_t linePa;         // Physical address (home node's view)
     int homeNode;            // Home node that sent the ack
     uint64_t epoch;          // Per-transaction epoch
+    uint64_t reqId;          // v4: transaction ID
     bool success;            // True if operation succeeded
 
-    OuterAckMsg() : linePa(0), homeNode(-1), epoch(0), success(false) {}
+    OuterAckMsg() : linePa(0), homeNode(-1), epoch(0), reqId(0), success(false) {}
 };
 
 // ---- M8: Global Invalidation Message Types ----
@@ -77,9 +80,10 @@ struct OuterInvalidateMsg {
     int sharerNode;            // Node being invalidated
     int homeNode;              // Home node that sent the invalidation
     uint64_t epoch;            // Per-transaction epoch
+    uint64_t reqId;            // v4: transaction ID
 
     OuterInvalidateMsg() : linePa(0), sharerLocalPa(0),
-        sharerNode(-1), homeNode(-1), epoch(0) {}
+        sharerNode(-1), homeNode(-1), epoch(0), reqId(0) {}
 };
 
 // Invalidation acknowledgment sent from sharer node back to home UBCC.
@@ -88,10 +92,11 @@ struct OuterInvalidationAck {
     int ackNode;             // Node that completed invalidation
     int homeNode;            // Home node that initiated the invalidation
     uint64_t epoch;          // Per-transaction epoch
+    uint64_t reqId;          // v4: transaction ID
     bool success;            // True if invalidation succeeded
 
     OuterInvalidationAck() : linePa(0), ackNode(-1), homeNode(-1),
-                              epoch(0), success(false) {}
+                              epoch(0), reqId(0), success(false) {}
 };
 
 // ---- M6: Outer Recall Message Types ----
@@ -102,11 +107,12 @@ struct OuterRecallMsg {
     int ownerNode;           // Node being recalled
     int homeNode;            // Node that initiated the recall
     uint64_t epoch;          // Per-transaction epoch
+    uint64_t reqId;          // v4: transaction ID
     bool isReadRequest;      // True if recall triggered by read (downgrade to shared)
     bool dataNeeded;         // True if dirty data must be returned
 
     OuterRecallMsg() : linePa(0), ownerLocalPa(0), ownerNode(-1), homeNode(-1),
-                       epoch(0), isReadRequest(false), dataNeeded(false) {}
+                       epoch(0), reqId(0), isReadRequest(false), dataNeeded(false) {}
 };
 
 // Recall response sent from owner node's EPBackend back to home UBCC.
@@ -115,11 +121,12 @@ struct OuterRecallResponse {
     int ownerNode;           // Node that was recalled
     int homeNode;            // Home node that initiated the recall
     uint64_t epoch;          // Per-transaction epoch
+    uint64_t reqId;          // v4: transaction ID
     bool dataReturned;       // True if dirty data was returned
     bool ackReceived;        // True if recall completed
 
     OuterRecallResponse() : linePa(0), ownerNode(-1), homeNode(-1),
-                            epoch(0), dataReturned(false), ackReceived(false) {}
+                            epoch(0), reqId(0), dataReturned(false), ackReceived(false) {}
 };
 
 // ---- M5 Phase 2: Outer Message Envelope ----
@@ -133,9 +140,10 @@ struct OuterReqEnvelope {
     bool writeIntent;        // True if requester has write intent
     int srcNode;             // Requester node ID
     uint64_t epoch;          // Per-transaction epoch
+    uint64_t reqId;          // v4: requester-allocated transaction ID
 
     OuterReqEnvelope() : linePa(0), reqType(OuterReqType::GlobalReadShared),
-                         writeIntent(false), srcNode(-1), epoch(0) {}
+                         writeIntent(false), srcNode(-1), epoch(0), reqId(0) {}
 };
 
 struct OuterGrantEnvelope {
@@ -143,12 +151,96 @@ struct OuterGrantEnvelope {
     OuterGrantType grantType;   // GrantShared/Exclusive/Modified
     int homeNode;               // Home node ID
     uint64_t epoch;             // Per-transaction epoch
+    uint64_t reqId;             // v4: transaction ID
     Tick grantVisibleTick;      // Tick when grant decision was made
     Tick sentinelVisibleTick;   // Tick when sentinel was installed
 
     OuterGrantEnvelope() : linePa(0),
         grantType(OuterGrantType::GlobalGrantShared),
-        homeNode(-1), epoch(0), grantVisibleTick(0), sentinelVisibleTick(0) {}
+        homeNode(-1), epoch(0), reqId(0),
+        grantVisibleTick(0), sentinelVisibleTick(0) {}
+};
+
+// ---- v4: Clear / ClearAck (§3.5, §6.1) ----
+enum class ClearReason {
+    GrantHandshake    // Commit GRANT_HANDSHAKE intended result
+};
+
+struct OuterClearMsg {
+    uint64_t linePa;
+    int srcNode;
+    int homeNode;
+    uint64_t epoch;
+    uint64_t reqId;
+    ClearReason reason;
+
+    OuterClearMsg() : linePa(0), srcNode(-1), homeNode(-1),
+                      epoch(0), reqId(0), reason(ClearReason::GrantHandshake) {}
+};
+
+struct OuterClearAckMsg {
+    uint64_t linePa;
+    int homeNode;
+    int dstNode;
+    uint64_t epoch;
+    uint64_t reqId;
+    bool accepted;
+
+    OuterClearAckMsg() : linePa(0), homeNode(-1), dstNode(-1),
+                         epoch(0), reqId(0), accepted(false) {}
+};
+
+// ---- v4: Local Upgrade Messages (§4.1.4, §6.1) ----
+enum class UpgradeCause {
+    LocalCleanUnique,
+    LocalStoreUpgrade
+};
+
+struct OuterUpgradeReq {
+    uint64_t linePa;
+    int srcNode;
+    uint64_t epoch;       // requester-observed committed epoch
+    uint64_t reqId;       // requester-allocated ID
+    int desiredPerm;      // 0=Shared, 1=Unique
+    UpgradeCause cause;
+
+    OuterUpgradeReq() : linePa(0), srcNode(-1), epoch(0), reqId(0),
+                        desiredPerm(0), cause(UpgradeCause::LocalCleanUnique) {}
+};
+
+struct OuterUpgradeAck {
+    uint64_t linePa;
+    int homeNode;
+    int dstNode;
+    uint64_t epoch;       // reservedEpoch if accepted
+    uint64_t reqId;
+    bool accepted;
+
+    OuterUpgradeAck() : linePa(0), homeNode(-1), dstNode(-1),
+                        epoch(0), reqId(0), accepted(false) {}
+};
+
+struct OuterUpgradeDone {
+    uint64_t linePa;
+    int srcNode;
+    int homeNode;
+    uint64_t epoch;
+    uint64_t reqId;
+
+    OuterUpgradeDone() : linePa(0), srcNode(-1), homeNode(-1),
+                         epoch(0), reqId(0) {}
+};
+
+struct OuterUpgradeDoneAck {
+    uint64_t linePa;
+    int homeNode;
+    int dstNode;
+    uint64_t epoch;
+    uint64_t reqId;
+    bool accepted;
+
+    OuterUpgradeDoneAck() : linePa(0), homeNode(-1), dstNode(-1),
+                            epoch(0), reqId(0), accepted(false) {}
 };
 
 // Requester-side per-line bookkeeping state.
@@ -167,6 +259,7 @@ struct RequesterLineEntry {
     RequesterLineState state;
     OuterReqType pendingReq;
     uint64_t epoch;
+    uint64_t reqId;        // v4: outer transaction ID
     bool writeIntent;
     int homeNode;      // Home node for this remote line (-1 if local)
 };
@@ -234,7 +327,48 @@ class EPBackend : public SimObject
     OuterGrantType handleGrant(uint64_t line_pa, OuterGrantType grant,
                                 int homeNode);
 
-    // ---- M6: Recall Management ----
+    // ---- v4: Local Upgrade Management (§4.1.4, §4.2.3) ----
+    /**
+     * Initiate a local write upgrade for a remote sharer.
+     * Sends OuterUpgradeReq to home UBCC, waits for OuterUpgradeAck.
+     * Only after Ack(true) can EP-RNF reply SnpResp_I to local HN-F.
+     *
+     * @param line_pa   Local PA of the line being upgraded
+     * @param homeNode  Home node for this line
+     * @param desiredPerm Desired permission (0=Shared, 1=Unique)
+     * @param cause     Upgrade cause
+     * @param outEpoch  Output: reserved epoch from UpgradeAck
+     * @param outReqId  Output: reqId for this upgrade
+     * @return          True if UpgradeAck(true) received
+     */
+    bool notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
+                                  int desiredPerm, UpgradeCause cause,
+                                  uint64_t &outEpoch, uint64_t &outReqId);
+
+    /**
+     * Send OuterUpgradeDone after local upgrade completes.
+     *
+     * @param line_pa   Local PA
+     * @param homeNode  Home node
+     * @param epoch     reservedEpoch from UpgradeAck
+     * @param reqId     Original upgrade reqId
+     * @return          True if accepted by home
+     */
+    bool sendUpgradeDone(uint64_t line_pa, int homeNode,
+                         uint64_t epoch, uint64_t reqId);
+
+    // ---- v4: Clear / ClearAck (§3.5, §4.2.3) ----
+    /**
+     * Send a Clear to the home UBCC to commit a GRANT_HANDSHAKE.
+     *
+     * @param line_pa   Home PA
+     * @param homeNode  Home node
+     * @param epoch     Epoch from the grant
+     * @param reqId     Transaction reqId
+     * @return          True if Clear accepted (ClearAck.accepted==true)
+     */
+    bool sendClear(uint64_t line_pa, int homeNode,
+                   uint64_t epoch, uint64_t reqId);
     /**
      * Handle an incoming recall request from a home UBCC.
      * This is called on the owner node's EPBackend when the home
@@ -361,6 +495,14 @@ class EPBackend : public SimObject
     // M8: Envelope accessors for invalidation
     const OuterInvalidateMsg& lastInvalidateMsg() const { return _lastInvalidateMsg; }
     const OuterInvalidationAck& lastInvalidationAck() const { return _lastInvalidationAck; }
+
+    // v4: Clear / Upgrade envelope accessors
+    const OuterClearMsg& lastClearMsg() const { return _lastClearMsg; }
+    const OuterClearAckMsg& lastClearAckMsg() const { return _lastClearAckMsg; }
+    const OuterUpgradeReq& lastUpgradeReq() const { return _lastUpgradeReq; }
+    const OuterUpgradeAck& lastUpgradeAck() const { return _lastUpgradeAck; }
+    const OuterUpgradeDone& lastUpgradeDone() const { return _lastUpgradeDone; }
+    const OuterUpgradeDoneAck& lastUpgradeDoneAck() const { return _lastUpgradeDoneAck; }
 
     /**
      * Diagnose the expected grant for a given sideband combination
@@ -516,6 +658,16 @@ class EPBackend : public SimObject
     uint64_t _invalidationAckSentCount;
     OuterInvalidateMsg _lastInvalidateMsg;
     OuterInvalidationAck _lastInvalidationAck;
+
+    // ---- v4: Clear / ClearAck envelopes ----
+    OuterClearMsg _lastClearMsg;
+    OuterClearAckMsg _lastClearAckMsg;
+
+    // ---- v4: Local Upgrade envelopes ----
+    OuterUpgradeReq _lastUpgradeReq;
+    OuterUpgradeAck _lastUpgradeAck;
+    OuterUpgradeDone _lastUpgradeDone;
+    OuterUpgradeDoneAck _lastUpgradeDoneAck;
 
     // ---- M6: Cross-Node EPBackend Routing Registry ----
     static std::map<int, EPBackend*> _backendInstances;

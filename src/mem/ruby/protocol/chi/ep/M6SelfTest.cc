@@ -98,7 +98,7 @@ void runSelfTest(EPBackend *backend, int home_node)
     // ===========================================================
     {
         int requesterNode = 0; // self-node for directory tests
-        UBCCController::MESIState state;
+        MESIState state;
         int ownerNode;
         uint64_t sharersMask;
         bool dirty;
@@ -119,7 +119,7 @@ void runSelfTest(EPBackend *backend, int home_node)
                 pa_s, state, ownerNode, sharersMask, dirty);
             M6_CHECK("M6-4a-2: G_S entry exists", exists, "");
             M6_CHECK("M6-4a-3: G_S state == G_S",
-                     exists && state == UBCCController::MESIState::G_S,
+                     exists && state == MESIState::G_S,
                      exists ? std::string("state=") +
                          std::to_string(static_cast<int>(state)) : "");
             M6_CHECK("M6-4a-4: G_S ownerNode invalid (-1)",
@@ -149,7 +149,7 @@ void runSelfTest(EPBackend *backend, int home_node)
                 pa_e, state, ownerNode, sharersMask, dirty);
             M6_CHECK("M6-4b-2: G_E entry exists", exists, "");
             M6_CHECK("M6-4b-3: G_E state == G_E",
-                     exists && state == UBCCController::MESIState::G_E,
+                     exists && state == MESIState::G_E,
                      exists ? std::string("state=") +
                          std::to_string(static_cast<int>(state)) : "");
             M6_CHECK("M6-4b-4: G_E ownerNode valid (=requester)",
@@ -179,7 +179,7 @@ void runSelfTest(EPBackend *backend, int home_node)
                 pa_m, state, ownerNode, sharersMask, dirty);
             M6_CHECK("M6-4c-2: G_M entry exists", exists, "");
             M6_CHECK("M6-4c-3: G_M state == G_M",
-                     exists && state == UBCCController::MESIState::G_M,
+                     exists && state == MESIState::G_M,
                      exists ? std::string("state=") +
                          std::to_string(static_cast<int>(state)) : "");
             M6_CHECK("M6-4c-4: G_M ownerNode valid (=requester)",
@@ -197,8 +197,8 @@ void runSelfTest(EPBackend *backend, int home_node)
         {
             // Verify the enum values are different
             M6_CHECK("M6-4d-1: G_E != G_M (state enum values distinct)",
-                     static_cast<int>(UBCCController::MESIState::G_E)
-                     != static_cast<int>(UBCCController::MESIState::G_M),
+                     static_cast<int>(MESIState::G_E)
+                     != static_cast<int>(MESIState::G_M),
                      "G_E and G_M must be separate states");
         }
     }
@@ -276,7 +276,7 @@ void runSelfTest(EPBackend *backend, int home_node)
                 UBCC_OuterReqType::GlobalReadUnique, false, 1);
 
             // Verify: directory entry should now be G_E with owner=1
-            UBCCController::MESIState verifyState;
+            MESIState verifyState;
             int verifyOwner;
             uint64_t verifySharers;
             bool verifyDirty;
@@ -284,7 +284,7 @@ void runSelfTest(EPBackend *backend, int home_node)
                 pa_recall_n1, verifyState, verifyOwner, verifySharers, verifyDirty);
 
             M6_CHECK("M6-2-1: remote owner (node 1) established in G_E",
-                     verifyExists && verifyState == UBCCController::MESIState::G_E
+                     verifyExists && verifyState == MESIState::G_E
                      && verifyOwner == 1,
                      verifyExists
                          ? std::string("state=") +
@@ -303,7 +303,7 @@ void runSelfTest(EPBackend *backend, int home_node)
             UBCC_OuterGrantType grant =
                 node1Ubcc->processOuterRequest(pa_recall_n1,
                     UBCC_OuterReqType::GlobalReadShared, false,
-                    requesterNode,
+                    requesterNode, 0, 0,
                     nullptr, nullptr,
                     &recallNeeded, &recallOwnerNode);
 
@@ -337,7 +337,7 @@ void runSelfTest(EPBackend *backend, int home_node)
                      "Recall response counter should increment");
 
             // Step 4: Verify the directory state after recall
-            UBCCController::MESIState state;
+            MESIState state;
             int ownerNode;
             uint64_t sharersMask;
             bool dirty;
@@ -346,7 +346,7 @@ void runSelfTest(EPBackend *backend, int home_node)
 
             M6_CHECK("M6-2-7: directory entry exists after recall", exists, "");
             M6_CHECK("M6-2-8: state is G_S (downgraded from G_E by read recall)",
-                     exists && state == UBCCController::MESIState::G_S,
+                     exists && state == MESIState::G_S,
                      exists ? std::string("state=") +
                          std::to_string(static_cast<int>(state)) : "");
             M6_CHECK("M6-2-9: no exclusive owner after read recall",
@@ -385,7 +385,7 @@ void runSelfTest(EPBackend *backend, int home_node)
         bool recallNeeded = false;
         int recallOwnerNode = -1;
         ubcc->processOuterRequest(pa_simple,
-            UBCC_OuterReqType::GlobalReadShared, false, 1,
+            UBCC_OuterReqType::GlobalReadShared, false, 1, 0, 0,
             nullptr, nullptr,
             &recallNeeded, &recallOwnerNode);
 
@@ -397,7 +397,7 @@ void runSelfTest(EPBackend *backend, int home_node)
         uint64_t epoch_simple = ubcc->getEpochForLine(pa_simple);
         ubcc->processRecallResponse(pa_simple, 0, false, epoch_simple);
 
-        UBCCController::MESIState state;
+        MESIState state;
         int ownerNode;
         uint64_t sharersMask;
         bool dirty;
@@ -405,7 +405,7 @@ void runSelfTest(EPBackend *backend, int home_node)
                                       sharersMask, dirty);
 
         M6_CHECK("M6-2-sim-2: recall completed into G_S",
-                 state == UBCCController::MESIState::G_S,
+                 state == MESIState::G_S,
                  "Should be G_S after recall");
 
         // suppress unused variable warnings in non-debug builds
@@ -492,7 +492,7 @@ void runSelfTest(EPBackend *backend, int home_node)
         bool recallNeeded = false;
         int recallOwnerNode = -1;
         ubcc->processOuterRequest(pa_busy,
-            UBCC_OuterReqType::GlobalReadShared, false, 1,
+            UBCC_OuterReqType::GlobalReadShared, false, 1, 0, 0,
             nullptr, nullptr,
             &recallNeeded, &recallOwnerNode);
 
@@ -524,7 +524,7 @@ void runSelfTest(EPBackend *backend, int home_node)
                      !busy3, "Line should not be busy after recall");
 
             // Verify extended field access
-            UBCCController::MESIState state;
+            MESIState state;
             int ownerNode;
             uint64_t sharersMask;
             bool dirty;

@@ -4,7 +4,6 @@
 #include <cstdint>
 #include <cstring>
 #include <map>
-#include <queue>
 #include <set>
 #include <string>
 
@@ -41,54 +40,123 @@ enum class UBCC_RecallResult {
     RecallRejected       // Line is busy, request rejected
 };
 
-// ---- Phase 1: Outstanding request state machine ----
+// §6.1: Upgrade cause enumeration
+enum class UBCC_UpgradeCause {
+    LocalCleanUnique,    // Local CleanUnique upgrade (sharer → exclusive)
+    LocalStoreUpgrade    // Local store-triggered upgrade
+};
+
+// ---- M5: Home MESI directory states (moved before OutstandingRequest for visibility) ----
+enum class MESIState {
+    G_I,  // Invalid: no sharer, no owner
+    G_S,  // Shared: one or more sharers, no owner
+    G_E,  // Exclusive: one clean exclusive owner
+    G_M   // Modified: one dirty modified owner
+};
+
+// ---- Phase 1: Outstanding request state machine (v4 expanded) ----
+// Per §4.1.5: normative state machine for all four operation types.
 enum class OpType {
-    RECALL,           // Recall owner data before granting access
-    INVALIDATE,       // Invalidate sharers before upgrading to unique
-    GRANT_HANDSHAKE   // Prevent re-entry during grant→CompData→CompAck
+    RECALL,            // Recall owner data before granting access
+    INVALIDATE,        // Invalidate sharers before upgrading to unique
+    GRANT_HANDSHAKE,   // Grant commit pending Clear from requester
+    UPGRADE_PENDING    // Local upgrade four-message handshake in progress
 };
 
-enum class OpState {
-    WAITING_RESP,     // Waiting for recall response or invalidation acks
-    RESP_RCVD,        // Response received, waiting for interconnect delay
-    CANCELLED         // Timeout or error
+enum class OpStage {
+    CREATED,               // Just created, no response yet
+    WAITING_TARGET_RESP,   // RECALL: waiting for owner recall response
+    WAITING_ALL_ACKS,      // INVALIDATE: waiting for all sharer acks
+    WAITING_LOCAL_DONE,    // UPGRADE_PENDING: waiting for OuterUpgradeDone
+    WAITING_CLEAR,         // GRANT_HANDSHAKE: waiting for matching Clear
+    DONE,                  // Terminal: operation completed successfully
+    CANCELLED,             // Terminal: rejected or validation failed
+    TIMED_OUT,             // Terminal: retry budget exhausted
+    PERSISTENT_BUSY        // Terminal: irrevocable-after-ack, only accept Done
 };
 
+// §7.2: OutstandingRequest with full v4 fields for all four op types.
 struct OutstandingRequest {
-    uint64_t linePa;          // Associated cache line address
-    uint64_t epochAtCreate;   // Directory epoch when request was created
-    OpType   opType;          // Type of operation
-    OpState  state;           // Current state
-    int      requesterNode;   // Node waiting for completion
-    int      targetNode;      // Recall target or invalidation target node
-    Tick     startTick;       // When the request was created
-    Tick     respTick;        // When the response arrived
+    uint64_t linePa;           // Associated cache line address (home PA view)
+    uint64_t baseEpoch;        // Requester-observed committed epoch (validation baseline)
+    uint64_t reservedEpoch;    // Epoch to be committed on Clear or UpgradeDone
+    uint64_t reqId;            // Requester-allocated ID, home echoes back
+    OpType   opType;           // Type of operation
+    OpStage  stage;            // Current stage in normative state machine
+    int      requesterNode;    // Node waiting for completion
+    int      homeNode;         // Home node for this line
+    int      targetNode;       // Recall target / upgrade requester
+    uint64_t targetMask;       // Invalidation target mask (sharers to invalidate)
 
-    // Recall data buffer (P0-3)
-    uint8_t  dataBuffer[64];
-    bool     dataValid;
+    // Intended directory result (§4.1.3): reserved but NOT committed until Clear/UpgradeDone
+    MESIState intendedState;
+    uint64_t  intendedSharersMask;
+    int       intendedOwnerNode;
+    bool      intendedDirty;
 
-    // Original request parameters (for retry)
+    // Original request parameters
     UBCC_OuterReqType reqType;
     bool              writeIntent;
 
-    // Invalidation tracking (only for INVALIDATE)
+    // Recall / Invalidate barrier flags
+    bool     recallBarrierDone;
+    bool     invalidateBarrierDone;
+    bool     clearAckCached;     // True if ClearAck has been cached for tombstone replay
+
+    // Timing
+    Tick     createTick;
+    Tick     respTick;
+    Tick     deadlineTick;
+
+    bool     accepted;           // True if upgrade ack was true
+
+    // Recall data buffer (P0-3)
+    uint8_t  dataBuf[64];
+    bool     dataValid;
+
+    // Invalidation tracking
     int      pendingAckCount;
     uint64_t ackMask;
     uint64_t totalMask;
 
+    // Upgrade context (§4.1.4)
+    UBCC_UpgradeCause upgradeCause;
+
     OutstandingRequest()
-        : linePa(0), epochAtCreate(0),
-          opType(OpType::RECALL), state(OpState::WAITING_RESP),
-          requesterNode(-1), targetNode(-1),
-          startTick(0), respTick(0),
-          dataValid(false),
+        : linePa(0), baseEpoch(0), reservedEpoch(0), reqId(0),
+          opType(OpType::GRANT_HANDSHAKE), stage(OpStage::CREATED),
+          requesterNode(-1), homeNode(-1), targetNode(-1), targetMask(0),
+          intendedState(MESIState::G_I), intendedSharersMask(0),
+          intendedOwnerNode(-1), intendedDirty(false),
           reqType(UBCC_OuterReqType::GlobalReadShared),
           writeIntent(false),
-          pendingAckCount(0), ackMask(0), totalMask(0)
+          recallBarrierDone(false), invalidateBarrierDone(false),
+          clearAckCached(false),
+          createTick(0), respTick(0), deadlineTick(0),
+          accepted(false), dataValid(false),
+          pendingAckCount(0), ackMask(0), totalMask(0),
+          upgradeCause(UBCC_UpgradeCause::LocalCleanUnique)
     {
-        memset(dataBuffer, 0, 64);
+        memset(dataBuf, 0, 64);
     }
+};
+
+// §3.5 / §7.2: GrantHandshakeTombstone for duplicate Clear replay within window W.
+// When GRANT_HANDSHAKE reaches DONE, it converts to this tombstone instead of
+// being kept as a live outstanding.  Duplicate Clear within W returns the
+// identical cached ClearAck.
+struct GrantHandshakeTombstone {
+    uint64_t linePa;
+    uint64_t epoch;
+    uint64_t reqId;
+    OpType   opType;       // always GRANT_HANDSHAKE
+    bool     accepted;
+    Tick     expireTick;   // createTick + W
+
+    GrantHandshakeTombstone()
+        : linePa(0), epoch(0), reqId(0),
+          opType(OpType::GRANT_HANDSHAKE),
+          accepted(false), expireTick(0) {}
 };
 
 class UBCCController
@@ -107,27 +175,84 @@ class UBCCController
     static void registerInstance(int node_id, UBCCController *ubcc);
     static UBCCController* getInstance(int node_id);
 
-    // ---- M5: Home UBCC Grant Decision ----
+    // ---- M5: Home UBCC Grant Decision (v4: reserve-then-commit) ----
     /**
      * Process an outer protocol request from a requester node.
+     * Per §4.1.3: creates OutstandingRequest with intended result,
+     * BUT NEVER directly modifies committed DirEntry.
+     * Commit only on matching Clear (§3.3, §3.5).
      *
      * @param line_pa             Physical address (home node's view)
      * @param reqType             GlobalReadShared or GlobalReadUnique
      * @param writeIntent         True if requester has write intent
      * @param requesterNode       Node ID of the requesting node
+     * @param baseEpoch           Requester-observed committed epoch
+     * @param reqId               Requester-allocated transaction ID
      * @param outGrantVisibleTick Output: tick when grant decision was made
      * @param outSentinelVisibleTick Output: tick when sentinel was installed
      * @param outRecallNeeded     Output (M6): set to true if recall is needed
      * @param outRecallOwnerNode  Output (M6): node ID of owner to recall (-1 if none)
      * @return                    Grant type (GlobalGrantShared/Exclusive/Modified)
+     *                            or -1 cast to enum if BUSY
      */
     UBCC_OuterGrantType processOuterRequest(
         uint64_t line_pa, UBCC_OuterReqType reqType, bool writeIntent,
-        int requesterNode = -1,
+        int requesterNode,
+        uint64_t baseEpoch = 0, uint64_t reqId = 0,
         Tick *outGrantVisibleTick = nullptr,
         Tick *outSentinelVisibleTick = nullptr,
         bool *outRecallNeeded = nullptr,
         int *outRecallOwnerNode = nullptr);
+
+    // ---- v4: Local Upgrade Management (§4.1.4) ----
+    /**
+     * Process an OuterUpgradeReq from a sharer upgrading to unique.
+     * Creates UPGRADE_PENDING outstanding, reserves epoch, sends OuterUpgradeAck.
+     * Never modifies committed DirEntry.
+     *
+     * @param line_pa         Home PA
+     * @param requesterNode   Node requesting the upgrade
+     * @param epoch           Requester-observed committed epoch
+     * @param reqId           Requester-allocated ID
+     * @param desiredPerm     Desired permission (Shared=0, Unique=1)
+     * @param cause           Upgrade cause
+     * @return                true if accepted (Ack with accepted=true), false otherwise
+     */
+    bool processOuterUpgradeReq(
+        uint64_t line_pa, int requesterNode,
+        uint64_t epoch, uint64_t reqId,
+        int desiredPerm, UBCC_UpgradeCause cause);
+
+    /**
+     * Process an OuterUpgradeDone from a requester that completed local upgrade.
+     * Commits owner/state/epoch to DirEntry, retires UPGRADE_PENDING.
+     * Per §4.1.4 step 5.
+     *
+     * @param line_pa         Home PA
+     * @param requesterNode   Node that completed upgrade
+     * @param epoch           reservedEpoch from the UpgradeAck
+     * @param reqId           Original requester-allocated ID
+     * @return                true if accepted
+     */
+    bool processOuterUpgradeDone(
+        uint64_t line_pa, int requesterNode,
+        uint64_t epoch, uint64_t reqId);
+
+    // ---- v4: Clear / ClearAck (§3.5) ----
+    /**
+     * Process a Clear from the requester to commit a GRANT_HANDSHAKE.
+     * If prerequisites are DONE, commits intended DirEntry and retires
+     * the handshake to tombstone(W).
+     *
+     * @param line_pa         Home PA
+     * @param srcNode         Requester node
+     * @param epoch           Epoch from the grant
+     * @param reqId           Requester-allocated ID
+     * @return                true if Clear accepted and committed
+     */
+    bool processClear(
+        uint64_t line_pa, int srcNode,
+        uint64_t epoch, uint64_t reqId);
 
     // ---- M6: Recall Management ----
     /**
@@ -141,20 +266,13 @@ class UBCCController
      * @return                  True if recall completed successfully
      */
     bool processRecallResponse(uint64_t line_pa, int ownerNode,
-                               bool dataReceived, uint64_t responseEpoch = 0);
+                               bool dataReceived, uint64_t responseEpoch,
+                               uint64_t reqId = 0);
 
     /**
      * Check if a line is currently busy (recall or other op in progress).
      */
     bool isLineBusy(uint64_t line_pa) const;
-
-    // ---- Q3: Grant handshake completion callback ----
-    /**
-     * Called by the requester's EPBackend after the CHI CompData/CompAck
-     * handshake completes.  This releases the grantInProgress flag so
-     * subsequent requests for the same line can proceed.
-     */
-    void grantHandshakeComplete(uint64_t line_pa);
 
     // ---- M7: Writeback / Evict ----
     /**
@@ -240,7 +358,8 @@ class UBCCController
      * @return               True if ack accepted and processed
      */
     bool processInvalidationAck(uint64_t line_pa, int ackNode,
-                                uint64_t responseEpoch);
+                                uint64_t responseEpoch,
+                                uint64_t reqId = 0);
 
     /**
      * Get the pending invalidation count for a busy line.
@@ -277,15 +396,6 @@ class UBCCController
      */
     uint64_t getRecallResponseCount() const { return _recallResponseCount; }
     void resetRecallResponseCount() { _recallResponseCount = 0; }
-
-    // ---- M5: Home MESI directory states ----
-    // Forward-declared here (before DirEntry and member functions that use it).
-    enum class MESIState {
-        G_I,  // Invalid: no sharer, no owner
-        G_S,  // Shared: one or more sharers, no owner
-        G_E,  // Exclusive: one clean exclusive owner
-        G_M   // Modified: one dirty modified owner
-    };
 
     /**
      * Inspect the home UBCC directory entry for a given line.
@@ -326,7 +436,10 @@ class UBCCController
     void resetEpRnfSnoopCount() { _epRnfSnoopCount = 0; }
     void incrementEpRnfSnoopCount() { _epRnfSnoopCount++; }
 
-    // ---- M5/M6: Home directory entry ----
+    // ---- M5/M6: Home directory entry (§7.1) ----
+    // Stripped of pendingOp / pendingRequester / pendingRecallTarget /
+    // pendingReqType / pendingWriteIntent / grantTick / invalidation tracking /
+    // materializedData — all moved to OutstandingRequest.
     struct DirEntry {
         uint64_t lineAddr;
         MESIState state;
@@ -336,63 +449,17 @@ class UBCCController
         int ownerNode;
         // True if the owner holds dirty (modified) data
         bool dirty;
-        // Epoch for stale detection (incremented per transaction)
+        // Epoch for stale detection (committed global epoch, monotonic)
         uint64_t epoch;
-        // Pending operation type (0=none, 1=recall-in-progress)
-        int pendingOp;
-        // ---- Q3: Tick when grant was issued (for handshake delay) ----
-        Tick grantTick;
-        // ---- M6: Pending recall context ----
-        // Node ID of the requester waiting for recall completion (-1 if none)
-        int pendingRequester;
-        // Node ID of the owner being recalled (-1 if none)
-        int pendingRecallTarget;
-        // Original request type that triggered the recall
-        UBCC_OuterReqType pendingReqType;
-        // Original write intent that triggered the recall
-        bool pendingWriteIntent;
-
-        // ---- M8: Sharer invalidation tracking ----
-        int pendingInvalidationCount;
-        uint64_t pendingInvalidationMask;
-        uint64_t invalidatedAckMask;
-
-        // ---- P0-3: Epoch-bound materialized data cache ----
-        // When recall completes, the captured cache-line data is stored
-        // here and bound to the current directory epoch.  On the next
-        // write (epoch increment), the cache is invalidated.
-        // This eliminates the phys_mem scavenge for cross-node data.
-        uint8_t materializedData[64];
-        bool materializedValid;
-        uint64_t materializedEpoch;
+        // Monotonic local allocator for reqId (§7.1)
+        uint64_t nextReqId;
 
         DirEntry() : lineAddr(0), state(MESIState::G_I),
                      sharersMask(0), ownerNode(-1),
-                     dirty(false), epoch(0), pendingOp(0),
-                     grantTick(0),
-                     pendingRequester(-1), pendingRecallTarget(-1),
-                     pendingReqType(UBCC_OuterReqType::GlobalReadShared),
-                     pendingWriteIntent(false),
-                     pendingInvalidationCount(0),
-                     pendingInvalidationMask(0),
-                     invalidatedAckMask(0),
-                     materializedValid(false),
-                     materializedEpoch(0)
-        {
-            memset(materializedData, 0, 64);
-        }
+                     dirty(false), epoch(0), nextReqId(1) {}
     };
 
-    // ---- P0-3: Materialized data access for grant path ----
-    // Returns pointer to 64-byte cache-line data if available and
-    // epoch-valid, or nullptr if data must be sourced elsewhere.
-    const uint8_t* getMaterializedData(uint64_t linePa) const;
-    bool hasMaterializedData(uint64_t linePa) const;
-    // Write captured recall data into the directory for this line.
-    void setMaterializedData(uint64_t linePa, const uint8_t* data,
-                             int len, uint64_t epoch);
-
-    // ---- Phase 1: Outstanding request API ----
+    // ---- v4: Outstanding request API ----
     OutstandingRequest* findOutstanding(uint64_t linePa);
     OutstandingRequest* createOutstanding(uint64_t linePa, OpType opType,
                                           int requesterNode, int targetNode);
@@ -410,11 +477,17 @@ class UBCCController
     // Per-line directory entries for lines homed at this node.
     std::map<uint64_t, DirEntry> _directory;
 
-    // ---- Phase 1: Outstanding request table ----
-    // Per-line in-flight operations (recall/invalidation/grant-handshake).
-    // One active operation per line.  Completed operations are removed
-    // after the grant is delivered to the requester.
+    // ---- v4: Outstanding request table ----
+    // Per-line in-flight operations.
     std::map<uint64_t, OutstandingRequest> _outstandingReqs;
+
+    // ---- v4: Grant handshake tombstone table (§3.5) ----
+    // Completed GRANT_HANDSHAKE operations become tombstones for W ticks,
+    // enabling idempotent duplicate Clear replay.
+    std::map<uint64_t, GrantHandshakeTombstone> _tombstones;
+
+    // ---- v4: Tombstone window (configurable, default 100000 ticks) ----
+    Tick _tombstoneWindowW = 100000;
 
     // ---- M6: Recall counters ----
     uint64_t _recallCount;
@@ -429,21 +502,6 @@ class UBCCController
     // ---- M8: Invalidation counters ----
     uint64_t _invalidationCount;
     uint64_t _invalidationAckCount;
-
-    // ---- Legacy M4 structures (retained for compatibility) ----
-    struct OuterEntry {
-        uint64_t addr;
-        uint64_t state;
-        uint64_t tick;
-    };
-    std::map<uint64_t, OuterEntry> _metadata;
-
-    struct OuterQueueEntry {
-        uint64_t addr;
-        uint64_t tick;
-        int latency;
-    };
-    std::queue<OuterQueueEntry> _outerQueue;
 
     // EP_RNF snoop counter (local, test-only)
     uint64_t _epRnfSnoopCount = 0;
@@ -462,12 +520,51 @@ class UBCCController
     // ---- M6 private helpers ----
     /**
      * Initiate a recall of the current owner.
-     * Marks the line busy (pendingOp=1) and records pending context.
-     * The caller must complete the recall via processRecallResponse().
+     * Marks the line busy and records pending context in OutstandingRequest.
      */
     bool initiateRecall(uint64_t line_pa, DirEntry &entry,
                         UBCC_OuterReqType reqType, bool writeIntent,
                         int requesterNode);
+
+    // ---- v4 private helpers ----
+    /**
+     * Half-range epoch comparison (§3.1.2).
+     * Returns true if a is newer than b.
+     */
+    static bool isNewerEpoch(uint64_t a, uint64_t b);
+
+    /**
+     * Allocate a new reserved epoch (increments committed epoch + 1).
+     */
+    uint64_t allocateReservedEpoch(DirEntry &entry);
+
+    /**
+     * Commit intended directory result from OutstandingRequest to DirEntry.
+     * Only called from processClear() or processOuterUpgradeDone().
+     */
+    void commitIntendedResult(DirEntry &entry, const OutstandingRequest &ost);
+
+    /**
+     * Retire a GRANT_HANDSHAKE to tombstone(W) for duplicate Clear replay.
+     */
+    void retireToTombstone(const OutstandingRequest &ost, bool accepted);
+
+    /**
+     * Check tombstone for matching (pa, epoch, reqId) and return cached result.
+     * Returns true if a matching tombstone was found (and not expired).
+     */
+    bool checkTombstone(uint64_t linePa, uint64_t epoch, uint64_t reqId,
+                        bool &outAccepted);
+
+    /**
+     * Remove expired tombstones.
+     */
+    void cleanupTombstones();
+
+    /**
+     * Allocate a monotonic reqId from the directory.
+     */
+    uint64_t allocateReqId(DirEntry &entry);
 };
 
 } // namespace ruby

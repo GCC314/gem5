@@ -290,11 +290,13 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
 
     // Create requester bookkeeping entry (uses requester's PA view)
     _epochCounter++;
+    uint64_t reqIdVal = _epochCounter;  // v4: monotonic reqId from epoch counter
     RequesterLineEntry entry;
     entry.lineAddr = line_pa;
     entry.state = RequesterLineState::R_WAIT_GRANT;
     entry.pendingReq = reqType;
     entry.epoch = _epochCounter;
+    entry.reqId = reqIdVal;    // v4: store reqId
     entry.writeIntent = writeIntent;
     entry.homeNode = homeNode;
     _requesterLines[line_pa] = entry;
@@ -325,13 +327,14 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
     reqEnv.writeIntent = writeIntent;
     reqEnv.srcNode = _nodeId;
     reqEnv.epoch = entry.epoch;
+    reqEnv.reqId = reqIdVal;  // v4: requester-allocated reqId
     _lastReqEnv = reqEnv;
 
     DPRINTF(RubyCHIGeneric,
             "EPBackend node_id=%d: outer request envelope "
-            "linePa=0x%lx reqType=%d writeIntent=%d srcNode=%d epoch=%lu\n",
+            "linePa=0x%lx reqType=%d writeIntent=%d srcNode=%d epoch=%lu reqId=%lu\n",
             _nodeId, reqEnv.linePa, static_cast<int>(reqEnv.reqType),
-            reqEnv.writeIntent, reqEnv.srcNode, reqEnv.epoch);
+            reqEnv.writeIntent, reqEnv.srcNode, reqEnv.epoch, reqEnv.reqId);
 
     // Convert outer request type to UBCC's internal enum
     UBCC_OuterReqType ubccReq =
@@ -355,6 +358,7 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
     int recallOwnerNode = -1;
     UBCC_OuterGrantType ubccGrant =
         homeUbcc->processOuterRequest(homePa, ubccReq, writeIntent, _nodeId,
+                                      entry.epoch, reqIdVal,  // v4: baseEpoch, reqId
                                       &grantVisibleTick, &sentinelVisibleTick,
                                       &recallNeeded, &recallOwnerNode);
 
@@ -371,24 +375,14 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
         // Build recall message
         OuterRecallMsg recallMsg;
         recallMsg.linePa = homePa;
-        // P1-4: Compute owner's local PA for _requesterLines lookup
         recallMsg.ownerLocalPa = _addrMap.buildDsmPA(
             recallOwnerNode, homeNode, offset);
         recallMsg.ownerNode = recallOwnerNode;
         recallMsg.homeNode = homeNode;
-        // P1-5: Use home UBCC's per-line directory epoch (not the
-        // requester's global _epochCounter).  The directory epoch is
-        // what processRecallResponse checks via checkEpochForLine().
-        // Using the local _epochCounter causes a stale-epoch rejection
-        // when multiple remote misses have incremented the counter
-        // beyond the directory's per-line epoch value.
-        // See M8 invalidation path (line ~428) for the same pattern.
         recallMsg.epoch = homeUbcc->getEpochForLine(homePa);
-        // Recall triggered by read: owner downgrades to shared
-        // Recall triggered by unique/write: owner invalidates
+        recallMsg.reqId = reqIdVal;  // v4: outer transaction reqId
         recallMsg.isReadRequest = (reqType == OuterReqType::GlobalReadShared);
-        // Data is needed if the owner was dirty (G_M state)
-        recallMsg.dataNeeded = true; // conservative: always request data
+        recallMsg.dataNeeded = true;
 
         _lastRecallMsg = recallMsg;
 
@@ -453,12 +447,12 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
 
                     OuterInvalidateMsg invMsg;
                     invMsg.linePa = homePa;
-                    // Compute sharer's local PA
                     invMsg.sharerLocalPa = _addrMap.buildDsmPA(
                         s, homeNode, offset);
                     invMsg.sharerNode = s;
                     invMsg.homeNode = homeNode;
-                    invMsg.epoch = homeEpoch; // P0-1: use home epoch
+                    invMsg.epoch = homeEpoch;
+                    invMsg.reqId = reqIdVal;  // v4: outer transaction reqId
 
                     _lastInvalidateMsg = invMsg;
 
@@ -486,7 +480,7 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
                                 _nodeId, s);
 
                         // Direct ack through home UBCC (use home epoch)
-                        homeUbcc->processInvalidationAck(homePa, s, homeEpoch);
+                        homeUbcc->processInvalidationAck(homePa, s, homeEpoch, reqIdVal);
                     }
                 }
             }
@@ -499,6 +493,7 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
     grantEnv.linePa = homePa;
     grantEnv.homeNode = homeNode;
     grantEnv.epoch = entry.epoch;
+    grantEnv.reqId = reqIdVal;  // v4: outer transaction reqId
     grantEnv.grantVisibleTick = grantVisibleTick;
     grantEnv.sentinelVisibleTick = sentinelVisibleTick;
 
@@ -538,36 +533,26 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
 
     DPRINTF(RubyCHIGeneric,
             "EPBackend node_id=%d: outer grant envelope "
-            "linePa=0x%lx grantType=%d homeNode=%d epoch=%lu\n",
+            "linePa=0x%lx grantType=%d homeNode=%d epoch=%lu reqId=%lu\n",
             _nodeId, grantEnv.linePa, static_cast<int>(grantEnv.grantType),
-            grantEnv.homeNode, grantEnv.epoch);
+            grantEnv.homeNode, grantEnv.epoch, grantEnv.reqId);
 
     // Handle grant result and update bookkeeping
     OuterGrantType result = handleGrant(line_pa, grant, homeNode);
 
-    // ---- P0-3: Try UBCC materialized data first ----
-    // When recall has completed, the home UBCC stores the captured
-    // cache-line data in its DirEntry.  This is the canonical source
-    // and avoids the unreliable phys_mem scavenge across PA views.
-    const uint8_t *matData = homeUbcc->getMaterializedData(line_pa);
-    if (matData) {
-        _lastGrantDataBlock.setData(matData, 0, 64);
-        _lastGrantDataValid = true;
-        printf("[Q2-DEBUG] populateGrantData node=%d using UBCC "
-               "materialized data for PA=0x%lx "
-               "first_word=0x%08x\n",
-               _nodeId, line_pa,
-               *(reinterpret_cast<const uint32_t*>(matData)));
-    } else {
-        // Fallback: try phys_mem scavenge (legacy path)
-        populateGrantData(line_pa, homePa, homeNode);
-    }
+    // v4: Populate grant data from recall buffer if available, then fallback to phys_mem
+    populateGrantData(line_pa, homePa, homeNode);
 
     // ---- M6: Clear outer txn pending and signal completion ----
     if (_epRnfCtrl) {
         _epRnfCtrl->setOuterTxnPending(line_pa, false);
         _epRnfCtrl->signalOuterTxnComplete(line_pa);
     }
+
+    // v4: Send Clear to home UBCC to commit the GRANT_HANDSHAKE intended result.
+    // Per §3.3, §3.5, §5.1-5.4: the commit point for normal misses is when
+    // home accepts the matching Clear, not when the grant was first emitted.
+    sendClear(homePa, homeNode, entry.epoch, reqIdVal);
 
     return static_cast<int>(result);
 
@@ -1109,16 +1094,8 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
             _lastGrantDataValid = true;
             _lastGrantDataProvenance = GrantDataProvenance::Recall;
 
-            // P0-3: Also store in HOME UBCC materialized data cache.
-            // This is the canonical cross-node data path: the home
-            // UBCC holds the authoritative data for its line, and
-            // future grants read from it instead of searching phys_mem.
-            UBCCController *hubcc =
-                UBCCController::getInstance(recallMsg.homeNode);
-            if (hubcc) {
-                hubcc->setMaterializedData(
-                    recallMsg.linePa, buf, 64, recallMsg.epoch);
-            }
+            // v4: Data stored in local grant buffer (no longer using
+            // UBCC materialized data since DirEntry stripped that field).
         } else {
             printf("[Q2-DEBUG] recall funcRead FAILED node=%d, "
                    "falling back to phys_mem\n",
@@ -1180,6 +1157,7 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
     resp.ownerNode = _nodeId;
     resp.homeNode = recallMsg.homeNode;
     resp.epoch = recallMsg.epoch;
+    resp.reqId = recallMsg.reqId;  // v4: echo reqId
     resp.dataReturned = recallMsg.dataNeeded;
     resp.ackReceived = true;
     return sendRecallResponse(resp);
@@ -1213,7 +1191,7 @@ EPBackend::sendRecallResponse(const OuterRecallResponse &response)
     // Complete the recall at the home UBCC
     bool ok = homeUbcc->processRecallResponse(
         response.linePa, response.ownerNode, response.dataReturned,
-        response.epoch);
+        response.epoch, response.reqId);
 
     if (!ok) {
         warn("EPBackend node_id=%d: home UBCC rejected recall response "
@@ -1422,9 +1400,9 @@ EPBackend::handleInvalidationRequest(const OuterInvalidateMsg &invMsg)
 {
     DPRINTF(RubyEP,
             "EPBackend node_id=%d: handleInvalidationRequest "
-            "PA=0x%lx sharerNode=%d homeNode=%d epoch=%lu\n",
+            "PA=0x%lx sharerNode=%d homeNode=%d epoch=%lu reqId=%lu\n",
             _nodeId, invMsg.linePa, invMsg.sharerNode,
-            invMsg.homeNode, invMsg.epoch);
+            invMsg.homeNode, invMsg.epoch, invMsg.reqId);
 
     // M8 P0-1: Validate — this node must be the invalidation target.
     if (invMsg.sharerNode != _nodeId) {
@@ -1437,39 +1415,51 @@ EPBackend::handleInvalidationRequest(const OuterInvalidateMsg &invMsg)
     _lastInvalidateMsg = invMsg;
     _invalidationReceivedCount++;
 
-    // In the single-gem5 prototype, invalidate the requester-side
-    // bookkeeping immediately.
-    // P1-4: Use sharerLocalPa (sharer's local PA) for _requesterLines lookup.
+    // Update requester-side bookkeeping
     uint64_t lookupPa = (invMsg.sharerLocalPa != 0)
                            ? invMsg.sharerLocalPa
                            : invMsg.linePa;
     {
         auto it = _requesterLines.find(lookupPa);
         if (it != _requesterLines.end()) {
-            // Invalidation: line is downgraded to invalid
             it->second.state = RequesterLineState::R_I;
         }
     }
 
-    // ---- Q3: Cross-node invalidation ack (no CleanUnique) ----
-    // The CleanUnique CHI request to HN-F is NOT needed for cross-node
-    // invalidations.  The UBCC manages the cross-node directory, and
-    // the invalidation ack goes back to the home UBCC, not the local
-    // HN-F.  Sending CleanUnique causes extra TBE allocation in HN-F,
-    // which triggers `decrementReserved(): m_reserved > 0` assertion.
-    //
-    // Instead, send the invalidation ack directly to the home UBCC.
-
-    // Build invalidation ack
-    OuterInvalidationAck ack;
-    ack.linePa = invMsg.linePa;
-    ack.ackNode = _nodeId;
-    ack.homeNode = invMsg.homeNode;
-    ack.epoch = invMsg.epoch;
-    ack.success = true;
-
-    sendInvalidationAck(ack);
-    return true;
+    // ---- v4 (§4.2.4): FIXED — use EP-RNF.startCleanUnique, wait for
+    // callback before sending invalidation ack.  Previous code directly
+    // ack'd, bypassing HN-F and losing grant/invalidation serialization.
+    if (_epRnfCtrl) {
+        // Capture invMsg by value for the callback
+        OuterInvalidateMsg capturedMsg = invMsg;
+        _epRnfCtrl->startCleanUnique(
+            capturedMsg.sharerLocalPa,
+            [this, capturedMsg](bool ok) {
+                OuterInvalidationAck ack;
+                ack.linePa = capturedMsg.linePa;
+                ack.ackNode = _nodeId;
+                ack.homeNode = capturedMsg.homeNode;
+                ack.epoch = capturedMsg.epoch;
+                ack.reqId = capturedMsg.reqId;
+                ack.success = ok;
+                sendInvalidationAck(ack);
+            });
+        return true;
+    } else {
+        // Fallback: if no EP-RNF controller, ack directly (prototype mode)
+        warn("EPBackend node_id=%d: no EP-RNF controller, "
+             "sending invalidation ack directly (bypasses HN-F)\n",
+             _nodeId);
+        OuterInvalidationAck ack;
+        ack.linePa = invMsg.linePa;
+        ack.ackNode = _nodeId;
+        ack.homeNode = invMsg.homeNode;
+        ack.epoch = invMsg.epoch;
+        ack.reqId = invMsg.reqId;
+        ack.success = true;
+        sendInvalidationAck(ack);
+        return true;
+    }
 }
 
 bool
@@ -1477,9 +1467,9 @@ EPBackend::sendInvalidationAck(const OuterInvalidationAck &ack)
 {
     DPRINTF(RubyEP,
             "EPBackend node_id=%d: sendInvalidationAck "
-            "PA=0x%lx ackNode=%d homeNode=%d epoch=%lu\n",
+            "PA=0x%lx ackNode=%d homeNode=%d epoch=%lu reqId=%lu\n",
             _nodeId, ack.linePa, ack.ackNode,
-            ack.homeNode, ack.epoch);
+            ack.homeNode, ack.epoch, ack.reqId);
 
     // Store for inspection
     _lastInvalidationAck = ack;
@@ -1494,7 +1484,7 @@ EPBackend::sendInvalidationAck(const OuterInvalidationAck &ack)
     }
 
     bool ok = homeUbcc->processInvalidationAck(
-        ack.linePa, ack.ackNode, ack.epoch);
+        ack.linePa, ack.ackNode, ack.epoch, ack.reqId);
 
     if (!ok) {
         warn("EPBackend node_id=%d: home UBCC rejected invalidation ack "
@@ -1502,6 +1492,186 @@ EPBackend::sendInvalidationAck(const OuterInvalidationAck &ack)
     }
 
     return ok;
+}
+
+// ---- v4: Local Upgrade Management (§4.1.4, §4.2.3) ----
+
+bool
+EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
+                                    int desiredPerm, UpgradeCause cause,
+                                    uint64_t &outEpoch, uint64_t &outReqId)
+{
+    DPRINTF(RubyEP,
+            "EPBackend node_id=%d: notifyLocalWriteUpgrade "
+            "PA=0x%lx homeNode=%d desiredPerm=%d\n",
+            _nodeId, line_pa, homeNode, desiredPerm);
+
+    // Translate local PA to home PA
+    uint64_t offset = _addrMap.dsmOffset(line_pa);
+    uint64_t homePa = _addrMap.buildDsmPA(homeNode, homeNode, offset);
+
+    // Allocate new epoch and reqId
+    _epochCounter++;
+    uint64_t epochVal = _epochCounter;
+    uint64_t reqIdVal = _epochCounter;
+
+    // Get home UBCC
+    UBCCController *homeUbcc = UBCCController::getInstance(homeNode);
+    if (!homeUbcc) {
+        if (homeNode != _nodeId) {
+            fatal("EPBackend node_id=%d: remote UBCC for homeNode=%d "
+                  "not registered for upgrade\n", _nodeId, homeNode);
+        }
+        homeUbcc = _ubcc;
+    }
+    if (!homeUbcc) {
+        fatal("EPBackend node_id=%d: no UBCC for upgrade PA=0x%lx\n",
+              _nodeId, line_pa);
+    }
+
+    // Convert EPBackend UpgradeCause to UBCC UpgradeCause
+    UBCC_UpgradeCause ubccCause =
+        (cause == UpgradeCause::LocalCleanUnique)
+            ? UBCC_UpgradeCause::LocalCleanUnique
+            : UBCC_UpgradeCause::LocalStoreUpgrade;
+
+    // Send OuterUpgradeReq to home UBCC
+    OuterUpgradeReq upgradeReq;
+    upgradeReq.linePa = homePa;
+    upgradeReq.srcNode = _nodeId;
+    upgradeReq.epoch = epochVal;
+    upgradeReq.reqId = reqIdVal;
+    upgradeReq.desiredPerm = desiredPerm;
+    upgradeReq.cause = cause;
+    _lastUpgradeReq = upgradeReq;
+
+    bool accepted = homeUbcc->processOuterUpgradeReq(
+        homePa, _nodeId, epochVal, reqIdVal,
+        desiredPerm, ubccCause);
+
+    if (accepted) {
+        // Store returned values (reservedEpoch, echoed reqId)
+        outEpoch = epochVal;
+        outReqId = reqIdVal;
+
+        // Build ack envelope
+        OuterUpgradeAck ack;
+        ack.linePa = homePa;
+        ack.homeNode = homeNode;
+        ack.dstNode = _nodeId;
+        ack.epoch = epochVal;
+        ack.reqId = reqIdVal;
+        ack.accepted = true;
+        _lastUpgradeAck = ack;
+
+        DPRINTF(RubyEP,
+                "EPBackend node_id=%d: upgrade accepted "
+                "PA=0x%lx epoch=%lu reqId=%lu\n",
+                _nodeId, line_pa, epochVal, reqIdVal);
+    } else {
+        OuterUpgradeAck ack;
+        ack.linePa = homePa;
+        ack.homeNode = homeNode;
+        ack.dstNode = _nodeId;
+        ack.epoch = epochVal;
+        ack.reqId = reqIdVal;
+        ack.accepted = false;
+        _lastUpgradeAck = ack;
+    }
+
+    return accepted;
+}
+
+bool
+EPBackend::sendUpgradeDone(uint64_t line_pa, int homeNode,
+                            uint64_t epoch, uint64_t reqId)
+{
+    DPRINTF(RubyEP,
+            "EPBackend node_id=%d: sendUpgradeDone "
+            "PA=0x%lx homeNode=%d epoch=%lu reqId=%lu\n",
+            _nodeId, line_pa, homeNode, epoch, reqId);
+
+    uint64_t offset = _addrMap.dsmOffset(line_pa);
+    uint64_t homePa = _addrMap.buildDsmPA(homeNode, homeNode, offset);
+
+    UBCCController *homeUbcc = UBCCController::getInstance(homeNode);
+    if (!homeUbcc) {
+        if (homeNode != _nodeId) {
+            fatal("EPBackend node_id=%d: remote UBCC for upgrade done\n",
+                  _nodeId);
+        }
+        homeUbcc = _ubcc;
+    }
+    if (!homeUbcc) {
+        return false;
+    }
+
+    OuterUpgradeDone doneMsg;
+    doneMsg.linePa = homePa;
+    doneMsg.srcNode = _nodeId;
+    doneMsg.homeNode = homeNode;
+    doneMsg.epoch = epoch;
+    doneMsg.reqId = reqId;
+    _lastUpgradeDone = doneMsg;
+
+    bool accepted = homeUbcc->processOuterUpgradeDone(
+        homePa, _nodeId, epoch, reqId);
+
+    OuterUpgradeDoneAck doneAck;
+    doneAck.linePa = homePa;
+    doneAck.homeNode = homeNode;
+    doneAck.dstNode = _nodeId;
+    doneAck.epoch = epoch;
+    doneAck.reqId = reqId;
+    doneAck.accepted = accepted;
+    _lastUpgradeDoneAck = doneAck;
+
+    return accepted;
+}
+
+// ---- v4: Clear / ClearAck (§3.5) ----
+
+bool
+EPBackend::sendClear(uint64_t line_pa, int homeNode,
+                      uint64_t epoch, uint64_t reqId)
+{
+    DPRINTF(RubyEP,
+            "EPBackend node_id=%d: sendClear "
+            "PA=0x%lx homeNode=%d epoch=%lu reqId=%lu\n",
+            _nodeId, line_pa, homeNode, epoch, reqId);
+
+    UBCCController *homeUbcc = UBCCController::getInstance(homeNode);
+    if (!homeUbcc) {
+        if (homeNode != _nodeId) {
+            fatal("EPBackend node_id=%d: remote UBCC for Clear\n", _nodeId);
+        }
+        homeUbcc = _ubcc;
+    }
+    if (!homeUbcc) {
+        return false;
+    }
+
+    OuterClearMsg clearMsg;
+    clearMsg.linePa = line_pa;
+    clearMsg.srcNode = _nodeId;
+    clearMsg.homeNode = homeNode;
+    clearMsg.epoch = epoch;
+    clearMsg.reqId = reqId;
+    clearMsg.reason = ClearReason::GrantHandshake;
+    _lastClearMsg = clearMsg;
+
+    bool accepted = homeUbcc->processClear(line_pa, _nodeId, epoch, reqId);
+
+    OuterClearAckMsg ack;
+    ack.linePa = line_pa;
+    ack.homeNode = homeNode;
+    ack.dstNode = _nodeId;
+    ack.epoch = epoch;
+    ack.reqId = reqId;
+    ack.accepted = accepted;
+    _lastClearAckMsg = ack;
+
+    return accepted;
 }
 
 } // namespace ruby

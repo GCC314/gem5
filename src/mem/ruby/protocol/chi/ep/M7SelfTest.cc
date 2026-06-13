@@ -98,7 +98,7 @@ void runSelfTest(EPBackend *backend, int home_node)
                  std::string("grant=") + std::to_string(static_cast<int>(grant)));
 
         // Verify G_M state
-        UBCCController::MESIState state;
+        MESIState state;
         int ownerNode;
         uint64_t sharersMask;
         bool dirty;
@@ -106,7 +106,7 @@ void runSelfTest(EPBackend *backend, int home_node)
             pa, state, ownerNode, sharersMask, dirty);
 
         M7_CHECK("M7-1-2: state is G_M",
-                 exists && state == UBCCController::MESIState::G_M
+                 exists && state == MESIState::G_M
                  && dirty == true && ownerNode == 0,
                  exists ? std::string("state=") +
                      std::to_string(static_cast<int>(state)) +
@@ -134,7 +134,7 @@ void runSelfTest(EPBackend *backend, int home_node)
             pa, state, ownerNode, sharersMask, dirty);
 
         M7_CHECK("M7-1-5: state is G_E after writeback (keepAsClean=true)",
-                 exists && state == UBCCController::MESIState::G_E
+                 exists && state == MESIState::G_E
                  && dirty == false && ownerNode == 0,
                  exists ? std::string("state=") +
                      std::to_string(static_cast<int>(state)) +
@@ -150,7 +150,7 @@ void runSelfTest(EPBackend *backend, int home_node)
         exists = ubcc->getUbccDirFieldsForTest(
             pa2, state, ownerNode, sharersMask, dirty);
         M7_CHECK("M7-1-6: state is G_I after writeback (keepAsClean=false)",
-                 exists && state == UBCCController::MESIState::G_I
+                 exists && state == MESIState::G_I
                  && ownerNode == -1,
                  exists ? std::string("state=") +
                      std::to_string(static_cast<int>(state)) +
@@ -213,7 +213,7 @@ void runSelfTest(EPBackend *backend, int home_node)
             UBCC_OuterReqType::GlobalReadShared, false, 1);
 
         // Verify both in sharer mask
-        UBCCController::MESIState state;
+        MESIState state;
         int ownerNode;
         uint64_t sharersMask;
         bool dirty;
@@ -256,7 +256,7 @@ void runSelfTest(EPBackend *backend, int home_node)
         exists = ubcc->getUbccDirFieldsForTest(
             pa, state, ownerNode, sharersMask, dirty);
         M7_CHECK("M7-2-5: state is G_I after all evict",
-                 exists && state == UBCCController::MESIState::G_I
+                 exists && state == MESIState::G_I
                  && sharersMask == 0,
                  std::string("state=") +
                      std::to_string(static_cast<int>(state)) +
@@ -282,7 +282,7 @@ void runSelfTest(EPBackend *backend, int home_node)
         int recallOwnerNode = -1;
         UBCC_OuterGrantType grant =
             ubcc->processOuterRequest(pa,
-                UBCC_OuterReqType::GlobalReadUnique, true, 1,
+                UBCC_OuterReqType::GlobalReadUnique, true, 1, 0, 0,
                 nullptr, nullptr,
                 &recallNeeded, &recallOwnerNode);
 
@@ -299,7 +299,7 @@ void runSelfTest(EPBackend *backend, int home_node)
                  recallOk, "Recall response should be accepted");
 
         // Verify: node 1 is now the sole owner
-        UBCCController::MESIState state;
+        MESIState state;
         int ownerNode;
         uint64_t sharersMask;
         bool dirty;
@@ -316,9 +316,9 @@ void runSelfTest(EPBackend *backend, int home_node)
 
         // Step 4: Another transfer — node 2 requests → recall of node 1
         ubcc->processOuterRequest(pa,
-            UBCC_OuterReqType::GlobalReadUnique, false, 2,
-            nullptr, nullptr,
-            &recallNeeded, &recallOwnerNode);
+                UBCC_OuterReqType::GlobalReadUnique, false, 2, 0, 0,
+                nullptr, nullptr,
+                &recallNeeded, &recallOwnerNode);
 
         uint64_t epoch2 = ubcc->getEpochForLine(pa);
         ubcc->processRecallResponse(pa, 1, false, epoch2);
@@ -349,8 +349,8 @@ void runSelfTest(EPBackend *backend, int home_node)
 
         // Step 2: Another request increments epoch to 2
         ubcc->processOuterRequest(pa,
-            UBCC_OuterReqType::GlobalReadShared, false, 1,
-            nullptr, nullptr);
+                UBCC_OuterReqType::GlobalReadShared, false, 1, 0, 0,
+                nullptr, nullptr);
 
         uint64_t currentEpoch = ubcc->getEpochForLine(pa);
         // Epoch should be >= 2 (each processOuterRequest increments)
@@ -404,6 +404,7 @@ void runSelfTest(EPBackend *backend, int home_node)
         int recallOwnerNode = -1;
         ubcc->processOuterRequest(pa2,
             UBCC_OuterReqType::GlobalReadShared, false, 1,
+            0, 0,
             nullptr, nullptr,
             &recallNeeded, &recallOwnerNode);
 
@@ -496,7 +497,7 @@ void runSelfTest(EPBackend *backend, int home_node)
             bool recallNeeded = false;
             int recallOwnerNode = -1;
             ubcc->processOuterRequest(pa,
-                UBCC_OuterReqType::GlobalReadShared, false, 1,
+                UBCC_OuterReqType::GlobalReadShared, false, 1, 0, 0,
                 nullptr, nullptr,
                 &recallNeeded, &recallOwnerNode);
 
@@ -508,7 +509,7 @@ void runSelfTest(EPBackend *backend, int home_node)
             uint64_t epoch = ubcc->getEpochForLine(pa);
             ubcc->processRecallResponse(pa, 0, false, epoch);
 
-            UBCCController::MESIState state;
+            MESIState state;
             int ownerNode;
             uint64_t sharersMask;
             bool dirty;
@@ -516,7 +517,7 @@ void runSelfTest(EPBackend *backend, int home_node)
                 pa, state, ownerNode, sharersMask, dirty);
 
             M7_CHECK("M7-6a-2: state is G_S after read recall",
-                     exists && state == UBCCController::MESIState::G_S,
+                     exists && state == MESIState::G_S,
                      std::string("state=") +
                          std::to_string(static_cast<int>(state)));
 
@@ -546,7 +547,7 @@ void runSelfTest(EPBackend *backend, int home_node)
             bool recallNeeded = false;
             int recallOwnerNode = -1;
             ubcc->processOuterRequest(pa,
-                UBCC_OuterReqType::GlobalReadUnique, false, 1,
+                UBCC_OuterReqType::GlobalReadUnique, false, 1, 0, 0,
                 nullptr, nullptr,
                 &recallNeeded, &recallOwnerNode);
 
@@ -558,7 +559,7 @@ void runSelfTest(EPBackend *backend, int home_node)
             uint64_t epoch = ubcc->getEpochForLine(pa);
             ubcc->processRecallResponse(pa, 0, true, epoch);
 
-            UBCCController::MESIState state;
+            MESIState state;
             int ownerNode;
             uint64_t sharersMask;
             bool dirty;
@@ -574,7 +575,7 @@ void runSelfTest(EPBackend *backend, int home_node)
                      "Old owner must be invalidated (not in sharers)");
 
             M7_CHECK("M7-6b-4: state is G_E (clean exclusive for new owner)",
-                     exists && state == UBCCController::MESIState::G_E
+                     exists && state == MESIState::G_E
                      && !dirty,
                      std::string("state=") +
                          std::to_string(static_cast<int>(state)) +
@@ -587,18 +588,18 @@ void runSelfTest(EPBackend *backend, int home_node)
             bool rn2 = false;
             int ron2 = -1;
             ubcc->processOuterRequest(pa2,
-                UBCC_OuterReqType::GlobalReadUnique, true, 1,
+                UBCC_OuterReqType::GlobalReadUnique, true, 1, 0, 0,
                 nullptr, nullptr, &rn2, &ron2);
             uint64_t epoch2 = ubcc->getEpochForLine(pa2);
             ubcc->processRecallResponse(pa2, 0, false, epoch2);
 
-            UBCCController::MESIState st2;
+            MESIState st2;
             int o2;
             uint64_t sm2;
             bool d2;
             bool ex2 = ubcc->getUbccDirFieldsForTest(pa2, st2, o2, sm2, d2);
             M7_CHECK("M7-6b-5: write_intent=true → new owner gets G_M",
-                     ex2 && st2 == UBCCController::MESIState::G_M
+                     ex2 && st2 == MESIState::G_M
                      && o2 == 1 && d2 == true,
                      std::string("state=") +
                          std::to_string(static_cast<int>(st2)) +
@@ -677,9 +678,9 @@ void runSelfTest(EPBackend *backend, int home_node)
             UBCC_OuterReqType::GlobalReadUnique, true, 0);
         // Trigger recall → read request from node 2 makes it shared
         bool rn = false; int ron = -1;
-        ubcc->processOuterRequest(pa,
-            UBCC_OuterReqType::GlobalReadShared, false, 2,
-            nullptr, nullptr, &rn, &ron);
+            ubcc->processOuterRequest(pa,
+                UBCC_OuterReqType::GlobalReadShared, false, 2, 0, 0,
+                nullptr, nullptr, &rn, &ron);
         // But this triggers recall of the owner... 
         // Actually for P0-2, let's test the simpler case:
         // Make node 0 G_M owner + node 2 a separate sharer through request
@@ -693,9 +694,9 @@ void runSelfTest(EPBackend *backend, int home_node)
             UBCC_OuterReqType::GlobalReadUnique, false, 0);
         // Node 2 becomes a sharer (recall → shared)
         bool rn2 = false; int ron2 = -1;
-        ubcc->processOuterRequest(pa2,
-            UBCC_OuterReqType::GlobalReadShared, false, 2,
-            nullptr, nullptr, &rn2, &ron2);
+            ubcc->processOuterRequest(pa2,
+                UBCC_OuterReqType::GlobalReadShared, false, 2, 0, 0,
+                nullptr, nullptr, &rn2, &ron2);
         // Complete recall — node 0 downgraded to shared, node 2 also shared
         uint64_t epoch_after_recall = ubcc->getEpochForLine(pa2);
         ubcc->processRecallResponse(pa2, 0, false, epoch_after_recall);
@@ -706,9 +707,9 @@ void runSelfTest(EPBackend *backend, int home_node)
             UBCC_OuterReqType::GlobalReadUnique, true, 0); // G_M, dirty=true
         // Node 1 requests shared → recall → owner downgraded to shared
         rn2 = false; ron2 = -1;
-        ubcc->processOuterRequest(pa3,
-            UBCC_OuterReqType::GlobalReadShared, false, 1,
-            nullptr, nullptr, &rn2, &ron2);
+            ubcc->processOuterRequest(pa3,
+                UBCC_OuterReqType::GlobalReadShared, false, 1, 0, 0,
+                nullptr, nullptr, &rn2, &ron2);
         // Complete recall: now both nodes 0 and 1 are sharers, dirty=false, no owner
         uint64_t epoch3 = ubcc->getEpochForLine(pa3);
         ubcc->processRecallResponse(pa3, 0, false, epoch3);
@@ -723,7 +724,7 @@ void runSelfTest(EPBackend *backend, int home_node)
                  "Sharer eviction should succeed");
 
         // Verify: dirty flag should NOT have been changed by sharer-only evict
-        UBCCController::MESIState st;
+        MESIState st;
         int own;
         uint64_t mask;
         bool d;

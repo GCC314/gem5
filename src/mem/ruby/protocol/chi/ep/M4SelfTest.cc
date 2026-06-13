@@ -144,7 +144,7 @@ void runSelfTest(UBCCController *ubcc, int home_node)
                  std::string("grant=") + std::to_string(static_cast<int>(grant1)));
 
         // Verify: EP_RNF (requester) is in sharers
-        UBCCController::MESIState state;
+        MESIState state;
         int ownerNode;
         uint64_t sharersMask;
         bool dirty;
@@ -153,7 +153,7 @@ void runSelfTest(UBCCController *ubcc, int home_node)
         M4_CHECK("M4-TC-Sharer-2: entry exists after Shared grant",
                  exists, "");
         M4_CHECK("M4-TC-Sharer-3: state == G_S after Shared grant",
-                 exists && state == UBCCController::MESIState::G_S,
+                 exists && state == MESIState::G_S,
                  exists ? std::string("state=") +
                      std::to_string(static_cast<int>(state)) : "entry missing");
         M4_CHECK("M4-TC-Sharer-4: EP_RNF in sharersMask",
@@ -177,7 +177,7 @@ void runSelfTest(UBCCController *ubcc, int home_node)
                  exists ? std::string("ownerNode=") + std::to_string(ownerNode)
                         : "entry missing");
         M4_CHECK("M4-TC-Owner-3: state == G_E after Unique grant",
-                 exists && state == UBCCController::MESIState::G_E,
+                 exists && state == MESIState::G_E,
                  exists ? std::string("state=") +
                      std::to_string(static_cast<int>(state)) : "entry missing");
 
@@ -231,14 +231,14 @@ void runSelfTest(UBCCController *ubcc, int home_node)
             false, requester);
 
         // Verify entry exists (M4-4-a: UBCC directory accessible)
-        UBCCController::MESIState state;
+        MESIState state;
         int ownerNode;
         uint64_t sharersMask;
         bool dirty;
         bool exists = ubcc->getUbccDirFieldsForTest(dsm_pa3, state, ownerNode,
                                                      sharersMask, dirty);
         M4_CHECK("M4-4-a: UBCC directory entry exists for DSM line",
-                 exists && state == UBCCController::MESIState::G_S,
+                 exists && state == MESIState::G_S,
                  "directory entry must be G_S after Shared grant");
 
         // Now add a simulated other sharer by directly faking a second
@@ -298,7 +298,7 @@ void runSelfTest(UBCCController *ubcc, int home_node)
                  std::string("grant=") + std::to_string(static_cast<int>(grant)));
 
         // M4-5-b: getUbccDirFieldsForTest provides snapshot
-        UBCCController::MESIState state;
+        MESIState state;
         int ownerNode;
         uint64_t sharersMask;
         bool dirty;
@@ -307,7 +307,7 @@ void runSelfTest(UBCCController *ubcc, int home_node)
         M4_CHECK("M4-5-b: getUbccDirFieldsForTest returns entry",
                  exists, "");
         M4_CHECK("M4-5-c: round-trip: state==G_M ownerNode==requester dirty==true",
-                 exists && state == UBCCController::MESIState::G_M
+                 exists && state == MESIState::G_M
                         && ownerNode == requester
                         && dirty,
                  "full round-trip verification");
@@ -316,7 +316,7 @@ void runSelfTest(UBCCController *ubcc, int home_node)
     // ---- Test 7: M4-FMT — directory field completeness ----
     // Verify getUbccDirFieldsForTest returns all four fields meaningfully.
     {
-        UBCCController::MESIState state;
+        MESIState state;
         int ownerNode;
         uint64_t sharersMask;
         bool dirty;
@@ -325,7 +325,7 @@ void runSelfTest(UBCCController *ubcc, int home_node)
         bool exists = ubcc->getUbccDirFieldsForTest(dsm_pa2, state, ownerNode,
                                                      sharersMask, dirty);
         M4_CHECK("M4-FMT-1: getUbccDirFieldsForTest returns all fields",
-                 exists && state == UBCCController::MESIState::G_E
+                 exists && state == MESIState::G_E
                         && ownerNode == static_cast<int>(home_node)
                         && sharersMask == 0
                         && dirty == false,

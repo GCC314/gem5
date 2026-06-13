@@ -94,7 +94,7 @@ void runSelfTest(EPBackend *backend, int home_node)
                  std::string("grant=") + std::to_string(static_cast<int>(grant0)));
 
         // Verify G_S, node 0 in sharers
-        UBCCController::MESIState state;
+        MESIState state;
         int ownerNode;
         uint64_t sharersMask;
         bool dirty;
@@ -102,7 +102,7 @@ void runSelfTest(EPBackend *backend, int home_node)
             pa, state, ownerNode, sharersMask, dirty);
 
         M8_CHECK("M8-1-2: state is G_S after first shared",
-                 exists && state == UBCCController::MESIState::G_S
+                 exists && state == MESIState::G_S
                  && ownerNode == -1 && !dirty,
                  std::string("state=") +
                      std::to_string(static_cast<int>(state)) +
@@ -127,7 +127,7 @@ void runSelfTest(EPBackend *backend, int home_node)
             pa, state, ownerNode, sharersMask, dirty);
 
         M8_CHECK("M8-1-5: state remains G_S with two sharers",
-                 exists && state == UBCCController::MESIState::G_S
+                 exists && state == MESIState::G_S
                  && ownerNode == -1 && !dirty,
                  std::string("state=") +
                      std::to_string(static_cast<int>(state)) +
@@ -188,7 +188,7 @@ void runSelfTest(EPBackend *backend, int home_node)
                      grant == UBCC_OuterGrantType::GlobalGrantModified,
                      std::string("grant=") + std::to_string(static_cast<int>(grant)));
 
-            UBCCController::MESIState state;
+            MESIState state;
             int ownerNode;
             uint64_t sharersMask;
             bool dirty;
@@ -196,7 +196,7 @@ void runSelfTest(EPBackend *backend, int home_node)
                 pa, state, ownerNode, sharersMask, dirty);
 
             M8_CHECK("M8-2a-2: state is G_M after upgrade",
-                     exists && state == UBCCController::MESIState::G_M
+                     exists && state == MESIState::G_M
                      && ownerNode == 0 && dirty,
                      std::string("state=") +
                          std::to_string(static_cast<int>(state)) +
@@ -234,7 +234,7 @@ void runSelfTest(EPBackend *backend, int home_node)
                          " after=" + std::to_string(invCountAfter));
 
             // Verify line is in invalidation-pending state (pendingOp=2)
-            UBCCController::MESIState state;
+            MESIState state;
             int ownerNode;
             uint64_t sharersMask;
             bool dirty;
@@ -246,7 +246,7 @@ void runSelfTest(EPBackend *backend, int home_node)
                 pendingReq, pendingRecall);
 
             M8_CHECK("M8-2b-3: state is G_M (upgraded immediately)",
-                     exists && state == UBCCController::MESIState::G_M,
+                     exists && state == MESIState::G_M,
                      std::string("state=") +
                          std::to_string(static_cast<int>(state)));
 
@@ -307,7 +307,7 @@ void runSelfTest(EPBackend *backend, int home_node)
 
             // Verify Node0 is still owner
             M8_CHECK("M8-2b-13: Node0 remains owner",
-                     exists && ownerNode == 0 && state == UBCCController::MESIState::G_M,
+                     exists && ownerNode == 0 && state == MESIState::G_M,
                      "owner and state unchanged after invalidation ack");
 
             M8_CHECK("M8-2b-14: No pending invalidations after all acks",
@@ -366,7 +366,7 @@ void runSelfTest(EPBackend *backend, int home_node)
             ubcc->processInvalidationAck(pa, 0, epoch);
             ubcc->processInvalidationAck(pa, 1, epoch);
 
-            UBCCController::MESIState state;
+            MESIState state;
             int ownerNode;
             uint64_t sharersMask;
             bool dirty, busy;
@@ -408,7 +408,7 @@ void runSelfTest(EPBackend *backend, int home_node)
                  grant1 == UBCC_OuterGrantType::GlobalGrantShared,
                  std::string("grant=") + std::to_string(static_cast<int>(grant1)));
 
-        UBCCController::MESIState state;
+        MESIState state;
         int ownerNode;
         uint64_t sharersMask;
         bool dirty;
@@ -416,7 +416,7 @@ void runSelfTest(EPBackend *backend, int home_node)
             pa, state, ownerNode, sharersMask, dirty);
 
         M8_CHECK("M8-3-2: state is G_S (not G_M) after ReadShared",
-                 exists && state == UBCCController::MESIState::G_S,
+                 exists && state == MESIState::G_S,
                  std::string("state=") +
                      std::to_string(static_cast<int>(state)));
 
@@ -474,7 +474,7 @@ void runSelfTest(EPBackend *backend, int home_node)
                 UBCC_OuterReqType::GlobalReadShared, false, 2);
 
             // Verify mask has exactly nodes 0 and 2
-            UBCCController::MESIState state;
+            MESIState state;
             int ownerNode;
             uint64_t sharersMask;
             bool dirty;
@@ -502,7 +502,7 @@ void runSelfTest(EPBackend *backend, int home_node)
             uint64_t epoch = ubcc->getEpochForLine(pa);
             ubcc->processEvict(pa, 2, epoch);
 
-            UBCCController::MESIState state;
+            MESIState state;
             int ownerNode;
             uint64_t sharersMask;
             bool dirty;
@@ -536,7 +536,7 @@ void runSelfTest(EPBackend *backend, int home_node)
 
             uint64_t maskBefore = 0;
             {
-                UBCCController::MESIState s;
+                MESIState s;
                 int o; uint64_t m; bool d;
                 ubcc->getUbccDirFieldsForTest(pa, s, o, m, d);
                 maskBefore = m;
@@ -556,7 +556,7 @@ void runSelfTest(EPBackend *backend, int home_node)
             ubcc->processInvalidationAck(pa, 2, epoch);
 
             // After all acks, sharerMask should be clean
-            UBCCController::MESIState state;
+            MESIState state;
             int ownerNode;
             uint64_t sharersMask;
             bool dirty;
@@ -570,7 +570,7 @@ void runSelfTest(EPBackend *backend, int home_node)
                          std::to_string(sharersMask));
 
             M8_CHECK("M8-4c-3: state is G_E after unique upgrade",
-                     exists && state == UBCCController::MESIState::G_E,
+                     exists && state == MESIState::G_E,
                      std::string("state=") +
                          std::to_string(static_cast<int>(state)));
 
@@ -592,13 +592,13 @@ void runSelfTest(EPBackend *backend, int home_node)
             bool recallNeeded = false;
             int recallOwnerNode = -1;
             ubcc->processOuterRequest(pa,
-                UBCC_OuterReqType::GlobalReadShared, false, 2,
+                UBCC_OuterReqType::GlobalReadShared, false, 2, 0, 0,
                 nullptr, nullptr, &recallNeeded, &recallOwnerNode);
 
             uint64_t epoch = ubcc->getEpochForLine(pa);
             ubcc->processRecallResponse(pa, 0, false, epoch);
 
-            UBCCController::MESIState state;
+            MESIState state;
             int ownerNode;
             uint64_t sharersMask;
             bool dirty;
@@ -606,7 +606,7 @@ void runSelfTest(EPBackend *backend, int home_node)
                 pa, state, ownerNode, sharersMask, dirty);
 
             M8_CHECK("M8-4d-1: state is G_S after read recall",
-                     exists && state == UBCCController::MESIState::G_S,
+                     exists && state == MESIState::G_S,
                      std::string("state=") +
                          std::to_string(static_cast<int>(state)));
 
@@ -716,7 +716,7 @@ void runSelfTest(EPBackend *backend, int home_node)
             UBCC_OuterReqType::GlobalReadUnique, false, 0);
 
         // Verify line is busy (pendingOp=2)
-        UBCCController::MESIState state;
+        MESIState state;
         int ownerNode;
         uint64_t sharersMask;
         bool dirty, busy;
