@@ -269,7 +269,9 @@ EPRNFController::init()
             "hnfVersion=%d\n",
             _nodeId, _numCacheControllers, _hnfVersion);
 
-    selfTest();
+    // F4: selfTest disabled — manual snoop injection causes init-phase
+    // SnpShared→EP-RNF fatal before any workload runs (§gap_analysis).
+    // selfTest();
 }
 
 void

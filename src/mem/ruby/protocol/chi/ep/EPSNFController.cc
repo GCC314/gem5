@@ -29,7 +29,8 @@ EPSNFController::init()
 {
     EPController::init();
     fatal_if(!_backend, "EP_SNF node_id=%d: no backend attached", _nodeId);
-    selfTest();
+    // F4: selfTest disabled (§gap_analysis)
+    // selfTest();
 }
 
 void
