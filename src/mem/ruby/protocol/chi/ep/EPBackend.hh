@@ -288,19 +288,15 @@ enum class GrantDataSource {
     NoData        // No data needed / zero-fill (uninitialized memory)
 };
 
-#include "mem/simple_mem.hh"
+// Forward declaration — full type in EPBackend.cc
+namespace memory { class SimpleMemory; }
 
 struct HomeMemoryService {
     memory::SimpleMemory *physMem;
     HomeMemoryService(memory::SimpleMemory *pm = nullptr) : physMem(pm) {}
 
-    // Read a cache line from DDR4 at the given physical address.
-    // Returns true if physMem is available, false otherwise.
-    // On success, buf is filled with the contents.
+    // Implemented in EPBackend.cc where SimpleMemory is fully defined
     bool read(uint64_t homePa, uint8_t *buf, int size) const;
-
-    // Write a cache line to DDR4 at the given physical address.
-    // Returns true if physMem is available, false otherwise.
     bool write(uint64_t homePa, const uint8_t *buf, int size) const;
 };
 
