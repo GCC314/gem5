@@ -288,12 +288,11 @@ enum class GrantDataSource {
     NoData        // No data needed / zero-fill (uninitialized memory)
 };
 
-// Forward-declare for HomeMemoryService
-class SimpleMemory;
+#include "mem/simple_mem.hh"
 
 struct HomeMemoryService {
-    SimpleMemory *physMem;
-    HomeMemoryService(SimpleMemory *pm = nullptr) : physMem(pm) {}
+    memory::SimpleMemory *physMem;
+    HomeMemoryService(memory::SimpleMemory *pm = nullptr) : physMem(pm) {}
 
     // Read a cache line from DDR4 at the given physical address.
     // Returns true if physMem is available, false otherwise.
