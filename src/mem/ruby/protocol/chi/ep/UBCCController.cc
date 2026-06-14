@@ -609,6 +609,9 @@ UBCCController::processRecallResponse(uint64_t line_pa, int ownerNode,
                                        uint64_t reqId,
                                        const DataBlock *dataBlk)
 {
+    printf("[RECALL-DIAG] UBCC node_id=%d processRecallResponse PA=0x%lx "
+           "owner=%d epoch=%lu reqId=%lu\n",
+           _nodeId, line_pa, ownerNode, responseEpoch, reqId);
     auto it = _directory.find(line_pa);
     if (it == _directory.end()) {
         DPRINTF(RubyEP,
