@@ -1600,6 +1600,8 @@ action(Send_ReadNoSnp, desc="") {
 
   clearExpectedReqResp(tbe);
   tbe.expected_req_resp.addExpectedDataType(CHIDataType:CompData_UC);
+  tbe.expected_req_resp.addExpectedDataType(CHIDataType:CompData_SC);
+  tbe.expected_req_resp.addExpectedDataType(CHIDataType:CompData_UD_PD);
   // NOTE: the first CompData received counts as RespSepData
   tbe.expected_req_resp.addExpectedRespType(CHIResponseType:RespSepData);
   tbe.expected_req_resp.setExpectedCount(2);
