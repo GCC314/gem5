@@ -668,7 +668,10 @@ EPRNFController::handleSnpCleanInvalid(const CHIRequestMsg *msg)
     //   2) Local upgrade (remote sharer upgrade): OuterUpgradeReq → wait
     //      for OuterUpgradeAck(true) → then SnpResp_I (§5.5)
 
-    // Check if upgrade is pending for this PA (set by EPBackend)
+    EPBackend *backend = EPBackend::getBackendInstance(_nodeId);
+    bool isDsmLine = backend && backend->isDsmAddrCrossNode(msg->m_addr);
+
+    // Check if upgrade is pending for this PA (set by the first snoop arrival)
     auto upIt = _upgradePending.find(msg->m_addr);
     if (upIt != _upgradePending.end() && upIt->second.valid) {
         // ---- Upgrade path (§5.5 t2-t5) ----
@@ -684,11 +687,54 @@ EPRNFController::handleSnpCleanInvalid(const CHIRequestMsg *msg)
         return true;
     }
 
+    if (isDsmLine) {
+        int homeNode = backend->homeNodeCrossNode(msg->m_addr);
+        uint64_t epoch = 0;
+        uint64_t reqId = 0;
+
+        DPRINTF(RubyCHIGeneric,
+                "EP_RNF node_id=%d: SnpCleanInvalid first-arrival upgrade path "
+                "for PA=0x%lx home=%d — issuing OuterUpgradeReq\n",
+                _nodeId, msg->m_addr, homeNode);
+        printf("[UPGRADE-DIAG] node=%d first SnpCleanInvalid PA=0x%lx home=%d\n",
+               _nodeId, msg->m_addr, homeNode);
+
+        bool accepted = backend->notifyLocalWriteUpgrade(
+            msg->m_addr, homeNode, 1,
+            UpgradeCause::LocalCleanUnique,
+            epoch, reqId);
+
+        if (!accepted) {
+            DPRINTF(RubyCHIGeneric,
+                    "EP_RNF node_id=%d: OuterUpgradeReq not accepted for "
+                    "PA=0x%lx — deferring SnpResp_I for retry\n",
+                    _nodeId, msg->m_addr);
+            printf("[UPGRADE-DIAG] node=%d OuterUpgradeReq rejected PA=0x%lx\n",
+                   _nodeId, msg->m_addr);
+            return false;
+        }
+
+        UpgradePending pending;
+        pending.valid = true;
+        pending.linePa = msg->m_addr;
+        pending.homeNode = homeNode;
+        pending.epoch = epoch;
+        pending.reqId = reqId;
+        pending.hnfDest = msg->m_requestor;
+        _upgradePending[msg->m_addr] = pending;
+
+        receiveUpgradeAck(msg->m_addr);
+        return true;
+    }
+
     // ---- Non-upgrade: immediate SnpResp_I ----
     DPRINTF(RubyCHIGeneric,
             "EP_RNF node_id=%d: SnpCleanInvalid non-upgrade for PA=0x%lx "
             "— immediate SnpResp_I\n",
             _nodeId, msg->m_addr);
+    warn("EP_RNF node_id=%d: SnpCleanInvalid PA=0x%lx arrived without "
+         "upgradePending context; local upgrade path is disconnected\n",
+         _nodeId, msg->m_addr);
     return sendSnpRespI(msg);
 }
 
@@ -1297,6 +1343,9 @@ EPRNFController::receiveUpgradeAck(uint64_t linePa)
                 "EP_RNF node_id=%d: receiveUpgradeAck for PA=0x%lx but "
                 "no upgrade pending\n",
                 _nodeId, linePa);
+        warn("EP_RNF node_id=%d: receiveUpgradeAck PA=0x%lx lost upgrade "
+             "context before deferred SnpResp_I\n",
+             _nodeId, linePa);
         return;
     }
 
@@ -1304,6 +1353,9 @@ EPRNFController::receiveUpgradeAck(uint64_t linePa)
             "EP_RNF node_id=%d: OuterUpgradeAck received for PA=0x%lx "
             "— sending deferred SnpResp_I to HN-F\n",
             _nodeId, linePa);
+    printf("[UPGRADE-DIAG] node=%d UpgradeAck PA=0x%lx home=%d epoch=%lu reqId=%lu\n",
+           _nodeId, linePa, upIt->second.homeNode,
+           upIt->second.epoch, upIt->second.reqId);
 
     // Send deferred SnpResp_I to HN-F
     NetDest dest(m_ruby_system);
@@ -1314,6 +1366,28 @@ EPRNFController::receiveUpgradeAck(uint64_t linePa)
         m_machineID, dest,
         false, false, 0, 0, MessageSizeType_Control);
     sendResponseMsg(rsp);
+
+    EPBackend *backend = EPBackend::getBackendInstance(_nodeId);
+    if (!backend) {
+        warn("EP_RNF node_id=%d: cannot send UpgradeDone for PA=0x%lx "
+             "because backend is missing\n",
+             _nodeId, linePa);
+        _upgradePending.erase(upIt);
+        return;
+    }
+
+    bool doneOk = backend->sendUpgradeDone(
+        linePa, upIt->second.homeNode, upIt->second.epoch,
+        upIt->second.reqId);
+    printf("[UPGRADE-DIAG] node=%d UpgradeDone PA=0x%lx ok=%d home=%d epoch=%lu reqId=%lu\n",
+           _nodeId, linePa, doneOk, upIt->second.homeNode,
+           upIt->second.epoch, upIt->second.reqId);
+    if (!doneOk) {
+        warn("EP_RNF node_id=%d: sendUpgradeDone failed for PA=0x%lx "
+             "home=%d epoch=%lu reqId=%lu\n",
+             _nodeId, linePa, upIt->second.homeNode,
+             upIt->second.epoch, upIt->second.reqId);
+    }
 
     // Clear upgrade pending state
     _upgradePending.erase(upIt);

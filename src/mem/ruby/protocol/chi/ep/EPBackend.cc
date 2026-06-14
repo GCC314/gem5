@@ -951,6 +951,19 @@ EPBackend::sendRecallResponse(const OuterRecallResponse &response)
     _lastRecallResponse = response;
     _recallResponseSentCount++;
 
+    if (response.hasDataPayload) {
+        EPBackend *homeBackend = EPBackend::getBackendInstance(response.homeNode);
+        RubySystem *homeRuby = homeBackend ? homeBackend->getRubySystem() : nullptr;
+        auto *physMem = homeRuby ? homeRuby->getPhysMem() : nullptr;
+        HomeMemoryService hms(physMem);
+        uint8_t buf[64] = {};
+        memcpy(buf, response.dataPayload.getData(0, 64), 64);
+        bool installed = hms.write(response.linePa, buf, 64);
+        printf("[RECALL-DIAG] home-install node=%d home=%d PA=0x%lx installed=%d hasData=%d\n",
+               _nodeId, response.homeNode, response.linePa,
+               installed, response.hasDataPayload);
+    }
+
     // Route response to home node's UBCC.
     // M6 P0-1: No fallback — the home UBCC must be registered.
     // Falling back to local _ubcc silently bypasses the home node's

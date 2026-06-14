@@ -415,13 +415,14 @@ class EPRNFController : public EPController
     struct UpgradePending {
         bool valid;
         uint64_t linePa;
+        int homeNode;
         uint64_t epoch;
         uint64_t reqId;
         MachineID hnfDest;      // HN-F that sent SnpCleanInvalid
         bool ackReceived;       // true when OuterUpgradeAck(true) arrived
 
-        UpgradePending() : valid(false), linePa(0), epoch(0), reqId(0),
-                           ackReceived(false) {}
+        UpgradePending() : valid(false), linePa(0), homeNode(-1), epoch(0),
+                           reqId(0), ackReceived(false) {}
     };
     std::map<uint64_t, UpgradePending> _upgradePending;
 
