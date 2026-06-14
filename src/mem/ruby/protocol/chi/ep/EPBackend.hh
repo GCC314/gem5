@@ -288,6 +288,8 @@ enum class GrantDataSource {
     RecallBuffer, // Data captured from recall (dirty owner eviction)
     NoData        // No data needed / zero-fill (uninitialized memory)
 };
+
+struct HomeMemoryService {
     memory::SimpleMemory *physMem;
     HomeMemoryService(memory::SimpleMemory *pm = nullptr) : physMem(pm) {}
     // Implemented in EPBackend.cc
