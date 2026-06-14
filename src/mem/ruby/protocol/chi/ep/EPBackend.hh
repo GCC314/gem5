@@ -278,15 +278,35 @@ struct RequesterLineSnapshot {
     int homeNode;   // Home node for this remote line (-1 if none)
 };
 
-// ---- Q2: Grant Data Provenance ----
-// Tracks which PA view produced the grant data populated by
-// populateGrantData().  Used for debugging data-path issues
-// without relying on content-based heuristics.
-enum class GrantDataProvenance {
-    None,     // No grant data has been populated
-    ReqPA,    // Data read from requester's local PA view
-    HomePA,   // Data read from home node's PA view
-    Recall,   // P0-3: Data captured by recall handler (functionalRead)
+// ---- F3: Grant Data Source ----
+// Formal data source for grant data population.
+// Replaces the debug-only GrantDataProvenance with a concrete
+// enumeration of authoritative data sources (§F3.1).
+enum class GrantDataSource {
+    HomeMemory,   // Data resides in DDR4 at the home node (clean/shared)
+    RecallBuffer, // Data captured from recall (dirty owner eviction)
+    NoData        // No data needed / zero-fill (uninitialized memory)
+};
+
+// Forward-declare for HomeMemoryService
+class AbstractMemory;
+
+// ---- F3: Home Memory Service ----
+// Provides unified read/write access to local DDR4 backing store
+// via RubySystem->getPhysMem().  This is the single authoritative
+// entry point for clean/shared grant data (§F3.1).
+struct HomeMemoryService {
+    AbstractMemory *physMem;
+    HomeMemoryService(AbstractMemory *pm = nullptr) : physMem(pm) {}
+
+    // Read a cache line from DDR4 at the given physical address.
+    // Returns true if physMem is available, false otherwise.
+    // On success, buf is filled with the contents.
+    bool read(uint64_t homePa, uint8_t *buf, int size) const;
+
+    // Write a cache line to DDR4 at the given physical address.
+    // Returns true if physMem is available, false otherwise.
+    bool write(uint64_t homePa, const uint8_t *buf, int size) const;
 };
 
 // Snapshot of the last UBCC sideband observed by EP_SNF on a recvRequestMsg.
@@ -545,10 +565,10 @@ class EPBackend : public SimObject
     int lastGrantDataSize() const;
 
     /**
-     * Return the provenance of the last grant data.
-     * Indicates which PA view was used to populate the buffer.
+     * Return the data source of the last grant data (F3).
+     * Indicates whether data came from HomeMemory, RecallBuffer, or NoData.
      */
-    GrantDataProvenance lastGrantDataProvenance() const { return _lastGrantDataProvenance; }
+    GrantDataSource lastGrantDataSource() const { return _lastGrantDataSource; }
 
     bool isDsmAddr(uint64_t pa) const;
 
@@ -619,7 +639,7 @@ class EPBackend : public SimObject
     // Used by EPSNFController to construct CompData response payload.
     DataBlock _lastGrantDataBlock;
     bool _lastGrantDataValid = false;
-    GrantDataProvenance _lastGrantDataProvenance = GrantDataProvenance::None;
+    GrantDataSource _lastGrantDataSource = GrantDataSource::NoData;
 
     // ---- F2: Recall Capture Data Buffer ----
     // Data captured from CHI completion during recall, transferred from
@@ -629,19 +649,13 @@ class EPBackend : public SimObject
     bool _recallCaptureDataValid = false;
 
     /**
-     * Populate the grant data buffer by reading from the home node's
-     * DL_SNF memory via functional access.
+     * F3: Populate the grant data buffer from a formal data source.
+     * Replaces the old functionalRead/scavenge/back-fill approach.
      *
-     * Tries multiple PA views to find the data:
-     *   1) requester's PA view (reqPa) — where CPU timing stores
-     *      write to phys_mem via hitCallback
-     *   2) home node's PA view (homePa) — where DDR4 controller stores
-     *
-     * @param reqPa    Physical address in requester node's PA view
-     * @param homePa   Physical address in home node's PA view
-     * @param homeNode Node ID of the home node
+     * @param homePa     Physical address in home node's PA view
+     * @param dataSource Formal data source (HomeMemory/RecallBuffer/NoData)
      */
-    void populateGrantData(uint64_t reqPa, uint64_t homePa, int homeNode);
+    void populateGrantData(uint64_t homePa, GrantDataSource dataSource);
 
     // ---- M5: Requester-Side Bookkeeping ----
     // Per-line entries tracking global permissions for remote DSM lines.

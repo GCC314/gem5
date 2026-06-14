@@ -9,6 +9,7 @@
 
 #include "base/types.hh"
 #include "mem/ruby/common/DataBlock.hh"
+#include "mem/ruby/protocol/chi/ep/EPBackend.hh"  // F3: GrantDataSource
 
 namespace gem5
 {
@@ -115,6 +116,9 @@ struct OutstandingRequest {
     uint8_t  dataBuf[64];
     bool     dataValid;
 
+    // F3: Data source for the grant (HomeMemory / RecallBuffer / NoData)
+    GrantDataSource dataSource;
+
     // Invalidation tracking
     int      pendingAckCount;
     uint64_t ackMask;
@@ -135,6 +139,7 @@ struct OutstandingRequest {
           clearAckCached(false),
           createTick(0), respTick(0), deadlineTick(0),
           accepted(false), dataValid(false),
+          dataSource(GrantDataSource::HomeMemory),  // F3
           pendingAckCount(0), ackMask(0), totalMask(0),
           upgradeCause(UBCC_UpgradeCause::LocalCleanUnique)
     {
@@ -193,6 +198,7 @@ class UBCCController
      * @param outSentinelVisibleTick Output: tick when sentinel was installed
      * @param outRecallNeeded     Output (M6): set to true if recall is needed
      * @param outRecallOwnerNode  Output (M6): node ID of owner to recall (-1 if none)
+     * @param outDataSource       Output (F3): data source for the grant
      * @return                    Grant type (GlobalGrantShared/Exclusive/Modified)
      *                            or -1 cast to enum if BUSY
      */
@@ -203,7 +209,8 @@ class UBCCController
         Tick *outGrantVisibleTick = nullptr,
         Tick *outSentinelVisibleTick = nullptr,
         bool *outRecallNeeded = nullptr,
-        int *outRecallOwnerNode = nullptr);
+        int *outRecallOwnerNode = nullptr,
+        GrantDataSource *outDataSource = nullptr);
 
     // ---- v4: Local Upgrade Management (§4.1.4) ----
     /**

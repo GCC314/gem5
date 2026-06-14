@@ -252,9 +252,29 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
                 "EP_SNF node_id=%d: CompData populated with grant data "
                 "first_byte=0x%02x\n", _nodeId, gdata[0]);
     } else {
+        // F3: Data not ready — defer/retry instead of silent zero-fill.
+        // Only NoData (explicit zero-fill) is allowed through without data.
+        GrantDataSource ds = _backend->lastGrantDataSource();
+        if (ds != GrantDataSource::NoData) {
+            DPRINTF(RubyCHIGeneric,
+                    "EP_SNF node_id=%d: grant data not ready (dataSource=%d), "
+                    "deferring to retry queue\n",
+                    _nodeId, static_cast<int>(ds));
+            EPSNFController::RetryEntry entry;
+            entry.linePa = msg->m_addr;
+            entry.neededPerm = neededPerm;
+            entry.writeIntent = writeIntent;
+            entry.hnReq = msg->m_requestor;
+            entry.fwdReq = msg->m_fwdRequestor;
+            entry.dataToFwdReq = msg->m_dataToFwdRequestor;
+            _retryQueue.push_back(entry);
+            scheduleEvent(Cycles(1));
+            return true;
+        }
+        // NoData: zero-fill is the correct behavior
         DPRINTF(RubyCHIGeneric,
                 "EP_SNF node_id=%d: CompData fallback to zeros "
-                "(grant data not available)\n", _nodeId);
+                "(NoData source)\n", _nodeId);
     }
 
     // ---- v4: shared_hint + CompData type for shared grants (§4.4.2, §5.1) ----

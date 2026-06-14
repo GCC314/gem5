@@ -109,7 +109,8 @@ UBCCController::processOuterRequest(
     int requesterNode,
     uint64_t baseEpoch, uint64_t reqId,
     Tick *outGrantVisibleTick, Tick *outSentinelVisibleTick,
-    bool *outRecallNeeded, int *outRecallOwnerNode)
+    bool *outRecallNeeded, int *outRecallOwnerNode,
+    GrantDataSource *outDataSource)
 {
     DPRINTF(RubyCHIGeneric,
             "UBCC node_id=%d: processOuterRequest PA=0x%lx req=%d write=%d "
@@ -117,9 +118,10 @@ UBCCController::processOuterRequest(
             _nodeId, line_pa, static_cast<int>(reqType), writeIntent,
             requesterNode, baseEpoch, reqId);
 
-    // Initialize M6 recall outputs
+    // Initialize M6 recall outputs and F3 dataSource output
     if (outRecallNeeded)   *outRecallNeeded = false;
     if (outRecallOwnerNode) *outRecallOwnerNode = -1;
+    if (outDataSource) *outDataSource = GrantDataSource::HomeMemory;
 
     // Validate: only DSM addresses for this home node
     if (!isDsmAddr(line_pa)) {
@@ -171,6 +173,7 @@ UBCCController::processOuterRequest(
         Tick now = curTick();
         if (outGrantVisibleTick) *outGrantVisibleTick = now;
         if (outSentinelVisibleTick) *outSentinelVisibleTick = now;
+        if (outDataSource) *outDataSource = GrantDataSource::HomeMemory; // F3: conservative
         return UBCC_OuterGrantType::GlobalGrantShared; // conservative
     }
 
@@ -203,6 +206,8 @@ UBCCController::processOuterRequest(
                     oreq->intendedSharersMask = (1ULL << requesterNode);
                     oreq->intendedOwnerNode = -1;
                     oreq->intendedDirty = false;
+                    oreq->dataSource = GrantDataSource::HomeMemory;
+                    if (outDataSource) *outDataSource = GrantDataSource::HomeMemory;
                 }
             } else { // GlobalReadUnique
                 if (!writeIntent) {
@@ -218,6 +223,8 @@ UBCCController::processOuterRequest(
                         oreq->intendedSharersMask = 0;
                         oreq->intendedOwnerNode = requesterNode;
                         oreq->intendedDirty = false;
+                        oreq->dataSource = GrantDataSource::HomeMemory;
+                        if (outDataSource) *outDataSource = GrantDataSource::HomeMemory;
                     }
                 } else {
                     grant = UBCC_OuterGrantType::GlobalGrantModified;
@@ -232,6 +239,8 @@ UBCCController::processOuterRequest(
                         oreq->intendedSharersMask = 0;
                         oreq->intendedOwnerNode = requesterNode;
                         oreq->intendedDirty = true;
+                        oreq->dataSource = GrantDataSource::HomeMemory;
+                        if (outDataSource) *outDataSource = GrantDataSource::HomeMemory;
                     }
                 }
             }
@@ -252,6 +261,8 @@ UBCCController::processOuterRequest(
                     oreq->intendedSharersMask = entry.sharersMask | (1ULL << requesterNode);
                     oreq->intendedOwnerNode = -1;
                     oreq->intendedDirty = false;
+                    oreq->dataSource = GrantDataSource::HomeMemory;
+                    if (outDataSource) *outDataSource = GrantDataSource::HomeMemory;
                 }
             } else {
                 // Unique request — invalidation needed for non-requester sharers
@@ -278,6 +289,7 @@ UBCCController::processOuterRequest(
                         invOreq->intendedOwnerNode = requesterNode;
                         invOreq->intendedSharersMask = 0;
                         invOreq->intendedDirty = writeIntent;
+                        invOreq->dataSource = GrantDataSource::HomeMemory; // F3
                     }
                     _invalidationCount++;
                     // Return BUSY — invalidation must complete before grant
@@ -300,6 +312,8 @@ UBCCController::processOuterRequest(
                         oreq->intendedSharersMask = 0;
                         oreq->intendedOwnerNode = requesterNode;
                         oreq->intendedDirty = writeIntent;
+                        oreq->dataSource = GrantDataSource::HomeMemory;
+                        if (outDataSource) *outDataSource = GrantDataSource::HomeMemory;
                     }
                 }
             }
@@ -344,6 +358,9 @@ UBCCController::processOuterRequest(
                     if (recallData.dataValid) {
                         memcpy(grantOreq->dataBuf, recallData.dataBuf, 64);
                     }
+                    // F3: Data source is RecallBuffer since data came from recall
+                    grantOreq->dataSource = GrantDataSource::RecallBuffer;
+                    if (outDataSource) *outDataSource = GrantDataSource::RecallBuffer;
                     if (reqType == UBCC_OuterReqType::GlobalReadShared) {
                         grant = UBCC_OuterGrantType::GlobalGrantShared;
                         grantOreq->intendedState = MESIState::G_S;
@@ -369,7 +386,7 @@ UBCCController::processOuterRequest(
                 }
                 DPRINTF(RubyEP,
                         "UBCC node_id=%d: RECALL→GRANT_HANDSHAKE transition "
-                        "PA=0x%lx requester=%d intended=%s (NEW object)\n",
+                        "PA=0x%lx requester=%d intended=%s dataSource=RecallBuffer (NEW object)\n",
                         _nodeId, line_pa, requesterNode,
                         grantOreq ? mesiStateName(grantOreq->intendedState)
                                   : "none");
@@ -392,6 +409,8 @@ UBCCController::processOuterRequest(
                     _recallCount++;
                     if (outRecallNeeded) *outRecallNeeded = true;
                     if (outRecallOwnerNode) *outRecallOwnerNode = existingOwner;
+                    // F3: Data source for recall path is RecallBuffer
+                    if (outDataSource) *outDataSource = GrantDataSource::RecallBuffer;
 
                     // Create RECALL outstanding
                     OutstandingRequest *recallOreq = createOutstanding(
@@ -403,6 +422,7 @@ UBCCController::processOuterRequest(
                         recallOreq->stage = OpStage::WAITING_TARGET_RESP;
                         recallOreq->reqType = reqType;
                         recallOreq->writeIntent = writeIntent;
+                        recallOreq->dataSource = GrantDataSource::RecallBuffer;
                     }
                     // Return BUSY — recall must complete before grant
                     return static_cast<UBCC_OuterGrantType>(-1);
@@ -426,6 +446,8 @@ UBCCController::processOuterRequest(
                     oreq->intendedSharersMask = newSharers;
                     oreq->intendedOwnerNode = -1;
                     oreq->intendedDirty = false;
+                    oreq->dataSource = GrantDataSource::HomeMemory;
+                    if (outDataSource) *outDataSource = GrantDataSource::HomeMemory;
                 }
             } else {
                 grant = writeIntent
@@ -442,6 +464,8 @@ UBCCController::processOuterRequest(
                     oreq->intendedSharersMask = 0;
                     oreq->intendedOwnerNode = requesterNode;
                     oreq->intendedDirty = writeIntent;
+                    oreq->dataSource = GrantDataSource::HomeMemory;
+                    if (outDataSource) *outDataSource = GrantDataSource::HomeMemory;
                 }
             }
             break;
@@ -497,7 +521,8 @@ UBCCController::inspectUbccDirForTest(uint64_t line_pa)
             << "\"ostRequester\":" << ost.requesterNode << ","
             << "\"ostTarget\":" << ost.targetNode << ","
             << "\"ostReservedEpoch\":" << ost.reservedEpoch << ","
-            << "\"ostReqId\":" << ost.reqId;
+            << "\"ostReqId\":" << ost.reqId << ","
+            << "\"ostDataSource\":" << static_cast<int>(ost.dataSource);  // F3
         if (ost.opType == OpType::INVALIDATE) {
             oss << ","
                 << "\"pendingInvalidationCount\":" << ost.pendingAckCount << ","
@@ -1421,6 +1446,7 @@ UBCCController::createOutstanding(uint64_t linePa, OpType opType,
     req.deadlineTick = curTick() + _interconnectLatency * 10;
     req.accepted = false;
     req.dataValid = false;
+    req.dataSource = GrantDataSource::HomeMemory;  // F3: default
     req.pendingAckCount = 0;
     req.ackMask = 0;
     req.totalMask = 0;
