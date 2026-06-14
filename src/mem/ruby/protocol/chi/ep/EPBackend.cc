@@ -885,8 +885,12 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
 
     if (recallMsg.isReadRequest) {
         // Read recall: ReadShared to downgrade owner to R_S
+        printf("[RECALL-DIAG] node=%d initiating ReadShared recall PA=0x%lx\n",
+               _nodeId, recallMsg.linePa);
         _epRnfCtrl->startReadShared(ownerLocalPa,
             [this, capturedMsg](bool success) {
+                printf("[RECALL-DIAG] node=%d ReadShared callback success=%d valid=%d\n",
+                       _nodeId, success, _recallCaptureDataValid);
                 OuterRecallResponse resp;
                 resp.linePa = capturedMsg.linePa;
                 resp.ownerNode = capturedMsg.ownerNode;
