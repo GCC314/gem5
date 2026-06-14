@@ -820,10 +820,22 @@ action(Finish_CleanUnique, desc="") {
     assert(tbe.dir_sharers.count() == 1);
     assert(tbe.dataUnique);
 
-    // needed by UpdateDirState_FromReqResp triggered by the expected CompAck
-    tbe.dataMaybeDirtyUpstream := true;
-    tbe.requestorToBeExclusiveOwner := true;
-    tbe.dir_ownerExists := false;
+    // v4 SnpShared fix: EP-RNF proxy CleanUnique is completion-only,
+    // not an owner grant. Do not set owner intent for these transactions.
+    if (epRnfMachineVersion >= 0 &&
+        tbe.requestor == tbe.epRnfMachineID &&
+        tbe.epProxyOp != EpProxyOp:NoProxyOp) {
+      tbe.dataMaybeDirtyUpstream := false;
+      tbe.requestorToBeOwner := false;
+      tbe.requestorToBeExclusiveOwner := false;
+      tbe.dir_ownerExists := false;
+      tbe.updateDirOnCompAck := false;
+    } else {
+      // needed by UpdateDirState_FromReqResp triggered by the expected CompAck
+      tbe.dataMaybeDirtyUpstream := true;
+      tbe.requestorToBeExclusiveOwner := true;
+      tbe.dir_ownerExists := false;
+    }
 
     tbe.actions.push(Event:SendCompUCResp);
     tbe.actions.push(Event:WaitCompAck);
@@ -2656,29 +2668,32 @@ action(UpdateDirState_FromReqResp, desc="") {
     if ((in_msg.type == CHIResponseType:CompAck) && tbe.updateDirOnCompAck) {
       assert(tbe.requestor == in_msg.responder);
 
-      tbe.dir_sharers.add(in_msg.responder);
+      // v4 SnpShared fix: EP-RNF proxy CompAck is completion-only,
+      // not a directory mutation point. Skip all directory updates
+      // for proxy special completion (InvalidateOnly/RecallUnique).
+      bool is_ep_proxy_special := epRnfMachineVersion >= 0 &&
+                                   tbe.requestor == tbe.epRnfMachineID &&
+                                   tbe.epProxyOp != EpProxyOp:NoProxyOp;
 
-      // v4: Skip owner promotion when responder is EP-RNF.
-      // For proxy ops (InvalidateOnly/RecallUnique), EP-RNF should
-      // not become the directory owner.
-      bool is_eprnf_responder := epRnfMachineVersion >= 0 &&
-                                   in_msg.responder == tbe.epRnfMachineID;
+      if (!is_ep_proxy_special) {
+        tbe.dir_sharers.add(in_msg.responder);
 
-      if (tbe.requestorToBeOwner && !is_eprnf_responder) {
-        assert(tbe.dataMaybeDirtyUpstream);
-        assert(tbe.dir_ownerExists == false);
-        assert(tbe.requestorToBeExclusiveOwner == false);
-        tbe.dir_owner := in_msg.responder;
-        tbe.dir_ownerExists := true;
-        tbe.dir_ownerIsExcl := false;
+        if (tbe.requestorToBeOwner) {
+          assert(tbe.dataMaybeDirtyUpstream);
+          assert(tbe.dir_ownerExists == false);
+          assert(tbe.requestorToBeExclusiveOwner == false);
+          tbe.dir_owner := in_msg.responder;
+          tbe.dir_ownerExists := true;
+          tbe.dir_ownerIsExcl := false;
 
-      } else if (tbe.requestorToBeExclusiveOwner && !is_eprnf_responder) {
-        assert(tbe.dataMaybeDirtyUpstream);
-        assert(tbe.dir_ownerExists == false);
-        assert(tbe.dir_sharers.count() == 1);
-        tbe.dir_owner := in_msg.responder;
-        tbe.dir_ownerExists := true;
-        tbe.dir_ownerIsExcl := true;
+        } else if (tbe.requestorToBeExclusiveOwner) {
+          assert(tbe.dataMaybeDirtyUpstream);
+          assert(tbe.dir_ownerExists == false);
+          assert(tbe.dir_sharers.count() == 1);
+          tbe.dir_owner := in_msg.responder;
+          tbe.dir_ownerExists := true;
+          tbe.dir_ownerIsExcl := true;
+        }
       }
     }
   }
