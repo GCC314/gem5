@@ -262,6 +262,8 @@ class UBCCController
         uint64_t line_pa, int srcNode,
         uint64_t epoch, uint64_t reqId);
 
+    bool copyOutstandingGrantData(uint64_t line_pa, DataBlock &outBlk) const;
+
     // ---- M6: Recall Management ----
     /**
      * Receive recall response from the owner node (data/ack).

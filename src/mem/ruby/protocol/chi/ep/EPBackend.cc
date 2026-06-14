@@ -585,6 +585,12 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
     // Handle grant result and update bookkeeping
     OuterGrantType result = handleGrant(line_pa, grant, homeNode);
 
+    if (dataSource == GrantDataSource::RecallBuffer) {
+        DataBlock recallBlk(64);
+        bool recallDataOk = homeUbcc->copyOutstandingGrantData(homePa, recallBlk);
+        setRecallCaptureData(recallBlk, recallDataOk);
+    }
+
     // v4: Populate grant data using formal F3 data source
     populateGrantData(homePa, dataSource);
 

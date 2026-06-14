@@ -1315,13 +1315,36 @@ UBCCController::processClear(
     return true;
 }
 
+bool
+UBCCController::copyOutstandingGrantData(uint64_t line_pa, DataBlock &outBlk) const
+{
+    auto it = _outstandingReqs.find(line_pa);
+    if (it == _outstandingReqs.end()) {
+        return false;
+    }
+
+    const OutstandingRequest &ost = it->second;
+    if (!ost.dataValid) {
+        return false;
+    }
+
+    if (ost.opType != OpType::GRANT_HANDSHAKE &&
+        ost.opType != OpType::RECALL) {
+        return false;
+    }
+
+    outBlk.setData(ost.dataBuf, 0, 64);
+    return true;
+}
+
 // ---- v4: Private helpers ----
 
 // Half-range epoch comparison (§3.1.2)
 bool
 UBCCController::isNewerEpoch(uint64_t a, uint64_t b)
 {
-    return ((a - b) & 0xffffffffffffffffULL) < (1ULL << 63);
+    uint64_t delta = (a - b) & 0xffffffffffffffffULL;
+    return delta != 0 && delta < (1ULL << 63);
 }
 
 uint64_t
