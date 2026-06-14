@@ -467,6 +467,10 @@ EPRNFController::recvDataMsg(const CHIDataMsg *msg)
         // Use msg->m_responder: the HN-F that sent CompData to us
         it->second.hnfDest = msg->m_responder;
 
+        // F2: Capture recall data from CompData beat
+        it->second.recallDataBlk = msg->getdataBlk();
+        it->second.recallDataValid = true;
+
         // Build CompAck message and try to send
         NetDest destNet(m_ruby_system);
         destNet.add(msg->m_responder);
@@ -504,6 +508,10 @@ EPRNFController::recvDataMsg(const CHIDataMsg *msg)
     if (it->second.op == PendingChiOp::ReadUnique) {
         it->second.hnfDest = msg->m_responder;
         it->second.beatsReceived++;
+
+        // F2: Capture recall data from first/most recent CompData beat
+        it->second.recallDataBlk = msg->getdataBlk();
+        it->second.recallDataValid = true;
 
         DPRINTF(RubyCHIGeneric,
                 "EP_RNF node_id=%d: ReadUnique data beat %d/%d for "
@@ -845,6 +853,16 @@ EPRNFController::finishChiTxn(uint64_t linePa, bool success)
 
     auto cb = txnIt->second.onComplete;
     bool hadQueuedSnoop = txnIt->second.snoopSlotValid;
+
+    // F2: Transfer recall capture data to EPBackend before erasing txn,
+    // so that the callback (which runs after erase) can access it.
+    if (txnIt->second.recallDataValid && _backend) {
+        _backend->setRecallCaptureData(
+            txnIt->second.recallDataBlk, true);
+    } else if (_backend) {
+        _backend->setRecallCaptureData(
+            DataBlock(), false);  // invalidate previous capture
+    }
 
     // Erase completed transaction
     _pendingChiTxns.erase(txnIt);

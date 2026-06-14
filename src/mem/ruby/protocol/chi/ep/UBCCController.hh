@@ -8,6 +8,7 @@
 #include <string>
 
 #include "base/types.hh"
+#include "mem/ruby/common/DataBlock.hh"
 
 namespace gem5
 {
@@ -263,11 +264,14 @@ class UBCCController
      * @param ownerNode         Node that was recalled
      * @param dataReceived      True if dirty data was returned
      * @param responseEpoch     Epoch from the response message (M7: stale check)
+     * @param reqId             Transaction ID
+     * @param dataBlk           F2: actual data payload (64 bytes), nullptr if none
      * @return                  True if recall completed successfully
      */
     bool processRecallResponse(uint64_t line_pa, int ownerNode,
                                bool dataReceived, uint64_t responseEpoch,
-                               uint64_t reqId = 0);
+                               uint64_t reqId = 0,
+                               const DataBlock *dataBlk = nullptr);
 
     /**
      * Check if a line is currently busy (recall or other op in progress).

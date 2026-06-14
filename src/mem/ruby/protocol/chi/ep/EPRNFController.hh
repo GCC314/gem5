@@ -263,6 +263,9 @@ class EPRNFController : public EPController
         bool queuedRetToSrc;     // v4: retToSrc for queued snoop
         Tick startTick;
         std::function<void(bool)> onComplete;
+        // F2: Recall data capture from CHI data beats
+        DataBlock recallDataBlk;
+        bool recallDataValid;
 
         PendingChiTxn()
             : linePa(0), epoch(0), reqId(0),
@@ -273,7 +276,8 @@ class EPRNFController : public EPController
               callbackPayloadStable(false),
               snoopSlotValid(false),
               queuedSnoopType(CHI::CHIRequestType_null),
-              queuedRetToSrc(false), startTick(0) {}
+              queuedRetToSrc(false), startTick(0),
+              recallDataBlk(64), recallDataValid(false) {}
     };
 
     // ---- v4: Retry queue entry (§4.3.4, §7.5) ----

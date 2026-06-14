@@ -1,6 +1,7 @@
 #include "mem/ruby/protocol/chi/ep/UBCCController.hh"
 
 #include <cstdio>
+#include <cstring>
 #include <sstream>
 
 #include "base/logging.hh"
@@ -318,35 +319,60 @@ UBCCController::processOuterRequest(
                 rit->second.requesterNode == requesterNode &&
                 rit->second.stage == OpStage::DONE) {
                 recallAlreadyDone = true;
-                // v4 D-11 fix: Transition RECALL → GRANT_HANDSHAKE in place
-                // (createOutstanding blocks double-outstanding for same PA)
+
+                // F2: RECALL and GRANT_HANDSHAKE are two separate lifecycle
+                // objects.  Remove the terminal RECALL first, then create a
+                // new GRANT_HANDSHAKE.  DO NOT mutate opType in place.
+                OutstandingRequest recallData = rit->second;  // capture fields
+                removeOutstanding(line_pa);  // free the PA slot
+
                 uint64_t newSharers = (1ULL << requesterNode);
                 if (existingOwner >= 0)
                     newSharers |= (1ULL << existingOwner);
-                rit->second.opType = OpType::GRANT_HANDSHAKE;
-                rit->second.stage = OpStage::WAITING_CLEAR;
-                rit->second.recallBarrierDone = true;
-                rit->second.intendedState = MESIState::G_S;
-                rit->second.intendedSharersMask = newSharers;
-                rit->second.intendedOwnerNode = -1;
-                rit->second.intendedDirty = false;
-                if (reqType == UBCC_OuterReqType::GlobalReadShared) {
-                    grant = UBCC_OuterGrantType::GlobalGrantShared;
+
+                OutstandingRequest *grantOreq = createOutstanding(
+                    line_pa, OpType::GRANT_HANDSHAKE,
+                    requesterNode, -1);
+                if (grantOreq) {
+                    grantOreq->reservedEpoch = recallData.reservedEpoch;
+                    grantOreq->reqId = recallData.reqId;
+                    grantOreq->baseEpoch = recallData.baseEpoch;
+                    grantOreq->stage = OpStage::WAITING_CLEAR;
+                    grantOreq->recallBarrierDone = true;
+                    // F2: Copy recall data from RECALL → GRANT_HANDSHAKE
+                    grantOreq->dataValid = recallData.dataValid;
+                    if (recallData.dataValid) {
+                        memcpy(grantOreq->dataBuf, recallData.dataBuf, 64);
+                    }
+                    if (reqType == UBCC_OuterReqType::GlobalReadShared) {
+                        grant = UBCC_OuterGrantType::GlobalGrantShared;
+                        grantOreq->intendedState = MESIState::G_S;
+                        grantOreq->intendedSharersMask = newSharers;
+                        grantOreq->intendedOwnerNode = -1;
+                        grantOreq->intendedDirty = false;
+                    } else {
+                        grant = writeIntent
+                            ? UBCC_OuterGrantType::GlobalGrantModified
+                            : UBCC_OuterGrantType::GlobalGrantExclusive;
+                        grantOreq->intendedState = writeIntent
+                            ? MESIState::G_M : MESIState::G_E;
+                        grantOreq->intendedOwnerNode = requesterNode;
+                        grantOreq->intendedSharersMask = 0;
+                        grantOreq->intendedDirty = writeIntent;
+                    }
                 } else {
-                    grant = writeIntent
-                        ? UBCC_OuterGrantType::GlobalGrantModified
-                        : UBCC_OuterGrantType::GlobalGrantExclusive;
-                    rit->second.intendedState = writeIntent
-                        ? MESIState::G_M : MESIState::G_E;
-                    rit->second.intendedOwnerNode = requesterNode;
-                    rit->second.intendedSharersMask = 0;
-                    rit->second.intendedDirty = writeIntent;
+                    // Failed to create GRANT_HANDSHAKE — restore RECALL
+                    // (should not happen since PA was freed above)
+                    fatal("UBCC node_id=%d: failed to create GRANT_HANDSHAKE "
+                          "after removing DONE RECALL PA=0x%lx\n",
+                          _nodeId, line_pa);
                 }
                 DPRINTF(RubyEP,
                         "UBCC node_id=%d: RECALL→GRANT_HANDSHAKE transition "
-                        "PA=0x%lx requester=%d intended=%s\n",
+                        "PA=0x%lx requester=%d intended=%s (NEW object)\n",
                         _nodeId, line_pa, requesterNode,
-                        mesiStateName(rit->second.intendedState));
+                        grantOreq ? mesiStateName(grantOreq->intendedState)
+                                  : "none");
                 return grant;
             }
 
@@ -555,7 +581,8 @@ UBCCController::initiateRecall(uint64_t line_pa, DirEntry &entry,
 bool
 UBCCController::processRecallResponse(uint64_t line_pa, int ownerNode,
                                        bool dataReceived, uint64_t responseEpoch,
-                                       uint64_t reqId)
+                                       uint64_t reqId,
+                                       const DataBlock *dataBlk)
 {
     auto it = _directory.find(line_pa);
     if (it == _directory.end()) {
@@ -619,6 +646,18 @@ UBCCController::processRecallResponse(uint64_t line_pa, int ownerNode,
     ost->stage = OpStage::DONE;
     ost->respTick = curTick();
     ost->dataValid = dataReceived;
+
+    // F2: Preserve terminal tuple for GRANT_HANDSHAKE creation on retry:
+    // (linePa, requesterNode, baseEpoch, reservedEpoch, reqId, opType=RECALL)
+    // All fields except stage/dataValid/recallBarrierDone/respTick already
+    // hold their terminal values and MUST NOT be mutated further.
+
+    // F2: Store actual recall data in outstanding's dataBuf for later
+    // transfer to GRANT_HANDSHAKE when it's created.
+    if (dataBlk && dataReceived) {
+        memcpy(ost->dataBuf, dataBlk->getData(0, 64), 64);
+        ost->dataValid = true;
+    }
 
     // v4: The directory transition occurs ONLY when the GRANT_HANDSHAKE
     // Clear arrives. Here we only release the recall barrier.
@@ -1206,6 +1245,23 @@ UBCCController::processClear(
         warn("UBCC node_id=%d: processClear PA=0x%lx "
              "reqId mismatch: ost=%lu clear=%lu — dropped\n",
              _nodeId, line_pa, ost->reqId, reqId);
+        return false;
+    }
+
+    // F2: Strong validation — requesterNode must match srcNode
+    if (ost->requesterNode >= 0 && ost->requesterNode != srcNode) {
+        warn("UBCC node_id=%d: processClear PA=0x%lx "
+             "requesterNode mismatch: ost=%d clear=%d — dropped\n",
+             _nodeId, line_pa, ost->requesterNode, srcNode);
+        return false;
+    }
+
+    // F2: Stage must be WAITING_CLEAR — only accept Clear for an active
+    // GRANT_HANDSHAKE that is actually expecting a Clear commit.
+    if (ost->stage != OpStage::WAITING_CLEAR) {
+        warn("UBCC node_id=%d: processClear PA=0x%lx "
+             "stage mismatch: expected WAITING_CLEAR got %d — dropped\n",
+             _nodeId, line_pa, static_cast<int>(ost->stage));
         return false;
     }
 

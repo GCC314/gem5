@@ -124,9 +124,12 @@ struct OuterRecallResponse {
     uint64_t reqId;          // v4: transaction ID
     bool dataReturned;       // True if dirty data was returned
     bool ackReceived;        // True if recall completed
+    DataBlock dataPayload;   // F2: actual 64-byte cache line data from owner
+    bool hasDataPayload;     // F2: true if dataPayload is valid
 
     OuterRecallResponse() : linePa(0), ownerNode(-1), homeNode(-1),
-                            epoch(0), reqId(0), dataReturned(false), ackReceived(false) {}
+                            epoch(0), reqId(0), dataReturned(false), ackReceived(false),
+                            dataPayload(64), hasDataPayload(false) {}
 };
 
 // ---- M5 Phase 2: Outer Message Envelope ----
@@ -396,6 +399,16 @@ class EPBackend : public SimObject
     void resetRecallReceivedCount() { _recallReceivedCount = 0; }
 
     /**
+     * F2: Set recall capture data from EPRNFController before callback fires.
+     * Called by EPRNFController::finishChiTxn() to transfer data from
+     * PendingChiTxn.recallDataBlk to EPBackend.
+     */
+    void setRecallCaptureData(const DataBlock &data, bool valid) {
+        _recallCaptureDataBlock = data;
+        _recallCaptureDataValid = valid;
+    }
+
+    /**
      * Get the count of recall responses sent by this EPBackend.
      */
     uint64_t getRecallResponseSentCount() const { return _recallResponseSentCount; }
@@ -607,6 +620,13 @@ class EPBackend : public SimObject
     DataBlock _lastGrantDataBlock;
     bool _lastGrantDataValid = false;
     GrantDataProvenance _lastGrantDataProvenance = GrantDataProvenance::None;
+
+    // ---- F2: Recall Capture Data Buffer ----
+    // Data captured from CHI completion during recall, transferred from
+    // EPRNFController::PendingChiTxn.recallDataBlk before the callback fires.
+    // Used to construct OuterRecallResponse with actual data payload.
+    DataBlock _recallCaptureDataBlock;
+    bool _recallCaptureDataValid = false;
 
     /**
      * Populate the grant data buffer by reading from the home node's

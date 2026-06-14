@@ -566,7 +566,9 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
     // v4: Send Clear to home UBCC to commit the GRANT_HANDSHAKE intended result.
     // Per §3.3, §3.5, §5.1-5.4: the commit point for normal misses is when
     // home accepts the matching Clear, not when the grant was first emitted.
-    sendClear(homePa, homeNode, entry.epoch, reqIdVal);
+    // F2: Use grant envelope tuple (epoch, reqId), not entry.epoch which may
+    // have been overwritten by a subsequent retry.
+    sendClear(homePa, homeNode, grantEnv.epoch, grantEnv.reqId);
 
     return static_cast<int>(result);
 
@@ -1066,115 +1068,65 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
         }
     }
 
-    // ---- Q2 FIX: Capture owner data during recall ----
-    // When the owner has dirty data (G_M state), the recall must
-    // extract the actual data from the owner's cache hierarchy and
-    // make it available to the requester.  Without this, the
-    // requester's populateGrantData() finds only zeros in phys_mem
-    // because CPU stores write to the cache, not phys_mem.
-    //
-    // We functional-read from the Ruby system (which queries the
-    // cache hierarchy) using the owner's local PA, then write the
-    // data to phys_mem at the HOME PA so that populateGrantData()
-    // on the requester side finds it.
-    if (recallMsg.dataNeeded && _ruby_system) {
-        uint64_t homePa = recallMsg.linePa;
-        uint64_t localPa = (recallMsg.ownerLocalPa != 0)
-                              ? recallMsg.ownerLocalPa
-                              : recallMsg.linePa;
-        uint8_t buf[64] = {};
-        RequestPtr req = std::make_shared<Request>(
-            localPa, 64, 0, RequestorID(0));
-        req->setFlags(Request::PHYSICAL);
-        Packet pkt(req, MemCmd::ReadReq);
-        pkt.dataStatic(buf);
+    // ---- F2: Real CHI recall via EP-RNF → HN-F → L2 ----
+    // Replaces the functionalRead + phys_mem broadcast + fake sendRecallResponse
+    // path with a proper async CHI request.  The callback sends the recall
+    // response carrying actual data captured from the cache hierarchy.
+    uint64_t ownerLocalPa = (recallMsg.ownerLocalPa != 0)
+                               ? recallMsg.ownerLocalPa
+                               : recallMsg.linePa;
 
-        // Q2 DEBUG: print before reading
-        printf("[Q2-DEBUG] recall on node=%d localPA=0x%lx homePA=0x%lx "
-               "ownerNode=%d homeNode=%d\n",
-               _nodeId, localPa, homePa,
-               recallMsg.ownerNode, recallMsg.homeNode);
-
-        // Try functional read from Ruby system (cache hierarchy)
-        if (_ruby_system->functionalRead(&pkt)) {
-            printf("[Q2-DEBUG] recall funcRead OK node=%d "
-                   "first_word=0x%08x second_word=0x%08x\n",
-                   _nodeId,
-                   *(reinterpret_cast<uint32_t*>(buf)),
-                   *(reinterpret_cast<uint32_t*>(buf + 4)));
-
-            // P0-3: Store recall data directly in grant data buffer.
-            _lastGrantDataBlock.setData(buf, 0, 64);
-            _lastGrantDataValid = true;
-            _lastGrantDataProvenance = GrantDataProvenance::Recall;
-
-            // v4: Data stored in local grant buffer (no longer using
-            // UBCC materialized data since DirEntry stripped that field).
-        } else {
-            printf("[Q2-DEBUG] recall funcRead FAILED node=%d, "
-                   "falling back to phys_mem\n",
-                   _nodeId);
-            // Fallback: try phys_mem directly
-            auto *phys_mem = _ruby_system->getPhysMem();
-            if (phys_mem) {
-                phys_mem->functionalAccess(&pkt);
-            }
-            printf("[Q2-DEBUG] recall phys_mem fallback node=%d "
-                   "first_word=0x%08x\n",
-                   _nodeId,
-                   *(reinterpret_cast<uint32_t*>(buf)));
-        }
-
-        // Q2 FIX P1-5: Write the captured data to ALL nodes' phys_mem.
-        // In the single-gem5 prototype, each node has its own RubySystem
-        // with its own SimpleMemory (phys_mem).  A requester's
-        // populateGrantData() reads from ITS OWN RubySystem's phys_mem,
-        // so we must write to every node's phys_mem to cover all possible
-        // future requesters.
-        //
-        // Previous code only wrote to home node + local node, which
-        // left other nodes seeing stale/zero data.
-        {
-            for (auto &kv : _backendInstances) {
-                int targetNode = kv.first;
-                EPBackend *targetBackend = kv.second;
-                if (!targetBackend || !targetBackend->getRubySystem())
-                    continue;
-                auto *targetPhysMem =
-                    targetBackend->getRubySystem()->getPhysMem();
-                if (!targetPhysMem)
-                    continue;
-
-                RequestPtr wrReq = std::make_shared<Request>(
-                    homePa, 64, 0, RequestorID(0));
-                wrReq->setFlags(Request::PHYSICAL);
-                Packet wrPkt2(wrReq, MemCmd::WriteReq);
-                wrPkt2.dataStatic(buf);
-                targetPhysMem->functionalAccess(&wrPkt2);
-            }
-            DPRINTF(RubyEP,
-                    "EPBackend node_id=%d: recall data broadcast to "
-                    "all %zu nodes phys_mem homePA=0x%lx "
-                    "first_word=0x%08x\n",
-                    _nodeId, _backendInstances.size(), homePa,
-                    *(reinterpret_cast<uint32_t*>(buf)));
-        }
+    if (!_epRnfCtrl) {
+        fatal("EPBackend node_id=%d: no EP_RNF controller for recall "
+              "PA=0x%lx\n", _nodeId, recallMsg.linePa);
     }
 
-    // Q3: Cross-node recall response (no ReadShared to HN-F)
-    // The ReadShared CHI request to the local HN-F is NOT needed for
-    // cross-node recall.  The recall data has already been collected
-    // via functionalRead and broadcast to all nodes' phys_mem.
-    // Sending ReadShared causes extra TBE allocation in HN-F.
-    OuterRecallResponse resp;
-    resp.linePa = recallMsg.linePa;
-    resp.ownerNode = _nodeId;
-    resp.homeNode = recallMsg.homeNode;
-    resp.epoch = recallMsg.epoch;
-    resp.reqId = recallMsg.reqId;  // v4: echo reqId
-    resp.dataReturned = recallMsg.dataNeeded;
-    resp.ackReceived = true;
-    return sendRecallResponse(resp);
+    // Capture recallMsg fields for the async callback
+    OuterRecallMsg capturedMsg = recallMsg;
+
+    if (recallMsg.isReadRequest) {
+        // Read recall: ReadShared to downgrade owner to R_S
+        _epRnfCtrl->startReadShared(ownerLocalPa,
+            [this, capturedMsg](bool success) {
+                OuterRecallResponse resp;
+                resp.linePa = capturedMsg.linePa;
+                resp.ownerNode = capturedMsg.ownerNode;
+                resp.homeNode = capturedMsg.homeNode;
+                resp.epoch = capturedMsg.epoch;
+                resp.reqId = capturedMsg.reqId;
+                resp.ackReceived = success;
+                resp.dataReturned = capturedMsg.dataNeeded && success &&
+                                    _recallCaptureDataValid;
+                if (_recallCaptureDataValid) {
+                    resp.dataPayload = _recallCaptureDataBlock;
+                    resp.hasDataPayload = true;
+                }
+                sendRecallResponse(resp);
+            });
+    } else {
+        // Write recall: ReadUnique with RecallUnique proxy op
+        _epRnfCtrl->startReadUnique(ownerLocalPa,
+            [this, capturedMsg](bool success) {
+                OuterRecallResponse resp;
+                resp.linePa = capturedMsg.linePa;
+                resp.ownerNode = capturedMsg.ownerNode;
+                resp.homeNode = capturedMsg.homeNode;
+                resp.epoch = capturedMsg.epoch;
+                resp.reqId = capturedMsg.reqId;
+                resp.ackReceived = success;
+                resp.dataReturned = capturedMsg.dataNeeded && success &&
+                                    _recallCaptureDataValid;
+                if (_recallCaptureDataValid) {
+                    resp.dataPayload = _recallCaptureDataBlock;
+                    resp.hasDataPayload = true;
+                }
+                sendRecallResponse(resp);
+            });
+    }
+
+    // Return true: recall initiated asynchronously.
+    // The callback will send the response to the home UBCC.
+    return true;
 }
 
 bool
@@ -1182,9 +1134,9 @@ EPBackend::sendRecallResponse(const OuterRecallResponse &response)
 {
     DPRINTF(RubyEP,
             "EPBackend node_id=%d: sendRecallResponse "
-            "PA=0x%lx homeNode=%d dataReturned=%d\n",
+            "PA=0x%lx homeNode=%d dataReturned=%d hasData=%d\n",
             _nodeId, response.linePa, response.homeNode,
-            response.dataReturned);
+            response.dataReturned, response.hasDataPayload);
 
     // Store for inspection
     _lastRecallResponse = response;
@@ -1202,10 +1154,11 @@ EPBackend::sendRecallResponse(const OuterRecallResponse &response)
               _nodeId, response.homeNode, response.linePa);
     }
 
-    // Complete the recall at the home UBCC
+    // F2: Pass recall data payload to home UBCC for storage in RECALL ost
     bool ok = homeUbcc->processRecallResponse(
         response.linePa, response.ownerNode, response.dataReturned,
-        response.epoch, response.reqId);
+        response.epoch, response.reqId,
+        response.hasDataPayload ? &response.dataPayload : nullptr);
 
     if (!ok) {
         warn("EPBackend node_id=%d: home UBCC rejected recall response "
