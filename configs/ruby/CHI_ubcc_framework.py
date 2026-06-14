@@ -231,7 +231,7 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
             data_channel_size=params.data_width,
             ep_backend=ep_backend,
             addr_ranges=[NodeConfig.dsm_range_for(nid, seg_size, cfg.phy_base)
-                         for nid in range(num_nodes)])
+                         for nid in range(num_nodes) if nid != node_id])
         nd['ep_snf_wrapper'] = _make_ep_node(
             ruby_system, nd['ep_snf_cntrl'], node_id)
         setattr(ruby_system, f"ep_snf_node{node_id}", nd['ep_snf_wrapper'])

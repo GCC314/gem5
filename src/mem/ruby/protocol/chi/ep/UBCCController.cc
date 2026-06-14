@@ -1185,11 +1185,13 @@ UBCCController::processClear(
         return false;
     }
 
-    // Verify epoch match
-    if (ost->reservedEpoch != epoch) {
+    // v4: Verify epoch — the Clear carries the base epoch observed by
+    // requester; the GRANT_HANDSHAKE's reservedEpoch = baseEpoch + 1.
+    // Compare against baseEpoch (not reservedEpoch) for matching.
+    if (ost->baseEpoch != epoch) {
         warn("UBCC node_id=%d: processClear PA=0x%lx "
-             "epoch mismatch: ost=%lu clear=%lu — dropped\n",
-             _nodeId, line_pa, ost->reservedEpoch, epoch);
+             "epoch mismatch: ost_base=%lu clear=%lu — dropped\n",
+             _nodeId, line_pa, ost->baseEpoch, epoch);
         return false;
     }
 
@@ -1332,8 +1334,7 @@ OutstandingRequest*
 UBCCController::createOutstanding(uint64_t linePa, OpType opType,
                                   int requesterNode, int targetNode)
 {
-    // v4: Allow multiple outstanding per line (different opType)
-    // For now, keep single outstanding per line but track by opType
+    // v4: Keep single outstanding per line
     if (_outstandingReqs.count(linePa))
         return nullptr;
     OutstandingRequest req;
