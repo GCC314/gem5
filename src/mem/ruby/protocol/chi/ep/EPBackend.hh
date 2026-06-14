@@ -6,6 +6,7 @@
 #include <string>
 #include <vector>
 
+#include "mem/simple_mem.hh"
 #include "mem/ruby/common/DataBlock.hh"
 #include "mem/ruby/protocol/chi/ep/NodeAddressMap.hh"
 #include "params/EPBackend.hh"
@@ -287,16 +288,9 @@ enum class GrantDataSource {
     RecallBuffer, // Data captured from recall (dirty owner eviction)
     NoData        // No data needed / zero-fill (uninitialized memory)
 };
-
-// F3: Forward declaration for HomeMemoryService (full type in simple_mem.hh,
-// included by EPBackend.cc). Must be before the gem5 namespaces.
-namespace gem5 { namespace memory { class SimpleMemory; } }
-
-struct HomeMemoryService {
-    gem5::memory::SimpleMemory *physMem;
-    HomeMemoryService(gem5::memory::SimpleMemory *pm = nullptr) : physMem(pm) {}
-
-    // Implemented in EPBackend.cc where SimpleMemory is fully defined
+    memory::SimpleMemory *physMem;
+    HomeMemoryService(memory::SimpleMemory *pm = nullptr) : physMem(pm) {}
+    // Implemented in EPBackend.cc
     bool read(uint64_t homePa, uint8_t *buf, int size) const;
     bool write(uint64_t homePa, const uint8_t *buf, int size) const;
 };
