@@ -374,6 +374,9 @@ class EPRNFController : public EPController
     /** Send SnpResp_I to HN-F (common helper). */
     bool sendSnpRespI(const CHIRequestMsg *msg);
 
+    /** v4: Send SnpResp_SC to HN-F (preserving response for SnpShared). */
+    bool sendSnpRespSC(const CHIRequestMsg *msg);
+
     /** Send SnpRespData_SC to HN-F (SnpOnce response). */
     bool sendSnpRespDataSC(const CHIRequestMsg *msg);
 

@@ -86,7 +86,7 @@ EPSNFController::wakeup()
                 CHIDataType dataType = (it->neededPerm == 0)
                     ? CHIDataType_CompData_SC
                     : CHIDataType_CompData_UC;
-                bool sharedHint = (it->neededPerm == 0) && (_nodeId != homeNode);
+                bool sharedHint = (it->neededPerm == 0);
 
                 const uint8_t *gdata = _backend->lastGrantData();
                 for (int i = 0; i < dataMsgsPerLine; i++) {
@@ -262,7 +262,7 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
     // Unique grant (neededPerm==1): CompData_UC (baseline unique fill)
     CHIDataType dataType = (neededPerm == 0) ? CHIDataType_CompData_SC
                                              : CHIDataType_CompData_UC;
-    bool sharedHint = (neededPerm == 0) && (_nodeId != homeNode);  // v4: cross-node only
+    bool sharedHint = (neededPerm == 0);  // v4: always register EP-RNF for shared
 
     // ---- Q2 FIX: Splitting CompData into data-channel-sized chunks ----
     // The L2/HN-F's ExpectedMap counts data responses in CHUNKS
