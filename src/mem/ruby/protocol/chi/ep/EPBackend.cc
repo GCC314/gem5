@@ -288,17 +288,31 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
         reqType = OuterReqType::GlobalReadUnique;
     }
 
-    // Create requester bookkeeping entry (uses requester's PA view)
-    _epochCounter++;
-    uint64_t reqIdVal = _epochCounter;  // v4: monotonic reqId from epoch counter
+    // v4: Check for existing requester entry (retry after BUSY/recall).
+    // If found, reuse epoch/reqId so that Clear matches GRANT_HANDSHAKE.
+    auto existing = _requesterLines.find(line_pa);
+    bool isRetry = (existing != _requesterLines.end() &&
+                    existing->second.state == RequesterLineState::R_WAIT_GRANT);
+
+    uint64_t reqIdVal;
     RequesterLineEntry entry;
-    entry.lineAddr = line_pa;
-    entry.state = RequesterLineState::R_WAIT_GRANT;
-    entry.pendingReq = reqType;
-    entry.epoch = _epochCounter;
-    entry.reqId = reqIdVal;    // v4: store reqId
-    entry.writeIntent = writeIntent;
-    entry.homeNode = homeNode;
+    if (isRetry) {
+        reqIdVal = existing->second.reqId;
+        entry = existing->second;   // preserve original epoch/reqId
+        entry.pendingReq = reqType;
+        entry.writeIntent = writeIntent;
+        entry.homeNode = homeNode;
+    } else {
+        _epochCounter++;
+        reqIdVal = _epochCounter;  // v4: monotonic reqId from epoch counter
+        entry.lineAddr = line_pa;
+        entry.state = RequesterLineState::R_WAIT_GRANT;
+        entry.pendingReq = reqType;
+        entry.epoch = _epochCounter;
+        entry.reqId = reqIdVal;    // v4: store reqId
+        entry.writeIntent = writeIntent;
+        entry.homeNode = homeNode;
+    }
     _requesterLines[line_pa] = entry;
 
     // Dispatch to home node's UBCC via cross-node registry.

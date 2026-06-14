@@ -309,7 +309,48 @@ UBCCController::processOuterRequest(
             int existingOwner = entry.ownerNode;
             bool wasDirty = (entry.state == MESIState::G_M);
 
-            if (existingOwner >= 0 && existingOwner != requesterNode) {
+            // v4: Check if there's an already-completed RECALL for this requester
+            bool recallAlreadyDone = false;
+            auto rit = _outstandingReqs.find(line_pa);
+            if (rit != _outstandingReqs.end() &&
+                rit->second.opType == OpType::RECALL &&
+                rit->second.requesterNode == requesterNode &&
+                rit->second.stage == OpStage::DONE) {
+                recallAlreadyDone = true;
+                // v4 D-11 fix: Transition RECALL → GRANT_HANDSHAKE in place
+                // (createOutstanding blocks double-outstanding for same PA)
+                uint64_t newSharers = (1ULL << requesterNode);
+                if (existingOwner >= 0)
+                    newSharers |= (1ULL << existingOwner);
+                rit->second.opType = OpType::GRANT_HANDSHAKE;
+                rit->second.stage = OpStage::WAITING_CLEAR;
+                rit->second.recallBarrierDone = true;
+                rit->second.intendedState = MESIState::G_S;
+                rit->second.intendedSharersMask = newSharers;
+                rit->second.intendedOwnerNode = -1;
+                rit->second.intendedDirty = false;
+                if (reqType == UBCC_OuterReqType::GlobalReadShared) {
+                    grant = UBCC_OuterGrantType::GlobalGrantShared;
+                } else {
+                    grant = writeIntent
+                        ? UBCC_OuterGrantType::GlobalGrantModified
+                        : UBCC_OuterGrantType::GlobalGrantExclusive;
+                    rit->second.intendedState = writeIntent
+                        ? MESIState::G_M : MESIState::G_E;
+                    rit->second.intendedOwnerNode = requesterNode;
+                    rit->second.intendedSharersMask = 0;
+                    rit->second.intendedDirty = writeIntent;
+                }
+                DPRINTF(RubyEP,
+                        "UBCC node_id=%d: RECALL→GRANT_HANDSHAKE transition "
+                        "PA=0x%lx requester=%d intended=%s\n",
+                        _nodeId, line_pa, requesterNode,
+                        mesiStateName(rit->second.intendedState));
+                return grant;
+            }
+
+            if (existingOwner >= 0 && existingOwner != requesterNode
+                && !recallAlreadyDone) {
                 // v4: Recall needed — create RECALL + GRANT_HANDSHAKE
                 bool recallStarted = initiateRecall(
                     line_pa, entry, reqType, writeIntent, requesterNode);
