@@ -635,9 +635,10 @@ UBCCController::processRecallResponse(uint64_t line_pa, int ownerNode,
     // v4: Verify pending recall via OutstandingRequest
     OutstandingRequest *ost = findOutstanding(line_pa);
     if (!ost || ost->opType != OpType::RECALL) {
-        DPRINTF(RubyEP,
-                "UBCC node_id=%d: processRecallResponse PA=0x%lx "
-                "no pending recall\n", _nodeId, line_pa);
+        printf("[RECALL-DIAG] UBCC node_id=%d PA=0x%lx no RECALL outstanding: "
+               "ost=%p opType=%d\n",
+               _nodeId, line_pa, (void*)ost,
+               ost ? (int)ost->opType : -1);
         return false;
     }
 
