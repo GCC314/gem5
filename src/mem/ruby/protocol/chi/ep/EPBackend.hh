@@ -290,7 +290,8 @@ enum class GrantDataSource {
 
 // Forward-declare for HomeMemoryService
 class SimpleMemory;
-// ...
+
+struct HomeMemoryService {
     SimpleMemory *physMem;
     HomeMemoryService(SimpleMemory *pm = nullptr) : physMem(pm) {}
 
