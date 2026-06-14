@@ -509,6 +509,12 @@ action(Initiate_ReadShared_HitUpstream, desc="") {
 
 action(Initiate_ReadShared_HitUpstream_NoOwner, desc="") {
   tbe.actions.push(Event:ReadMissPipe);
+  // F1: DCT fallback — if sole sharer is EP-RNF, force non-DCT snoop path
+  if (tbe.use_DCT && epRnfMachineVersion >= 0 &&
+      tbe.dir_sharers.count() == 1 &&
+      tbe.dir_sharers.isElement(tbe.epRnfMachineID)) {
+    tbe.use_DCT := false;
+  }
   if (tbe.use_DCT) {
     tbe.actions.push(Event:SendSnpSharedFwdToSharer);
     tbe.actions.pushNB(Event:WaitCompAck);
@@ -1922,10 +1928,17 @@ action(Send_SnpUnique_RetToSrc, desc="") {
   if (tbe.dir_ownerExists) {
     dest := tbe.dir_owner;
   } else {
-    // v4: use pickSharerForSnoop to exclude EP-RNF from retToSrc target
-    dest := pickSharerForSnoop(tbe, tbe.dir_sharers);
+    // F1: if sole sharer is EP-RNF, send directly (non-Fwd path);
+    // pickSharerForSnoop asserts non-empty after EP-RNF removal.
+    if (epRnfMachineVersion >= 0 &&
+        tbe.dir_sharers.count() == 1 &&
+        tbe.dir_sharers.isElement(tbe.epRnfMachineID)) {
+      dest := tbe.epRnfMachineID;
+    } else {
+      dest := pickSharerForSnoop(tbe, tbe.dir_sharers);
+    }
   }
-  // v4: EP-RNF must never be retToSrc=true target
+  // F1: EP-RNF must never be retToSrc=true target
   bool useRetToSrc := true;
   if (epRnfMachineVersion >= 0 && dest == tbe.epRnfMachineID) {
     useRetToSrc := false;
@@ -1970,7 +1983,8 @@ action(Send_SnpUniqueFwd, desc="") {
 action(Send_SnpShared, desc="") {
   assert(is_valid(tbe));
 
-  // only sent to a dirty or exclusive snoopee
+  // v4 F1: EP-RNF must never be the target of SnpShared (preserving snoop).
+  // If dir_owner is EP-RNF, the protocol has a bug upstream — use non-Fwd path.
   assert(tbe.dataMaybeDirtyUpstream);
   assert(tbe.dir_ownerExists);
   assert(tbe.dir_sharers.count() > 0);
@@ -1983,6 +1997,8 @@ action(Send_SnpShared, desc="") {
 
   enqueue(snpOutPort, CHIRequestMsg, snoop_latency) {
     prepareRequest(tbe, CHIRequestType:SnpShared, out_msg);
+    // v4 F1: assert EP-RNF is never the dir_owner (must be caught upstream)
+    assert(tbe.dir_owner != tbe.epRnfMachineID);
     out_msg.Destination.add(tbe.dir_owner);
     out_msg.retToSrc := false;
     out_msg.ns := tbe.ns;
@@ -2061,10 +2077,17 @@ action(Send_SnpSharedFwd_ToSharer, desc="") {
   }
   tbe.expected_snp_resp.addExpectedCount(1);
 
+  // F1: pickSharerForSnoop asserts non-empty after EP-RNF removal;
+  // sole-EP-RNF case must have been handled by DCT fallback in caller.
+  MachineID fwdDest := pickSharerForSnoop(tbe, tbe.dir_sharers);
+  // F1: EP-RNF must never be a Fwd target
+  if (epRnfMachineVersion >= 0) {
+    assert(fwdDest != tbe.epRnfMachineID);
+  }
+
   enqueue(snpOutPort, CHIRequestMsg, snoop_latency) {
     prepareRequest(tbe, CHIRequestType:SnpSharedFwd, out_msg);
-    // v4: use pickSharerForSnoop to exclude EP-RNF from fwd target
-    out_msg.Destination.add(pickSharerForSnoop(tbe, tbe.dir_sharers));
+    out_msg.Destination.add(fwdDest);
     out_msg.retToSrc := retToSrc;
     out_msg.ns := tbe.ns;
   }
@@ -2096,8 +2119,15 @@ action(Send_SnpOnce, desc="") {
     if (tbe.dir_ownerExists) {
       out_msg.Destination.add(tbe.dir_owner);
     } else {
-      // v4: use pickSharerForSnoop to exclude EP-RNF from snoop target
-      out_msg.Destination.add(pickSharerForSnoop(tbe, tbe.dir_sharers));
+      // F1: if sole sharer is EP-RNF, send directly (SnpOnce is non-Fwd,
+      // EP-RNF handles it via SnpRespData_SC). Otherwise use pickSharerForSnoop.
+      if (epRnfMachineVersion >= 0 &&
+          tbe.dir_sharers.count() == 1 &&
+          tbe.dir_sharers.isElement(tbe.epRnfMachineID)) {
+        out_msg.Destination.add(tbe.epRnfMachineID);
+      } else {
+        out_msg.Destination.add(pickSharerForSnoop(tbe, tbe.dir_sharers));
+      }
     }
     out_msg.retToSrc := true;
     out_msg.ns := tbe.ns;
@@ -2130,8 +2160,14 @@ action(Send_SnpOnceFwd, desc="") {
     if (tbe.dir_ownerExists) {
       out_msg.Destination.add(tbe.dir_owner);
     } else {
-      // v4: use pickSharerForSnoop to exclude EP-RNF from fwd target
-      out_msg.Destination.add(pickSharerForSnoop(tbe, tbe.dir_sharers));
+      // F1: pickSharerForSnoop asserts non-empty after EP-RNF removal;
+      // sole-EP-RNF case must have been handled by DCT fallback in caller.
+      MachineID onceFwdDest := pickSharerForSnoop(tbe, tbe.dir_sharers);
+      // F1: EP-RNF must never be a Fwd target
+      if (epRnfMachineVersion >= 0) {
+        assert(onceFwdDest != tbe.epRnfMachineID);
+      }
+      out_msg.Destination.add(onceFwdDest);
     }
     out_msg.retToSrc := false;
     out_msg.ns := tbe.ns;

@@ -317,11 +317,10 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
         nd = per_node[node_id]
         snf_dests = []
         snf_dests.extend(nd['l_snf'].getAllControllers())
-        # Q2 FIX: Route ALL DSM through EP_SNF first so UBCC directory
-        # is consulted before local DDR4.  EP_SNF handles recalls when
-        # another node owns the line modified/exclusive.
+        # F1: Route ALL DSM through EP_SNF as the SINGLE downstream.
+        # DL_SNF only serves local-private/ubcc-exclusive memory;
+        # DSM must not go through DL_SNF.
         snf_dests.append(nd['ep_snf_cntrl'])
-        snf_dests.extend(nd['dl_snf'].getAllControllers())
         nd['hnf_wrapper'].setDownstream(snf_dests)
         # Q2 FIX: Force re-evaluation of downstream_destinations param
         # after the Python list was updated, so the C++ params struct
