@@ -141,12 +141,14 @@ UBCCController::processOuterRequest(
     ensureDirEntry(line_pa);
     DirEntry &entry = _directory[line_pa];
 
-    // v4: Check for existing outstanding — if any, return BUSY
+    // v4: Check for existing outstanding — if active, return BUSY
     OutstandingRequest *existing = findOutstanding(line_pa);
     if (existing) {
-        // v4: All conflicts during any outstanding are BUSY/RETRY (§3.4)
+        // v4 D-19: Keep DONE outstanding for recall→grant transition.
+        // Do NOT remove here — let G_E/G_M retry path detect and convert it.
         if (existing->stage != OpStage::DONE &&
-            existing->stage != OpStage::CANCELLED) {
+            existing->stage != OpStage::CANCELLED &&
+            existing->stage != OpStage::TIMED_OUT) {
             DPRINTF(RubyEP,
                     "UBCC node_id=%d: existing outstanding PA=0x%lx "
                     "opType=%d stage=%d — BUSY\n",
@@ -155,8 +157,7 @@ UBCCController::processOuterRequest(
                     static_cast<int>(existing->stage));
             return static_cast<UBCC_OuterGrantType>(-1);
         }
-        // outstanding in terminal state — remove and proceed
-        removeOutstanding(line_pa);
+        // RECALL.DONE or other terminal — keep in map, let case blocks handle transition
     }
 
     // v4: Check tombstone for duplicate Clear within window W
