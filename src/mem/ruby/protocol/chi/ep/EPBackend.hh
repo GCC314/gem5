@@ -288,12 +288,13 @@ enum class GrantDataSource {
     NoData        // No data needed / zero-fill (uninitialized memory)
 };
 
-// Forward declaration — full type in EPBackend.cc
-namespace memory { class SimpleMemory; }
+// F3: Forward declaration for HomeMemoryService (full type in simple_mem.hh,
+// included by EPBackend.cc). Must be before the gem5 namespaces.
+namespace gem5 { namespace memory { class SimpleMemory; } }
 
 struct HomeMemoryService {
-    memory::SimpleMemory *physMem;
-    HomeMemoryService(memory::SimpleMemory *pm = nullptr) : physMem(pm) {}
+    gem5::memory::SimpleMemory *physMem;
+    HomeMemoryService(gem5::memory::SimpleMemory *pm = nullptr) : physMem(pm) {}
 
     // Implemented in EPBackend.cc where SimpleMemory is fully defined
     bool read(uint64_t homePa, uint8_t *buf, int size) const;
