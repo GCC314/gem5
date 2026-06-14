@@ -1190,8 +1190,13 @@ UBCCController::processClear(
     // Compare against baseEpoch (not reservedEpoch) for matching.
     if (ost->baseEpoch != epoch) {
         warn("UBCC node_id=%d: processClear PA=0x%lx "
-             "epoch mismatch: ost_base=%lu clear=%lu — dropped\n",
+             "epoch mismatch: ost_base=%lu clear=%lu — dropping, "
+             "retiring stale GRANT_HANDSHAKE\n",
              _nodeId, line_pa, ost->baseEpoch, epoch);
+        // v4 D-18: Retire stale GRANT_HANDSHAKE so it doesn't block
+        // future RECALL/INVALIDATE creation for this PA.
+        retireToTombstone(*ost, false);
+        removeOutstanding(line_pa);
         return false;
     }
 
