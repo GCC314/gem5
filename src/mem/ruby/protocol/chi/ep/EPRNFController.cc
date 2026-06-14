@@ -638,15 +638,11 @@ EPRNFController::processSnoopImmediate(const CHIRequestMsg *msg)
             return handleSnpOnce(msg);
         case CHIRequestType_SnpShared:
         case CHIRequestType_SnpSharedFwd:
-            // F1 diagnostic: these should be unreachable via pickSharerForSnoop
-            // and DCT fallback.  During init/early sim they may still trigger;
-            // use SnpResp_SC (preserving) while the root cause is traced.
-            // TODO: restore fatal after init-phase EP-RNF-as-owner bug is fixed.
-            warn("EP_RNF node_id=%d: SnpShared/SnpSharedFwd at PA=0x%lx "
-                  "— defensive SnpResp_SC (F1 diagnostic, root cause TBD)\n",
+            fatal("EP_RNF node_id=%d: SnpShared/SnpSharedFwd at PA=0x%lx "
+                  "— unreachable per design (HN-F must DCT-fallback or use "
+                  "non-preserving path before sending to EP-RNF)\n",
                   _nodeId, msg->m_addr);
-            sendSnpRespSC(msg);
-            return true;
+            return false;
         default:
             // Unknown snoop: fallback to SnpResp_I
             DPRINTF(RubyCHIGeneric,
