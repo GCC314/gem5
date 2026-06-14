@@ -289,15 +289,10 @@ enum class GrantDataSource {
 };
 
 // Forward-declare for HomeMemoryService
-class AbstractMemory;
-
-// ---- F3: Home Memory Service ----
-// Provides unified read/write access to local DDR4 backing store
-// via RubySystem->getPhysMem().  This is the single authoritative
-// entry point for clean/shared grant data (§F3.1).
-struct HomeMemoryService {
-    AbstractMemory *physMem;
-    HomeMemoryService(AbstractMemory *pm = nullptr) : physMem(pm) {}
+class SimpleMemory;
+// ...
+    SimpleMemory *physMem;
+    HomeMemoryService(SimpleMemory *pm = nullptr) : physMem(pm) {}
 
     // Read a cache line from DDR4 at the given physical address.
     // Returns true if physMem is available, false otherwise.
