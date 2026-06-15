@@ -723,7 +723,19 @@ EPRNFController::handleSnpCleanInvalid(const CHIRequestMsg *msg)
         pending.hnfDest = msg->m_requestor;
         _upgradePending[msg->m_addr] = pending;
 
-        receiveUpgradeAck(msg->m_addr);
+        // upgrade_invalidate_fix D2: only call receiveUpgradeAck() immediately
+        // if the ack is ready (targetMask==0, lastUpgradeAck().accepted==true).
+        // If targetMask!=0, the ack will be triggered later via
+        // EPBackend::notifyUpgradeAckReady() when all invalidation acks arrive.
+        if (backend->lastUpgradeAck().accepted) {
+            // Fast path: no other sharers, immediate Ack(true)
+            receiveUpgradeAck(msg->m_addr);
+        } else {
+            // Deferred: wait for all invalidation acks to arrive
+            printf("[UPGRADE-DIAG] node=%d upgrade deferred ack PA=0x%lx "
+                   "— waiting for invalidation acks\n",
+                   _nodeId, msg->m_addr);
+        }
         return true;
     }
 

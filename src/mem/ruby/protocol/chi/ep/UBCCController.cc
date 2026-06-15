@@ -885,26 +885,44 @@ UBCCController::processInvalidationAck(uint64_t line_pa, int ackNode,
 
     // v4: Verify pending invalidation via OutstandingRequest
     OutstandingRequest *ost = findOutstanding(line_pa);
-    if (!ost || ost->opType != OpType::INVALIDATE) {
+    if (!ost) {
         // Already completed — idempotent
         DPRINTF(RubyEP,
                 "UBCC node_id=%d: processInvalidationAck PA=0x%lx "
-                "no pending invalidation — idempotent\n",
+                "no outstanding — idempotent\n",
                 _nodeId, line_pa);
         return true;
     }
 
-    // Check for duplicate ack
+    // upgrade_invalidate_fix: accept both INVALIDATE and UPGRADE_PENDING (WAITING_ALL_ACKS)
+    bool isUpgradePath = (ost->opType == OpType::UPGRADE_PENDING &&
+                          ost->stage == OpStage::WAITING_ALL_ACKS);
+    bool isInvalidatePath = (ost->opType == OpType::INVALIDATE);
+
+    if (!isInvalidatePath && !isUpgradePath) {
+        // Wrong op type or stage — idempotent
+        DPRINTF(RubyEP,
+                "UBCC node_id=%d: processInvalidationAck PA=0x%lx "
+                "opType=%d stage=%d — not applicable, idempotent\n",
+                _nodeId, line_pa,
+                static_cast<int>(ost->opType), static_cast<int>(ost->stage));
+        return true;
+    }
+
+    // Check for duplicate ack — use upgrade fields or standard fields
     uint64_t nodeBit = (1ULL << ackNode);
-    if (!(ost->totalMask & nodeBit)) {
+    uint64_t &effTargetMask = isUpgradePath ? ost->upgradeTargetMask : ost->totalMask;
+    uint64_t &effAckMask = isUpgradePath ? ost->upgradeAckMask : ost->ackMask;
+
+    if (!(effTargetMask & nodeBit)) {
         DPRINTF(RubyEP,
                 "UBCC node_id=%d: processInvalidationAck PA=0x%lx "
                 "ackNode=%d not in targetMask=0x%lx\n",
-                _nodeId, line_pa, ackNode, ost->totalMask);
+                _nodeId, line_pa, ackNode, effTargetMask);
         return false;
     }
 
-    if (ost->ackMask & nodeBit) {
+    if (effAckMask & nodeBit) {
         DPRINTF(RubyEP,
                 "UBCC node_id=%d: processInvalidationAck PA=0x%lx "
                 "duplicate ack from node %d — ignoring\n",
@@ -913,39 +931,90 @@ UBCCController::processInvalidationAck(uint64_t line_pa, int ackNode,
     }
 
     // Record the ack
-    ost->ackMask |= nodeBit;
-    ost->pendingAckCount--;
-    // Clear the sharer bit from committed entry
-    entry.sharersMask &= ~nodeBit;
+    effAckMask |= nodeBit;
+    if (isUpgradePath) {
+        ost->upgradePendingAckCount--;
+    } else {
+        ost->pendingAckCount--;
+    }
+
+    // upgrade_invalidate_fix §4.2.2: do NOT modify committed entry.sharersMask
+    // for UPGRADE_PENDING. Only for INVALIDATE path.
+    if (isInvalidatePath) {
+        entry.sharersMask &= ~nodeBit;
+    }
 
     DPRINTF(RubyEP,
-            "UBCC node_id=%d: invalidation ack PA=0x%lx ackNode=%d "
-            "remaining=%d ackMask=0x%lx totalMask=0x%lx\n",
+            "UBCC node_id=%d: invalidation ack PA=0x%lx ackNode=%d op=%s "
+            "remaining=%d ackMask=0x%lx targetMask=0x%lx\n",
             _nodeId, line_pa, ackNode,
-            ost->pendingAckCount, ost->ackMask, ost->totalMask);
+            isUpgradePath ? "UPGRADE" : "INVALIDATE",
+            isUpgradePath ? ost->upgradePendingAckCount : ost->pendingAckCount,
+            effAckMask, effTargetMask);
 
     _invalidationAckCount++;
 
     // Check if all invalidations are complete
-    if (ost->pendingAckCount == 0) {
+    bool allAcksDone = isUpgradePath ? (ost->upgradePendingAckCount == 0)
+                                     : (ost->pendingAckCount == 0);
+
+    if (allAcksDone) {
         DPRINTF(RubyEP,
                 "UBCC node_id=%d: all invalidations complete PA=0x%lx\n",
                 _nodeId, line_pa);
 
-        // v4: Release invalidate barrier
-        ost->invalidateBarrierDone = true;
-        ost->stage = OpStage::DONE;
-        ost->respTick = curTick();
+        if (isUpgradePath) {
+            // upgrade_invalidate_fix D2: all acks in → now safe to Ack(true)
+            ost->invalidateBarrierDone = true;
+            ost->accepted = true;
+            ost->stage = OpStage::WAITING_LOCAL_DONE;
+            ost->respTick = curTick();
 
-        // v4: Create GRANT_HANDSHAKE for the intended result.
-        // Convert the INVALIDATE outstanding in-place to GRANT_HANDSHAKE
-        // to avoid the create-then-remove race on the same linePa key.
-        ost->opType = OpType::GRANT_HANDSHAKE;
-        ost->stage = OpStage::WAITING_CLEAR;
-        // intendedState, intendedOwnerNode, intendedSharersMask, intendedDirty
-        // are already set from when the INVALIDATE was created.
-        ost->recallBarrierDone = false;
-        ost->invalidateBarrierDone = true;  // INVALIDATE is now DONE
+            printf("[UBCC-UPGRADE-ACK] pa=0x%lx requester=%d accepted=1 "
+                   "ackMask=0x%lx targetMask=0x%lx\n",
+                   line_pa, ost->requesterNode, ost->upgradeAckMask, ost->upgradeTargetMask);
+
+            // Notify the requester that OuterUpgradeAck(true) is ready.
+            // Route through EPBackend static registry.
+            EPBackend *reqBackend = EPBackend::getBackendInstance(ost->requesterNode);
+            if (reqBackend) {
+                reqBackend->notifyUpgradeAckReady(line_pa);
+            }
+
+            // TENTATIVE: if Done arrived early (upgradeDoneArrived), auto-commit now
+            if (ost->upgradeDoneArrived) {
+                printf("[UPGRADE-TENTATIVE-DONE-CACHED] pa=0x%lx requester=%d "
+                       "committing after acks complete (Done was cached)\n",
+                       line_pa, ost->requesterNode);
+                int intendedOwner = ost->intendedOwnerNode;
+                uint64_t reservedEp = ost->reservedEpoch;
+                commitIntendedResult(entry, *ost);
+                ost->stage = OpStage::DONE;
+                ost->respTick = curTick();
+                removeOutstanding(line_pa);
+
+                printf("[UBCC-UPGRADE-COMMIT] pa=0x%lx owner=%d reservedEpoch=%lu\n",
+                       line_pa, intendedOwner, reservedEp);
+
+                // Replay queued requesters after commit
+                replayPendingRequesters(line_pa);
+            }
+        } else {
+            // v4: Release invalidate barrier (INVALIDATE path)
+            ost->invalidateBarrierDone = true;
+            ost->stage = OpStage::DONE;
+            ost->respTick = curTick();
+
+            // v4: Create GRANT_HANDSHAKE for the intended result.
+            // Convert the INVALIDATE outstanding in-place to GRANT_HANDSHAKE
+            // to avoid the create-then-remove race on the same linePa key.
+            ost->opType = OpType::GRANT_HANDSHAKE;
+            ost->stage = OpStage::WAITING_CLEAR;
+            // intendedState, intendedOwnerNode, intendedSharersMask, intendedDirty
+            // are already set from when the INVALIDATE was created.
+            ost->recallBarrierDone = false;
+            ost->invalidateBarrierDone = true;  // INVALIDATE is now DONE
+        }
     }
 
     return true;
@@ -968,6 +1037,16 @@ UBCCController::getPendingInvalidationMask(uint64_t line_pa) const
     if (oit != _outstandingReqs.end() &&
         oit->second.opType == OpType::INVALIDATE)
         return oit->second.totalMask & ~oit->second.ackMask;
+    return 0;
+}
+
+uint64_t
+UBCCController::getUpgradePendingTargetMask(uint64_t line_pa) const
+{
+    auto oit = _outstandingReqs.find(line_pa);
+    if (oit != _outstandingReqs.end() &&
+        oit->second.opType == OpType::UPGRADE_PENDING)
+        return oit->second.upgradeTargetMask;
     return 0;
 }
 
@@ -998,6 +1077,15 @@ UBCCController::getEpochForLine(uint64_t line_pa) const
     if (it == _directory.end())
         return 0;
     return it->second.epoch;
+}
+
+uint64_t
+UBCCController::getOutstandingBaseEpoch(uint64_t line_pa) const
+{
+    auto it = _outstandingReqs.find(line_pa);
+    if (it == _outstandingReqs.end())
+        return 0;
+    return it->second.baseEpoch;
 }
 
 // ---- M7: GlobalWriteback ----
@@ -1235,6 +1323,10 @@ UBCCController::processOuterUpgradeReq(
     // v4: Allocate reserved epoch (committed epoch + 1)
     uint64_t reservedEpoch = allocateReservedEpoch(entry);
 
+    // upgrade_invalidate_fix D3: freeze targetMask at acceptance time
+    uint64_t reqBit = (1ULL << requesterNode);
+    uint64_t targetMask = entry.sharersMask & ~reqBit;
+
     // Create UPGRADE_PENDING outstanding
     OutstandingRequest *oreq = createOutstanding(
         line_pa, OpType::UPGRADE_PENDING, requesterNode, -1);
@@ -1249,21 +1341,51 @@ UBCCController::processOuterUpgradeReq(
     oreq->reservedEpoch = reservedEpoch;
     oreq->reqId = reqId;
     oreq->baseEpoch = epoch;
-    oreq->stage = OpStage::WAITING_LOCAL_DONE;
     oreq->upgradeCause = cause;
-    oreq->accepted = true;
 
     // Determine intended state
     bool writeIntent = (desiredPerm == 1);  // Unique
     oreq->intendedState = writeIntent ? MESIState::G_M : MESIState::G_E;
     oreq->intendedOwnerNode = requesterNode;
-    oreq->intendedSharersMask = entry.sharersMask & ~(1ULL << requesterNode);
+    oreq->intendedSharersMask = entry.sharersMask & ~reqBit;
     oreq->intendedDirty = writeIntent;
 
-    DPRINTF(RubyEP,
-            "UBCC node_id=%d: upgrade accepted PA=0x%lx "
-            "reservedEpoch=%lu reqId=%lu — irrevocable-after-ack\n",
-            _nodeId, line_pa, reservedEpoch, reqId);
+    if (targetMask != 0) {
+        // upgrade_invalidate_fix D1/D2: other sharers exist → must invalidate first
+        oreq->stage = OpStage::WAITING_ALL_ACKS;
+        oreq->accepted = false;  // not yet ready to Ack(true)
+        oreq->upgradeTargetMask = targetMask;
+        oreq->totalMask = targetMask;
+        oreq->upgradePendingAckCount = __builtin_popcountll(targetMask);
+        oreq->upgradeAckMask = 0;
+        oreq->invalidateBarrierDone = false;
+
+        printf("[UBCC-UPGRADE] pa=0x%lx requester=%d stage=WAITING_ALL_ACKS "
+               "targetMask=0x%lx pendingAckCount=%d\n",
+               line_pa, requesterNode, targetMask, oreq->upgradePendingAckCount);
+
+        DPRINTF(RubyEP,
+                "UBCC node_id=%d: upgrade accepted pending PA=0x%lx "
+                "reservedEpoch=%lu reqId=%lu targetMask=0x%lx — "
+                "waiting for invalidation acks before Ack(true)\n",
+                _nodeId, line_pa, reservedEpoch, reqId, targetMask);
+    } else {
+        // upgrade_invalidate_fix: no other sharers — fast path
+        oreq->stage = OpStage::WAITING_LOCAL_DONE;
+        oreq->accepted = true;
+        oreq->upgradeTargetMask = 0;
+        oreq->upgradePendingAckCount = 0;
+        oreq->upgradeAckMask = 0;
+
+        printf("[UBCC-UPGRADE] pa=0x%lx requester=%d stage=WAITING_LOCAL_DONE "
+               "targetMask=0 (no other sharers)\n",
+               line_pa, requesterNode);
+
+        DPRINTF(RubyEP,
+                "UBCC node_id=%d: upgrade accepted immediate PA=0x%lx "
+                "reservedEpoch=%lu reqId=%lu — no other sharers, Ack(true) now\n",
+                _nodeId, line_pa, reservedEpoch, reqId);
+    }
 
     // v4: §4.1.4 step 2-3 — DirEntry NOT modified; committed stays as-is.
     // irrevocable-after-ack: once accepted, can only be DONE or PERSISTENT_BUSY.
@@ -1304,8 +1426,49 @@ UBCCController::processOuterUpgradeDone(
         return false;
     }
 
-    // v4: §4.1.4 step 5 — commit intended result to DirEntry
     DirEntry &entry = it->second;
+
+    // upgrade_invalidate_fix D4 (TENTATIVE): Done may arrive before acks complete
+    if (ost->stage == OpStage::WAITING_ALL_ACKS) {
+        // TENTATIVE: cache the Done tuple, do NOT commit yet
+        ost->upgradeDoneArrived = true;
+        ost->upgradeDoneEpoch = epoch;
+        ost->upgradeDoneReqId = reqId;
+        ost->upgradeSavedStage = ost->stage;
+
+        printf("[UPGRADE-TENTATIVE-DONE-CACHED] pa=0x%lx requester=%d "
+               "stage=WAITING_ALL_ACKS (Done arrived before all acks) "
+               "cachedEpoch=%lu cachedReqId=%lu\n",
+               line_pa, requesterNode, epoch, reqId);
+
+        DPRINTF(RubyEP,
+                "UBCC node_id=%d: UpgradeDone TENTATIVE cached PA=0x%lx "
+                "requester=%d — waiting for remaining acks\n",
+                _nodeId, line_pa, requesterNode);
+
+        return true; // accepted but not committed
+    }
+
+    if (ost->stage != OpStage::WAITING_LOCAL_DONE) {
+        DPRINTF(RubyEP,
+                "UBCC node_id=%d: processOuterUpgradeDone PA=0x%lx "
+                "wrong stage=%d — rejecting\n",
+                _nodeId, line_pa, static_cast<int>(ost->stage));
+        return false;
+    }
+
+    // upgrade_invalidate_fix: only commit when WAITING_LOCAL_DONE and accepted
+    if (!ost->accepted) {
+        DPRINTF(RubyEP,
+                "UBCC node_id=%d: processOuterUpgradeDone PA=0x%lx "
+                "not yet accepted — rejecting\n",
+                _nodeId, line_pa);
+        return false;
+    }
+
+    // v4: §4.1.4 step 5 — commit intended result to DirEntry
+    int intendedOwner = ost->intendedOwnerNode;
+    uint64_t reservedEp = ost->reservedEpoch;
     commitIntendedResult(entry, *ost);
 
     // Retire UPGRADE_PENDING
@@ -1313,11 +1476,17 @@ UBCCController::processOuterUpgradeDone(
     ost->respTick = curTick();
     removeOutstanding(line_pa);
 
+    printf("[UBCC-UPGRADE-COMMIT] pa=0x%lx owner=%d reservedEpoch=%lu\n",
+           line_pa, intendedOwner, reservedEp);
+
     DPRINTF(RubyEP,
             "UBCC node_id=%d: upgrade committed PA=0x%lx "
             "newState=%s owner=%d epoch=%lu\n",
             _nodeId, line_pa, mesiStateName(entry.state),
             entry.ownerNode, entry.epoch);
+
+    // Replay queued requesters after commit
+    replayPendingRequesters(line_pa);
 
     return true;
 }
@@ -1577,7 +1746,12 @@ UBCCController::replayPendingRequesters(uint64_t linePa)
         PendingRequester pr = qit->second.front();
         qit->second.pop_front();
 
-        // §5.2: Rebase epoch to newly committed epoch (the Clear just advanced it)
+        // §5.2: Rebase epoch to newly committed epoch (the Clear just advanced it).
+        // upgrade_invalidate_fix D5: this rebaseEpoch becomes the baseEpoch
+        // in the new GRANT_HANDSHAKE. The requester's subsequent Clear must
+        // use THIS baseEpoch (from the grant envelope/GRANT_HANDSHAKE context),
+        // NOT its own stale local entry.epoch. The EPBackend-side fix in
+        // handleRemoteMiss/sendClear ensures this by reading getOutstandingBaseEpoch().
         uint64_t rebaseEpoch = entry.epoch;
 
         printf("[UBCC-QUEUE-REPLAY] pa=0x%lx requester=%d reqType=%s "

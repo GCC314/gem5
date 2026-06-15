@@ -525,6 +525,14 @@ class EPBackend : public SimObject
     const OuterUpgradeDone& lastUpgradeDone() const { return _lastUpgradeDone; }
     const OuterUpgradeDoneAck& lastUpgradeDoneAck() const { return _lastUpgradeDoneAck; }
 
+    // ---- upgrade_invalidate_fix: upgrade ack callback ----
+    /**
+     * Called by home UBCC when all invalidation acks for an upgrade
+     * have been received (upgrade_invalidate_fix D2).
+     * Triggers the deferred receiveUpgradeAck() on EPRNFController.
+     */
+    void notifyUpgradeAckReady(uint64_t linePa);
+
     /**
      * Diagnose the expected grant for a given sideband combination
      * without actually issuing the request.  Used by ARM_SYNC tests
@@ -690,6 +698,22 @@ class EPBackend : public SimObject
     OuterUpgradeAck _lastUpgradeAck;
     OuterUpgradeDone _lastUpgradeDone;
     OuterUpgradeDoneAck _lastUpgradeDoneAck;
+
+    // ---- upgrade_invalidate_fix: PendingGrantTxn (§3.3.3) ----
+    // Independent grant tuple context for Clear replay correctness (D5).
+    struct PendingGrantTxn {
+        bool valid;
+        uint64_t linePa;
+        int homeNode;
+        uint64_t baseEpoch;   // home-approved GRANT_HANDSHAKE baseEpoch
+        uint64_t reqId;
+        OuterGrantType grantType;
+
+        PendingGrantTxn() : valid(false), linePa(0), homeNode(-1),
+                            baseEpoch(0), reqId(0),
+                            grantType(OuterGrantType::GlobalGrantShared) {}
+    };
+    std::map<uint64_t, PendingGrantTxn> _pendingGrantTxns;
 
     // ---- M6: Cross-Node EPBackend Routing Registry ----
     static std::map<int, EPBackend*> _backendInstances;

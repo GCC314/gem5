@@ -537,10 +537,23 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
     OuterGrantEnvelope grantEnv;
     grantEnv.linePa = homePa;
     grantEnv.homeNode = homeNode;
-    grantEnv.epoch = entry.epoch;
+
+    // upgrade_invalidate_fix D5: use home's GRANT_HANDSHAKE baseEpoch
+    // for the Clear tuple, NOT the requester's local entry.epoch.
+    // The home may have rebased the epoch for queued/replayed requests.
+    uint64_t grantBaseEpoch = homeUbcc->getOutstandingBaseEpoch(homePa);
+    if (grantBaseEpoch == 0) {
+        // Fallback: use local entry.epoch if no outstanding (shouldn't happen)
+        grantBaseEpoch = entry.epoch;
+    }
+    grantEnv.epoch = grantBaseEpoch;
     grantEnv.reqId = reqIdVal;  // v4: outer transaction reqId
     grantEnv.grantVisibleTick = grantVisibleTick;
     grantEnv.sentinelVisibleTick = sentinelVisibleTick;
+
+    // Also update local entry.epoch to match for future retries
+    entry.epoch = grantBaseEpoch;
+    _requesterLines[line_pa] = entry;
 
     // Self-test assertion: sentinelVisibleTick <= grantVisibleTick
     if (sentinelVisibleTick > grantVisibleTick) {
@@ -575,6 +588,18 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
     }
 
     _lastGrantEnv = grantEnv;
+
+    // upgrade_invalidate_fix D5: save PendingGrantTxn for Clear tuple correctness
+    {
+        PendingGrantTxn txn;
+        txn.valid = true;
+        txn.linePa = homePa;
+        txn.homeNode = homeNode;
+        txn.baseEpoch = grantBaseEpoch;
+        txn.reqId = reqIdVal;
+        txn.grantType = grantEnv.grantType;
+        _pendingGrantTxns[line_pa] = txn;
+    }
 
     DPRINTF(RubyCHIGeneric,
             "EPBackend node_id=%d: outer grant envelope "
@@ -1343,20 +1368,80 @@ EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
         outEpoch = epochVal;
         outReqId = reqIdVal;
 
-        // Build ack envelope
-        OuterUpgradeAck ack;
-        ack.linePa = homePa;
-        ack.homeNode = homeNode;
-        ack.dstNode = _nodeId;
-        ack.epoch = epochVal;
-        ack.reqId = reqIdVal;
-        ack.accepted = true;
-        _lastUpgradeAck = ack;
+        // upgrade_invalidate_fix: determine if invalidation fanout is needed
+        uint64_t upgradeTargetMask = homeUbcc->getUpgradePendingTargetMask(homePa);
 
-        DPRINTF(RubyEP,
-                "EPBackend node_id=%d: upgrade accepted "
-                "PA=0x%lx epoch=%lu reqId=%lu\n",
-                _nodeId, line_pa, epochVal, reqIdVal);
+        if (upgradeTargetMask != 0) {
+            // Other sharers exist — must invalidate them before Ack(true)
+            printf("[UPGRADE-DIAG] node=%d upgrade accepted PENDING PA=0x%lx "
+                   "targetMask=0x%lx — fanning out invalidations\n",
+                   _nodeId, line_pa, upgradeTargetMask);
+
+            // Fanout invalidations to each target sharer
+            // Reuse existing EPBackend invalidation routing path
+            uint64_t homeEpoch = homeUbcc->getEpochForLine(homePa);
+            uint64_t offset = _addrMap.dsmOffset(line_pa);
+
+            uint64_t remainingMask = upgradeTargetMask;
+            for (int s = 0; s < 64 && remainingMask != 0; s++) {
+                uint64_t sBit = (1ULL << s);
+                if (remainingMask & sBit) {
+                    remainingMask &= ~sBit;
+
+                    OuterInvalidateMsg invMsg;
+                    invMsg.linePa = homePa;
+                    invMsg.sharerLocalPa = _addrMap.buildDsmPA(
+                        s, homeNode, offset);
+                    invMsg.sharerNode = s;
+                    invMsg.homeNode = homeNode;
+                    invMsg.epoch = homeEpoch;
+                    invMsg.reqId = reqIdVal;
+
+                    _lastInvalidateMsg = invMsg;
+
+                    // Route invalidation to the sharer node's EPBackend
+                    EPBackend *sharerBackend = EPBackend::getBackendInstance(s);
+                    if (sharerBackend) {
+                        DPRINTF(RubyEP,
+                                "EPBackend node_id=%d: upgrade fanout "
+                                "invalidation to node %d\n", _nodeId, s);
+                        sharerBackend->handleInvalidationRequest(invMsg);
+                    } else {
+                        // Direct ack through home UBCC (fallback)
+                        DPRINTF(RubyEP,
+                                "EPBackend node_id=%d: sharer EPBackend for "
+                                "node %d not found — issuing direct ack\n",
+                                _nodeId, s);
+                        homeUbcc->processInvalidationAck(homePa, s, homeEpoch, reqIdVal);
+                    }
+                }
+            }
+
+            // Ack is NOT ready yet — will be sent when all acks arrive
+            OuterUpgradeAck ack;
+            ack.linePa = homePa;
+            ack.homeNode = homeNode;
+            ack.dstNode = _nodeId;
+            ack.epoch = epochVal;
+            ack.reqId = reqIdVal;
+            ack.accepted = false;  // deferred: not yet ready
+            _lastUpgradeAck = ack;
+        } else {
+            // No other sharers — immediate Ack(true)
+            OuterUpgradeAck ack;
+            ack.linePa = homePa;
+            ack.homeNode = homeNode;
+            ack.dstNode = _nodeId;
+            ack.epoch = epochVal;
+            ack.reqId = reqIdVal;
+            ack.accepted = true;  // immediate: Ack(true) ready now
+            _lastUpgradeAck = ack;
+
+            DPRINTF(RubyEP,
+                    "EPBackend node_id=%d: upgrade accepted immediate "
+                    "PA=0x%lx epoch=%lu reqId=%lu (no other sharers)\n",
+                    _nodeId, line_pa, epochVal, reqIdVal);
+        }
     } else {
         OuterUpgradeAck ack;
         ack.linePa = homePa;
@@ -1440,16 +1525,26 @@ EPBackend::sendClear(uint64_t line_pa, int homeNode,
         return false;
     }
 
+    // upgrade_invalidate_fix D5: prefer PendingGrantTxn.baseEpoch
+    // over caller-supplied epoch for replay/retry correctness
+    uint64_t clearEpoch = epoch;
+    auto txnIt = _pendingGrantTxns.find(line_pa);
+    if (txnIt != _pendingGrantTxns.end() && txnIt->second.valid) {
+        clearEpoch = txnIt->second.baseEpoch;
+        // Invalidate after use (single-consumer)
+        txnIt->second.valid = false;
+    }
+
     OuterClearMsg clearMsg;
     clearMsg.linePa = line_pa;
     clearMsg.srcNode = _nodeId;
     clearMsg.homeNode = homeNode;
-    clearMsg.epoch = epoch;
+    clearMsg.epoch = clearEpoch;
     clearMsg.reqId = reqId;
     clearMsg.reason = ClearReason::GrantHandshake;
     _lastClearMsg = clearMsg;
 
-    bool accepted = homeUbcc->processClear(line_pa, _nodeId, epoch, reqId);
+    bool accepted = homeUbcc->processClear(line_pa, _nodeId, clearEpoch, reqId);
 
     OuterClearAckMsg ack;
     ack.linePa = line_pa;
@@ -1461,6 +1556,27 @@ EPBackend::sendClear(uint64_t line_pa, int homeNode,
     _lastClearAckMsg = ack;
 
     return accepted;
+}
+
+// ---- upgrade_invalidate_fix: upgrade ack callback ----
+
+void
+EPBackend::notifyUpgradeAckReady(uint64_t linePa)
+{
+    // Called by home UBCC when all invalidation acks for an upgrade
+    // have been received. Triggers the deferred receiveUpgradeAck()
+    // on the local EPRNFController so that SnpResp_I can be sent to HN-F.
+    if (_epRnfCtrl) {
+        DPRINTF(RubyEP,
+                "EPBackend node_id=%d: notifyUpgradeAckReady PA=0x%lx "
+                "— triggering deferred receiveUpgradeAck\n",
+                _nodeId, linePa);
+        _epRnfCtrl->receiveUpgradeAck(linePa);
+    } else {
+        warn("EPBackend node_id=%d: notifyUpgradeAckReady PA=0x%lx "
+             "but no EPRNFController registered\n",
+             _nodeId, linePa);
+    }
 }
 
 } // namespace ruby

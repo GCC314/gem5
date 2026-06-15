@@ -128,6 +128,15 @@ struct OutstandingRequest {
     // Upgrade context (§4.1.4)
     UBCC_UpgradeCause upgradeCause;
 
+    // upgrade_invalidate_fix: UPGRADE_PENDING-specific fields
+    uint64_t upgradeTargetMask;      // frozen sharers snapshot (without requester)
+    int      upgradePendingAckCount; // remaining ack count before Ack(true)
+    uint64_t upgradeAckMask;         // bitmask of received InvalidationAck
+    bool     upgradeDoneArrived;     // TENTATIVE: Done arrived before acks complete
+    uint64_t upgradeDoneEpoch;       // TENTATIVE: cached Done epoch
+    uint64_t upgradeDoneReqId;       // TENTATIVE: cached Done reqId
+    OpStage  upgradeSavedStage;      // saved stage when Done arrived early (TENTATIVE)
+
     OutstandingRequest()
         : linePa(0), baseEpoch(0), reservedEpoch(0), reqId(0),
           opType(OpType::GRANT_HANDSHAKE), stage(OpStage::CREATED),
@@ -142,7 +151,10 @@ struct OutstandingRequest {
           accepted(false), dataValid(false),
           dataSource(GrantDataSource::HomeMemory),  // F3
           pendingAckCount(0), ackMask(0), totalMask(0),
-          upgradeCause(UBCC_UpgradeCause::LocalCleanUnique)
+          upgradeCause(UBCC_UpgradeCause::LocalCleanUnique),
+          upgradeTargetMask(0), upgradePendingAckCount(0), upgradeAckMask(0),
+          upgradeDoneArrived(false), upgradeDoneEpoch(0), upgradeDoneReqId(0),
+          upgradeSavedStage(OpStage::CREATED)
     {
         memset(dataBuf, 0, 64);
     }
@@ -345,6 +357,12 @@ class UBCCController
     uint64_t getEpochForLine(uint64_t line_pa) const;
 
     /**
+     * Get the baseEpoch for an outstanding request (0 if not found).
+     * upgrade_invalidate_fix D5: used by EPBackend Clear tuple fix.
+     */
+    uint64_t getOutstandingBaseEpoch(uint64_t line_pa) const;
+
+    /**
      * Get the writeback count (for test observation).
      */
     uint64_t getWritebackCount() const { return _writebackCount; }
@@ -403,6 +421,12 @@ class UBCCController
      * Get the mask of nodes still waiting for invalidation ack.
      */
     uint64_t getPendingInvalidationMask(uint64_t line_pa) const;
+
+    /**
+     * upgrade_invalidate_fix: get the frozen target mask for an
+     * UPGRADE_PENDING outstanding (0 if not found or not UPGRADE_PENDING).
+     */
+    uint64_t getUpgradePendingTargetMask(uint64_t line_pa) const;
 
     /**
      * Get the invalidation count (for test observation).

@@ -229,6 +229,10 @@ class EPRNFController : public EPController
      */
     void setOuterTxnPending(uint64_t linePa, bool pending);
 
+    /** v4: Called by EPBackend when OuterUpgradeAck(true) is received.
+     *  Triggers the deferred SnpResp_I to HN-F. */
+    void receiveUpgradeAck(uint64_t linePa);
+
     // ---- Q2 (deprecated): removed — RN-F should not send snoops ----
     // Snoops are HN-F's responsibility per CHI spec.  Recall/invalidation
     // must go through proper CHI Request path: EP-RNF → HN-F → HN-F handles snooping.
@@ -425,10 +429,6 @@ class EPRNFController : public EPController
                            reqId(0), ackReceived(false) {}
     };
     std::map<uint64_t, UpgradePending> _upgradePending;
-
-    /** v4: Called by EPBackend when OuterUpgradeAck(true) is received.
-     *  Triggers the deferred SnpResp_I to HN-F. */
-    void receiveUpgradeAck(uint64_t linePa);
 
     /** Count of Cache-type controllers (for reference). */
     int _numCacheControllers;
