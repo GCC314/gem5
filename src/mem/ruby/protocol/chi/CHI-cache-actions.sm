@@ -785,7 +785,11 @@ action(Initiate_CleanUnique, desc="") {
   // auto upgrade if HN
   tbe.dataUnique := tbe.dataUnique || is_HN;
   // get unique permission
-  if (tbe.dataUnique == false) {
+  // F6: skip SendCleanUnique for EP-RNF proxy ops — EP_SNF does not
+  // handle CleanUnique and EP-RNF doesn't need data for invalidation.
+  if (tbe.dataUnique == false &&
+      !(epRnfMachineVersion >= 0 && tbe.requestor == tbe.epRnfMachineID &&
+        tbe.epProxyOp != EpProxyOp:NoProxyOp)) {
     tbe.actions.push(Event:SendCleanUnique);
     tbe.actions.push(Event:CheckUpgrade_FromCU);
   }

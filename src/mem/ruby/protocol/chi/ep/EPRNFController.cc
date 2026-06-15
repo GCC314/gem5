@@ -367,8 +367,11 @@ EPRNFController::recvResponseMsg(const CHIResponseMsg *msg)
     // For CleanUnique: no data, just the token.
     // For ReadUnique: data arrives via CompData first, then Comp_UC finalizes.
     if (msg->m_type == CHIResponseType_Comp_UC) {
-        printf("[COMPUC-DIAG] node=%d received Comp_UC PA=0x%lx\n",
-               _nodeId, msg->m_addr);
+        auto it = _pendingChiTxns.find(msg->m_addr);
+        printf("[COMPUC-DIAG] node=%d received Comp_UC PA=0x%lx found=%d needsCompAck=%d\n",
+               _nodeId, msg->m_addr,
+               it != _pendingChiTxns.end(),
+               it != _pendingChiTxns.end() ? it->second.needsCompAck : -1);
         auto it = _pendingChiTxns.find(msg->m_addr);
         if (it != _pendingChiTxns.end() &&
             (it->second.op == PendingChiOp::CleanUnique ||
