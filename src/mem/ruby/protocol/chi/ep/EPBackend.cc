@@ -1567,11 +1567,22 @@ EPBackend::notifyUpgradeAckReady(uint64_t linePa)
     // have been received. Triggers the deferred receiveUpgradeAck()
     // on the local EPRNFController so that SnpResp_I can be sent to HN-F.
     if (_epRnfCtrl) {
+        uint64_t callbackPa = linePa;
+        // receiveUpgradeAck() tracks UpgradePending by requester-local PA,
+        // while home UBCC notifies us with the home-view PA. Translate back
+        // to the requester's local PA so deferred SnpResp_I / UpgradeDone can
+        // find the pending context for cross-node upgrades.
+        int homeNode = _lastUpgradeAck.homeNode;
+        if (homeNode >= 0) {
+            uint64_t offset = _addrMap.dsmOffset(linePa);
+            callbackPa = _addrMap.buildDsmPA(_nodeId, homeNode, offset);
+            _lastUpgradeAck.accepted = true;
+        }
         DPRINTF(RubyEP,
                 "EPBackend node_id=%d: notifyUpgradeAckReady PA=0x%lx "
-                "— triggering deferred receiveUpgradeAck\n",
-                _nodeId, linePa);
-        _epRnfCtrl->receiveUpgradeAck(linePa);
+                "localPA=0x%lx — triggering deferred receiveUpgradeAck\n",
+                _nodeId, linePa, callbackPa);
+        _epRnfCtrl->receiveUpgradeAck(callbackPa);
     } else {
         warn("EPBackend node_id=%d: notifyUpgradeAckReady PA=0x%lx "
              "but no EPRNFController registered\n",

@@ -466,14 +466,17 @@ EPRNFController::recvDataMsg(const CHIDataMsg *msg)
 
     // ---- ReadShared completion ----
     if (it->second.op == PendingChiOp::ReadShared) {
-        // Use msg->m_responder: the HN-F that sent CompData to us
+        // ReadShared can return multiple CompData beats.  Ack each beat and
+        // only finish the txn after the final beat, otherwise the HN-F keeps
+        // waiting for missing CompAck(s) and later CleanUnique/upgrade traffic
+        // on the same sharer line deadlocks.
         it->second.hnfDest = msg->m_responder;
+        it->second.beatsReceived++;
 
-        // F2: Capture recall data from CompData beat
+        // F2: Capture recall data from the most recent CompData beat.
         it->second.recallDataBlk = msg->getdataBlk();
         it->second.recallDataValid = true;
 
-        // Build CompAck message and try to send
         NetDest destNet(m_ruby_system);
         destNet.add(msg->m_responder);
         auto ack = std::make_shared<CHIResponseMsg>(
@@ -482,22 +485,23 @@ EPRNFController::recvDataMsg(const CHIDataMsg *msg)
             m_machineID, destNet,
             false, false, 0, 0, MessageSizeType_Control);
 
-        if (sendResponseMsg(ack)) {
-            // CompAck sent successfully — invoke callback
-            DPRINTF(RubyCHIGeneric,
-                    "EP_RNF node_id=%d: ReadShared complete for PA=0x%lx "
-                    "-- invoking callback\n",
-                    _nodeId, msg->m_addr);
-
-            finishChiTxn(msg->m_addr, true);
-        } else {
-            // CompAck failed — will retry
+        if (!sendResponseMsg(ack)) {
             it->second.needsCompAck = true;
             scheduleEvent(Cycles(1));
             DPRINTF(RubyCHIGeneric,
+                    "EP_RNF node_id=%d: ReadShared CompAck failed for "
+                    "PA=0x%lx beat=%d/%d, will retry\n",
+                    _nodeId, msg->m_addr,
+                    it->second.beatsReceived, it->second.beatsExpected);
+            return true;
+        }
+
+        if (it->second.beatsReceived >= it->second.beatsExpected) {
+            DPRINTF(RubyCHIGeneric,
                     "EP_RNF node_id=%d: ReadShared complete for PA=0x%lx "
-                    "but CompAck failed, will retry\n",
-                    _nodeId, msg->m_addr);
+                    "after %d beat(s) -- invoking callback\n",
+                    _nodeId, msg->m_addr, it->second.beatsReceived);
+            finishChiTxn(msg->m_addr, true);
         }
 
         return true;

@@ -1347,7 +1347,11 @@ UBCCController::processOuterUpgradeReq(
     bool writeIntent = (desiredPerm == 1);  // Unique
     oreq->intendedState = writeIntent ? MESIState::G_M : MESIState::G_E;
     oreq->intendedOwnerNode = requesterNode;
-    oreq->intendedSharersMask = entry.sharersMask & ~reqBit;
+    // upgrade_invalidate_fix: local upgrade commits to owner-only state.
+    // All non-requester sharers in targetMask are being invalidated, and the
+    // requester itself becomes the sole owner (G_E/G_M), so committed sharers
+    // must be cleared instead of preserving the pre-upgrade snapshot.
+    oreq->intendedSharersMask = 0;
     oreq->intendedDirty = writeIntent;
 
     if (targetMask != 0) {
