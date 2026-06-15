@@ -368,9 +368,6 @@ bool reqRdyPort_rsc_stall_handler() {
 void wakeupPendingReqs(TBE tbe) {
   if (tbe.wakeup_pending_req) {
     Addr addr := tbe.addr;
-    if (addr == 0x18000000) {
-      DPRINTF(RubySlicc, "[NF-WAKEUP-REQ] addr=%#x\n", addr);
-    }
     wakeup_port(reqRdyPort, addr);
     tbe.wakeup_pending_req := false;
   }
@@ -386,11 +383,8 @@ in_port(reqInPort, CHIRequestMsg, reqIn, rank=2,
       // DVM Sync and TLBIs from external sources will use txnId requests,
       // but they aren't implemented yet.
       assert(!in_msg.usesTxnId);
-      if (in_msg.addr == 0x18000000) {
-        DPRINTF(RubySlicc, "[NF-REQIN-ARRIVE] addr=%#x type=%d allowRetry=%d activeTBE=%d\n",
-          in_msg.addr, in_msg.type, in_msg.allowRetry,
-          is_valid(getCurrentActiveTBE(in_msg.addr)));
-      }
+      DPRINTF(RubySlicc, "[NF-REQIN-ARRIVE] addr=%#x type=%d allowRetry=%d\n",
+        in_msg.addr, in_msg.type, in_msg.allowRetry);
       if (in_msg.allowRetry) {
         trigger(Event:AllocRequest, in_msg.addr,
               getCacheEntry(in_msg.addr), getCurrentActiveTBE(in_msg.addr));
