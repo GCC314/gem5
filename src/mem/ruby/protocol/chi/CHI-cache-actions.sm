@@ -504,6 +504,11 @@ action(Initiate_ReadShared_Hit, desc="") {
 
 action(Initiate_ReadShared_HitUpstream, desc="") {
   tbe.actions.push(Event:ReadMissPipe);
+  // v4: DCT fallback — if requester is EP-RNF, force non-DCT snoop path
+  if (tbe.use_DCT && epRnfMachineVersion >= 0 &&
+      tbe.requestor == tbe.epRnfMachineID) {
+    tbe.use_DCT := false;
+  }
   // v4: DCT fallback — if sole sharer is EP-RNF, force non-DCT snoop path
   if (tbe.use_DCT && epRnfMachineVersion >= 0 &&
       tbe.dir_sharers.count() == 1 &&
@@ -524,6 +529,11 @@ action(Initiate_ReadShared_HitUpstream, desc="") {
 
 action(Initiate_ReadShared_HitUpstream_NoOwner, desc="") {
   tbe.actions.push(Event:ReadMissPipe);
+  // F7: DCT fallback — if requester is EP-RNF, force non-DCT snoop path
+  if (tbe.use_DCT && epRnfMachineVersion >= 0 &&
+      tbe.requestor == tbe.epRnfMachineID) {
+    tbe.use_DCT := false;
+  }
   // F1: DCT fallback — if sole sharer is EP-RNF, force non-DCT snoop path
   if (tbe.use_DCT && epRnfMachineVersion >= 0 &&
       tbe.dir_sharers.count() == 1 &&
