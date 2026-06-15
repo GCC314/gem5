@@ -320,6 +320,27 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
     // v4: Check for existing requester entry (retry after BUSY/recall).
     // If found, reuse epoch/reqId so that Clear matches GRANT_HANDSHAKE.
     auto existing = _requesterLines.find(line_pa);
+
+    // Same-node duplicate ReadShared coalescing:
+    // another local CPU may miss on the same remote line after a sibling CPU
+    // already obtained R_S/R_E/R_M.  Issuing a brand-new outer request here
+    // clobbers the stable requester-line state back to R_WAIT_GRANT and can
+    // enqueue a pointless duplicate behind a foreign requester, which is what
+    // drives the TC6/TC11 dup_retry stall.  Instead, report BUSY and let HN-F
+    // retry once the earlier fill becomes visible in the local hierarchy.
+    if (neededPerm == 0 && existing != _requesterLines.end()) {
+        RequesterLineState st = existing->second.state;
+        if (st == RequesterLineState::R_S ||
+            st == RequesterLineState::R_E ||
+            st == RequesterLineState::R_M) {
+            DPRINTF(RubyEP,
+                    "EPBackend node_id=%d: duplicate shared miss PA=0x%lx "
+                    "while requester state=%d already covers it — retry local\n",
+                    _nodeId, line_pa, static_cast<int>(st));
+            return -1;
+        }
+    }
+
     bool isRetry = (existing != _requesterLines.end() &&
                     existing->second.state == RequesterLineState::R_WAIT_GRANT);
 
@@ -562,8 +583,16 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
               _nodeId, line_pa, sentinelVisibleTick, grantVisibleTick);
     }
 
-    // Q3: Busy — caller should retry later
+    // Q3: Busy — caller should retry later.
+    // This request never obtained a grant, so the temporary M6 busy window
+    // must be torn down here; otherwise EP-RNF keeps the line marked as
+    // outerTxnPending forever and later retries / delayed snoop responses
+    // can self-deadlock.
     if (static_cast<int>(ubccGrant) < 0) {
+        if (_epRnfCtrl) {
+            _epRnfCtrl->setOuterTxnPending(line_pa, false);
+            _epRnfCtrl->signalOuterTxnComplete(line_pa);
+        }
         return -1;
     }
 

@@ -2933,10 +2933,16 @@ action(Send_CompData, desc="") {
   bool snd_dirty_on_rs := (is_rd_shared && !is_rd_nsd) &&
                           !tbe.dir_ownerExists;
 
-  // v4: When requestor is EP-RNF, force clean-shared semantics.
-  // EP-RNF must always receive CompData_SC, never dirty/unique data.
+  // v4: When requestor is EP-RNF, force clean-shared response semantics
+  // on the wire.  IMPORTANT: for normal EP-RNF requests (NoProxyOp),
+  // this must NOT rewrite the HN-F's own local data/dir bookkeeping.
+  // Those TBE fields describe the controller's final cache/dir state, not
+  // just the outgoing CompData encoding.  Only proxy special completions
+  // (InvalidateOnly / RecallUnique) may scrub the local TBE state here.
   bool is_eprnf_req := epRnfMachineVersion >= 0 &&
                        tbe.requestor == tbe.epRnfMachineID;
+  bool is_eprnf_proxy_req := is_eprnf_req &&
+                             tbe.epProxyOp != EpProxyOp:NoProxyOp;
 
   if (is_rd_once || is_rd_no_snp) {
     tbe.snd_msgType := CHIDataType:CompData_I;
@@ -2945,9 +2951,11 @@ action(Send_CompData, desc="") {
     if (is_eprnf_req) {
       // v4: Force SC semantics for EP-RNF; clear dirty/unique flags
       tbe.snd_msgType := CHIDataType:CompData_SC;
-      tbe.dataDirty := false;
-      tbe.dataUnique := false;
-      tbe.dataMaybeDirtyUpstream := false;
+      if (is_eprnf_proxy_req) {
+        tbe.dataDirty := false;
+        tbe.dataUnique := false;
+        tbe.dataMaybeDirtyUpstream := false;
+      }
     } else if (tbe.dataDirty) {
       tbe.snd_msgType := CHIDataType:CompData_UD_PD;
     } else {
@@ -2960,7 +2968,7 @@ action(Send_CompData, desc="") {
       // notice the MaintainCoherence will send WriteClean if the line
       // is dirty and we won't be caching the data
       tbe.snd_msgType := CHIDataType:CompData_SC;
-      if (is_eprnf_req) {
+      if (is_eprnf_proxy_req) {
         // v4: Force clean-shared for EP-RNF
         tbe.dataDirty := false;
         tbe.dataUnique := false;
