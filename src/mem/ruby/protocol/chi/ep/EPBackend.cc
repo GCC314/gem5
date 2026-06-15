@@ -1212,6 +1212,8 @@ EPBackend::resetOwnerMismatchRejectedCount()
 bool
 EPBackend::handleInvalidationRequest(const OuterInvalidateMsg &invMsg)
 {
+    printf("[INVAL-DIAG] node=%d handleInvalidationRequest PA=0x%lx home=%d sharerLocalPA=0x%lx\n",
+           _nodeId, invMsg.linePa, invMsg.homeNode, invMsg.sharerLocalPa);
     DPRINTF(RubyEP,
             "EPBackend node_id=%d: handleInvalidationRequest "
             "PA=0x%lx sharerNode=%d homeNode=%d epoch=%lu reqId=%lu\n",
@@ -1246,9 +1248,13 @@ EPBackend::handleInvalidationRequest(const OuterInvalidateMsg &invMsg)
     if (_epRnfCtrl) {
         // Capture invMsg by value for the callback
         OuterInvalidateMsg capturedMsg = invMsg;
+        printf("[INVAL-DIAG] node=%d calling startCleanUnique PA=0x%lx\n",
+               _nodeId, capturedMsg.sharerLocalPa);
         _epRnfCtrl->startCleanUnique(
             capturedMsg.sharerLocalPa,
             [this, capturedMsg](bool ok) {
+                printf("[INVAL-DIAG] node=%d startCleanUnique callback PA=0x%lx ok=%d\n",
+                       _nodeId, capturedMsg.linePa, ok);
                 OuterInvalidationAck ack;
                 ack.linePa = capturedMsg.linePa;
                 ack.ackNode = _nodeId;

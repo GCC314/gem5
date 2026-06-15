@@ -367,6 +367,8 @@ EPRNFController::recvResponseMsg(const CHIResponseMsg *msg)
     // For CleanUnique: no data, just the token.
     // For ReadUnique: data arrives via CompData first, then Comp_UC finalizes.
     if (msg->m_type == CHIResponseType_Comp_UC) {
+        printf("[COMPUC-DIAG] node=%d received Comp_UC PA=0x%lx\n",
+               _nodeId, msg->m_addr);
         auto it = _pendingChiTxns.find(msg->m_addr);
         if (it != _pendingChiTxns.end() &&
             (it->second.op == PendingChiOp::CleanUnique ||
@@ -1197,6 +1199,8 @@ EPRNFController::startCleanUnique(uint64_t linePa,
 
     // Check for duplicate pending transaction on this line
     if (_pendingChiTxns.find(linePa) != _pendingChiTxns.end()) {
+        printf("[CLEANUNIQUE-DIAG] node=%d PA=0x%lx DUPLICATE — already has pending txn op=%d\n",
+               _nodeId, linePa, (int)_pendingChiTxns[linePa].op);
         DPRINTF(RubyCHIGeneric,
                 "EP_RNF node_id=%d: startCleanUnique addr=0x%lx "
                 "already has pending txn\n",
@@ -1216,7 +1220,7 @@ EPRNFController::startCleanUnique(uint64_t linePa,
     // CleanUnique returns Comp_UC (completion token only, no data beats)
     txn.beatsExpected = 0;
     txn.beatsReceived = 0;
-    txn.needsCompAck = false;
+    txn.needsCompAck = true;  // F6: must send CompAck to unblock HN-F WaitCompAck
     txn.outerTxnPending = false;
     txn.callbackPayloadStable = false;
     txn.startTick = curTick();
@@ -1226,6 +1230,8 @@ EPRNFController::startCleanUnique(uint64_t linePa,
     // Send CleanUnique to HN-F via reqOut with InvalidateOnly proxy op
     bool sent = sendChiRequest(linePa, CHIRequestType_CleanUnique,
                                EpProxyOp_InvalidateOnly);
+    printf("[CLEANUNIQUE-DIAG] node=%d PA=0x%lx sendChiRequest sent=%d\n",
+           _nodeId, linePa, sent);
     if (!sent) {
         // Send failed — clean up pending txn and notify caller
         _pendingChiTxns.erase(linePa);
