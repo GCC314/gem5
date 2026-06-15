@@ -144,20 +144,73 @@ UBCCController::processOuterRequest(
     ensureDirEntry(line_pa);
     DirEntry &entry = _directory[line_pa];
 
-    // v4: Check for existing outstanding — if active, return BUSY
+    // v4: Check for existing outstanding — if active and belongs to a different
+    // requester, try to enqueue (§4.2, recall_done_fix.md).
+    // Same requester with live outstanding → BUSY (no self-queue).
     OutstandingRequest *existing = findOutstanding(line_pa);
     if (existing) {
-        // v4 D-19: Keep DONE outstanding for recall→grant transition.
-        // Do NOT remove here — let G_E/G_M retry path detect and convert it.
+        // Non-terminal: still active (RECALL WAITING, INVALIDATE WAITING, etc.)
         if (existing->stage != OpStage::DONE &&
             existing->stage != OpStage::CANCELLED &&
             existing->stage != OpStage::TIMED_OUT) {
-            DPRINTF(RubyEP,
-                    "UBCC node_id=%d: existing outstanding PA=0x%lx "
-                    "opType=%d stage=%d — BUSY\n",
-                    _nodeId, line_pa,
-                    static_cast<int>(existing->opType),
-                    static_cast<int>(existing->stage));
+            // Same requester already has live outstanding → BUSY
+            if (existing->requesterNode == requesterNode) {
+                DPRINTF(RubyEP,
+                        "UBCC node_id=%d: existing outstanding PA=0x%lx "
+                        "same requester=%d opType=%d stage=%d — BUSY\n",
+                        _nodeId, line_pa, requesterNode,
+                        static_cast<int>(existing->opType),
+                        static_cast<int>(existing->stage));
+                return static_cast<UBCC_OuterGrantType>(-1);
+            }
+            // recall_done_fix.md §4.2 Case C: different requester — enqueue or drop
+            auto &q = _pendingRequesters[line_pa];
+            bool isRS = (reqType == UBCC_OuterReqType::GlobalReadShared);
+
+            // §4.4: Duplicate retry — same (requester, reqId) already queued → BUSY
+            for (auto &pr : q) {
+                if (pr.node == requesterNode && pr.reqId == reqId) {
+                    printf("[UBCC-QUEUE] pa=0x%lx action=dup_retry "
+                           "requester=%d reqType=%s writeIntent=%d reqId=%lu depth=%zu\n",
+                           line_pa, requesterNode,
+                           isRS ? "RS" : "RU", writeIntent, reqId, q.size());
+                    return static_cast<UBCC_OuterGrantType>(-1);
+                }
+            }
+
+            // §6 Q3=C: RS merge RS — if incoming is RS and queue already has RS, skip
+            bool alreadyHasRS = false;
+            for (auto &pr : q) {
+                if (pr.reqType == UBCC_OuterReqType::GlobalReadShared) {
+                    alreadyHasRS = true;
+                    break;
+                }
+            }
+            if (isRS && alreadyHasRS) {
+                printf("[UBCC-QUEUE] pa=0x%lx action=merge "
+                       "requester=%d reqType=RS writeIntent=0 reqId=%lu depth=%zu\n",
+                       line_pa, requesterNode, reqId, q.size());
+                return static_cast<UBCC_OuterGrantType>(-1);
+            }
+
+            if (q.size() < MAX_PENDING_PER_PA) {
+                PendingRequester pr;
+                pr.node = requesterNode;
+                pr.reqType = reqType;
+                pr.writeIntent = writeIntent;
+                pr.epoch = baseEpoch;
+                pr.reqId = reqId;
+                q.push_back(pr);
+                printf("[UBCC-QUEUE] pa=0x%lx action=enqueue "
+                       "requester=%d reqType=%s writeIntent=%d reqId=%lu depth=%zu\n",
+                       line_pa, requesterNode,
+                       isRS ? "RS" : "RU", writeIntent, reqId, q.size());
+            } else {
+                printf("[UBCC-QUEUE] pa=0x%lx action=drop_full "
+                       "requester=%d reqType=%s writeIntent=%d reqId=%lu depth=%zu\n",
+                       line_pa, requesterNode,
+                       isRS ? "RS" : "RU", writeIntent, reqId, q.size());
+            }
             return static_cast<UBCC_OuterGrantType>(-1);
         }
         // RECALL.DONE or other terminal — keep in map, let case blocks handle transition
@@ -391,6 +444,62 @@ UBCCController::processOuterRequest(
                         grantOreq ? mesiStateName(grantOreq->intendedState)
                                   : "none");
                 return grant;
+            }
+
+            // recall_done_fix.md §4.2 Case B: RECALL.DONE exists but for
+            // a DIFFERENT requester.  Do NOT consume it; enqueue instead.
+            if (rit != _outstandingReqs.end() &&
+                rit->second.opType == OpType::RECALL &&
+                rit->second.stage == OpStage::DONE &&
+                rit->second.requesterNode != requesterNode) {
+                auto &q = _pendingRequesters[line_pa];
+                bool isRS = (reqType == UBCC_OuterReqType::GlobalReadShared);
+
+                // §4.4: Duplicate retry check
+                for (auto &pr : q) {
+                    if (pr.node == requesterNode && pr.reqId == reqId) {
+                        printf("[UBCC-QUEUE] pa=0x%lx action=dup_retry "
+                               "requester=%d reqType=%s writeIntent=%d reqId=%lu depth=%zu\n",
+                               line_pa, requesterNode,
+                               isRS ? "RS" : "RU", writeIntent, reqId, q.size());
+                        return static_cast<UBCC_OuterGrantType>(-1);
+                    }
+                }
+
+                // §6 RS merge
+                bool alreadyHasRS = false;
+                for (auto &pr : q) {
+                    if (pr.reqType == UBCC_OuterReqType::GlobalReadShared) {
+                        alreadyHasRS = true;
+                        break;
+                    }
+                }
+                if (isRS && alreadyHasRS) {
+                    printf("[UBCC-QUEUE] pa=0x%lx action=merge "
+                           "requester=%d reqType=RS writeIntent=0 reqId=%lu depth=%zu\n",
+                           line_pa, requesterNode, reqId, q.size());
+                    return static_cast<UBCC_OuterGrantType>(-1);
+                }
+
+                if (q.size() < MAX_PENDING_PER_PA) {
+                    PendingRequester pr;
+                    pr.node = requesterNode;
+                    pr.reqType = reqType;
+                    pr.writeIntent = writeIntent;
+                    pr.epoch = baseEpoch;
+                    pr.reqId = reqId;
+                    q.push_back(pr);
+                    printf("[UBCC-QUEUE] pa=0x%lx action=enqueue "
+                           "requester=%d reqType=%s writeIntent=%d reqId=%lu depth=%zu\n",
+                           line_pa, requesterNode,
+                           isRS ? "RS" : "RU", writeIntent, reqId, q.size());
+                } else {
+                    printf("[UBCC-QUEUE] pa=0x%lx action=drop_full "
+                           "requester=%d reqType=%s writeIntent=%d reqId=%lu depth=%zu\n",
+                           line_pa, requesterNode,
+                           isRS ? "RS" : "RU", writeIntent, reqId, q.size());
+                }
+                return static_cast<UBCC_OuterGrantType>(-1);
             }
 
             if (existingOwner >= 0 && existingOwner != requesterNode
@@ -1306,6 +1415,10 @@ UBCCController::processClear(
     retireToTombstone(*ost, true);
     removeOutstanding(line_pa);
 
+    // recall_done_fix.md §5: Replay queued pending requesters using the
+    // newly committed state (just committed by this Clear).
+    replayPendingRequesters(line_pa);
+
     // Order log audit (§3.6)
     printf("[UBCC-ORDER] pa=0x%lx epoch=%lu reqId=%lu op=ClearGrantHandshake "
            "requester=%d state=%s\n",
@@ -1387,12 +1500,15 @@ UBCCController::retireToTombstone(const OutstandingRequest &ost, bool accepted)
     ts.opType = OpType::GRANT_HANDSHAKE;
     ts.accepted = accepted;
     ts.expireTick = curTick() + _tombstoneWindowW;
-    _tombstones[ost.linePa] = ts;
+    // §7.4 / recall_done_fix.md: per-PA multi-entry deque so queued replay
+    // doesn't clobber earlier tombstones within window W.
+    _tombstones[ost.linePa].push_back(ts);
 
     DPRINTF(RubyEP,
             "UBCC node_id=%d: retireToTombstone PA=0x%lx "
-            "epoch=%lu reqId=%lu expireTick=%lu\n",
-            _nodeId, ost.linePa, ost.reservedEpoch, ost.reqId, ts.expireTick);
+            "epoch=%lu reqId=%lu expireTick=%lu depth=%zu\n",
+            _nodeId, ost.linePa, ost.reservedEpoch, ost.reqId, ts.expireTick,
+            _tombstones[ost.linePa].size());
 }
 
 bool
@@ -1404,14 +1520,16 @@ UBCCController::checkTombstone(uint64_t linePa, uint64_t epoch, uint64_t reqId,
     if (it == _tombstones.end())
         return false;
 
-    GrantHandshakeTombstone &ts = it->second;
-    if (ts.epoch == epoch && ts.reqId == reqId) {
-        outAccepted = ts.accepted;
-        DPRINTF(RubyEP,
-                "UBCC node_id=%d: checkTombstone HIT PA=0x%lx "
-                "epoch=%lu reqId=%lu accepted=%d\n",
-                _nodeId, linePa, epoch, reqId, ts.accepted);
-        return true;
+    // §7.4 / recall_done_fix.md: scan the deque for matching (epoch, reqId)
+    for (auto &ts : it->second) {
+        if (ts.epoch == epoch && ts.reqId == reqId) {
+            outAccepted = ts.accepted;
+            DPRINTF(RubyEP,
+                    "UBCC node_id=%d: checkTombstone HIT PA=0x%lx "
+                    "epoch=%lu reqId=%lu accepted=%d\n",
+                    _nodeId, linePa, epoch, reqId, ts.accepted);
+            return true;
+        }
     }
     return false;
 }
@@ -1421,16 +1539,79 @@ UBCCController::cleanupTombstones()
 {
     Tick now = curTick();
     for (auto it = _tombstones.begin(); it != _tombstones.end(); ) {
-        if (it->second.expireTick <= now) {
+        auto &deq = it->second;
+        // Remove expired entries from the front (FIFO push order)
+        while (!deq.empty() && deq.front().expireTick <= now) {
             DPRINTF(RubyEP,
                     "UBCC node_id=%d: tombstone expired PA=0x%lx "
                     "epoch=%lu reqId=%lu\n",
-                    _nodeId, it->second.linePa,
-                    it->second.epoch, it->second.reqId);
+                    _nodeId, deq.front().linePa,
+                    deq.front().epoch, deq.front().reqId);
+            deq.pop_front();
+        }
+        if (deq.empty()) {
             it = _tombstones.erase(it);
         } else {
             ++it;
         }
+    }
+}
+
+// ---- recall_done_fix.md §5: Replay queued pending requesters ----
+void
+UBCCController::replayPendingRequesters(uint64_t linePa)
+{
+    auto qit = _pendingRequesters.find(linePa);
+    if (qit == _pendingRequesters.end() || qit->second.empty())
+        return;
+
+    // Get current committed entry (just committed by Clear or UpgradeDone)
+    auto dit = _directory.find(linePa);
+    if (dit == _directory.end())
+        return;
+    DirEntry &entry = dit->second;
+
+    // Replay all queued entries one by one, each as a fresh processOuterRequest
+    // with rebased epoch against the NEW committed state.
+    while (!qit->second.empty()) {
+        PendingRequester pr = qit->second.front();
+        qit->second.pop_front();
+
+        // §5.2: Rebase epoch to newly committed epoch (the Clear just advanced it)
+        uint64_t rebaseEpoch = entry.epoch;
+
+        printf("[UBCC-QUEUE-REPLAY] pa=0x%lx requester=%d reqType=%s "
+               "writeIntent=%d reqId=%lu originalEpoch=%lu rebaseEpoch=%lu "
+               "committedState=%s\n",
+               linePa, pr.node,
+               (pr.reqType == UBCC_OuterReqType::GlobalReadShared) ? "RS" : "RU",
+               pr.writeIntent, pr.reqId, pr.epoch, rebaseEpoch,
+               mesiStateName(entry.state));
+
+        // Replay as fresh processOuterRequest — it sees the NEW committed state.
+        // The outcome depends on the current committed state:
+        //   G_S + RS → direct GRANT_HANDSHAKE (no recall/invalidate)
+        //   G_S + RU → INVALIDATE + GRANT_HANDSHAKE
+        //   G_E/G_M + RS/RU → new RECALL + GRANT_HANDSHAKE
+        processOuterRequest(linePa, pr.reqType, pr.writeIntent,
+                            pr.node, rebaseEpoch, pr.reqId,
+                            nullptr, nullptr, nullptr, nullptr, nullptr);
+
+        // If the replay created a new live outstanding, stop here.
+        // The remainder of the queue will be replayed when that outstanding's
+        // Clear commits (chained replay).
+        if (findOutstanding(linePa)) {
+            // Live outstanding created — break, remaining queue stays
+            break;
+        }
+        // No outstanding created (e.g., immediate grant that returned BUSY
+        // because the entry was already enqueued elsewhere) — continue to
+        // next queued entry.
+    }
+
+    // Clean up empty queue to avoid stale entries
+    if (qit->second.empty()) {
+        _pendingRequesters.erase(qit);
     }
 }
 

@@ -3,6 +3,7 @@
 
 #include <cstdint>
 #include <cstring>
+#include <deque>
 #include <map>
 #include <set>
 #include <string>
@@ -168,6 +169,24 @@ struct GrantHandshakeTombstone {
 class UBCCController
 {
   public:
+    // §3.1: Pending requester atom — queued behind live outstanding.
+    // Per recall_done_fix.md: RECALL.DONE is requester-private; foreign
+    // requesters are queued here until the head requester's Clear commits.
+    struct PendingRequester {
+        int node;                 // Requester node ID
+        UBCC_OuterReqType reqType; // RS or RU
+        bool writeIntent;          // True for RU with write intent
+        uint64_t epoch;            // Observed epoch at enqueue time
+        uint64_t reqId;            // Requester-allocated ID, reused on replay
+
+        PendingRequester()
+            : node(-1), reqType(UBCC_OuterReqType::GlobalReadShared),
+              writeIntent(false), epoch(0), reqId(0) {}
+    };
+
+    // Maximum pending requesters per PA (configurable queue depth)
+    static constexpr size_t MAX_PENDING_PER_PA = 4;
+
     UBCCController(int node_id, RubySystem *ruby_system = nullptr);
     ~UBCCController();
 
@@ -497,7 +516,14 @@ class UBCCController
     // ---- v4: Grant handshake tombstone table (§3.5) ----
     // Completed GRANT_HANDSHAKE operations become tombstones for W ticks,
     // enabling idempotent duplicate Clear replay.
-    std::map<uint64_t, GrantHandshakeTombstone> _tombstones;
+    // §7.4 / recall_done_fix.md: per-PA multi-entry deque so queued replay
+    // doesn't clobber earlier tombstones within window W.
+    std::map<uint64_t, std::deque<GrantHandshakeTombstone>> _tombstones;
+
+    // ---- recall_done_fix.md: Pending requester queue per PA ----
+    // Foreign requesters that arrive while a live outstanding exists for
+    // the same PA are queued here.  Replayed on Clear commit.
+    std::map<uint64_t, std::deque<PendingRequester>> _pendingRequesters;
 
     // ---- v4: Tombstone window (configurable, default 100000 ticks) ----
     Tick _tombstoneWindowW = 100000;
@@ -573,6 +599,14 @@ class UBCCController
      * Remove expired tombstones.
      */
     void cleanupTombstones();
+
+    /**
+     * Replay queued pending requesters after a Clear commit.
+     * Called from processClear() after committing intended result.
+     * Dequeues the head requester and calls processOuterRequest()
+     * with rebased epoch against the NEW committed state.
+     */
+    void replayPendingRequesters(uint64_t linePa);
 
     /**
      * Allocate a monotonic reqId from the directory.
