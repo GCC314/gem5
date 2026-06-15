@@ -1137,6 +1137,7 @@ EPRNFController::startReadShared(uint64_t linePa,
     txn.beatsExpected = dataMsgsPerLine;
     txn.beatsReceived = 0;
     txn.needsCompAck = false;
+    txn.recallDataValid = false;
     txn.outerTxnPending = false;
     txn.callbackPayloadStable = false;
     txn.startTick = curTick();
@@ -1184,6 +1185,7 @@ EPRNFController::startReadUnique(uint64_t linePa,
     txn.beatsExpected = dataMsgsPerLine;
     txn.beatsReceived = 0;
     txn.needsCompAck = false;
+    txn.recallDataValid = false;
     txn.outerTxnPending = false;
     txn.callbackPayloadStable = false;
     txn.startTick = curTick();
@@ -1233,6 +1235,7 @@ EPRNFController::startCleanUnique(uint64_t linePa,
     txn.beatsExpected = 0;
     txn.beatsReceived = 0;
     txn.needsCompAck = true;  // F6: must send CompAck to unblock HN-F WaitCompAck
+    txn.recallDataValid = false;
     txn.outerTxnPending = false;
     txn.callbackPayloadStable = false;
     txn.startTick = curTick();
