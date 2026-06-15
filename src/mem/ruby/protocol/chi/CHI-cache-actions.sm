@@ -3708,6 +3708,10 @@ action(CheckCacheFill, desc="") {
 action(Finalize_DeallocateRequest, desc="") {
   assert(is_valid(tbe));
   assert(tbe.actions.empty());
+  if (tbe.addr == 0x18000000) {
+    DPRINTF(RubySlicc, "[NF-FINAL-DEALLOC] addr=%#x reqType=%d isReqTBE=%d\n",
+      tbe.addr, tbe.reqType, tbe.is_req_tbe);
+  }
   wakeupPendingReqs(tbe);
   wakeupPendingSnps(tbe);
   wakeupPendingTgrs(tbe);
