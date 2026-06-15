@@ -323,6 +323,19 @@ UBCCController::processOuterRequest(
                 if (requesterNode >= 0)
                     otherSharers &= ~(1ULL << requesterNode);
 
+                // F6: If requester is an existing sharer, this is a local
+                // upgrade. Defer to the UPGRADE_PENDING path (§4.1.3 G_S row).
+                // Do NOT create INVALIDATE here — let processOuterUpgradeReq
+                // handle it via the EP-RNF upgrade handshake.
+                bool isExistingSharer = (requesterNode >= 0) &&
+                    (entry.sharersMask & (1ULL << requesterNode));
+                if (isExistingSharer) {
+                    printf("[UBCC-SHARER-UPGRADE] pa=0x%lx requester=%d "
+                           "is existing sharer — deferring to UPGRADE_PENDING\n",
+                           line_pa, requesterNode);
+                    return static_cast<UBCC_OuterGrantType>(-1);
+                }
+
                 if (otherSharers != 0) {
                     // v4: Create INVALIDATE + GRANT_HANDSHAKE
                     // INVALIDATE outstanding
