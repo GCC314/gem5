@@ -939,7 +939,7 @@ EPRNFController::finishChiTxn(uint64_t linePa, bool success)
             txnIt->second.recallDataBlk, true);
     } else if (_backend) {
         _backend->setRecallCaptureData(
-            DataBlock(), false);  // invalidate previous capture
+            DataBlock(cacheLineSize), false);  // invalidate previous capture
     }
 
     // Erase completed transaction
