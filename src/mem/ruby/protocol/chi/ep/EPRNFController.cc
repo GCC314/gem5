@@ -379,10 +379,9 @@ EPRNFController::recvResponseMsg(const CHIResponseMsg *msg)
     if (msg->m_type == CHIResponseType_Comp_UC) {
         auto it = _pendingChiTxns.find(msg->m_addr);
         printf("[COMPUC-DIAG] node=%d received Comp_UC PA=0x%lx found=%d needsCompAck=%d\n",
-           _nodeId, msg->m_addr,
-           it != _pendingChiTxns.end(),
-           it != _pendingChiTxns.end() ? it->second.needsCompAck : -1);
-        auto it = _pendingChiTxns.find(msg->m_addr);
+               _nodeId, msg->m_addr,
+               it != _pendingChiTxns.end(),
+               it != _pendingChiTxns.end() ? it->second.needsCompAck : -1);
         if (it != _pendingChiTxns.end() &&
             (it->second.op == PendingChiOp::CleanUnique ||
              it->second.op == PendingChiOp::ReadUnique)) {
