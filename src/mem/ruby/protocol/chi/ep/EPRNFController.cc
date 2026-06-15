@@ -357,6 +357,16 @@ EPRNFController::recvResponseMsg(const CHIResponseMsg *msg)
             "EP_RNF node_id=%d recvResponseMsg type=%s addr=0x%lx\n",
             _nodeId, CHIResponseType_to_string(msg->m_type), msg->m_addr);
 
+    // F6-diagnostic: log RetryAck/PCrdGrant for CleanUnique debugging
+    if (msg->m_type == CHIResponseType_RetryAck ||
+        msg->m_type == CHIResponseType_PCrdGrant) {
+        auto it = _pendingChiTxns.find(msg->m_addr);
+        printf("[EPRNF-RETRY-DIAG] node=%d type=%s PA=0x%lx chiInFlight=%d pendingFound=%d\n",
+               _nodeId, msg->m_type == CHIResponseType_RetryAck ? "RetryAck" : "PCrdGrant",
+               msg->m_addr, _chiRequestInFlight,
+               it != _pendingChiTxns.end());
+    }
+
     // CompAck from HN-F or other agents: ignore (not tracking req responses)
     if (msg->m_type == CHIResponseType_CompAck) {
         return true;
@@ -369,9 +379,9 @@ EPRNFController::recvResponseMsg(const CHIResponseMsg *msg)
     if (msg->m_type == CHIResponseType_Comp_UC) {
         auto it = _pendingChiTxns.find(msg->m_addr);
         printf("[COMPUC-DIAG] node=%d received Comp_UC PA=0x%lx found=%d needsCompAck=%d\n",
-               _nodeId, msg->m_addr,
-               it != _pendingChiTxns.end(),
-               it != _pendingChiTxns.end() ? it->second.needsCompAck : -1);
+           _nodeId, msg->m_addr,
+           it != _pendingChiTxns.end(),
+           it != _pendingChiTxns.end() ? it->second.needsCompAck : -1);
         auto it = _pendingChiTxns.find(msg->m_addr);
         if (it != _pendingChiTxns.end() &&
             (it->second.op == PendingChiOp::CleanUnique ||

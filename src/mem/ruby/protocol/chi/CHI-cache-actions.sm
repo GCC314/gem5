@@ -262,6 +262,14 @@ action(Initiate_Request, desc="") {
   DirEntry dir_entry := getDirEntry(address);
   copyCacheAndDir(cache_entry, dir_entry, tbe, initial);
 
+  // F6-diag: log CleanUnique start
+  if (tbe.reqType == CHIRequestType:CleanUnique) {
+    DPRINTF(RubySlicc,
+      "[HNF-CU-START] addr=%#x epProxy=%d sharers=%d owner=%d dataValid=%d dataUnique=%d\n",
+      address, tbe.epProxyOp, tbe.dir_sharers.count(), tbe.dir_ownerExists,
+      tbe.dataValid, tbe.dataUnique);
+  }
+
   tbe.use_DMT := is_HN && enable_DMT;
   tbe.use_DCT := enable_DCT;
 
@@ -422,6 +430,14 @@ action(StallRequest, desc="") {
   assert(tbe.addr == address);
   // tracks pending
   tbe.wakeup_pending_req := true;
+
+  // F6-diag: log CleanUnique stall
+  if (tbe.reqType == CHIRequestType:CleanUnique) {
+    DPRINTF(RubySlicc,
+      "[HNF-CU-STALLED] addr=%#x activeReq=%d pendReq=%d expReq=%d expSnp=%d\n",
+      address, tbe.reqType, tbe.pendReqType,
+      tbe.expected_req_resp.expected(), tbe.expected_snp_resp.expected());
+  }
   stall_and_wait(reqRdyPort, address);
 }
 
@@ -809,6 +825,11 @@ action(Initiate_CleanUnique_Stale, desc="") {
 action(Finish_CleanUnique, desc="") {
   // This is should be executed at the end of a transaction
   assert(tbe.actions.empty());
+
+  // F6-diag: log stale path decision
+  DPRINTF(RubySlicc, "[HNF-CU-FINISH] addr=%#x epProxy=%d inSharers=%d count=%d\n",
+          address, tbe.epProxyOp, tbe.dir_sharers.isElement(tbe.requestor),
+          tbe.dir_sharers.count());
 
   // everyone may have been hit by an invalidation so check again
   if (tbe.dir_sharers.isElement(tbe.requestor) == false) {
@@ -1915,6 +1936,8 @@ action(Send_SnpCleanInvalid_NoReq, desc="") {
     out_msg.ns := tbe.ns;
     setExpectedForInvSnoop(tbe, false);
     tbe.expected_snp_resp.setExpectedCount(out_msg.Destination.count());
+    DPRINTF(RubySlicc, "[HNF-CU-SNPCLN] addr=%#x targets=%d\n",
+            address, out_msg.Destination.count());
   }
 }
 
@@ -2322,6 +2345,8 @@ action(Receive_SnpDataResp, desc="") {
     if (tbe.expected_snp_resp.receiveData(in_msg.type) == false) {
       error("Received unexpected message");
     }
+    DPRINTF(RubySlicc, "[HNF-CU-SNPDATARESP] addr=%#x type=%d remain=%d\n",
+            address, in_msg.type, tbe.expected_snp_resp.expected());
     // Copy data to tbe only if we didn't have valid data or the received
     // data is dirty
     if ((tbe.dataBlkValid.isFull() == false) ||
@@ -2807,6 +2832,8 @@ action(Receive_SnpResp, desc="") {
       error("Received unexpected message");
     }
     assert(in_msg.stale == tbe.is_stale);
+    DPRINTF(RubySlicc, "[HNF-CU-SNPRESP] addr=%#x type=%d remain=%d\n",
+            address, in_msg.type, tbe.expected_snp_resp.expected());
   }
 }
 
@@ -3299,6 +3326,7 @@ action(Send_CompI, desc="") {
 
 action(Send_CompUC, desc="") {
   assert(is_valid(tbe));
+  DPRINTF(RubySlicc, "[HNF-CU-COMPUC] addr=%#x stale=0\n", address);
   enqueue(rspOutPort, CHIResponseMsg, response_latency) {
     out_msg.addr := address;
     out_msg.type := CHIResponseType:Comp_UC;
@@ -3311,6 +3339,7 @@ action(Send_CompUC, desc="") {
 
 action(Send_CompUC_Stale, desc="") {
   assert(is_valid(tbe));
+  DPRINTF(RubySlicc, "[HNF-CU-COMPUC] addr=%#x stale=1\n", address);
   enqueue(rspOutPort, CHIResponseMsg, response_latency) {
     out_msg.addr := address;
     out_msg.type := CHIResponseType:Comp_UC;
