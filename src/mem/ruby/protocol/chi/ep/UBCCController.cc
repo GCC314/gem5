@@ -180,10 +180,10 @@ UBCCController::processOuterRequest(
                             "requester=%d reqId=%lu intended=%s — granting\n",
                             _nodeId, line_pa, requesterNode, reqId,
                             mesiStateName(existing->intendedState));
-                    if (dataSource) *dataSource = GrantDataSource::HomeMemory;
-                    if (grantVisibleTick) *grantVisibleTick = curTick();
-                    if (recallNeeded) *recallNeeded = false;
-                    if (recallOwnerNode) *recallOwnerNode = -1;
+                    if (outDataSource) *outDataSource = GrantDataSource::HomeMemory;
+                    if (outGrantVisibleTick) *outGrantVisibleTick = curTick();
+                    if (outRecallNeeded) *outRecallNeeded = false;
+                    if (outRecallOwnerNode) *outRecallOwnerNode = -1;
                     return grantTypeFromIntended(existing->intendedState);
                 }
                 DPRINTF(RubyEP,
