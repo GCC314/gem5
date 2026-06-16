@@ -657,18 +657,13 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
     // v4: Populate grant data using formal F3 data source
     populateGrantData(homePa, dataSource);
 
-    // ---- M6: Clear outer txn pending and signal completion ----
+    sendClear(homePa, homeNode, grantEnv.epoch, grantEnv.reqId);
+
+    // ---- M6: Clear outer txn pending and signal completion (after Clear) ----
     if (_epRnfCtrl) {
         _epRnfCtrl->setOuterTxnPending(line_pa, false);
         _epRnfCtrl->signalOuterTxnComplete(line_pa);
     }
-
-    // v4: Send Clear to home UBCC to commit the GRANT_HANDSHAKE intended result.
-    // Per §3.3, §3.5, §5.1-5.4: the commit point for normal misses is when
-    // home accepts the matching Clear, not when the grant was first emitted.
-    // F2: Use grant envelope tuple (epoch, reqId), not entry.epoch which may
-    // have been overwritten by a subsequent retry.
-    sendClear(homePa, homeNode, grantEnv.epoch, grantEnv.reqId);
 
     return static_cast<int>(result);
 
@@ -1585,13 +1580,6 @@ EPBackend::sendClear(uint64_t line_pa, int homeNode,
         clearEpoch = txnIt->second.baseEpoch;
         // Invalidate after use (single-consumer)
         txnIt->second.valid = false;
-    }
-
-    // Q1: If outstanding already consumed by another node's Clear, soft-skip.
-    if (homeUbcc && homeUbcc->getOutstandingBaseEpoch(line_pa) == 0) {
-        printf("[SENDCLEAR-SKIP] node=%d PA=0x%lx epoch=%lu reqId=%lu\n",
-               _nodeId, line_pa, clearEpoch, reqId);
-        return true;
     }
 
     OuterClearMsg clearMsg;

@@ -147,7 +147,7 @@ struct OutstandingRequest {
           reqType(UBCC_OuterReqType::GlobalReadShared),
           writeIntent(false),
           recallBarrierDone(false), invalidateBarrierDone(false),
-          clearAckCached(false),
+          clearAckCached(false), replayArmed(false),
           createTick(0), respTick(0), deadlineTick(0),
           accepted(false), dataValid(false),
           dataSource(GrantDataSource::HomeMemory),  // F3
