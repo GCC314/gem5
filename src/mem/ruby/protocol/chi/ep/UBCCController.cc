@@ -103,6 +103,18 @@ UBCCController::mesiStateName(MESIState s) const
     }
 }
 
+// F24: Map intended MESI state to outer grant type
+static UBCC_OuterGrantType
+grantTypeFromIntended(MESIState s)
+{
+    switch (s) {
+        case MESIState::G_S: return UBCC_OuterGrantType::GlobalGrantShared;
+        case MESIState::G_E: return UBCC_OuterGrantType::GlobalGrantExclusive;
+        case MESIState::G_M: return UBCC_OuterGrantType::GlobalGrantModified;
+        default: return UBCC_OuterGrantType::GlobalGrantShared;
+    }
+}
+
 UBCC_OuterGrantType
 UBCCController::processOuterRequest(
     uint64_t line_pa, UBCC_OuterReqType reqType, bool writeIntent,
@@ -154,7 +166,26 @@ UBCCController::processOuterRequest(
             existing->stage != OpStage::CANCELLED &&
             existing->stage != OpStage::TIMED_OUT) {
             // Same requester already has live outstanding → BUSY
+            // F24: Unless this outstanding was created by replay (replayArmed=true)
+            // and the retry matches the grant tuple — then return the grant directly.
             if (existing->requesterNode == requesterNode) {
+                if (existing->replayArmed &&
+                    existing->stage == OpStage::WAITING_CLEAR &&
+                    existing->reqId == reqId &&
+                    existing->reqType == reqType &&
+                    existing->writeIntent == writeIntent) {
+                    // Retry hit on replay-armed grant — return the grant
+                    DPRINTF(RubyEP,
+                            "UBCC node_id=%d: replayArmed hit PA=0x%lx "
+                            "requester=%d reqId=%lu intended=%s — granting\n",
+                            _nodeId, line_pa, requesterNode, reqId,
+                            mesiStateName(existing->intendedState));
+                    if (dataSource) *dataSource = GrantDataSource::HomeMemory;
+                    if (grantVisibleTick) *grantVisibleTick = curTick();
+                    if (recallNeeded) *recallNeeded = false;
+                    if (recallOwnerNode) *recallOwnerNode = -1;
+                    return grantTypeFromIntended(existing->intendedState);
+                }
                 DPRINTF(RubyEP,
                         "UBCC node_id=%d: existing outstanding PA=0x%lx "
                         "same requester=%d opType=%d stage=%d — BUSY\n",
@@ -1793,6 +1824,12 @@ UBCCController::replayPendingRequesters(uint64_t linePa)
         // Clear commits (chained replay).
         if (findOutstanding(linePa)) {
             // Live outstanding created — break, remaining queue stays
+            // F24: Mark the grant as replay-armed so the requester's
+            // retry can hit it directly instead of being marked dup_retry.
+            OutstandingRequest *ost = findOutstanding(linePa);
+            if (ost) {
+                ost->replayArmed = true;
+            }
             break;
         }
         // No outstanding created (e.g., immediate grant that returned BUSY

@@ -105,6 +105,7 @@ struct OutstandingRequest {
     bool     recallBarrierDone;
     bool     invalidateBarrierDone;
     bool     clearAckCached;     // True if ClearAck has been cached for tombstone replay
+    bool     replayArmed;        // True if this grant was created by replay (retry-hit allowed)
 
     // Timing
     Tick     createTick;
