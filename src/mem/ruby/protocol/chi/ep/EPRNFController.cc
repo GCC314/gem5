@@ -386,19 +386,10 @@ EPRNFController::recvResponseMsg(const CHIResponseMsg *msg)
             (it->second.op == PendingChiOp::CleanUnique ||
              it->second.op == PendingChiOp::ReadUnique)) {
 
-            // For ReadUnique: only complete if all data beats received
-            if (it->second.op == PendingChiOp::ReadUnique &&
-                it->second.beatsReceived < it->second.beatsExpected) {
-                // Still waiting for data beats — defer completion
-                DPRINTF(RubyCHIGeneric,
-                        "EP_RNF node_id=%d: Comp_UC for ReadUnique at "
-                        "PA=0x%lx but waiting for data beats (%d/%d), "
-                        "deferring\n",
-                        _nodeId, msg->m_addr,
-                        it->second.beatsReceived, it->second.beatsExpected);
-                // Mark that Comp_UC arrived; completion when data beats done
-                it->second.callbackPayloadStable = true;
-                it->second.hnfDest = msg->m_responder;
+            // For ReadUnique: data beats drive completion, not Comp_UC.
+            // The last data beat already sent CompAck + finishChiTxn.
+            // If we get here, beats may still be pending — defer.
+            if (it->second.op == PendingChiOp::ReadUnique) {
                 return true;
             }
 
@@ -480,44 +471,27 @@ EPRNFController::recvDataMsg(const CHIDataMsg *msg)
 
     // ---- ReadShared completion ----
     if (it->second.op == PendingChiOp::ReadShared) {
-        // ReadShared can return multiple CompData beats.  Ack each beat and
-        // only finish the txn after the final beat, otherwise the HN-F keeps
-        // waiting for missing CompAck(s) and later CleanUnique/upgrade traffic
-        // on the same sharer line deadlocks.
         it->second.hnfDest = msg->m_responder;
         it->second.beatsReceived++;
-
-        // F2: Capture recall data from the most recent CompData beat.
         it->second.recallDataBlk = msg->getdataBlk();
         it->second.recallDataValid = true;
 
-        NetDest destNet(m_ruby_system);
-        destNet.add(msg->m_responder);
-        auto ack = std::make_shared<CHIResponseMsg>(
-            curTick(), cacheLineSize, m_ruby_system,
-            msg->m_addr, CHIResponseType_CompAck,
-            m_machineID, destNet,
-            false, false, 0, 0, MessageSizeType_Control);
-
-        if (!sendResponseMsg(ack)) {
-            it->second.needsCompAck = true;
-            scheduleEvent(Cycles(1));
-            DPRINTF(RubyCHIGeneric,
-                    "EP_RNF node_id=%d: ReadShared CompAck failed for "
-                    "PA=0x%lx beat=%d/%d, will retry\n",
-                    _nodeId, msg->m_addr,
-                    it->second.beatsReceived, it->second.beatsExpected);
-            return true;
-        }
-
+        // Send CompAck only on last beat (HN-F expects exactly 1 per txn)
         if (it->second.beatsReceived >= it->second.beatsExpected) {
-            DPRINTF(RubyCHIGeneric,
-                    "EP_RNF node_id=%d: ReadShared complete for PA=0x%lx "
-                    "after %d beat(s) -- invoking callback\n",
-                    _nodeId, msg->m_addr, it->second.beatsReceived);
+            NetDest destNet(m_ruby_system);
+            destNet.add(msg->m_responder);
+            auto ack = std::make_shared<CHIResponseMsg>(
+                curTick(), cacheLineSize, m_ruby_system,
+                msg->m_addr, CHIResponseType_CompAck,
+                m_machineID, destNet,
+                false, false, 0, 0, MessageSizeType_Control);
+            if (!sendResponseMsg(ack)) {
+                it->second.needsCompAck = true;
+                scheduleEvent(Cycles(1));
+                return true;
+            }
             finishChiTxn(msg->m_addr, true);
         }
-
         return true;
     }
 
@@ -528,46 +502,25 @@ EPRNFController::recvDataMsg(const CHIDataMsg *msg)
     if (it->second.op == PendingChiOp::ReadUnique) {
         it->second.hnfDest = msg->m_responder;
         it->second.beatsReceived++;
-
-        // F2: Capture recall data from first/most recent CompData beat
         it->second.recallDataBlk = msg->getdataBlk();
         it->second.recallDataValid = true;
 
-        DPRINTF(RubyCHIGeneric,
-                "EP_RNF node_id=%d: ReadUnique data beat %d/%d for "
-                "PA=0x%lx\n",
-                _nodeId, it->second.beatsReceived,
-                it->second.beatsExpected, msg->m_addr);
-
-        // Send CompAck for each data beat (CHI requires per-beat CompAck)
-        NetDest destNet(m_ruby_system);
-        destNet.add(msg->m_responder);
-        auto ack = std::make_shared<CHIResponseMsg>(
-            curTick(), cacheLineSize, m_ruby_system,
-            msg->m_addr, CHIResponseType_CompAck,
-            m_machineID, destNet,
-            false, false, 0, 0, MessageSizeType_Control);
-
-        if (!sendResponseMsg(ack)) {
-            // CompAck failed — will retry
-            it->second.needsCompAck = true;
-            scheduleEvent(Cycles(1));
-            DPRINTF(RubyCHIGeneric,
-                    "EP_RNF node_id=%d: ReadUnique CompAck failed for "
-                    "PA=0x%lx, will retry\n",
-                    _nodeId, msg->m_addr);
-        }
-
-        // Non-DCT ReadUnique: all CompData beats received = complete.
-        // Comp_UC is only used for CleanUnique; ReadUnique completion
-        // is driven by the last data beat.
+        // Only send CompAck on last beat. HN-F expects exactly 1 per txn.
         if (it->second.beatsReceived >= it->second.beatsExpected) {
-            printf("[EPRNF-RU-DONE] node=%d PA=0x%lx beats=%d/%d\n",
-                   _nodeId, msg->m_addr,
-                   it->second.beatsReceived, it->second.beatsExpected);
+            NetDest destNet(m_ruby_system);
+            destNet.add(msg->m_responder);
+            auto ack = std::make_shared<CHIResponseMsg>(
+                curTick(), cacheLineSize, m_ruby_system,
+                msg->m_addr, CHIResponseType_CompAck,
+                m_machineID, destNet,
+                false, false, 0, 0, MessageSizeType_Control);
+            if (!sendResponseMsg(ack)) {
+                it->second.needsCompAck = true;
+                scheduleEvent(Cycles(1));
+                return true;
+            }
             finishChiTxn(msg->m_addr, true);
         }
-
         return true;
     }
 
