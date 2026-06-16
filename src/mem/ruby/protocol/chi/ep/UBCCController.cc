@@ -253,7 +253,7 @@ UBCCController::processOuterRequest(
 
     // v4: Check tombstone for duplicate Clear within window W
     bool tsAccepted = false;
-    if (checkTombstone(line_pa, entry.epoch, reqId, tsAccepted)) {
+    if (checkTombstone(line_pa, baseEpoch, reqId, tsAccepted)) {
         // Already committed — return idempotent grant
         DPRINTF(RubyEP,
                 "UBCC node_id=%d: tombstone HIT for PA=0x%lx — idempotent grant\n",
@@ -296,6 +296,7 @@ UBCCController::processOuterRequest(
                     oreq->intendedDirty = false;
                     oreq->dataSource = GrantDataSource::HomeMemory;
                     if (outDataSource) *outDataSource = GrantDataSource::HomeMemory;
+                    if (outAuthEpoch) *outAuthEpoch = oreq->baseEpoch;
                 }
             } else { // GlobalReadUnique
                 if (!writeIntent) {
@@ -313,6 +314,7 @@ UBCCController::processOuterRequest(
                         oreq->intendedDirty = false;
                         oreq->dataSource = GrantDataSource::HomeMemory;
                         if (outDataSource) *outDataSource = GrantDataSource::HomeMemory;
+                        if (outAuthEpoch) *outAuthEpoch = oreq->baseEpoch;
                     }
                 } else {
                     grant = UBCC_OuterGrantType::GlobalGrantModified;
@@ -329,6 +331,7 @@ UBCCController::processOuterRequest(
                         oreq->intendedDirty = true;
                         oreq->dataSource = GrantDataSource::HomeMemory;
                         if (outDataSource) *outDataSource = GrantDataSource::HomeMemory;
+                        if (outAuthEpoch) *outAuthEpoch = oreq->baseEpoch;
                     }
                 }
             }
@@ -351,6 +354,7 @@ UBCCController::processOuterRequest(
                     oreq->intendedDirty = false;
                     oreq->dataSource = GrantDataSource::HomeMemory;
                     if (outDataSource) *outDataSource = GrantDataSource::HomeMemory;
+                    if (outAuthEpoch) *outAuthEpoch = oreq->baseEpoch;
                 }
             } else {
                 // Unique request — invalidation needed for non-requester sharers
@@ -391,6 +395,7 @@ UBCCController::processOuterRequest(
                         invOreq->intendedSharersMask = 0;
                         invOreq->intendedDirty = writeIntent;
                         invOreq->dataSource = GrantDataSource::HomeMemory; // F3
+                        if (outAuthEpoch) *outAuthEpoch = invOreq->baseEpoch;
                     }
                     _invalidationCount++;
                     // Return BUSY — invalidation must complete before grant
@@ -415,6 +420,7 @@ UBCCController::processOuterRequest(
                         oreq->intendedDirty = writeIntent;
                         oreq->dataSource = GrantDataSource::HomeMemory;
                         if (outDataSource) *outDataSource = GrantDataSource::HomeMemory;
+                        if (outAuthEpoch) *outAuthEpoch = oreq->baseEpoch;
                     }
                 }
             }
@@ -462,6 +468,7 @@ UBCCController::processOuterRequest(
                     // F3: Data source is RecallBuffer since data came from recall
                     grantOreq->dataSource = GrantDataSource::RecallBuffer;
                     if (outDataSource) *outDataSource = GrantDataSource::RecallBuffer;
+                    if (outAuthEpoch) *outAuthEpoch = grantOreq->baseEpoch;
                     if (reqType == UBCC_OuterReqType::GlobalReadShared) {
                         grant = UBCC_OuterGrantType::GlobalGrantShared;
                         grantOreq->intendedState = MESIState::G_S;
@@ -582,6 +589,7 @@ UBCCController::processOuterRequest(
                         recallOreq->reqType = reqType;
                         recallOreq->writeIntent = writeIntent;
                         recallOreq->dataSource = GrantDataSource::RecallBuffer;
+                        if (outAuthEpoch) *outAuthEpoch = recallOreq->baseEpoch;
                     }
                     // Return BUSY — recall must complete before grant
                     return static_cast<UBCC_OuterGrantType>(-1);
@@ -607,6 +615,7 @@ UBCCController::processOuterRequest(
                     oreq->intendedDirty = false;
                     oreq->dataSource = GrantDataSource::HomeMemory;
                     if (outDataSource) *outDataSource = GrantDataSource::HomeMemory;
+                    if (outAuthEpoch) *outAuthEpoch = oreq->baseEpoch;
                 }
             } else {
                 grant = writeIntent
@@ -625,6 +634,7 @@ UBCCController::processOuterRequest(
                     oreq->intendedDirty = writeIntent;
                     oreq->dataSource = GrantDataSource::HomeMemory;
                     if (outDataSource) *outDataSource = GrantDataSource::HomeMemory;
+                    if (outAuthEpoch) *outAuthEpoch = oreq->baseEpoch;
                 }
             }
             break;
@@ -1577,9 +1587,23 @@ UBCCController::processClear(
 
     // Verify GRANT_HANDSHAKE outstanding
     OutstandingRequest *ost = findOutstanding(line_pa);
+    printf("[TC5-CLEAR-TRACE] processClearEnter home=%d pa=0x%lx src=%d "
+           "epoch=%lu reqId=%lu hasOutstanding=%d",
+           _nodeId, line_pa, srcNode, epoch, reqId, ost ? 1 : 0);
+    if (ost) {
+        printf(" opType=%d stage=%d ostRequester=%d ostBase=%lu ostReserved=%lu ostReqId=%lu",
+               static_cast<int>(ost->opType), static_cast<int>(ost->stage),
+               ost->requesterNode, ost->baseEpoch, ost->reservedEpoch,
+               ost->reqId);
+    }
+    printf("\n");
+
     if (!ost || ost->opType != OpType::GRANT_HANDSHAKE) {
         // No active GRANT_HANDSHAKE — check for already-completed
         // (might be tombstone already cleaned up)
+        printf("[TC5-CLEAR-TRACE] processClearDrop home=%d pa=0x%lx src=%d "
+               "reason=no_grant_handshake\n",
+               _nodeId, line_pa, srcNode);
         warn("UBCC node_id=%d: processClear PA=0x%lx "
              "no GRANT_HANDSHAKE outstanding — dropped\n",
              _nodeId, line_pa);
@@ -1590,6 +1614,9 @@ UBCCController::processClear(
     // requester; the GRANT_HANDSHAKE's reservedEpoch = baseEpoch + 1.
     // Compare against baseEpoch (not reservedEpoch) for matching.
     if (ost->baseEpoch != epoch) {
+        printf("[TC5-CLEAR-TRACE] processClearDrop home=%d pa=0x%lx src=%d "
+               "reason=epoch_mismatch ostBase=%lu clear=%lu\n",
+               _nodeId, line_pa, srcNode, ost->baseEpoch, epoch);
         warn("UBCC node_id=%d: processClear PA=0x%lx "
              "epoch mismatch: ost_base=%lu clear=%lu — dropping, "
              "retiring stale GRANT_HANDSHAKE\n",
@@ -1603,6 +1630,9 @@ UBCCController::processClear(
 
     // Verify reqId match
     if (ost->reqId != reqId) {
+        printf("[TC5-CLEAR-TRACE] processClearDrop home=%d pa=0x%lx src=%d "
+               "reason=reqid_mismatch ostReqId=%lu clearReqId=%lu\n",
+               _nodeId, line_pa, srcNode, ost->reqId, reqId);
         warn("UBCC node_id=%d: processClear PA=0x%lx "
              "reqId mismatch: ost=%lu clear=%lu — dropped\n",
              _nodeId, line_pa, ost->reqId, reqId);
@@ -1611,6 +1641,9 @@ UBCCController::processClear(
 
     // F2: Strong validation — requesterNode must match srcNode
     if (ost->requesterNode >= 0 && ost->requesterNode != srcNode) {
+        printf("[TC5-CLEAR-TRACE] processClearDrop home=%d pa=0x%lx src=%d "
+               "reason=requester_mismatch ostRequester=%d\n",
+               _nodeId, line_pa, srcNode, ost->requesterNode);
         warn("UBCC node_id=%d: processClear PA=0x%lx "
              "requesterNode mismatch: ost=%d clear=%d — dropped\n",
              _nodeId, line_pa, ost->requesterNode, srcNode);
@@ -1620,6 +1653,9 @@ UBCCController::processClear(
     // F2: Stage must be WAITING_CLEAR — only accept Clear for an active
     // GRANT_HANDSHAKE that is actually expecting a Clear commit.
     if (ost->stage != OpStage::WAITING_CLEAR) {
+        printf("[TC5-CLEAR-TRACE] processClearDrop home=%d pa=0x%lx src=%d "
+               "reason=stage_mismatch stage=%d\n",
+               _nodeId, line_pa, srcNode, static_cast<int>(ost->stage));
         warn("UBCC node_id=%d: processClear PA=0x%lx "
              "stage mismatch: expected WAITING_CLEAR got %d — dropped\n",
              _nodeId, line_pa, static_cast<int>(ost->stage));
@@ -1643,6 +1679,10 @@ UBCCController::processClear(
     replayPendingRequesters(line_pa);
 
     // Order log audit (§3.6)
+    printf("[TC5-CLEAR-TRACE] processClearAccept home=%d pa=0x%lx src=%d "
+           "epoch=%lu reqId=%lu newState=%s\n",
+           _nodeId, line_pa, srcNode, epoch, reqId,
+           mesiStateName(entry.state));
     printf("[UBCC-ORDER] pa=0x%lx epoch=%lu reqId=%lu op=ClearGrantHandshake "
            "requester=%d state=%s\n",
            line_pa, epoch, reqId, srcNode,
@@ -1718,7 +1758,7 @@ UBCCController::retireToTombstone(const OutstandingRequest &ost, bool accepted)
 {
     GrantHandshakeTombstone ts;
     ts.linePa = ost.linePa;
-    ts.epoch = ost.reservedEpoch;
+    ts.epoch = ost.baseEpoch;
     ts.reqId = ost.reqId;
     ts.opType = OpType::GRANT_HANDSHAKE;
     ts.accepted = accepted;
@@ -1729,8 +1769,9 @@ UBCCController::retireToTombstone(const OutstandingRequest &ost, bool accepted)
 
     DPRINTF(RubyEP,
             "UBCC node_id=%d: retireToTombstone PA=0x%lx "
-            "epoch=%lu reqId=%lu expireTick=%lu depth=%zu\n",
-            _nodeId, ost.linePa, ost.reservedEpoch, ost.reqId, ts.expireTick,
+            "baseEpoch=%lu reservedEpoch=%lu reqId=%lu expireTick=%lu depth=%zu\n",
+            _nodeId, ost.linePa, ost.baseEpoch, ost.reservedEpoch, ost.reqId,
+            ts.expireTick,
             _tombstones[ost.linePa].size());
 }
 

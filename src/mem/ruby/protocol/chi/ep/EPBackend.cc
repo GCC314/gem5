@@ -25,6 +25,18 @@ namespace gem5
 namespace ruby
 {
 
+namespace
+{
+
+uint64_t
+makeRequesterReqId(int nodeId, uint64_t seq)
+{
+    return (static_cast<uint64_t>(nodeId & 0xff) << 56) |
+           (seq & 0x00ffffffffffffffULL);
+}
+
+} // anonymous namespace
+
 // ---- F3: HomeMemoryService method implementations ----
 bool HomeMemoryService::read(uint64_t homePa, uint8_t *buf, int size) const
 {
@@ -358,7 +370,7 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
         entry.homeNode = homeNode;
     } else {
         _epochCounter++;
-        reqIdVal = _epochCounter;  // v4: monotonic reqId from epoch counter
+        reqIdVal = makeRequesterReqId(_nodeId, _epochCounter);
         entry.lineAddr = line_pa;
         entry.state = RequesterLineState::R_WAIT_GRANT;
         entry.pendingReq = reqType;
@@ -433,6 +445,11 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
                                       &grantVisibleTick, &sentinelVisibleTick,
                                       &recallNeeded, &recallOwnerNode,
                                       &dataSource, &authEpoch);
+
+    printf("[TC5-CLEAR-TRACE] handleRemoteMiss node=%d localPA=0x%lx homePA=0x%lx "
+           "ubccGrant=%d reqId=%lu entryEpoch=%lu authEpoch=%lu recallNeeded=%d owner=%d\n",
+           _nodeId, line_pa, homePa, static_cast<int>(ubccGrant), reqIdVal,
+           entry.epoch, authEpoch, recallNeeded, recallOwnerNode);
 
     // ---- M6: Handle recall path ----
     // If the home UBCC signals that a recall is needed, we must
@@ -636,7 +653,11 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
         txn.baseEpoch = grantBaseEpoch;
         txn.reqId = reqIdVal;
         txn.grantType = grantEnv.grantType;
-        _pendingGrantTxns[line_pa] = txn;
+        _pendingGrantTxns[homePa] = txn;
+        printf("[TC5-CLEAR-TRACE] savePendingGrantTxn node=%d keyPA=0x%lx homePA=0x%lx "
+               "baseEpoch=%lu reqId=%lu grantType=%d\n",
+               _nodeId, homePa, homePa, txn.baseEpoch, txn.reqId,
+               static_cast<int>(txn.grantType));
     }
 
     DPRINTF(RubyCHIGeneric,
@@ -1374,7 +1395,7 @@ EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
     // Allocate new epoch and reqId
     _epochCounter++;
     uint64_t epochVal = _epochCounter;
-    uint64_t reqIdVal = _epochCounter;
+    uint64_t reqIdVal = makeRequesterReqId(_nodeId, _epochCounter);
 
     // Get home UBCC
     UBCCController *homeUbcc = UBCCController::getInstance(homeNode);
@@ -1576,11 +1597,18 @@ EPBackend::sendClear(uint64_t line_pa, int homeNode,
     // over caller-supplied epoch for replay/retry correctness
     uint64_t clearEpoch = epoch;
     auto txnIt = _pendingGrantTxns.find(line_pa);
+    bool foundPendingGrantTxn =
+        (txnIt != _pendingGrantTxns.end() && txnIt->second.valid);
     if (txnIt != _pendingGrantTxns.end() && txnIt->second.valid) {
         clearEpoch = txnIt->second.baseEpoch;
         // Invalidate after use (single-consumer)
         txnIt->second.valid = false;
     }
+
+    printf("[TC5-CLEAR-TRACE] sendClear node=%d linePA=0x%lx homeNode=%d "
+           "callerEpoch=%lu clearEpoch=%lu reqId=%lu pendingTxnHit=%d\n",
+           _nodeId, line_pa, homeNode, epoch, clearEpoch, reqId,
+           foundPendingGrantTxn);
 
     OuterClearMsg clearMsg;
     clearMsg.linePa = line_pa;
@@ -1592,6 +1620,10 @@ EPBackend::sendClear(uint64_t line_pa, int homeNode,
     _lastClearMsg = clearMsg;
 
     bool accepted = homeUbcc->processClear(line_pa, _nodeId, clearEpoch, reqId);
+
+    printf("[TC5-CLEAR-TRACE] sendClearResult node=%d linePA=0x%lx homeNode=%d "
+           "clearEpoch=%lu reqId=%lu accepted=%d\n",
+           _nodeId, line_pa, homeNode, clearEpoch, reqId, accepted);
 
     OuterClearAckMsg ack;
     ack.linePa = line_pa;
