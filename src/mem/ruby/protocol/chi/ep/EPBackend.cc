@@ -424,13 +424,15 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
     // ---- M6: Recall detection ----
     bool recallNeeded = false;
     int recallOwnerNode = -1;
-    GrantDataSource dataSource = GrantDataSource::HomeMemory;  // F3: output from UBCC
+    GrantDataSource dataSource = GrantDataSource::HomeMemory;
+    uint64_t authEpoch = 0;
+
     UBCC_OuterGrantType ubccGrant =
         homeUbcc->processOuterRequest(homePa, ubccReq, writeIntent, _nodeId,
-                                      entry.epoch, reqIdVal,  // v4: baseEpoch, reqId
+                                      entry.epoch, reqIdVal,
                                       &grantVisibleTick, &sentinelVisibleTick,
                                       &recallNeeded, &recallOwnerNode,
-                                      &dataSource);  // F3: data source
+                                      &dataSource, &authEpoch);
 
     // ---- M6: Handle recall path ----
     // If the home UBCC signals that a recall is needed, we must
@@ -566,9 +568,8 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
     // upgrade_invalidate_fix D5: use home's GRANT_HANDSHAKE baseEpoch
     // for the Clear tuple, NOT the requester's local entry.epoch.
     // The home may have rebased the epoch for queued/replayed requests.
-    uint64_t grantBaseEpoch = homeUbcc->getOutstandingBaseEpoch(homePa);
+    uint64_t grantBaseEpoch = authEpoch;
     if (grantBaseEpoch == 0) {
-        // Fallback: use local entry.epoch if no outstanding (shouldn't happen)
         grantBaseEpoch = entry.epoch;
     }
     grantEnv.epoch = grantBaseEpoch;
@@ -1572,6 +1573,13 @@ EPBackend::sendClear(uint64_t line_pa, int homeNode,
         clearEpoch = txnIt->second.baseEpoch;
         // Invalidate after use (single-consumer)
         txnIt->second.valid = false;
+    }
+
+    // Q1: If outstanding already consumed by another node's Clear, soft-skip.
+    if (homeUbcc && homeUbcc->getOutstandingBaseEpoch(line_pa) == 0) {
+        printf("[SENDCLEAR-SKIP] node=%d PA=0x%lx epoch=%lu reqId=%lu\n",
+               _nodeId, line_pa, clearEpoch, reqId);
+        return true;
     }
 
     OuterClearMsg clearMsg;

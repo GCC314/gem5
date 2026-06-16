@@ -242,7 +242,8 @@ class UBCCController
         Tick *outSentinelVisibleTick = nullptr,
         bool *outRecallNeeded = nullptr,
         int *outRecallOwnerNode = nullptr,
-        GrantDataSource *outDataSource = nullptr);
+        GrantDataSource *outDataSource = nullptr,
+        uint64_t *outAuthEpoch = nullptr);
 
     // ---- v4: Local Upgrade Management (§4.1.4) ----
     /**

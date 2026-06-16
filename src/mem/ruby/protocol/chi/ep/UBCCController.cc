@@ -122,7 +122,8 @@ UBCCController::processOuterRequest(
     uint64_t baseEpoch, uint64_t reqId,
     Tick *outGrantVisibleTick, Tick *outSentinelVisibleTick,
     bool *outRecallNeeded, int *outRecallOwnerNode,
-    GrantDataSource *outDataSource)
+    GrantDataSource *outDataSource,
+    uint64_t *outAuthEpoch)
 {
     DPRINTF(RubyCHIGeneric,
             "UBCC node_id=%d: processOuterRequest PA=0x%lx req=%d write=%d "
@@ -134,6 +135,7 @@ UBCCController::processOuterRequest(
     if (outRecallNeeded)   *outRecallNeeded = false;
     if (outRecallOwnerNode) *outRecallOwnerNode = -1;
     if (outDataSource) *outDataSource = GrantDataSource::HomeMemory;
+    if (outAuthEpoch) *outAuthEpoch = 0;
 
     // Validate: only DSM addresses for this home node
     if (!isDsmAddr(line_pa)) {
@@ -182,8 +184,10 @@ UBCCController::processOuterRequest(
                             mesiStateName(existing->intendedState));
                     if (outDataSource) *outDataSource = GrantDataSource::HomeMemory;
                     if (outGrantVisibleTick) *outGrantVisibleTick = curTick();
+                    if (outSentinelVisibleTick) *outSentinelVisibleTick = curTick();
                     if (outRecallNeeded) *outRecallNeeded = false;
                     if (outRecallOwnerNode) *outRecallOwnerNode = -1;
+                    if (outAuthEpoch) *outAuthEpoch = existing->baseEpoch;
                     return grantTypeFromIntended(existing->intendedState);
                 }
                 DPRINTF(RubyEP,
