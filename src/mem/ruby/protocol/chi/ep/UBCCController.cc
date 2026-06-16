@@ -553,6 +553,8 @@ UBCCController::processOuterRequest(
             if (existingOwner >= 0 && existingOwner != requesterNode
                 && !recallAlreadyDone) {
                 // v4: Recall needed — create RECALL + GRANT_HANDSHAKE
+                printf("[RECALL-CREATE] UBCC node=%d PA=0x%lx existingOwner=%d requester=%d\n",
+                       _nodeId, line_pa, existingOwner, requesterNode);
                 bool recallStarted = initiateRecall(
                     line_pa, entry, reqType, writeIntent, requesterNode);
 

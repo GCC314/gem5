@@ -558,13 +558,13 @@ EPRNFController::recvDataMsg(const CHIDataMsg *msg)
                     _nodeId, msg->m_addr);
         }
 
-        // If all beats received AND Comp_UC already arrived, complete now
-        if (it->second.beatsReceived >= it->second.beatsExpected &&
-            it->second.callbackPayloadStable) {
-            DPRINTF(RubyCHIGeneric,
-                    "EP_RNF node_id=%d: ReadUnique all data + Comp_UC "
-                    "received for PA=0x%lx -- invoking callback\n",
-                    _nodeId, msg->m_addr);
+        // Non-DCT ReadUnique: all CompData beats received = complete.
+        // Comp_UC is only used for CleanUnique; ReadUnique completion
+        // is driven by the last data beat.
+        if (it->second.beatsReceived >= it->second.beatsExpected) {
+            printf("[EPRNF-RU-DONE] node=%d PA=0x%lx beats=%d/%d\n",
+                   _nodeId, msg->m_addr,
+                   it->second.beatsReceived, it->second.beatsExpected);
             finishChiTxn(msg->m_addr, true);
         }
 
@@ -924,6 +924,8 @@ EPRNFController::processQueuedSnoop(uint64_t linePa)
 void
 EPRNFController::finishChiTxn(uint64_t linePa, bool success)
 {
+    printf("[EPRNF-FINISH] node=%d PA=0x%lx success=%d\n",
+           _nodeId, linePa, success);
     auto txnIt = _pendingChiTxns.find(linePa);
     if (txnIt == _pendingChiTxns.end()) {
         return;
@@ -976,10 +978,8 @@ EPRNFController::sendChiRequest(uint64_t linePa, CHIRequestType reqType,
     // twice for a single incrementReserved, triggering assertion failure.
     if (_chiRequestInFlight) {
         // Defer: queue the request for later processing
-        DPRINTF(RubyCHIGeneric,
-                "EP_RNF node_id=%d: sendChiRequest addr=0x%lx type=%d "
-                "DEFERRED (request already in flight)\n",
-                _nodeId, linePa, static_cast<int>(reqType));
+        printf("[EPRNF-DEFER] node=%d PA=0x%lx type=%d — queued\n",
+               _nodeId, linePa, static_cast<int>(reqType));
         DeferredChiRequest d;
         d.linePa = linePa;
         d.reqType = reqType;
@@ -1194,6 +1194,8 @@ EPRNFController::startReadUnique(uint64_t linePa,
 
     bool sent = sendChiRequest(linePa, CHIRequestType_ReadUnique,
                                EpProxyOp_RecallUnique);
+    printf("[EPRNF-RECALL] node=%d startReadUnique PA=0x%lx sent=%d\n",
+           _nodeId, linePa, sent);
     if (!sent) {
         _pendingChiTxns.erase(linePa);
         DPRINTF(RubyCHIGeneric,

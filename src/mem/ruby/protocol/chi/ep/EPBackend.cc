@@ -439,6 +439,8 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
     // route the recall through the owner node's EPBackend
     // (not bypass it with a direct processRecallResponse call).
     if (recallNeeded && recallOwnerNode >= 0) {
+        printf("[RECALL-ROUTE] EPBackend node=%d PA=0x%lx ownerNode=%d\n",
+               _nodeId, line_pa, recallOwnerNode);
         DPRINTF(RubyEP,
                 "EPBackend node_id=%d: M6 recall needed PA=0x%lx "
                 "ownerNode=%d requesterNode=%d\n",
@@ -465,6 +467,8 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
         // This eliminates the direct shortcut and ensures proper
         // owner-node recall semantics.
         EPBackend *ownerBackend = EPBackend::getBackendInstance(recallOwnerNode);
+        printf("[RECALL-DELIVER] node=%d ownerNode=%d ownerBackend=%p\n",
+               _nodeId, recallOwnerNode, (void*)ownerBackend);
         if (ownerBackend) {
             DPRINTF(RubyEP,
                     "EPBackend node_id=%d: routing recall to owner "
@@ -889,6 +893,8 @@ EPBackend::diagnoseExpectedGrant(int neededPerm, bool writeIntent) const
 bool
 EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
 {
+    printf("[RECALL-ENTRY] EPBackend node=%d PA=0x%lx ownerNode=%d homeNode=%d\n",
+           _nodeId, recallMsg.linePa, recallMsg.ownerNode, recallMsg.homeNode);
     DPRINTF(RubyEP,
             "EPBackend node_id=%d: handleRecallRequest "
             "PA=0x%lx ownerNode=%d homeNode=%d epoch=%lu "
@@ -973,8 +979,12 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
             });
     } else {
         // Write recall: ReadUnique with RecallUnique proxy op
+        printf("[RECALL-DIAG] node=%d initiating ReadUnique recall PA=0x%lx\n",
+               _nodeId, recallMsg.linePa);
         _epRnfCtrl->startReadUnique(ownerLocalPa,
             [this, capturedMsg](bool success) {
+                printf("[RECALL-DIAG] node=%d ReadUnique callback success=%d\n",
+                       _nodeId, success);
                 OuterRecallResponse resp;
                 resp.linePa = capturedMsg.linePa;
                 resp.ownerNode = capturedMsg.ownerNode;
@@ -1000,6 +1010,8 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
 bool
 EPBackend::sendRecallResponse(const OuterRecallResponse &response)
 {
+    printf("[RECALL-RESP] node=%d PA=0x%lx homeNode=%d dataReturned=%d\n",
+           _nodeId, response.linePa, response.homeNode, response.dataReturned);
     DPRINTF(RubyEP,
             "EPBackend node_id=%d: sendRecallResponse "
             "PA=0x%lx homeNode=%d dataReturned=%d hasData=%d\n",

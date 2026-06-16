@@ -728,6 +728,11 @@ action(Initiate_ReadUnique_HitUpstream, desc="") {
   // requester; so force it off if that's the case
   tbe.use_DCT := tbe.use_DCT && (tbe.dir_sharers.count() == 1) &&
                  (tbe.dir_sharers.isElement(tbe.requestor) == false);
+  // v4: DCT fallback — if requester is EP-RNF, force non-DCT snoop path
+  if (tbe.use_DCT && epRnfMachineVersion >= 0 &&
+      tbe.requestor == tbe.epRnfMachineID) {
+    tbe.use_DCT := false;
+  }
   // v4: DCT fallback — if sole sharer is EP-RNF, force non-DCT snoop path
   if (tbe.use_DCT && epRnfMachineVersion >= 0 &&
       tbe.dir_sharers.count() == 1 &&
