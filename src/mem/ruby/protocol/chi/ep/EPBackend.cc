@@ -14,6 +14,7 @@
 #include "mem/simple_mem.hh"
 #include "mem/ruby/protocol/chi/ep/EPRNFController.hh"
 #include "mem/ruby/protocol/chi/ep/UBCCController.hh"
+#include "mem/ruby/protocol/chi/ep/UBAdapter.hh"
 #include "mem/ruby/protocol/CHI/CHIRequestType.hh"
 #include "mem/ruby/system/RubySystem.hh"
 #include "params/EPBackend.hh"
@@ -79,6 +80,7 @@ EPBackend::EPBackend(const Params &p)
   : SimObject(p),
     _nodeId(p.node_id),
     _addrMap(3, 128ULL * 1024 * 1024),
+    _ubAdapter(p.ub_adapter),
     _ruby_system(p.ruby_system),
     _lastGrantDataBlock(64),  // cache line size = 64 bytes
     _lastGrantDataValid(false),
@@ -92,6 +94,11 @@ EPBackend::EPBackend(const Params &p)
 {
     auto *ruby_system = p.ruby_system;
     _ubcc = new UBCCController(_nodeId, ruby_system);
+
+    // Phase 2: Bind EPBackend to UBAdapter for message-path access
+    if (_ubAdapter) {
+        _ubAdapter->bindBackend(this);
+    }
 
     // M6: Register this EPBackend in the static cross-node routing registry
     _backendInstances[_nodeId] = this;
@@ -134,6 +141,11 @@ void
 EPBackend::init()
 {
     SimObject::init();
+
+    // Phase 2: Wire UBCC to UBRouter via UBAdapter.
+    if (_ubAdapter && _ubcc) {
+        _ubAdapter->bindUbccToRouter(_ubcc);
+    }
 
     // ---- M4 Sentinel Registration Self-Test ----
     // ---- M5 Sideband Self-Test ----
@@ -381,21 +393,10 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
     }
     _requesterLines[line_pa] = entry;
 
-    // Dispatch to home node's UBCC via cross-node registry.
-    UBCCController *homeUbcc = UBCCController::getInstance(homeNode);
-    if (!homeUbcc) {
-        if (homeNode != _nodeId) {
-            fatal("EPBackend node_id=%d: remote UBCC for homeNode=%d "
-                  "not registered (local UBCC is NOT a valid fallback "
-                  "for cross-node access).  Check UBCC registry.\n",
-                  _nodeId, homeNode);
-        }
-        // Only allow fallback when home IS the local node
-        homeUbcc = _ubcc;
-    }
-    if (!homeUbcc) {
-        fatal("EPBackend node_id=%d: no UBCC available for home node %d "
-              "PA=0x%lx\n", _nodeId, homeNode, line_pa);
+    if (!_ubAdapter) {
+        fatal("EPBackend node_id=%d: UBAdapter required for remote miss "
+              "PA=0x%lx homeNode=%d\n",
+              _nodeId, line_pa, homeNode);
     }
 
     // ---- M5 Phase 2: Outer Message Envelope ----
@@ -439,12 +440,21 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
     GrantDataSource dataSource = GrantDataSource::HomeMemory;
     uint64_t authEpoch = 0;
 
-    UBCC_OuterGrantType ubccGrant =
-        homeUbcc->processOuterRequest(homePa, ubccReq, writeIntent, _nodeId,
-                                      entry.epoch, reqIdVal,
-                                      &grantVisibleTick, &sentinelVisibleTick,
-                                      &recallNeeded, &recallOwnerNode,
-                                      &dataSource, &authEpoch);
+    UBCC_OuterGrantType ubccGrant;
+    int pendingInvCount = -1;
+    uint64_t pendingInvMask = 0;
+    uint64_t committedEpoch = 0;
+    DataBlock routedGrantData(64);
+    bool routedGrantDataValid = false;
+    int grantInt = _ubAdapter->sendReadReq(
+        homePa, static_cast<int>(ubccReq), writeIntent, _nodeId,
+        entry.epoch, reqIdVal, homeNode,
+        &grantVisibleTick, &sentinelVisibleTick,
+        &recallNeeded, &recallOwnerNode,
+        reinterpret_cast<int*>(&dataSource), &authEpoch,
+        &pendingInvCount, &pendingInvMask, &committedEpoch,
+        &routedGrantData, &routedGrantDataValid);
+    ubccGrant = static_cast<UBCC_OuterGrantType>(grantInt);
 
     printf("[TC5-CLEAR-TRACE] handleRemoteMiss node=%d localPA=0x%lx homePA=0x%lx "
            "ubccGrant=%d reqId=%lu entryEpoch=%lu authEpoch=%lu recallNeeded=%d owner=%d\n",
@@ -470,60 +480,28 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
             recallOwnerNode, homeNode, offset);
         recallMsg.ownerNode = recallOwnerNode;
         recallMsg.homeNode = homeNode;
-        recallMsg.epoch = homeUbcc->getEpochForLine(homePa);
+        recallMsg.epoch = committedEpoch;
         recallMsg.reqId = reqIdVal;  // v4: outer transaction reqId
         recallMsg.isReadRequest = (reqType == OuterReqType::GlobalReadShared);
         recallMsg.dataNeeded = true;
 
         _lastRecallMsg = recallMsg;
 
-        // M6: Route recall through the owner node's EPBackend.
-        // The owner EPBackend processes the recall (handleRecallRequest)
-        // and sends the response back to the home UBCC via
-        // sendRecallResponse -> processRecallResponse.
-        // This eliminates the direct shortcut and ensures proper
-        // owner-node recall semantics.
-        EPBackend *ownerBackend = EPBackend::getBackendInstance(recallOwnerNode);
-        printf("[RECALL-DELIVER] node=%d ownerNode=%d ownerBackend=%p\n",
-               _nodeId, recallOwnerNode, (void*)ownerBackend);
-        if (ownerBackend) {
-            DPRINTF(RubyEP,
-                    "EPBackend node_id=%d: routing recall to owner "
-                    "EPBackend node %d\n",
-                    _nodeId, recallOwnerNode);
-            bool recallOk = ownerBackend->handleRecallRequest(recallMsg);
-            if (!recallOk) {
-                // M6 P0-2: Recall failure must abort the grant.
-                // Proceeding to handleGrant after a failed recall
-                // violates the protocol (the line may still be owned
-                // by the recalled node with conflicting permissions).
-                fatal("EPBackend node_id=%d: owner EPBackend node %d "
-                      "rejected recall for PA=0x%lx - "
-                      "cannot proceed with grant\n",
-                      _nodeId, recallOwnerNode, line_pa);
-            }
-        } else {
-            // M6 P0-1: No fallback — owner EPBackend must be in registry.
-            // Bypassing the owner EPBackend with a direct
-            // processRecallResponse call silently skips the proper
-            // recall path and must never happen.
-            fatal("EPBackend node_id=%d: owner EPBackend for node %d "
-                  "not found in registry for recall PA=0x%lx - "
-                  "cannot bypass recall path\n",
-                  _nodeId, recallOwnerNode, line_pa);
-        }
+        DPRINTF(RubyEP,
+                "EPBackend node_id=%d: routing recall to owner "
+                "EPBackend node %d via UBAdapter\n",
+                _nodeId, recallOwnerNode);
+        _ubAdapter->sendRecallReqToOwner(recallOwnerNode, recallMsg);
     }
 
     // ---- M8: Global Invalidation Routing ----
     // Check if the home UBCC has pending invalidations from this
     // request (e.g., G_S upgrade to unique with external sharers).
     {
-        int pendingInvCount = homeUbcc->getPendingInvalidationCount(homePa);
         if (pendingInvCount > 0) {
-            uint64_t pendingInvMask = homeUbcc->getPendingInvalidationMask(homePa);
-            // P0-1: Use home UBCC's line epoch (not requester's local epoch)
+            // P0-1: Use home committed epoch (not requester's local epoch)
             // so that processInvalidationAck's checkEpochForLine() matches.
-            uint64_t homeEpoch = homeUbcc->getEpochForLine(homePa);
+            uint64_t homeEpoch = committedEpoch;
             DPRINTF(RubyEP,
                     "EPBackend node_id=%d: M8 routing invalidations "
                     "PA=0x%lx homePa=0x%lx invCount=%d invMask=0x%lx "
@@ -549,32 +527,10 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
 
                     _lastInvalidateMsg = invMsg;
 
-                    // Route invalidation to the sharer node's EPBackend
-                    EPBackend *sharerBackend = EPBackend::getBackendInstance(s);
-                    if (sharerBackend) {
-                        DPRINTF(RubyEP,
-                                "EPBackend node_id=%d: routing invalidation "
-                                "to node %d\n", _nodeId, s);
-                        bool invOk = sharerBackend->handleInvalidationRequest(invMsg);
-                        if (!invOk) {
-                            fatal("EPBackend node_id=%d: sharer node %d "
-                                  "rejected invalidation for PA=0x%lx\n",
-                                  _nodeId, s, line_pa);
-                        }
-                    } else {
-                        // In single-gem5 prototype with cross-node EPBackend
-                        // registry, all nodes' EPBackends should be registered.
-                        // If a sharer's EPBackend is missing (maybe it hasn't
-                        // been instantiated yet in a real multi-gem5 scenario),
-                        // we can issue a direct ack for prototype purposes.
-                        DPRINTF(RubyEP,
-                                "EPBackend node_id=%d: sharer EPBackend for "
-                                "node %d not found — issuing direct ack\n",
-                                _nodeId, s);
-
-                        // Direct ack through home UBCC (use home epoch)
-                        homeUbcc->processInvalidationAck(homePa, s, homeEpoch, reqIdVal);
-                    }
+                    DPRINTF(RubyEP,
+                            "EPBackend node_id=%d: routing invalidation "
+                            "to node %d via UBAdapter\n", _nodeId, s);
+                    _ubAdapter->sendInvalidateReqToSharer(s, invMsg);
                 }
             }
         }
@@ -670,9 +626,7 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
     OuterGrantType result = handleGrant(line_pa, grant, homeNode);
 
     if (dataSource == GrantDataSource::RecallBuffer) {
-        DataBlock recallBlk(64);
-        bool recallDataOk = homeUbcc->copyOutstandingGrantData(homePa, recallBlk);
-        setRecallCaptureData(recallBlk, recallDataOk);
+        setRecallCaptureData(routedGrantData, routedGrantDataValid);
     }
 
     // v4: Populate grant data using formal F3 data source
@@ -1051,23 +1005,16 @@ EPBackend::sendRecallResponse(const OuterRecallResponse &response)
                installed, response.hasDataPayload);
     }
 
-    // Route response to home node's UBCC.
-    // M6 P0-1: No fallback — the home UBCC must be registered.
-    // Falling back to local _ubcc silently bypasses the home node's
-    // directory and must never happen.
-    UBCCController *homeUbcc = UBCCController::getInstance(response.homeNode);
-    if (!homeUbcc) {
-        fatal("EPBackend node_id=%d: home UBCC for node %d not found "
-              "for recall response PA=0x%lx - "
-              "cannot fall back to local UBCC\n",
-              _nodeId, response.homeNode, response.linePa);
+    if (!_ubAdapter) {
+        fatal("EPBackend node_id=%d: UBAdapter required for recall response "
+              "PA=0x%lx homeNode=%d\n",
+              _nodeId, response.linePa, response.homeNode);
     }
-
-    // F2: Pass recall data payload to home UBCC for storage in RECALL ost
-    bool ok = homeUbcc->processRecallResponse(
+    bool ok = _ubAdapter->sendRecallResp(
         response.linePa, response.ownerNode, response.dataReturned,
         response.epoch, response.reqId,
-        response.hasDataPayload ? &response.dataPayload : nullptr);
+        response.hasDataPayload ? &response.dataPayload : nullptr,
+        response.homeNode);
 
     if (!ok) {
         warn("EPBackend node_id=%d: home UBCC rejected recall response "
@@ -1121,20 +1068,13 @@ EPBackend::handleWriteback(uint64_t line_pa, bool keepAsClean)
     _lastWritebackMsg.epoch = epochVal;
     _lastWritebackMsg.keepAsClean = keepAsClean;
 
-    // Route to home UBCC
-    UBCCController *homeUbcc = UBCCController::getInstance(homeNode);
-    if (!homeUbcc) {
-        DPRINTF(RubyEP,
-                "EPBackend node_id=%d: home UBCC for node %d not found, "
-                "falling back to local UBCC\n", _nodeId, homeNode);
-        homeUbcc = _ubcc;
+    if (!_ubAdapter) {
+        fatal("EPBackend node_id=%d: UBAdapter required for writeback "
+              "PA=0x%lx homeNode=%d\n",
+              _nodeId, line_pa, homeNode);
     }
-    if (!homeUbcc) {
-        fatal("EPBackend node_id=%d: no UBCC available for writeback "
-              "PA=0x%lx\n", _nodeId, line_pa);
-    }
-
-    bool ok = homeUbcc->processWriteback(homePa, _nodeId, epochVal, keepAsClean);
+    bool ok = _ubAdapter->sendWritebackReq(
+        homePa, _nodeId, epochVal, keepAsClean, homeNode);
 
     // Build ack envelope
     _lastAckMsg.linePa = homePa;
@@ -1203,20 +1143,12 @@ EPBackend::handleEvict(uint64_t line_pa)
     _lastEvictMsg.homeNode = homeNode;
     _lastEvictMsg.epoch = epochVal;
 
-    // Route to home UBCC
-    UBCCController *homeUbcc = UBCCController::getInstance(homeNode);
-    if (!homeUbcc) {
-        DPRINTF(RubyEP,
-                "EPBackend node_id=%d: home UBCC for node %d not found, "
-                "falling back to local UBCC\n", _nodeId, homeNode);
-        homeUbcc = _ubcc;
+    if (!_ubAdapter) {
+        fatal("EPBackend node_id=%d: UBAdapter required for evict "
+              "PA=0x%lx homeNode=%d\n",
+              _nodeId, line_pa, homeNode);
     }
-    if (!homeUbcc) {
-        fatal("EPBackend node_id=%d: no UBCC available for evict "
-              "PA=0x%lx\n", _nodeId, line_pa);
-    }
-
-    bool ok = homeUbcc->processEvict(homePa, _nodeId, epochVal);
+    bool ok = _ubAdapter->sendEvictReq(homePa, _nodeId, epochVal, homeNode);
 
     // Build ack envelope
     _lastAckMsg.linePa = homePa;
@@ -1357,16 +1289,14 @@ EPBackend::sendInvalidationAck(const OuterInvalidationAck &ack)
     _lastInvalidationAck = ack;
     _invalidationAckSentCount++;
 
-    // Route ack to home node's UBCC
-    UBCCController *homeUbcc = UBCCController::getInstance(ack.homeNode);
-    if (!homeUbcc) {
-        fatal("EPBackend node_id=%d: home UBCC for node %d not found "
-              "for invalidation ack PA=0x%lx\n",
-              _nodeId, ack.homeNode, ack.linePa);
+    if (!_ubAdapter) {
+        fatal("EPBackend node_id=%d: UBAdapter required for invalidation ack "
+              "PA=0x%lx homeNode=%d\n",
+              _nodeId, ack.linePa, ack.homeNode);
     }
-
-    bool ok = homeUbcc->processInvalidationAck(
-        ack.linePa, ack.ackNode, ack.epoch, ack.reqId);
+    bool ok = _ubAdapter->sendInvalidateAck(
+        ack.linePa, ack.ackNode, ack.epoch, ack.reqId,
+        ack.homeNode);
 
     if (!ok) {
         warn("EPBackend node_id=%d: home UBCC rejected invalidation ack "
@@ -1397,18 +1327,10 @@ EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
     uint64_t epochVal = _epochCounter;
     uint64_t reqIdVal = makeRequesterReqId(_nodeId, _epochCounter);
 
-    // Get home UBCC
-    UBCCController *homeUbcc = UBCCController::getInstance(homeNode);
-    if (!homeUbcc) {
-        if (homeNode != _nodeId) {
-            fatal("EPBackend node_id=%d: remote UBCC for homeNode=%d "
-                  "not registered for upgrade\n", _nodeId, homeNode);
-        }
-        homeUbcc = _ubcc;
-    }
-    if (!homeUbcc) {
-        fatal("EPBackend node_id=%d: no UBCC for upgrade PA=0x%lx\n",
-              _nodeId, line_pa);
+    if (!_ubAdapter) {
+        fatal("EPBackend node_id=%d: UBAdapter required for upgrade "
+              "PA=0x%lx homeNode=%d\n",
+              _nodeId, line_pa, homeNode);
     }
 
     // Convert EPBackend UpgradeCause to UBCC UpgradeCause
@@ -1417,7 +1339,7 @@ EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
             ? UBCC_UpgradeCause::LocalCleanUnique
             : UBCC_UpgradeCause::LocalStoreUpgrade;
 
-    // Send OuterUpgradeReq to home UBCC
+    // Send OuterUpgradeReq to home UBCC via message passing
     OuterUpgradeReq upgradeReq;
     upgradeReq.linePa = homePa;
     upgradeReq.srcNode = _nodeId;
@@ -1427,17 +1349,17 @@ EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
     upgradeReq.cause = cause;
     _lastUpgradeReq = upgradeReq;
 
-    bool accepted = homeUbcc->processOuterUpgradeReq(
+    uint64_t upgradeTargetMask = 0;
+    uint64_t committedEpoch = 0;
+    bool accepted = _ubAdapter->sendUpgradeReq(
         homePa, _nodeId, epochVal, reqIdVal,
-        desiredPerm, ubccCause);
+        desiredPerm, static_cast<int>(ubccCause),
+        &upgradeTargetMask, &committedEpoch, homeNode);
 
     if (accepted) {
         // Store returned values (reservedEpoch, echoed reqId)
         outEpoch = epochVal;
         outReqId = reqIdVal;
-
-        // upgrade_invalidate_fix: determine if invalidation fanout is needed
-        uint64_t upgradeTargetMask = homeUbcc->getUpgradePendingTargetMask(homePa);
 
         if (upgradeTargetMask != 0) {
             // Other sharers exist — must invalidate them before Ack(true)
@@ -1447,7 +1369,7 @@ EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
 
             // Fanout invalidations to each target sharer
             // Reuse existing EPBackend invalidation routing path
-            uint64_t homeEpoch = homeUbcc->getEpochForLine(homePa);
+            uint64_t homeEpoch = committedEpoch;
             uint64_t offset = _addrMap.dsmOffset(line_pa);
 
             uint64_t remainingMask = upgradeTargetMask;
@@ -1467,21 +1389,10 @@ EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
 
                     _lastInvalidateMsg = invMsg;
 
-                    // Route invalidation to the sharer node's EPBackend
-                    EPBackend *sharerBackend = EPBackend::getBackendInstance(s);
-                    if (sharerBackend) {
-                        DPRINTF(RubyEP,
-                                "EPBackend node_id=%d: upgrade fanout "
-                                "invalidation to node %d\n", _nodeId, s);
-                        sharerBackend->handleInvalidationRequest(invMsg);
-                    } else {
-                        // Direct ack through home UBCC (fallback)
-                        DPRINTF(RubyEP,
-                                "EPBackend node_id=%d: sharer EPBackend for "
-                                "node %d not found — issuing direct ack\n",
-                                _nodeId, s);
-                        homeUbcc->processInvalidationAck(homePa, s, homeEpoch, reqIdVal);
-                    }
+                    DPRINTF(RubyEP,
+                            "EPBackend node_id=%d: upgrade fanout "
+                            "invalidation to node %d via UBAdapter\n", _nodeId, s);
+                    _ubAdapter->sendInvalidateReqToSharer(s, invMsg);
                 }
             }
 
@@ -1536,16 +1447,10 @@ EPBackend::sendUpgradeDone(uint64_t line_pa, int homeNode,
     uint64_t offset = _addrMap.dsmOffset(line_pa);
     uint64_t homePa = _addrMap.buildDsmPA(homeNode, homeNode, offset);
 
-    UBCCController *homeUbcc = UBCCController::getInstance(homeNode);
-    if (!homeUbcc) {
-        if (homeNode != _nodeId) {
-            fatal("EPBackend node_id=%d: remote UBCC for upgrade done\n",
-                  _nodeId);
-        }
-        homeUbcc = _ubcc;
-    }
-    if (!homeUbcc) {
-        return false;
+    if (!_ubAdapter) {
+        fatal("EPBackend node_id=%d: UBAdapter required for upgrade done "
+              "PA=0x%lx homeNode=%d\n",
+              _nodeId, line_pa, homeNode);
     }
 
     OuterUpgradeDone doneMsg;
@@ -1556,8 +1461,8 @@ EPBackend::sendUpgradeDone(uint64_t line_pa, int homeNode,
     doneMsg.reqId = reqId;
     _lastUpgradeDone = doneMsg;
 
-    bool accepted = homeUbcc->processOuterUpgradeDone(
-        homePa, _nodeId, epoch, reqId);
+    bool accepted = _ubAdapter->sendUpgradeDoneReq(
+        homePa, _nodeId, epoch, reqId, homeNode);
 
     OuterUpgradeDoneAck doneAck;
     doneAck.linePa = homePa;
@@ -1582,19 +1487,7 @@ EPBackend::sendClear(uint64_t line_pa, int homeNode,
             "PA=0x%lx homeNode=%d epoch=%lu reqId=%lu\n",
             _nodeId, line_pa, homeNode, epoch, reqId);
 
-    UBCCController *homeUbcc = UBCCController::getInstance(homeNode);
-    if (!homeUbcc) {
-        if (homeNode != _nodeId) {
-            fatal("EPBackend node_id=%d: remote UBCC for Clear\n", _nodeId);
-        }
-        homeUbcc = _ubcc;
-    }
-    if (!homeUbcc) {
-        return false;
-    }
-
     // upgrade_invalidate_fix D5: prefer PendingGrantTxn.baseEpoch
-    // over caller-supplied epoch for replay/retry correctness
     uint64_t clearEpoch = epoch;
     auto txnIt = _pendingGrantTxns.find(line_pa);
     bool foundPendingGrantTxn =
@@ -1619,7 +1512,13 @@ EPBackend::sendClear(uint64_t line_pa, int homeNode,
     clearMsg.reason = ClearReason::GrantHandshake;
     _lastClearMsg = clearMsg;
 
-    bool accepted = homeUbcc->processClear(line_pa, _nodeId, clearEpoch, reqId);
+    if (!_ubAdapter) {
+        fatal("EPBackend node_id=%d: UBAdapter required for clear "
+              "PA=0x%lx homeNode=%d\n",
+              _nodeId, line_pa, homeNode);
+    }
+    bool accepted = _ubAdapter->sendClearReq(
+        line_pa, _nodeId, clearEpoch, reqId, homeNode);
 
     printf("[TC5-CLEAR-TRACE] sendClearResult node=%d linePA=0x%lx homeNode=%d "
            "clearEpoch=%lu reqId=%lu accepted=%d\n",

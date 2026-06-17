@@ -223,7 +223,14 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
         all_cntrls.extend(nd['dl_snf'].getAllControllers())
         mem_backstores.append(nd['dl_memctrl'])
 
-        ep_backend = EPBackend(node_id=node_id, ruby_system=ruby_system)
+        # Phase 2: Create UBAdapter and UBRouter per node
+        ub_router = UBRouter(node_id=node_id, ub_msg_latency="0ns")
+        ub_adapter = UBAdapter(node_id=node_id, router=ub_router)
+        nd['ub_router'] = ub_router
+        nd['ub_adapter'] = ub_adapter
+
+        ep_backend = EPBackend(node_id=node_id, ruby_system=ruby_system,
+                               ub_adapter=ub_adapter)
 
         nd['ep_snf_cntrl'] = EPSNFController(
             version=chi_defs.Versions.getVersion(chi_defs.CHI_Cache_Controller),

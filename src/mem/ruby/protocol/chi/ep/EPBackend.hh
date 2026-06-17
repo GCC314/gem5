@@ -20,6 +20,7 @@ namespace ruby
 
 class UBCCController;
 class EPRNFController;
+class UBAdapter;
 class RubySystem;
 
 // ---- M5 Outer Protocol Types ----
@@ -576,6 +577,10 @@ class EPBackend : public SimObject
     /** Access to UBCCController for Python inspection */
     UBCCController* getUBCC() const { return _ubcc; }
 
+    /** Bind the UBAdapter for message-path access to UBCC. */
+    void setUBAdapter(UBAdapter *adapter) { _ubAdapter = adapter; }
+    UBAdapter* getUBAdapter() const { return _ubAdapter; }
+
     // ---- M5 Inspection API ----
     /** Inspect requester-side bookkeeping for a given line. */
     RequesterLineSnapshot inspectRequesterState(uint64_t line_pa) const;
@@ -627,6 +632,7 @@ class EPBackend : public SimObject
     const int _nodeId;
     NodeAddressMap _addrMap;
     UBCCController *_ubcc = nullptr;
+    UBAdapter *_ubAdapter = nullptr;  // Phase 2: message-path adapter
     EPRNFController *_epRnfCtrl = nullptr;
     RubySystem *_ruby_system = nullptr;
 

@@ -19,6 +19,7 @@ namespace ruby
 {
 
 class RubySystem;
+class UBRouter;
 
 // Forward declarations for M5 outer protocol types.
 // These mirror the enums in EPBackend.hh but are used internally.
@@ -206,6 +207,9 @@ class UBCCController
     int nodeId() const { return _nodeId; }
 
     void wakeup();
+
+    /** Set the local router for sending messages (e.g., UpgradeAckNotify). */
+    void setRouter(UBRouter *router) { _router = router; }
 
     // ---- Cross-Node Routing Registry ----
     // In single-gem5 prototype, all UBCC instances register themselves
@@ -525,6 +529,9 @@ class UBCCController
 
    private:
     const int _nodeId;
+
+    /** Local UBRouter for sending messages (e.g., UpgradeAckNotify). */
+    UBRouter *_router = nullptr;
 
     // Q3: Estimated UBCC-to-remote-UBCC interconnect latency (ticks).
     // Controls how long pendingOp=3 blocks before grant is released.

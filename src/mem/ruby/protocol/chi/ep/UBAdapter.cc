@@ -1,0 +1,660 @@
+#include "mem/ruby/protocol/chi/ep/UBAdapter.hh"
+
+#include <cstdio>
+
+#include "base/logging.hh"
+#include "debug/RubyEP.hh"
+#include "mem/ruby/protocol/chi/ep/EPBackend.hh"
+#include "mem/ruby/protocol/chi/ep/UBRouter.hh"
+#include "mem/ruby/protocol/chi/ep/UBCCController.hh"
+#include "sim/cur_tick.hh"
+
+namespace gem5
+{
+namespace ruby
+{
+
+UBAdapter::UBAdapter(const Params &p)
+    : SimObject(p),
+      _nodeId(p.node_id),
+      _router(p.router),
+      _addrMap(3, 128ULL * 1024 * 1024)
+{
+    DPRINTF(RubyEP, "UBAdapter node=%d created\n", _nodeId);
+}
+
+UBAdapter::~UBAdapter()
+{
+}
+
+void
+UBAdapter::init()
+{
+    SimObject::init();
+
+    // Cross-bind with router.
+    if (_router) {
+        _router->setAdapter(this);
+    }
+}
+
+// ---- Wire UBCC to router ----
+
+void
+UBAdapter::bindUbccToRouter(UBCCController *ubcc)
+{
+    if (_router) {
+        _router->bindUbcc(ubcc);
+        // Also give UBCC a back-reference to the router
+        // so it can send messages (e.g., UpgradeAckNotify).
+        ubcc->setRouter(_router);
+        DPRINTF(RubyEP,
+                "UBAdapter node=%d: bound UBCC to router\n", _nodeId);
+    } else {
+        warn("UBAdapter node=%d: bindUbccToRouter called but no router\n",
+             _nodeId);
+    }
+}
+
+// ---- Phase 2: Synchronous Read Request ----
+
+int
+UBAdapter::sendReadReq(
+    uint64_t homePa, int reqType, bool writeIntent,
+    int requesterNode, uint64_t epoch, uint64_t reqId,
+    int homeNode,
+    Tick *outGrantVisibleTick, Tick *outSentinelVisibleTick,
+    bool *outRecallNeeded, int *outRecallOwnerNode,
+    int *outDataSource, uint64_t *outAuthEpoch,
+    int *outPendingInvCount, uint64_t *outPendingInvMask,
+    uint64_t *outCommittedEpoch,
+    DataBlock *outGrantData, bool *outGrantDataValid)
+{
+    DPRINTF(RubyEP,
+            "UBAdapter node=%d: sendReadReq homePa=0x%lx "
+            "reqType=%d writeIntent=%d reqNode=%d epoch=%lu reqId=%lu homeNode=%d\n",
+            _nodeId, homePa, reqType, writeIntent,
+            requesterNode, epoch, reqId, homeNode);
+
+    if (!_router) {
+        fatal("UBAdapter node=%d: sendReadReq called with no router bound\n",
+              _nodeId);
+    }
+
+    // Build ReadReq UBMsg
+    UBMsg req;
+    req.h.type = UBMsgType::ReadReq;
+    req.h.srcNode = _nodeId;
+    req.h.dstNode = homeNode;
+    req.h.homeNode = homeNode;
+    req.h.requesterNode = requesterNode;
+    req.h.targetNode = homeNode;
+    req.h.flags = writeIntent ? static_cast<uint32_t>(UB_FLAG_WRITE_INTENT) : 0;
+    req.h.homeLinePa = homePa;
+    req.h.localLinePa = 0;
+    req.h.epoch = epoch;
+    req.h.reqId = reqId;
+    req.h.seqNum = _nextSeq++;
+    req.h.enqueueTick = curTick();
+    req.h.readyTick = curTick();
+
+    req.b.readReq.neededPerm = (reqType == 0) ? 0 : 1;
+
+    DPRINTF(RubyEP,
+            "UBAdapter node=%d: sending ReadReq %s\n",
+            _nodeId, ubMsgToString(req).c_str());
+
+    _lastResponseValid = false;
+    _router->sendMessage(req);
+
+    if (!_lastResponseValid) {
+        warn("UBAdapter node=%d: sendReadReq: no response received "
+             "PA=0x%lx\n", _nodeId, homePa);
+        return -1;
+    }
+
+    const UBMsg &resp = _lastResponse;
+    if (resp.h.type != UBMsgType::ReadResp) {
+        warn("UBAdapter node=%d: sendReadReq: unexpected response type %s "
+             "PA=0x%lx\n", _nodeId, ubMsgTypeName(resp.h.type), homePa);
+        return -1;
+    }
+
+    int grant = static_cast<int>(resp.b.readResp.grantType);
+
+    if (outGrantVisibleTick)
+        *outGrantVisibleTick = resp.b.readResp.grantVisibleTick;
+    if (outSentinelVisibleTick)
+        *outSentinelVisibleTick = resp.b.readResp.sentinelVisibleTick;
+    if (outRecallNeeded)
+        *outRecallNeeded = resp.b.readResp.recallNeeded;
+    if (outRecallOwnerNode)
+        *outRecallOwnerNode = resp.b.readResp.recallOwnerNode;
+    if (outDataSource)
+        *outDataSource = resp.b.readResp.dataSource;
+    if (outAuthEpoch)
+        *outAuthEpoch = resp.b.readResp.authEpoch;
+    if (outPendingInvCount)
+        *outPendingInvCount = resp.b.readResp.pendingInvCount;
+    if (outPendingInvMask)
+        *outPendingInvMask = resp.b.readResp.pendingInvMask;
+    if (outCommittedEpoch)
+        *outCommittedEpoch = resp.b.readResp.committedEpoch;
+    if (outGrantDataValid) {
+        *outGrantDataValid =
+            (resp.h.flags & static_cast<uint32_t>(UB_FLAG_HAS_DATA)) != 0;
+    }
+    if (outGrantData &&
+        (resp.h.flags & static_cast<uint32_t>(UB_FLAG_HAS_DATA)) != 0) {
+        outGrantData->setData(resp.b.readResp.grantData, 0, 64);
+    }
+
+    DPRINTF(RubyEP,
+            "UBAdapter node=%d: sendReadReq result grant=%d "
+            "recallNeeded=%d recallOwner=%d dataSource=%d authEpoch=%lu\n",
+            _nodeId, grant,
+            resp.b.readResp.recallNeeded, resp.b.readResp.recallOwnerNode,
+            resp.b.readResp.dataSource, resp.b.readResp.authEpoch);
+
+    return grant;
+}
+
+// ---- Phase 2+: Writeback Request ----
+
+bool
+UBAdapter::sendWritebackReq(uint64_t homePa, int requesterNode,
+                             uint64_t epochVal, bool keepAsClean,
+                             int homeNode)
+{
+    DPRINTF(RubyEP,
+            "UBAdapter node=%d: sendWritebackReq homePa=0x%lx "
+            "reqNode=%d epoch=%lu keepAsClean=%d homeNode=%d\n",
+            _nodeId, homePa, requesterNode, epochVal, keepAsClean, homeNode);
+
+    if (!_router) {
+        fatal("UBAdapter node=%d: sendWritebackReq called with no router bound\n",
+              _nodeId);
+    }
+
+    UBMsg req;
+    req.h.type = UBMsgType::WritebackReq;
+    req.h.srcNode = _nodeId;
+    req.h.dstNode = homeNode;
+    req.h.homeNode = homeNode;
+    req.h.requesterNode = requesterNode;
+    req.h.homeLinePa = homePa;
+    req.h.epoch = epochVal;
+    req.h.seqNum = _nextSeq++;
+    req.h.enqueueTick = curTick();
+    req.h.readyTick = curTick();
+    if (keepAsClean)
+        req.h.flags |= static_cast<uint32_t>(UB_FLAG_KEEP_AS_CLEAN);
+
+    _lastResponseValid = false;
+    _router->sendMessage(req);
+
+    if (!_lastResponseValid) {
+        warn("UBAdapter node=%d: sendWritebackReq: no response PA=0x%lx\n",
+             _nodeId, homePa);
+        return false;
+    }
+
+    const UBMsg &resp = _lastResponse;
+    if (resp.h.type != UBMsgType::WritebackResp) {
+        warn("UBAdapter node=%d: sendWritebackReq: unexpected response type %s\n",
+             _nodeId, ubMsgTypeName(resp.h.type));
+        return false;
+    }
+
+    return resp.b.writebackResp.success;
+}
+
+// ---- Evict Request ----
+
+bool
+UBAdapter::sendEvictReq(uint64_t homePa, int evictingNode, uint64_t epochVal,
+                         int homeNode)
+{
+    DPRINTF(RubyEP,
+            "UBAdapter node=%d: sendEvictReq homePa=0x%lx "
+            "evictingNode=%d epoch=%lu homeNode=%d\n",
+            _nodeId, homePa, evictingNode, epochVal, homeNode);
+
+    if (!_router) {
+        fatal("UBAdapter node=%d: sendEvictReq called with no router bound\n",
+              _nodeId);
+    }
+
+    UBMsg req;
+    req.h.type = UBMsgType::EvictReq;
+    req.h.srcNode = _nodeId;
+    req.h.dstNode = homeNode;
+    req.h.homeNode = homeNode;
+    req.h.requesterNode = evictingNode;
+    req.h.homeLinePa = homePa;
+    req.h.epoch = epochVal;
+    req.h.seqNum = _nextSeq++;
+    req.h.enqueueTick = curTick();
+    req.h.readyTick = curTick();
+
+    _lastResponseValid = false;
+    _router->sendMessage(req);
+
+    if (!_lastResponseValid) {
+        warn("UBAdapter node=%d: sendEvictReq: no response PA=0x%lx\n",
+             _nodeId, homePa);
+        return false;
+    }
+
+    const UBMsg &resp = _lastResponse;
+    if (resp.h.type != UBMsgType::EvictResp) {
+        warn("UBAdapter node=%d: sendEvictReq: unexpected response type %s\n",
+             _nodeId, ubMsgTypeName(resp.h.type));
+        return false;
+    }
+
+    return resp.b.evictResp.success;
+}
+
+// ---- Upgrade Request ----
+
+bool
+UBAdapter::sendUpgradeReq(uint64_t homePa, int requesterNode,
+                            uint64_t epoch, uint64_t reqId,
+                            int desiredPerm, int cause,
+                            uint64_t *outUpgradeTargetMask,
+                            uint64_t *outCommittedEpoch,
+                            int homeNode)
+{
+    DPRINTF(RubyEP,
+            "UBAdapter node=%d: sendUpgradeReq homePa=0x%lx "
+            "reqNode=%d epoch=%lu reqId=%lu desiredPerm=%d homeNode=%d\n",
+            _nodeId, homePa, requesterNode, epoch, reqId, desiredPerm, homeNode);
+
+    if (!_router) {
+        fatal("UBAdapter node=%d: sendUpgradeReq called with no router bound\n",
+              _nodeId);
+    }
+
+    UBMsg req;
+    req.h.type = UBMsgType::UpgradeReq;
+    req.h.srcNode = _nodeId;
+    req.h.dstNode = homeNode;
+    req.h.homeNode = homeNode;
+    req.h.requesterNode = requesterNode;
+    req.h.homeLinePa = homePa;
+    req.h.epoch = epoch;
+    req.h.reqId = reqId;
+    req.h.seqNum = _nextSeq++;
+    req.h.enqueueTick = curTick();
+    req.h.readyTick = curTick();
+
+    req.b.upgradeReq.desiredPerm = static_cast<uint8_t>(desiredPerm);
+    req.b.upgradeReq.cause = static_cast<uint8_t>(cause);
+
+    _lastResponseValid = false;
+    _router->sendMessage(req);
+
+    if (!_lastResponseValid) {
+        warn("UBAdapter node=%d: sendUpgradeReq: no response PA=0x%lx\n",
+             _nodeId, homePa);
+        return false;
+    }
+
+    const UBMsg &resp = _lastResponse;
+    if (resp.h.type != UBMsgType::UpgradeResp) {
+        warn("UBAdapter node=%d: sendUpgradeReq: unexpected response type %s\n",
+             _nodeId, ubMsgTypeName(resp.h.type));
+        return false;
+    }
+
+    bool accepted = (resp.h.flags & static_cast<uint32_t>(UB_FLAG_ACCEPTED)) != 0;
+    if (outUpgradeTargetMask)
+        *outUpgradeTargetMask = resp.b.upgradeResp.upgradeTargetMask;
+    if (outCommittedEpoch)
+        *outCommittedEpoch = resp.b.upgradeResp.committedEpoch;
+
+    DPRINTF(RubyEP,
+            "UBAdapter node=%d: sendUpgradeReq result accepted=%d targetMask=0x%lx\n",
+            _nodeId, accepted, resp.b.upgradeResp.upgradeTargetMask);
+
+    return accepted;
+}
+
+// ---- Upgrade Done Request ----
+
+bool
+UBAdapter::sendUpgradeDoneReq(uint64_t homePa, int requesterNode,
+                               uint64_t epoch, uint64_t reqId,
+                               int homeNode)
+{
+    DPRINTF(RubyEP,
+            "UBAdapter node=%d: sendUpgradeDoneReq homePa=0x%lx "
+            "reqNode=%d epoch=%lu reqId=%lu homeNode=%d\n",
+            _nodeId, homePa, requesterNode, epoch, reqId, homeNode);
+
+    if (!_router) {
+        fatal("UBAdapter node=%d: sendUpgradeDoneReq called with no router bound\n",
+              _nodeId);
+    }
+
+    UBMsg req;
+    req.h.type = UBMsgType::UpgradeDoneReq;
+    req.h.srcNode = _nodeId;
+    req.h.dstNode = homeNode;
+    req.h.homeNode = homeNode;
+    req.h.requesterNode = requesterNode;
+    req.h.homeLinePa = homePa;
+    req.h.epoch = epoch;
+    req.h.reqId = reqId;
+    req.h.seqNum = _nextSeq++;
+    req.h.enqueueTick = curTick();
+    req.h.readyTick = curTick();
+
+    _lastResponseValid = false;
+    _router->sendMessage(req);
+
+    if (!_lastResponseValid) {
+        warn("UBAdapter node=%d: sendUpgradeDoneReq: no response PA=0x%lx\n",
+             _nodeId, homePa);
+        return false;
+    }
+
+    const UBMsg &resp = _lastResponse;
+    if (resp.h.type != UBMsgType::UpgradeDoneResp) {
+        warn("UBAdapter node=%d: sendUpgradeDoneReq: unexpected response type %s\n",
+             _nodeId, ubMsgTypeName(resp.h.type));
+        return false;
+    }
+
+    return resp.b.upgradeDoneResp.accepted;
+}
+
+// ---- Clear Request ----
+
+bool
+UBAdapter::sendClearReq(uint64_t linePa, int srcNode,
+                         uint64_t epoch, uint64_t reqId,
+                         int homeNode)
+{
+    DPRINTF(RubyEP,
+            "UBAdapter node=%d: sendClearReq PA=0x%lx "
+            "srcNode=%d epoch=%lu reqId=%lu homeNode=%d\n",
+            _nodeId, linePa, srcNode, epoch, reqId, homeNode);
+
+    if (!_router) {
+        fatal("UBAdapter node=%d: sendClearReq called with no router bound\n",
+              _nodeId);
+    }
+
+    UBMsg req;
+    req.h.type = UBMsgType::ClearReq;
+    req.h.srcNode = _nodeId;
+    req.h.dstNode = homeNode;
+    req.h.homeNode = homeNode;
+    req.h.requesterNode = srcNode;
+    req.h.homeLinePa = linePa;
+    req.h.epoch = epoch;
+    req.h.reqId = reqId;
+    req.h.seqNum = _nextSeq++;
+    req.h.enqueueTick = curTick();
+    req.h.readyTick = curTick();
+
+    req.b.clearReq.reason = 0; // GrantHandshake
+
+    _lastResponseValid = false;
+    _router->sendMessage(req);
+
+    if (!_lastResponseValid) {
+        warn("UBAdapter node=%d: sendClearReq: no response PA=0x%lx\n",
+             _nodeId, linePa);
+        return false;
+    }
+
+    const UBMsg &resp = _lastResponse;
+    if (resp.h.type != UBMsgType::ClearResp) {
+        warn("UBAdapter node=%d: sendClearReq: unexpected response type %s\n",
+             _nodeId, ubMsgTypeName(resp.h.type));
+        return false;
+    }
+
+    return resp.b.clearResp.accepted;
+}
+
+// ---- Recall Response (fire-and-forget → home UBCC) ----
+
+bool
+UBAdapter::sendRecallResp(uint64_t linePa, int ownerNode,
+                           bool dataReturned, uint64_t epoch,
+                           uint64_t reqId,
+                           const DataBlock *dataBlk,
+                           int homeNode)
+{
+    DPRINTF(RubyEP,
+            "UBAdapter node=%d: sendRecallResp PA=0x%lx "
+            "owner=%d dataReturned=%d epoch=%lu reqId=%lu homeNode=%d\n",
+            _nodeId, linePa, ownerNode, dataReturned, epoch, reqId, homeNode);
+
+    if (!_router) {
+        fatal("UBAdapter node=%d: sendRecallResp called with no router bound\n",
+              _nodeId);
+    }
+
+    UBMsg req;
+    req.h.type = UBMsgType::RecallResp;
+    req.h.srcNode = _nodeId;
+    req.h.dstNode = homeNode;
+    req.h.homeNode = homeNode;
+    req.h.requesterNode = ownerNode;
+    req.h.homeLinePa = linePa;
+    req.h.epoch = epoch;
+    req.h.reqId = reqId;
+    req.h.seqNum = _nextSeq++;
+    req.h.enqueueTick = curTick();
+    req.h.readyTick = curTick();
+
+    if (dataReturned)
+        req.h.flags |= static_cast<uint32_t>(UB_FLAG_DATA_RETURNED);
+    if (dataBlk && dataReturned) {
+        req.h.flags |= static_cast<uint32_t>(UB_FLAG_HAS_DATA);
+        memcpy(req.b.recallResp.data, dataBlk->getData(0, 64), 64);
+    }
+
+    // Fire-and-forget: no response expected
+    _router->sendMessage(req);
+    return true;
+}
+
+// ---- Invalidation Ack (fire-and-forget → home UBCC) ----
+
+bool
+UBAdapter::sendInvalidateAck(uint64_t linePa, int ackNode,
+                              uint64_t epoch, uint64_t reqId,
+                              int homeNode)
+{
+    DPRINTF(RubyEP,
+            "UBAdapter node=%d: sendInvalidateAck PA=0x%lx "
+            "ackNode=%d epoch=%lu reqId=%lu homeNode=%d\n",
+            _nodeId, linePa, ackNode, epoch, reqId, homeNode);
+
+    if (!_router) {
+        fatal("UBAdapter node=%d: sendInvalidateAck called with no router bound\n",
+              _nodeId);
+    }
+
+    UBMsg req;
+    req.h.type = UBMsgType::InvalidateAck;
+    req.h.srcNode = _nodeId;
+    req.h.dstNode = homeNode;
+    req.h.homeNode = homeNode;
+    req.h.requesterNode = ackNode;
+    req.h.homeLinePa = linePa;
+    req.h.epoch = epoch;
+    req.h.reqId = reqId;
+    req.h.seqNum = _nextSeq++;
+    req.h.enqueueTick = curTick();
+    req.h.readyTick = curTick();
+
+    // Fire-and-forget
+    _router->sendMessage(req);
+    return true;
+}
+
+// ---- Cross-node Recall Request (EPBackend → EPBackend via router) ----
+
+void
+UBAdapter::sendRecallReqToOwner(int targetNode,
+                                 const OuterRecallMsg &recallMsg)
+{
+    DPRINTF(RubyEP,
+            "UBAdapter node=%d: sendRecallReqToOwner target=%d PA=0x%lx\n",
+            _nodeId, targetNode, recallMsg.linePa);
+
+    if (!_router) {
+        fatal("UBAdapter node=%d: sendRecallReqToOwner called with no router bound\n",
+              _nodeId);
+    }
+
+    UBMsg req;
+    req.h.type = UBMsgType::RecallReq;
+    req.h.srcNode = _nodeId;
+    req.h.dstNode = targetNode;
+    req.h.homeNode = recallMsg.homeNode;
+    req.h.requesterNode = _nodeId;
+    req.h.targetNode = targetNode;
+    req.h.homeLinePa = recallMsg.linePa;
+    req.h.localLinePa = recallMsg.ownerLocalPa;
+    req.h.epoch = recallMsg.epoch;
+    req.h.reqId = recallMsg.reqId;
+    req.h.seqNum = _nextSeq++;
+    req.h.enqueueTick = curTick();
+    req.h.readyTick = curTick();
+
+    if (recallMsg.isReadRequest)
+        req.h.flags |= static_cast<uint32_t>(UB_FLAG_IS_READ_RECALL);
+    if (recallMsg.dataNeeded)
+        req.h.flags |= static_cast<uint32_t>(UB_FLAG_HAS_DATA);
+
+    // Fire-and-forget: no response expected from the remote adapter
+    _router->sendMessage(req);
+}
+
+// ---- Cross-node Invalidate Request (EPBackend → EPBackend via router) ----
+
+void
+UBAdapter::sendInvalidateReqToSharer(int targetNode,
+                                      const OuterInvalidateMsg &invMsg)
+{
+    DPRINTF(RubyEP,
+            "UBAdapter node=%d: sendInvalidateReqToSharer target=%d PA=0x%lx\n",
+            _nodeId, targetNode, invMsg.linePa);
+
+    if (!_router) {
+        fatal("UBAdapter node=%d: sendInvalidateReqToSharer called with no router bound\n",
+              _nodeId);
+    }
+
+    UBMsg req;
+    req.h.type = UBMsgType::InvalidateReq;
+    req.h.srcNode = _nodeId;
+    req.h.dstNode = targetNode;
+    req.h.homeNode = invMsg.homeNode;
+    req.h.requesterNode = _nodeId;
+    req.h.targetNode = targetNode;
+    req.h.homeLinePa = invMsg.linePa;
+    req.h.localLinePa = invMsg.sharerLocalPa;
+    req.h.epoch = invMsg.epoch;
+    req.h.reqId = invMsg.reqId;
+    req.h.seqNum = _nextSeq++;
+    req.h.enqueueTick = curTick();
+    req.h.readyTick = curTick();
+
+    // Fire-and-forget
+    _router->sendMessage(req);
+}
+
+// ---- Receive message from router ----
+
+void
+UBAdapter::recvFromRouter(const UBMsg &msg)
+{
+    DPRINTF(RubyEP,
+            "UBAdapter node=%d: recvFromRouter type=%s src=%d dst=%d\n",
+            _nodeId, ubMsgTypeName(msg.h.type),
+            msg.h.srcNode, msg.h.dstNode);
+
+    switch (msg.h.type) {
+        case UBMsgType::ReadResp:
+        case UBMsgType::WritebackResp:
+        case UBMsgType::EvictResp:
+        case UBMsgType::UpgradeResp:
+        case UBMsgType::UpgradeDoneResp:
+        case UBMsgType::ClearResp:
+            // Synchronous response — store for caller
+            _lastResponse = msg;
+            _lastResponseValid = true;
+            break;
+
+        case UBMsgType::UpgradeAckNotify: {
+            // Async notification from UBCC: all invalidation acks received
+            // for an upgrade. Forward to EPBackend::notifyUpgradeAckReady().
+            if (_backend) {
+                _backend->notifyUpgradeAckReady(msg.h.homeLinePa);
+            } else {
+                warn("UBAdapter node=%d: UpgradeAckNotify received but no EPBackend bound\n",
+                     _nodeId);
+            }
+            break;
+        }
+
+        case UBMsgType::RecallReq: {
+            // Reconstruct OuterRecallMsg from UBMsg and deliver to EPBackend
+            OuterRecallMsg recallMsg;
+            recallMsg.linePa = msg.h.homeLinePa;
+            recallMsg.ownerLocalPa = msg.h.localLinePa;
+            recallMsg.ownerNode = msg.h.targetNode;
+            recallMsg.homeNode = msg.h.homeNode;
+            recallMsg.epoch = msg.h.epoch;
+            recallMsg.reqId = msg.h.reqId;
+            recallMsg.isReadRequest =
+                (msg.h.flags & static_cast<uint32_t>(UB_FLAG_IS_READ_RECALL)) != 0;
+            recallMsg.dataNeeded =
+                (msg.h.flags & static_cast<uint32_t>(UB_FLAG_HAS_DATA)) != 0;
+
+            if (_backend) {
+                _backend->handleRecallRequest(recallMsg);
+            } else {
+                warn("UBAdapter node=%d: RecallReq received but no EPBackend bound\n",
+                     _nodeId);
+            }
+            break;
+        }
+
+        case UBMsgType::InvalidateReq: {
+            // Reconstruct OuterInvalidateMsg from UBMsg and deliver to EPBackend
+            OuterInvalidateMsg invMsg;
+            invMsg.linePa = msg.h.homeLinePa;
+            invMsg.sharerLocalPa = msg.h.localLinePa;
+            invMsg.sharerNode = msg.h.targetNode;
+            invMsg.homeNode = msg.h.homeNode;
+            invMsg.epoch = msg.h.epoch;
+            invMsg.reqId = msg.h.reqId;
+
+            if (_backend) {
+                _backend->handleInvalidationRequest(invMsg);
+            } else {
+                warn("UBAdapter node=%d: InvalidateReq received but no EPBackend bound\n",
+                     _nodeId);
+            }
+            break;
+        }
+
+        default:
+            warn("UBAdapter node=%d: unhandled message type %s\n",
+                 _nodeId, ubMsgTypeName(msg.h.type));
+            break;
+    }
+}
+
+} // namespace ruby
+} // namespace gem5

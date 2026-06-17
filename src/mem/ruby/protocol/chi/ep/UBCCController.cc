@@ -8,6 +8,7 @@
 #include "debug/RubyCHIGeneric.hh"
 #include "debug/RubyEP.hh"
 #include "mem/ruby/protocol/chi/ep/NodeAddressMap.hh"
+#include "mem/ruby/protocol/chi/ep/UBRouter.hh"
 #include "mem/ruby/system/RubySystem.hh"
 #include "sim/cur_tick.hh"
 
@@ -1035,11 +1036,27 @@ UBCCController::processInvalidationAck(uint64_t line_pa, int ackNode,
                    line_pa, ost->requesterNode, ost->upgradeAckMask, ost->upgradeTargetMask);
 
             // Notify the requester that OuterUpgradeAck(true) is ready.
-            // Route through EPBackend static registry.
-            EPBackend *reqBackend = EPBackend::getBackendInstance(ost->requesterNode);
-            if (reqBackend) {
-                reqBackend->notifyUpgradeAckReady(line_pa);
+            // Route through router (message-based) instead of direct EPBackend call.
+            if (!_router) {
+                fatal("UBCC node_id=%d: router required for UpgradeAckNotify "
+                      "PA=0x%lx requester=%d\n",
+                      _nodeId, line_pa, ost->requesterNode);
             }
+            UBMsg notifyMsg;
+            notifyMsg.h.type = UBMsgType::UpgradeAckNotify;
+            notifyMsg.h.srcNode = _nodeId;
+            notifyMsg.h.dstNode = ost->requesterNode;
+            notifyMsg.h.homeNode = _nodeId;
+            notifyMsg.h.requesterNode = ost->requesterNode;
+            notifyMsg.h.homeLinePa = line_pa;
+            notifyMsg.h.epoch = ost->reservedEpoch;
+            notifyMsg.h.reqId = ost->reqId;
+            notifyMsg.h.flags =
+                static_cast<uint32_t>(gem5::ruby::UB_FLAG_ACCEPTED);
+            notifyMsg.h.seqNum = 0;
+            notifyMsg.h.enqueueTick = curTick();
+            notifyMsg.h.readyTick = curTick();
+            _router->sendMessage(notifyMsg);
 
             // TENTATIVE: if Done arrived early (upgradeDoneArrived), auto-commit now
             if (ost->upgradeDoneArrived) {

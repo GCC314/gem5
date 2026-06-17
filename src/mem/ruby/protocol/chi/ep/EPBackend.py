@@ -11,3 +11,4 @@ class EPBackend(SimObject):
 
     node_id = Param.Int(0, "Node ID for this backend")
     ruby_system = Param.RubySystem("")
+    ub_adapter = Param.UBAdapter(NULL, "UBAdapter for message-path UBCC access")
