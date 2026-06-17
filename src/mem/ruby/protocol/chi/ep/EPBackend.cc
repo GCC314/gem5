@@ -93,7 +93,7 @@ EPBackend::EPBackend(const Params &p)
     _invalidationAckSentCount(0)
 {
     auto *ruby_system = p.ruby_system;
-    _ubcc = new UBCCController(_nodeId, ruby_system);
+    _ubcc = new UBCCController(_nodeId, ruby_system, p.ubcc_epoch_bits);
 
     // Phase 2: Bind EPBackend to UBAdapter for message-path access
     if (_ubAdapter) {

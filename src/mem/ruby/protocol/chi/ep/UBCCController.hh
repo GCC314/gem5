@@ -201,7 +201,8 @@ class UBCCController
     // Maximum pending requesters per PA (configurable queue depth)
     static constexpr size_t MAX_PENDING_PER_PA = 4;
 
-    UBCCController(int node_id, RubySystem *ruby_system = nullptr);
+    UBCCController(int node_id, RubySystem *ruby_system = nullptr,
+                   uint32_t epoch_bits = 64);
     ~UBCCController();
 
     int nodeId() const { return _nodeId; }
@@ -561,6 +562,9 @@ class UBCCController
     // ---- v4: Tombstone window (configurable, default 100000 ticks) ----
     Tick _tombstoneWindowW = 100000;
 
+    // Configurable epoch width for wrap-around experiments.
+    uint32_t _epochBits = 64;
+
     // ---- M6: Recall counters ----
     uint64_t _recallCount;
     uint64_t _recallResponseCount;
@@ -603,7 +607,17 @@ class UBCCController
      * Half-range epoch comparison (§3.1.2).
      * Returns true if a is newer than b.
      */
-    static bool isNewerEpoch(uint64_t a, uint64_t b);
+    bool isNewerEpoch(uint64_t a, uint64_t b) const;
+
+    /**
+     * Normalize an epoch to the configured epoch width.
+     */
+    uint64_t normalizeEpoch(uint64_t epoch) const;
+
+    /**
+     * Bitmask for the configured epoch width.
+     */
+    uint64_t epochMask() const;
 
     /**
      * Allocate a new reserved epoch (increments committed epoch + 1).

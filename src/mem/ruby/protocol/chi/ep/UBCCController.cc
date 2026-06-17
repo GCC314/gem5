@@ -34,9 +34,11 @@ UBCCController::getInstance(int node_id)
     return (it != _instances.end()) ? it->second : nullptr;
 }
 
-UBCCController::UBCCController(int node_id, RubySystem *ruby_system)
+UBCCController::UBCCController(int node_id, RubySystem *ruby_system,
+                               uint32_t epoch_bits)
   : _nodeId(node_id),
     _interconnectLatency(200),
+    _epochBits(epoch_bits),
     _recallCount(0),
     _recallResponseCount(0),
     _writebackCount(0),
@@ -49,6 +51,11 @@ UBCCController::UBCCController(int node_id, RubySystem *ruby_system)
     _dsmLocalBase(0),
     _dsmSegSize(0)
 {
+    if (_epochBits == 0 || _epochBits > 64) {
+        fatal("UBCC node_id=%d: epoch_bits=%u out of range (1..64)\n",
+              _nodeId, _epochBits);
+    }
+
     // Precompute DSM local range for isDsmAddr()
     // Hardcoded prototype constants: num_nodes=3, segSize=128MB, NODE_ADDR_SHIFT=40
     constexpr uint64_t kSegSize = 128ULL * 1024 * 1024;
@@ -56,6 +63,9 @@ UBCCController::UBCCController(int node_id, RubySystem *ruby_system)
     uint64_t nodeBase = static_cast<uint64_t>(node_id) << kNodeAddrShift;
     _dsmLocalBase = nodeBase + 2 * kSegSize + node_id * kSegSize;
     _dsmSegSize = kSegSize;
+    DPRINTF(RubyEP,
+            "UBCC node_id=%d: initialized with epoch_bits=%u mask=0x%lx\n",
+            _nodeId, _epochBits, epochMask());
 
     registerInstance(node_id, this);
 }
@@ -126,6 +136,8 @@ UBCCController::processOuterRequest(
     GrantDataSource *outDataSource,
     uint64_t *outAuthEpoch)
 {
+    baseEpoch = normalizeEpoch(baseEpoch);
+
     DPRINTF(RubyCHIGeneric,
             "UBCC node_id=%d: processOuterRequest PA=0x%lx req=%d write=%d "
             "requesterNode=%d baseEpoch=%lu reqId=%lu\n",
@@ -779,6 +791,8 @@ UBCCController::processRecallResponse(uint64_t line_pa, int ownerNode,
                                        uint64_t reqId,
                                        const DataBlock *dataBlk)
 {
+    responseEpoch = normalizeEpoch(responseEpoch);
+
     printf("[RECALL-DIAG] UBCC node_id=%d processRecallResponse PA=0x%lx "
            "owner=%d epoch=%lu reqId=%lu\n",
            _nodeId, line_pa, ownerNode, responseEpoch, reqId);
@@ -913,9 +927,11 @@ UBCCController::getPendingRecallTarget(uint64_t line_pa) const
 
 bool
 UBCCController::processInvalidationAck(uint64_t line_pa, int ackNode,
-                                        uint64_t responseEpoch,
-                                        uint64_t reqId)
+                                         uint64_t responseEpoch,
+                                         uint64_t reqId)
 {
+    responseEpoch = normalizeEpoch(responseEpoch);
+
     // Validate ackNode boundaries
     if (ackNode < 0 || ackNode >= 64) {
         warn("UBCC node_id=%d: processInvalidationAck PA=0x%lx "
@@ -1153,7 +1169,7 @@ UBCCController::getEpochForLine(uint64_t line_pa) const
     auto it = _directory.find(line_pa);
     if (it == _directory.end())
         return 0;
-    return it->second.epoch;
+    return normalizeEpoch(it->second.epoch);
 }
 
 uint64_t
@@ -1162,7 +1178,7 @@ UBCCController::getOutstandingBaseEpoch(uint64_t line_pa) const
     auto it = _outstandingReqs.find(line_pa);
     if (it == _outstandingReqs.end())
         return 0;
-    return it->second.baseEpoch;
+    return normalizeEpoch(it->second.baseEpoch);
 }
 
 // ---- M7: GlobalWriteback ----
@@ -1171,6 +1187,8 @@ bool
 UBCCController::processWriteback(uint64_t line_pa, int requesterNode,
                                   uint64_t epochVal, bool keepAsClean)
 {
+    epochVal = normalizeEpoch(epochVal);
+
     DPRINTF(RubyEP,
             "UBCC node_id=%d: processWriteback PA=0x%lx "
             "requesterNode=%d epoch=%lu keepAsClean=%d\n",
@@ -1253,6 +1271,8 @@ bool
 UBCCController::processEvict(uint64_t line_pa, int evictingNode,
                               uint64_t epochVal)
 {
+    epochVal = normalizeEpoch(epochVal);
+
     DPRINTF(RubyEP,
             "UBCC node_id=%d: processEvict PA=0x%lx "
             "evictingNode=%d epoch=%lu\n",
@@ -1368,6 +1388,8 @@ UBCCController::processOuterUpgradeReq(
     uint64_t epoch, uint64_t reqId,
     int desiredPerm, UBCC_UpgradeCause cause)
 {
+    epoch = normalizeEpoch(epoch);
+
     DPRINTF(RubyEP,
             "UBCC node_id=%d: processOuterUpgradeReq PA=0x%lx "
             "requesterNode=%d epoch=%lu reqId=%lu desiredPerm=%d\n",
@@ -1478,6 +1500,8 @@ UBCCController::processOuterUpgradeDone(
     uint64_t line_pa, int requesterNode,
     uint64_t epoch, uint64_t reqId)
 {
+    epoch = normalizeEpoch(epoch);
+
     DPRINTF(RubyEP,
             "UBCC node_id=%d: processOuterUpgradeDone PA=0x%lx "
             "requesterNode=%d epoch=%lu reqId=%lu\n",
@@ -1579,6 +1603,8 @@ UBCCController::processClear(
     uint64_t line_pa, int srcNode,
     uint64_t epoch, uint64_t reqId)
 {
+    epoch = normalizeEpoch(epoch);
+
     DPRINTF(RubyEP,
             "UBCC node_id=%d: processClear PA=0x%lx "
             "srcNode=%d epoch=%lu reqId=%lu\n",
@@ -1630,14 +1656,15 @@ UBCCController::processClear(
     // v4: Verify epoch — the Clear carries the base epoch observed by
     // requester; the GRANT_HANDSHAKE's reservedEpoch = baseEpoch + 1.
     // Compare against baseEpoch (not reservedEpoch) for matching.
-    if (ost->baseEpoch != epoch) {
+    if (normalizeEpoch(ost->baseEpoch) != epoch) {
         printf("[TC5-CLEAR-TRACE] processClearDrop home=%d pa=0x%lx src=%d "
                "reason=epoch_mismatch ostBase=%lu clear=%lu\n",
-               _nodeId, line_pa, srcNode, ost->baseEpoch, epoch);
+               _nodeId, line_pa, srcNode,
+               normalizeEpoch(ost->baseEpoch), epoch);
         warn("UBCC node_id=%d: processClear PA=0x%lx "
-             "epoch mismatch: ost_base=%lu clear=%lu — dropping, "
-             "retiring stale GRANT_HANDSHAKE\n",
-             _nodeId, line_pa, ost->baseEpoch, epoch);
+              "epoch mismatch: ost_base=%lu clear=%lu — dropping, "
+              "retiring stale GRANT_HANDSHAKE\n",
+              _nodeId, line_pa, normalizeEpoch(ost->baseEpoch), epoch);
         // v4 D-18: Retire stale GRANT_HANDSHAKE so it doesn't block
         // future RECALL/INVALIDATE creation for this PA.
         retireToTombstone(*ost, false);
@@ -1734,17 +1761,36 @@ UBCCController::copyOutstandingGrantData(uint64_t line_pa, DataBlock &outBlk) co
 
 // Half-range epoch comparison (§3.1.2)
 bool
-UBCCController::isNewerEpoch(uint64_t a, uint64_t b)
+UBCCController::isNewerEpoch(uint64_t a, uint64_t b) const
 {
-    uint64_t delta = (a - b) & 0xffffffffffffffffULL;
-    return delta != 0 && delta < (1ULL << 63);
+    const uint64_t mask = epochMask();
+    const uint64_t delta = (normalizeEpoch(a) - normalizeEpoch(b)) & mask;
+    const uint64_t half_range = (_epochBits == 64)
+        ? (1ULL << 63)
+        : (1ULL << (_epochBits - 1));
+    return delta != 0 && delta < half_range;
+}
+
+uint64_t
+UBCCController::normalizeEpoch(uint64_t epoch) const
+{
+    return epoch & epochMask();
+}
+
+uint64_t
+UBCCController::epochMask() const
+{
+    if (_epochBits >= 64) {
+        return 0xffffffffffffffffULL;
+    }
+    return (1ULL << _epochBits) - 1;
 }
 
 uint64_t
 UBCCController::allocateReservedEpoch(DirEntry &entry)
 {
     // reservedEpoch = committed epoch + 1; committed epoch is NOT modified here
-    return entry.epoch + 1;
+    return normalizeEpoch(entry.epoch + 1);
 }
 
 uint64_t
@@ -1760,7 +1806,7 @@ UBCCController::commitIntendedResult(DirEntry &entry, const OutstandingRequest &
     entry.sharersMask = ost.intendedSharersMask;
     entry.ownerNode = ost.intendedOwnerNode;
     entry.dirty = ost.intendedDirty;
-    entry.epoch = ost.reservedEpoch;
+    entry.epoch = normalizeEpoch(ost.reservedEpoch);
 
     DPRINTF(RubyEP,
             "UBCC node_id=%d: commitIntendedResult PA=0x%lx "
@@ -1775,7 +1821,7 @@ UBCCController::retireToTombstone(const OutstandingRequest &ost, bool accepted)
 {
     GrantHandshakeTombstone ts;
     ts.linePa = ost.linePa;
-    ts.epoch = ost.baseEpoch;
+    ts.epoch = normalizeEpoch(ost.baseEpoch);
     ts.reqId = ost.reqId;
     ts.opType = OpType::GRANT_HANDSHAKE;
     ts.accepted = accepted;
@@ -1794,8 +1840,9 @@ UBCCController::retireToTombstone(const OutstandingRequest &ost, bool accepted)
 
 bool
 UBCCController::checkTombstone(uint64_t linePa, uint64_t epoch, uint64_t reqId,
-                                bool &outAccepted)
+                                 bool &outAccepted)
 {
+    epoch = normalizeEpoch(epoch);
     cleanupTombstones();
     auto it = _tombstones.find(linePa);
     if (it == _tombstones.end())

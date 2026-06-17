@@ -7,6 +7,7 @@ Q1: DSM VA Mapping helper — call setup_dsm_va_mapping() from test scripts
     after Process creation to map DSM_VA_BASE + k*SEG to PA for each node.
 """
 import math
+import os
 
 import m5
 from m5.objects import *
@@ -160,7 +161,7 @@ def _make_ep_node(ruby_system, ep_cntrl, node_id):
 
 
 def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
-                        ruby_system, cpus):
+                         ruby_system, cpus):
     if buildEnv["PROTOCOL"] != "CHI":
         m5.panic("UBCC framework requires CHI protocol build")
 
@@ -170,7 +171,9 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
 
     num_nodes = DEFAULT_N
     seg_size = DEFAULT_SEG_SIZE
+    ubcc_epoch_bits = int(os.environ.get("UBCC_EPOCH_BITS", "64"))
     cache_line = system.cache_line_size.value
+    print(f"[UBCC-CONFIG] epoch_bits={ubcc_epoch_bits}")
     addr_map = NodeAddressMap(num_nodes, seg_size)
     params = chi_defs.NoC_Params
 
@@ -230,7 +233,8 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
         nd['ub_adapter'] = ub_adapter
 
         ep_backend = EPBackend(node_id=node_id, ruby_system=ruby_system,
-                               ub_adapter=ub_adapter)
+                               ub_adapter=ub_adapter,
+                               ubcc_epoch_bits=ubcc_epoch_bits)
 
         nd['ep_snf_cntrl'] = EPSNFController(
             version=chi_defs.Versions.getVersion(chi_defs.CHI_Cache_Controller),
