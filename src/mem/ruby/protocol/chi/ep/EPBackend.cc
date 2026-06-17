@@ -13,6 +13,7 @@
 #include "mem/request.hh"
 #include "mem/simple_mem.hh"
 #include "mem/ruby/protocol/chi/ep/EPRNFController.hh"
+#include "mem/ruby/protocol/chi/ep/MetaRNFController.hh"
 #include "mem/ruby/protocol/chi/ep/UBCCController.hh"
 #include "mem/ruby/protocol/chi/ep/UBAdapter.hh"
 #include "mem/ruby/protocol/CHI/CHIRequestType.hh"
@@ -80,6 +81,7 @@ EPBackend::EPBackend(const Params &p)
   : SimObject(p),
     _nodeId(p.node_id),
     _addrMap(3, 128ULL * 1024 * 1024),
+    _metaRnf(p.meta_rnf),
     _ubAdapter(p.ub_adapter),
     _ruby_system(p.ruby_system),
     _lastGrantDataBlock(64),  // cache line size = 64 bytes
@@ -93,7 +95,10 @@ EPBackend::EPBackend(const Params &p)
     _invalidationAckSentCount(0)
 {
     auto *ruby_system = p.ruby_system;
-    _ubcc = new UBCCController(_nodeId, ruby_system, p.ubcc_epoch_bits);
+    _ubcc = new UBCCController(_nodeId, ruby_system, p.ubcc_epoch_bits,
+                               p.ubcc_bf_bytes,
+                               p.ubcc_force_resident_entries);
+    _ubcc->setBackend(this);
 
     // Phase 2: Bind EPBackend to UBAdapter for message-path access
     if (_ubAdapter) {
@@ -835,6 +840,101 @@ EPBackend::clearSidebandSnapshot()
     _lastSideband.outerReqType = -1;
     _lastSideband.grantResult = -1;
     _lastSideband.homeNode = -1;
+}
+
+void
+EPBackend::setMetaRnfController(MetaRNFController *ctrl)
+{
+    _metaRnf = ctrl;
+}
+
+void
+EPBackend::issueBackstoreRead(uint64_t homePa)
+{
+    if (!_ubcc) {
+        return;
+    }
+    if (!_metaRnf) {
+        UBCCController::BackstoreEntry e;
+        bool found = _ubcc->lookupBackstore(homePa, e);
+        _ubcc->onBackstoreFillComplete(homePa, found, e);
+        return;
+    }
+
+    _metaRnf->issueRead(homePa,
+        [this, homePa](bool, const MetaBackstoreEntry&) {
+            UBCCController::BackstoreEntry e;
+            bool found = _ubcc->lookupBackstore(homePa, e);
+            _ubcc->onBackstoreFillComplete(homePa, found, e);
+        });
+}
+
+void
+EPBackend::issueBackstoreWrite(uint64_t homePa)
+{
+    if (!_ubcc) {
+        return;
+    }
+    if (!_metaRnf) {
+        _ubcc->onBackstoreWriteAck(homePa);
+        return;
+    }
+
+    UBCCController::BackstoreEntry e;
+    _ubcc->snapshotResidentForBackstore(homePa, e);
+    MetaBackstoreEntry me{static_cast<int>(e.state), e.sharersMask, e.epoch};
+    _metaRnf->issueWrite(homePa, me, [this, homePa]() {
+        _ubcc->onBackstoreWriteAck(homePa);
+    });
+}
+
+void
+EPBackend::issueBackstoreDelete(uint64_t homePa)
+{
+    if (!_ubcc) {
+        return;
+    }
+    if (!_metaRnf) {
+        _ubcc->onBackstoreDeleteAck(homePa, true);
+        return;
+    }
+
+    _metaRnf->issueDelete(homePa, [this, homePa](bool existed) {
+        _ubcc->onBackstoreDeleteAck(homePa, existed);
+    });
+}
+
+std::string
+EPBackend::inspectOffloadLineForTest(uint64_t homePa) const
+{
+    if (!_ubcc) {
+        return "{\"error\":\"no_ubcc\"}";
+    }
+    return _ubcc->inspectOffloadLineForTest(homePa);
+}
+
+bool
+EPBackend::debugSeedBackstoreForTest(
+    uint64_t homePa, int mesi, uint64_t sharersMask, uint64_t epoch)
+{
+    return _ubcc &&
+           _ubcc->debugSeedBackstoreForTest(homePa, mesi, sharersMask, epoch);
+}
+
+bool
+EPBackend::debugSeedResidentForTest(
+    uint64_t homePa, int mesi, uint64_t sharersMask, uint64_t epoch,
+    bool residentDirty)
+{
+    return _ubcc &&
+           _ubcc->debugSeedResidentForTest(homePa, mesi, sharersMask,
+                                           epoch, residentDirty);
+}
+
+bool
+EPBackend::debugForceResidentEvictForTest(uint64_t homePa)
+{
+    return _ubcc && _ubcc->debugForceResidentEvictForTest(homePa);
 }
 
 // ---- M5 Phase 2: Diagnose Expected Grant ----

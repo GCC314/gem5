@@ -13,3 +13,8 @@ class EPBackend(SimObject):
     ruby_system = Param.RubySystem("")
     ub_adapter = Param.UBAdapter(NULL, "UBAdapter for message-path UBCC access")
     ubcc_epoch_bits = Param.UInt32(64, "UBCC committed epoch width in bits")
+    meta_rnf = Param.MetaRNFController(NULL, "metadata async service stub")
+    ubcc_bf_bytes = Param.UInt32(64 * 1024, "resident dir counting bloom bytes")
+    ubcc_force_resident_entries = Param.UInt32(
+        0, "force resident entries for tests (0=auto)"
+    )

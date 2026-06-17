@@ -22,6 +22,7 @@ class UBCCController;
 class EPRNFController;
 class UBAdapter;
 class RubySystem;
+class MetaRNFController;
 
 // ---- M5 Outer Protocol Types ----
 // Outer protocol request types sent from EP_SNF (requester) to home UBCC.
@@ -602,6 +603,19 @@ class EPBackend : public SimObject
     /** Clear the last sideband snapshot (for test reset). */
     void clearSidebandSnapshot();
 
+    void setMetaRnfController(MetaRNFController *ctrl);
+    void issueBackstoreRead(uint64_t homePa);
+    void issueBackstoreWrite(uint64_t homePa);
+    void issueBackstoreDelete(uint64_t homePa);
+
+    std::string inspectOffloadLineForTest(uint64_t homePa) const;
+    bool debugSeedBackstoreForTest(uint64_t homePa, int mesi,
+                                   uint64_t sharersMask, uint64_t epoch);
+    bool debugSeedResidentForTest(uint64_t homePa, int mesi,
+                                  uint64_t sharersMask, uint64_t epoch,
+                                  bool residentDirty);
+    bool debugForceResidentEvictForTest(uint64_t homePa);
+
     // ---- M6: EP_RNF delayed response hook ----
     /**
      * Register the EPRNFController for delayed HN response support.
@@ -632,6 +646,7 @@ class EPBackend : public SimObject
     const int _nodeId;
     NodeAddressMap _addrMap;
     UBCCController *_ubcc = nullptr;
+    MetaRNFController *_metaRnf = nullptr;
     UBAdapter *_ubAdapter = nullptr;  // Phase 2: message-path adapter
     EPRNFController *_epRnfCtrl = nullptr;
     RubySystem *_ruby_system = nullptr;

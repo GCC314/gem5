@@ -172,6 +172,12 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
     num_nodes = DEFAULT_N
     seg_size = DEFAULT_SEG_SIZE
     ubcc_epoch_bits = int(os.environ.get("UBCC_EPOCH_BITS", "64"))
+    ubcc_bf_bytes = int(os.environ.get("UBCC_BF_BYTES", "65536"))
+    ubcc_force_resident_entries = int(
+        os.environ.get("UBCC_FORCE_RESIDENT_ENTRIES", "0"))
+    ubcc_meta_read_ticks = int(os.environ.get("UBCC_META_READ_TICKS", "8000"))
+    ubcc_meta_write_ticks = int(os.environ.get("UBCC_META_WRITE_TICKS", "7500"))
+    ubcc_meta_delete_ticks = int(os.environ.get("UBCC_META_DELETE_TICKS", "7500"))
     cache_line = system.cache_line_size.value
     print(f"[UBCC-CONFIG] epoch_bits={ubcc_epoch_bits}")
     addr_map = NodeAddressMap(num_nodes, seg_size)
@@ -229,12 +235,21 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
         # Phase 2: Create UBAdapter and UBRouter per node
         ub_router = UBRouter(node_id=node_id, ub_msg_latency="0ns")
         ub_adapter = UBAdapter(node_id=node_id, router=ub_router)
+        meta_rnf = MetaRNFController(
+            read_latency_ticks=ubcc_meta_read_ticks,
+            write_latency_ticks=ubcc_meta_write_ticks,
+            delete_latency_ticks=ubcc_meta_delete_ticks)
         nd['ub_router'] = ub_router
         nd['ub_adapter'] = ub_adapter
+        nd['meta_rnf'] = meta_rnf
 
         ep_backend = EPBackend(node_id=node_id, ruby_system=ruby_system,
+                               meta_rnf=meta_rnf,
                                ub_adapter=ub_adapter,
-                               ubcc_epoch_bits=ubcc_epoch_bits)
+                               ubcc_epoch_bits=ubcc_epoch_bits,
+                               ubcc_bf_bytes=ubcc_bf_bytes,
+                               ubcc_force_resident_entries=
+                                   ubcc_force_resident_entries)
 
         nd['ep_snf_cntrl'] = EPSNFController(
             version=chi_defs.Versions.getVersion(chi_defs.CHI_Cache_Controller),

@@ -7,6 +7,7 @@
 #include "base/logging.hh"
 #include "debug/RubyCHIGeneric.hh"
 #include "debug/RubyEP.hh"
+#include "mem/ruby/protocol/chi/ep/EPBackend.hh"
 #include "mem/ruby/protocol/chi/ep/NodeAddressMap.hh"
 #include "mem/ruby/protocol/chi/ep/UBRouter.hh"
 #include "mem/ruby/system/RubySystem.hh"
@@ -35,9 +36,12 @@ UBCCController::getInstance(int node_id)
 }
 
 UBCCController::UBCCController(int node_id, RubySystem *ruby_system,
-                               uint32_t epoch_bits)
+                               uint32_t epoch_bits,
+                               uint32_t resident_bf_bytes,
+                               uint32_t resident_force_entries)
   : _nodeId(node_id),
     _interconnectLatency(200),
+    _directory(resident_bf_bytes, resident_force_entries),
     _epochBits(epoch_bits),
     _recallCount(0),
     _recallResponseCount(0),
@@ -95,11 +99,218 @@ UBCCController::isDsmAddr(uint64_t pa) const
 void
 UBCCController::ensureDirEntry(uint64_t line_pa)
 {
-    if (_directory.find(line_pa) == _directory.end()) {
-        DirEntry entry;
-        entry.lineAddr = line_pa;
-        _directory[line_pa] = entry;
+    DirEntry entry;
+    if (!_directory.lookup(line_pa, entry)) {
+        DirEntry new_entry;
+        new_entry.lineAddr = line_pa;
+        _directory.insert(line_pa, new_entry);
+        _directory.touch(line_pa);
     }
+}
+
+UBCCController::ResidentAccessResult
+UBCCController::ensureResidentForAccess(
+    uint64_t line_pa, UBCC_OuterReqType reqType, bool writeIntent,
+    int requesterNode, uint64_t baseEpoch, uint64_t reqId, DirEntry &entry)
+{
+    size_t slot = 0;
+    if (_directory.lookupWithSlot(line_pa, entry, slot)) {
+        _directory.touch(line_pa);
+        if (_directory.fillPending(line_pa) || _directory.wbPending(line_pa)) {
+            PendingRequester pr;
+            pr.node = requesterNode;
+            pr.reqType = reqType;
+            pr.writeIntent = writeIntent;
+            pr.epoch = baseEpoch;
+            pr.reqId = reqId;
+            enqueueResidentWaiter(line_pa, pr);
+            refreshPinnedBit(line_pa);
+            return _directory.fillPending(line_pa)
+                ? ResidentAccessResult::Queued
+                : ResidentAccessResult::Busy;
+        }
+        refreshPinnedBit(line_pa);
+        return ResidentAccessResult::Ready;
+    }
+
+    return handleResidentMiss(line_pa, reqType, writeIntent,
+                              requesterNode, baseEpoch, reqId, entry);
+}
+
+UBCCController::ResidentAccessResult
+UBCCController::handleResidentMiss(
+    uint64_t line_pa, UBCC_OuterReqType reqType, bool writeIntent,
+    int requesterNode, uint64_t baseEpoch, uint64_t reqId, DirEntry &entry)
+{
+    const bool mayContain = _directory.bloomMayContain(line_pa);
+    if (!_directory.hasFreeSlot() && !evictOneVictim(line_pa)) {
+        return ResidentAccessResult::Busy;
+    }
+
+    DirEntry placeholder;
+    placeholder.lineAddr = line_pa;
+    placeholder.state = MESIState::G_I;
+    placeholder.sharersMask = 0;
+    placeholder.epoch = 0;
+    placeholder.residentDirty = false;
+
+    if (!_directory.insert(line_pa, placeholder)) {
+        if (!_directory.lookup(line_pa, placeholder)) {
+            return ResidentAccessResult::Busy;
+        }
+    }
+    _directory.touch(line_pa);
+
+    if (!mayContain) {
+        entry = placeholder;
+        refreshPinnedBit(line_pa);
+        return ResidentAccessResult::Ready;
+    }
+
+    _directory.setFillPending(line_pa, true);
+    _directory.setPinned(line_pa, true);
+    PendingRequester pr;
+    pr.node = requesterNode;
+    pr.reqType = reqType;
+    pr.writeIntent = writeIntent;
+    pr.epoch = baseEpoch;
+    pr.reqId = reqId;
+    enqueueResidentWaiter(line_pa, pr);
+
+    if (_backend) {
+        _backend->issueBackstoreRead(line_pa);
+    } else {
+        BackstoreEntry be;
+        bool found = lookupBackstore(line_pa, be);
+        onBackstoreFillComplete(line_pa, found, be);
+    }
+    return ResidentAccessResult::Queued;
+}
+
+void
+UBCCController::enqueueResidentWaiter(uint64_t linePa, const PendingRequester &pr)
+{
+    auto &q = _residentWaiters[linePa];
+    if (q.size() >= MAX_PENDING_PER_PA) {
+        return;
+    }
+    for (const auto &e : q) {
+        if (e.node == pr.node && e.reqId == pr.reqId && e.reqType == pr.reqType) {
+            return;
+        }
+    }
+    q.push_back(pr);
+}
+
+void
+UBCCController::refreshPinnedBit(uint64_t linePa)
+{
+    DirEntry e;
+    if (!_directory.lookup(linePa, e)) {
+        return;
+    }
+    bool pin = false;
+    pin = pin || (_outstandingReqs.find(linePa) != _outstandingReqs.end());
+    auto pit = _pendingRequesters.find(linePa);
+    pin = pin || (pit != _pendingRequesters.end() && !pit->second.empty());
+    auto rit = _residentWaiters.find(linePa);
+    pin = pin || (rit != _residentWaiters.end() && !rit->second.empty());
+    pin = pin || _directory.fillPending(linePa);
+    pin = pin || _directory.wbPending(linePa);
+    pin = pin || (e.state == MESIState::G_I && e.residentDirty);
+    _directory.setPinned(linePa, pin);
+}
+
+bool
+UBCCController::evictOneVictim(uint64_t avoidPa)
+{
+    uint64_t victimPa = 0;
+    DirEntry victim;
+    if (!_directory.pickVictim(avoidPa, victimPa, victim)) {
+        return false;
+    }
+
+    if (!victim.residentDirty) {
+        _directory.forceRemove(victimPa);
+        _residentWaiters.erase(victimPa);
+        _pendingRequesters.erase(victimPa);
+        return true;
+    }
+
+    _directory.setWbPending(victimPa, true);
+    _directory.setPinned(victimPa, true);
+    _evictionPendingRemoval.insert(victimPa);
+    if (victim.state == MESIState::G_I) {
+        scheduleBackstoreDelete(victimPa);
+    } else {
+        scheduleBackstoreWrite(victimPa);
+    }
+    return false;
+}
+
+void
+UBCCController::scheduleBackstoreWrite(uint64_t linePa)
+{
+    if (_backend) {
+        _backend->issueBackstoreWrite(linePa);
+    } else {
+        onBackstoreWriteAck(linePa);
+    }
+}
+
+void
+UBCCController::scheduleBackstoreDelete(uint64_t linePa)
+{
+    if (_backend) {
+        _backend->issueBackstoreDelete(linePa);
+    } else {
+        onBackstoreDeleteAck(linePa, true);
+    }
+}
+
+void
+UBCCController::replayResidentWaiters(uint64_t linePa)
+{
+    auto it = _residentWaiters.find(linePa);
+    if (it == _residentWaiters.end()) {
+        return;
+    }
+    if (_directory.fillPending(linePa) || _directory.wbPending(linePa)) {
+        return;
+    }
+
+    while (!it->second.empty()) {
+        PendingRequester pr = it->second.front();
+        it->second.pop_front();
+        if (pr.reqType == UBCC_OuterReqType::GlobalWriteback) {
+            if (!processWriteback(linePa, pr.node, pr.epoch, pr.writeIntent)) {
+                it->second.push_front(pr);
+                break;
+            }
+        } else if (pr.reqType == UBCC_OuterReqType::GlobalEvict) {
+            if (!processEvict(linePa, pr.node, pr.epoch)) {
+                it->second.push_front(pr);
+                break;
+            }
+        } else {
+            auto g = processOuterRequest(linePa, pr.reqType, pr.writeIntent,
+                                         pr.node, pr.epoch, pr.reqId,
+                                         nullptr, nullptr, nullptr, nullptr,
+                                         nullptr, nullptr);
+            if (static_cast<int>(g) == -1) {
+                it->second.push_front(pr);
+                break;
+            }
+        }
+        if (_directory.fillPending(linePa) || _directory.wbPending(linePa)) {
+            break;
+        }
+    }
+
+    if (it->second.empty()) {
+        _residentWaiters.erase(it);
+    }
+    refreshPinnedBit(linePa);
 }
 
 const char*
@@ -168,8 +379,12 @@ UBCCController::processOuterRequest(
               _nodeId, requesterNode);
     }
 
-    ensureDirEntry(line_pa);
-    DirEntry &entry = _directory[line_pa];
+    DirEntry entry;
+    ResidentAccessResult r = ensureResidentForAccess(
+        line_pa, reqType, writeIntent, requesterNode, baseEpoch, reqId, entry);
+    if (r != ResidentAccessResult::Ready) {
+        return static_cast<UBCC_OuterGrantType>(-1);
+    }
 
     // v4: Check for existing outstanding — if active and belongs to a different
     // requester, try to enqueue (§4.2, recall_done_fix.md).
@@ -442,8 +657,7 @@ UBCCController::processOuterRequest(
 
         case MESIState::G_E:
         case MESIState::G_M: {
-            int existingOwner = entry.ownerNode;
-            bool wasDirty = (entry.state == MESIState::G_M);
+            int existingOwner = DirEntry::ownerFromSharers(entry);
 
             // v4: Check if there's an already-completed RECALL for this requester
             bool recallAlreadyDone = false;
@@ -677,19 +891,18 @@ UBCCController::processOuterRequest(
 std::string
 UBCCController::inspectUbccDirForTest(uint64_t line_pa)
 {
-    auto it = _directory.find(line_pa);
-    if (it == _directory.end()) {
+    DirEntry e;
+    if (!_directory.lookup(line_pa, e)) {
         return "{\"error\": \"entry not found\"}";
     }
 
-    const DirEntry &e = it->second;
     std::ostringstream oss;
     oss << "{"
         << "\"lineAddr\":\"0x" << std::hex << e.lineAddr << std::dec << "\","
         << "\"state\":\"" << mesiStateName(e.state) << "\","
         << "\"sharersMask\":" << e.sharersMask << ","
-        << "\"ownerNode\":" << e.ownerNode << ","
-        << "\"dirty\":" << (e.dirty ? "true" : "false") << ","
+        << "\"ownerNode\":" << DirEntry::ownerFromSharers(e) << ","
+        << "\"dirty\":" << (DirEntry::protoDirty(e) ? "true" : "false") << ","
          << "\"epoch\":" << e.epoch;
 
     // v4: Outstanding state sourced from OutstandingRequest
@@ -732,15 +945,14 @@ UBCCController::getUbccDirFieldsForTest(uint64_t line_pa,
     MESIState &outState, int &outOwnerNode,
     uint64_t &outSharersMask, bool &outDirty) const
 {
-    auto it = _directory.find(line_pa);
-    if (it == _directory.end()) {
+    DirEntry e;
+    if (!_directory.lookup(line_pa, e)) {
         return false;
     }
-    const DirEntry &e = it->second;
     outState = e.state;
-    outOwnerNode = e.ownerNode;
+    outOwnerNode = DirEntry::ownerFromSharers(e);
     outSharersMask = e.sharersMask;
-    outDirty = e.dirty;
+    outDirty = DirEntry::protoDirty(e);
     return true;
 }
 
@@ -752,15 +964,14 @@ UBCCController::getUbccDirFieldsExtendedForTest(uint64_t line_pa,
     uint64_t &outSharersMask, bool &outDirty, bool &outBusy,
     int &outPendingRequester, int &outPendingRecallTarget) const
 {
-    auto it = _directory.find(line_pa);
-    if (it == _directory.end()) {
+    DirEntry e;
+    if (!_directory.lookup(line_pa, e)) {
         return false;
     }
-    const DirEntry &e = it->second;
     outState = e.state;
-    outOwnerNode = e.ownerNode;
+    outOwnerNode = DirEntry::ownerFromSharers(e);
     outSharersMask = e.sharersMask;
-    outDirty = e.dirty;
+    outDirty = DirEntry::protoDirty(e);
     outBusy = isLineBusy(line_pa);
     outPendingRequester = getPendingRequester(line_pa);
     outPendingRecallTarget = getPendingRecallTarget(line_pa);
@@ -778,8 +989,8 @@ UBCCController::initiateRecall(uint64_t line_pa, DirEntry &entry,
     DPRINTF(RubyEP,
             "UBCC node_id=%d: initiateRecall PA=0x%lx "
             "ownerNode=%d requester=%d state=%s dirty=%d\n",
-            _nodeId, line_pa, entry.ownerNode, requesterNode,
-            mesiStateName(entry.state), entry.dirty);
+            _nodeId, line_pa, DirEntry::ownerFromSharers(entry), requesterNode,
+            mesiStateName(entry.state), DirEntry::protoDirty(entry));
 
     return true;
 }
@@ -795,15 +1006,13 @@ UBCCController::processRecallResponse(uint64_t line_pa, int ownerNode,
     printf("[RECALL-DIAG] UBCC node_id=%d processRecallResponse PA=0x%lx "
            "owner=%d epoch=%lu reqId=%lu\n",
            _nodeId, line_pa, ownerNode, responseEpoch, reqId);
-    auto it = _directory.find(line_pa);
-    if (it == _directory.end()) {
+    DirEntry entry;
+    if (!_directory.lookup(line_pa, entry)) {
         DPRINTF(RubyEP,
                 "UBCC node_id=%d: processRecallResponse PA=0x%lx "
                 "entry not found\n", _nodeId, line_pa);
         return false;
     }
-
-    DirEntry &entry = it->second;
 
     // v4: Half-range epoch check
     if (!checkEpochForLine(line_pa, responseEpoch)) {
@@ -851,7 +1060,7 @@ UBCCController::processRecallResponse(uint64_t line_pa, int ownerNode,
             "prevState=%s dirty=%d\n",
             _nodeId, line_pa, ownerNode, dataReceived,
             requesterNode, static_cast<int>(reqType),
-            mesiStateName(entry.state), entry.dirty);
+            mesiStateName(entry.state), DirEntry::protoDirty(entry));
 
     // v4: Release recall barrier
     ost->recallBarrierDone = true;
@@ -880,7 +1089,7 @@ UBCCController::processRecallResponse(uint64_t line_pa, int ownerNode,
             "state=%s ownerNode=%d (DirEntry NOT modified — "
             "waiting for Clear to commit intended result)\n",
             _nodeId, line_pa,
-            mesiStateName(entry.state), entry.ownerNode);
+            mesiStateName(entry.state), DirEntry::ownerFromSharers(entry));
 
     return true;
 }
@@ -939,15 +1148,13 @@ UBCCController::processInvalidationAck(uint64_t line_pa, int ackNode,
         return false;
     }
 
-    auto it = _directory.find(line_pa);
-    if (it == _directory.end()) {
+    DirEntry entry;
+    if (!_directory.lookup(line_pa, entry)) {
         DPRINTF(RubyEP,
                 "UBCC node_id=%d: processInvalidationAck PA=0x%lx "
                 "entry not found\n", _nodeId, line_pa);
         return false;
     }
-
-    DirEntry &entry = it->second;
 
     // v4: Half-range epoch check
     if (!checkEpochForLine(line_pa, responseEpoch)) {
@@ -1018,6 +1225,7 @@ UBCCController::processInvalidationAck(uint64_t line_pa, int ackNode,
     // for UPGRADE_PENDING. Only for INVALIDATE path.
     if (isInvalidatePath) {
         entry.sharersMask &= ~nodeBit;
+        _directory.update(line_pa, entry);
     }
 
     DPRINTF(RubyEP,
@@ -1081,15 +1289,18 @@ UBCCController::processInvalidationAck(uint64_t line_pa, int ackNode,
                 int intendedOwner = ost->intendedOwnerNode;
                 uint64_t reservedEp = ost->reservedEpoch;
                 commitIntendedResult(entry, *ost);
+                _directory.update(line_pa, entry);
                 ost->stage = OpStage::DONE;
                 ost->respTick = curTick();
                 removeOutstanding(line_pa);
+                refreshPinnedBit(line_pa);
 
                 printf("[UBCC-UPGRADE-COMMIT] pa=0x%lx owner=%d reservedEpoch=%lu\n",
                        line_pa, intendedOwner, reservedEp);
 
                 // Replay queued requesters after commit
                 replayPendingRequesters(line_pa);
+                replayResidentWaiters(line_pa);
             }
         } else {
             // v4: Release invalidate barrier (INVALIDATE path)
@@ -1147,15 +1358,15 @@ UBCCController::getUpgradePendingTargetMask(uint64_t line_pa) const
 bool
 UBCCController::checkEpochForLine(uint64_t line_pa, uint64_t responseEpoch) const
 {
-    auto it = _directory.find(line_pa);
-    if (it == _directory.end())
+    DirEntry entry;
+    if (!_directory.lookup(line_pa, entry))
         return true; // No entry yet — accept (first miss creates entry)
 
     // v4: Half-range epoch comparison (§3.1.2).
     // Reject if responseEpoch is older than committed epoch.
     // Accept if responseEpoch >= committed epoch (within half-range).
     // This handles wrap-around correctly.
-    if (isNewerEpoch(it->second.epoch, responseEpoch)) {
+    if (isNewerEpoch(entry.epoch, responseEpoch)) {
         // committed epoch is newer than response → stale
         return false;
     }
@@ -1165,10 +1376,10 @@ UBCCController::checkEpochForLine(uint64_t line_pa, uint64_t responseEpoch) cons
 uint64_t
 UBCCController::getEpochForLine(uint64_t line_pa) const
 {
-    auto it = _directory.find(line_pa);
-    if (it == _directory.end())
+    DirEntry entry;
+    if (!_directory.lookup(line_pa, entry))
         return 0;
-    return normalizeEpoch(it->second.epoch);
+    return normalizeEpoch(entry.epoch);
 }
 
 uint64_t
@@ -1193,15 +1404,13 @@ UBCCController::processWriteback(uint64_t line_pa, int requesterNode,
             "requesterNode=%d epoch=%lu keepAsClean=%d\n",
             _nodeId, line_pa, requesterNode, epochVal, keepAsClean);
 
-    auto it = _directory.find(line_pa);
-    if (it == _directory.end()) {
-        // No directory entry — accept writeback (first registration)
-        // This handles the case where data was cached with stale/incomplete metadata.
-        ensureDirEntry(line_pa);
-        it = _directory.find(line_pa);
+    DirEntry entry;
+    ResidentAccessResult rr = ensureResidentForAccess(
+        line_pa, UBCC_OuterReqType::GlobalWriteback, keepAsClean,
+        requesterNode, epochVal, 0, entry);
+    if (rr != ResidentAccessResult::Ready) {
+        return false;
     }
-
-    DirEntry &entry = it->second;
 
     // v4: Outstanding-aware BUSY check (§4.6.2)
     if (isLineBusy(line_pa)) {
@@ -1225,11 +1434,12 @@ UBCCController::processWriteback(uint64_t line_pa, int requesterNode,
     // ---- M7: Owner match check ----
     // Writeback must come from the current owner (or -1 if no entry).
     // Reject if the requesting node is not the current owner.
-    if (entry.ownerNode >= 0 && entry.ownerNode != requesterNode) {
+    int ownerNode = DirEntry::ownerFromSharers(entry);
+    if (ownerNode >= 0 && ownerNode != requesterNode) {
         DPRINTF(RubyEP,
                 "UBCC node_id=%d: processWriteback PA=0x%lx "
                 "OWNER MISMATCH: requesterNode=%d != ownerNode=%d — REJECTED\n",
-                _nodeId, line_pa, requesterNode, entry.ownerNode);
+                _nodeId, line_pa, requesterNode, ownerNode);
         _ownerMismatchRejectedCount++;
         return false;
     }
@@ -1241,16 +1451,13 @@ UBCCController::processWriteback(uint64_t line_pa, int requesterNode,
     if (keepAsClean && requesterNode >= 0) {
         // Owner writes back but retains clean exclusive
         entry.state = MESIState::G_E;
-        entry.ownerNode = requesterNode;
-        entry.sharersMask = 0;
-        entry.dirty = false;
+        entry.sharersMask = (1ULL << requesterNode);
     } else {
         // Owner drops the line completely
         entry.state = MESIState::G_I;
-        entry.ownerNode = -1;
         entry.sharersMask = 0;
-        entry.dirty = false;
     }
+    entry.residentDirty = true;
     // v4: DirEntry.pendingOp removed — no-op here
 
     _writebackCount++;
@@ -1259,7 +1466,14 @@ UBCCController::processWriteback(uint64_t line_pa, int requesterNode,
             "UBCC node_id=%d: processWriteback PA=0x%lx complete "
             "newState=%s ownerNode=%d dirty=%d\n",
             _nodeId, line_pa, mesiStateName(entry.state),
-            entry.ownerNode, entry.dirty);
+            DirEntry::ownerFromSharers(entry), DirEntry::protoDirty(entry));
+
+    _directory.update(line_pa, entry);
+    _directory.touch(line_pa);
+    refreshPinnedBit(line_pa);
+    if (entry.state == MESIState::G_I) {
+        scheduleBackstoreDelete(line_pa);
+    }
 
     return true;
 }
@@ -1277,16 +1491,13 @@ UBCCController::processEvict(uint64_t line_pa, int evictingNode,
             "evictingNode=%d epoch=%lu\n",
             _nodeId, line_pa, evictingNode, epochVal);
 
-    auto it = _directory.find(line_pa);
-    if (it == _directory.end()) {
-        // No entry — nothing to evict, accept as no-op
-        DPRINTF(RubyEP,
-                "UBCC node_id=%d: processEvict PA=0x%lx "
-                "no entry — no-op\n", _nodeId, line_pa);
-        return true;
+    DirEntry entry;
+    ResidentAccessResult rr = ensureResidentForAccess(
+        line_pa, UBCC_OuterReqType::GlobalEvict, false,
+        evictingNode, epochVal, 0, entry);
+    if (rr != ResidentAccessResult::Ready) {
+        return false;
     }
-
-    DirEntry &entry = it->second;
 
     // ---- M7: Stale epoch check ----
     if (!checkEpochForLine(line_pa, epochVal)) {
@@ -1322,17 +1533,17 @@ UBCCController::processEvict(uint64_t line_pa, int evictingNode,
 
     // If the evicting node is the current owner (clean owner, G_E),
     // clear ownership.
-    if (entry.ownerNode >= 0 && entry.ownerNode == evictingNode) {
+    int ownerNode = DirEntry::ownerFromSharers(entry);
+    if (ownerNode >= 0 && ownerNode == evictingNode) {
         // Only clean owners (G_E) can evict without writeback.
         // Dirty owners (G_M) must writeback first.
-        if (entry.dirty) {
+        if (DirEntry::protoDirty(entry)) {
             DPRINTF(RubyEP,
                     "UBCC node_id=%d: processEvict PA=0x%lx "
                     "dirty owner evict not allowed — must writeback first\n",
                     _nodeId, line_pa);
             return false;
         }
-        entry.ownerNode = -1;
         entry.sharersMask = 0; // Exclusive owner has no sharers
         removedFromOwner = true;
     }
@@ -1344,15 +1555,16 @@ UBCCController::processEvict(uint64_t line_pa, int evictingNode,
                 "evictingNode=%d is neither owner (ownerNode=%d) nor sharer "
                 "(sharersMask=0x%lx) — REJECTED\n",
                 _nodeId, line_pa, evictingNode,
-                entry.ownerNode, entry.sharersMask);
+                ownerNode, entry.sharersMask);
         return false;
     }
 
     // ---- Determine new state ----
-    if (entry.sharersMask == 0 && entry.ownerNode < 0) {
+    ownerNode = DirEntry::ownerFromSharers(entry);
+    if (entry.sharersMask == 0 && ownerNode < 0) {
         // No sharers, no owner → G_I
         entry.state = MESIState::G_I;
-    } else if (entry.ownerNode >= 0) {
+    } else if (ownerNode >= 0) {
         // Exclusive owner remains (different from evicting node)
         // State stays G_E or G_M — unchanged
     } else {
@@ -1363,9 +1575,8 @@ UBCCController::processEvict(uint64_t line_pa, int evictingNode,
     // M7 P0-2: Only clear dirty if we removed a clean owner.
     // Sharer-only eviction must not touch dirty (owner's dirty state preserved).
     // Dirty owner eviction was already rejected above.
-    if (removedFromOwner) {
-        entry.dirty = false;
-    }
+    (void)removedFromOwner;
+    entry.residentDirty = true;
     _evictCount++;
 
     DPRINTF(RubyEP,
@@ -1374,7 +1585,14 @@ UBCCController::processEvict(uint64_t line_pa, int evictingNode,
             "sharersMask=0x%lx ownerNode=%d\n",
             _nodeId, line_pa, removedFromSharer, removedFromOwner,
             mesiStateName(entry.state),
-            entry.sharersMask, entry.ownerNode);
+            entry.sharersMask, DirEntry::ownerFromSharers(entry));
+
+    _directory.update(line_pa, entry);
+    _directory.touch(line_pa);
+    refreshPinnedBit(line_pa);
+    if (entry.state == MESIState::G_I) {
+        scheduleBackstoreDelete(line_pa);
+    }
 
     return true;
 }
@@ -1394,8 +1612,13 @@ UBCCController::processOuterUpgradeReq(
             "requesterNode=%d epoch=%lu reqId=%lu desiredPerm=%d\n",
             _nodeId, line_pa, requesterNode, epoch, reqId, desiredPerm);
 
-    ensureDirEntry(line_pa);
-    DirEntry &entry = _directory[line_pa];
+    DirEntry entry;
+    ResidentAccessResult rr = ensureResidentForAccess(
+        line_pa, UBCC_OuterReqType::GlobalReadUnique, true,
+        requesterNode, epoch, reqId, entry);
+    if (rr != ResidentAccessResult::Ready) {
+        return false;
+    }
 
     // Check if requester is a committed sharer
     if (requesterNode >= 0) {
@@ -1506,8 +1729,8 @@ UBCCController::processOuterUpgradeDone(
             "requesterNode=%d epoch=%lu reqId=%lu\n",
             _nodeId, line_pa, requesterNode, epoch, reqId);
 
-    auto it = _directory.find(line_pa);
-    if (it == _directory.end()) {
+    DirEntry entry;
+    if (!_directory.lookup(line_pa, entry)) {
         DPRINTF(RubyEP,
                 "UBCC node_id=%d: processOuterUpgradeDone PA=0x%lx "
                 "entry not found\n", _nodeId, line_pa);
@@ -1529,8 +1752,6 @@ UBCCController::processOuterUpgradeDone(
              _nodeId, line_pa);
         return false;
     }
-
-    DirEntry &entry = it->second;
 
     // upgrade_invalidate_fix D4 (TENTATIVE): Done may arrive before acks complete
     if (ost->stage == OpStage::WAITING_ALL_ACKS) {
@@ -1574,11 +1795,13 @@ UBCCController::processOuterUpgradeDone(
     int intendedOwner = ost->intendedOwnerNode;
     uint64_t reservedEp = ost->reservedEpoch;
     commitIntendedResult(entry, *ost);
+    _directory.update(line_pa, entry);
 
     // Retire UPGRADE_PENDING
     ost->stage = OpStage::DONE;
     ost->respTick = curTick();
     removeOutstanding(line_pa);
+    refreshPinnedBit(line_pa);
 
     printf("[UBCC-UPGRADE-COMMIT] pa=0x%lx owner=%d reservedEpoch=%lu\n",
            line_pa, intendedOwner, reservedEp);
@@ -1587,10 +1810,11 @@ UBCCController::processOuterUpgradeDone(
             "UBCC node_id=%d: upgrade committed PA=0x%lx "
             "newState=%s owner=%d epoch=%lu\n",
             _nodeId, line_pa, mesiStateName(entry.state),
-            entry.ownerNode, entry.epoch);
+            DirEntry::ownerFromSharers(entry), entry.epoch);
 
     // Replay queued requesters after commit
     replayPendingRequesters(line_pa);
+    replayResidentWaiters(line_pa);
 
     return true;
 }
@@ -1619,8 +1843,8 @@ UBCCController::processClear(
         return tsAccepted;
     }
 
-    auto it = _directory.find(line_pa);
-    if (it == _directory.end()) {
+    DirEntry entry;
+    if (!_directory.lookup(line_pa, entry)) {
         // Stale Clear for unknown line — log and drop (§3.5)
         warn("UBCC node_id=%d: stale Clear for unknown PA=0x%lx — dropped\n",
              _nodeId, line_pa);
@@ -1710,16 +1934,18 @@ UBCCController::processClear(
     // GRANT_HANDSHAKE after all barriers (RECALL/INVALIDATE) have completed.
 
     // v4: §3.3, §3.5 — commit intended result to committed DirEntry
-    DirEntry &entry = it->second;
     commitIntendedResult(entry, *ost);
+    _directory.update(line_pa, entry);
 
     // Retire GRANT_HANDSHAKE to tombstone(W) for duplicate Clear replay
     retireToTombstone(*ost, true);
     removeOutstanding(line_pa);
+    refreshPinnedBit(line_pa);
 
     // recall_done_fix.md §5: Replay queued pending requesters using the
     // newly committed state (just committed by this Clear).
     replayPendingRequesters(line_pa);
+    replayResidentWaiters(line_pa);
 
     // Order log audit (§3.6)
     printf("[TC5-CLEAR-TRACE] processClearAccept home=%d pa=0x%lx src=%d "
@@ -1796,17 +2022,36 @@ void
 UBCCController::commitIntendedResult(DirEntry &entry, const OutstandingRequest &ost)
 {
     entry.state = ost.intendedState;
-    entry.sharersMask = ost.intendedSharersMask;
-    entry.ownerNode = ost.intendedOwnerNode;
-    entry.dirty = ost.intendedDirty;
+    if (ost.intendedState == MESIState::G_E ||
+        ost.intendedState == MESIState::G_M) {
+        uint64_t mask = ost.intendedSharersMask;
+        if (__builtin_popcountll(mask) != 1 && ost.intendedOwnerNode >= 0) {
+            mask = (1ULL << ost.intendedOwnerNode);
+        }
+        entry.sharersMask = mask;
+    } else {
+        entry.sharersMask = ost.intendedSharersMask;
+    }
     entry.epoch = normalizeEpoch(ost.reservedEpoch);
+    entry.residentDirty = true;
+
+    panic_if((entry.state == MESIState::G_E || entry.state == MESIState::G_M) &&
+             __builtin_popcountll(entry.sharersMask) != 1,
+             "UBCC canonical assert failed PA=0x%lx state=%d sharers=0x%lx",
+             ost.linePa, static_cast<int>(entry.state), entry.sharersMask);
 
     DPRINTF(RubyEP,
             "UBCC node_id=%d: commitIntendedResult PA=0x%lx "
             "state=%s owner=%d sharers=0x%lx dirty=%d epoch=%lu\n",
             _nodeId, ost.linePa,
-            mesiStateName(entry.state), entry.ownerNode,
-            entry.sharersMask, entry.dirty, entry.epoch);
+            mesiStateName(entry.state), DirEntry::ownerFromSharers(entry),
+            entry.sharersMask, DirEntry::protoDirty(entry), entry.epoch);
+
+    if (entry.state != MESIState::G_I) {
+        _directory.bloomInsert(ost.linePa);
+    } else {
+        scheduleBackstoreDelete(ost.linePa);
+    }
 }
 
 void
@@ -1878,6 +2123,198 @@ UBCCController::cleanupTombstones()
     }
 }
 
+bool
+UBCCController::lookupBackstore(uint64_t linePa, BackstoreEntry &entry) const
+{
+    auto it = _backstore.find(linePa);
+    if (it == _backstore.end()) {
+        return false;
+    }
+    entry = it->second;
+    return true;
+}
+
+bool
+UBCCController::snapshotResidentForBackstore(
+    uint64_t linePa, BackstoreEntry &entry) const
+{
+    DirEntry e;
+    if (!_directory.lookup(linePa, e)) {
+        return false;
+    }
+    entry.state = e.state;
+    entry.sharersMask = e.sharersMask;
+    entry.epoch = e.epoch;
+    return true;
+}
+
+void
+UBCCController::onBackstoreFillComplete(
+    uint64_t linePa, bool found, const BackstoreEntry &entry)
+{
+    DirEntry e;
+    if (!_directory.lookup(linePa, e)) {
+        e.lineAddr = linePa;
+        e.state = MESIState::G_I;
+        e.sharersMask = 0;
+        e.epoch = 0;
+        e.residentDirty = false;
+        _directory.insert(linePa, e);
+    }
+
+    if (found) {
+        e.state = entry.state;
+        e.sharersMask = entry.sharersMask;
+        e.epoch = entry.epoch;
+        e.residentDirty = false;
+    } else {
+        e.state = MESIState::G_I;
+        e.sharersMask = 0;
+        e.residentDirty = false;
+    }
+    _directory.update(linePa, e);
+    _directory.setFillPending(linePa, false);
+    _directory.touch(linePa);
+    refreshPinnedBit(linePa);
+    replayResidentWaiters(linePa);
+}
+
+void
+UBCCController::onBackstoreWriteAck(uint64_t linePa)
+{
+    DirEntry e;
+    if (!_directory.lookup(linePa, e)) {
+        return;
+    }
+    if (e.state != MESIState::G_I) {
+        _backstore[linePa] = BackstoreEntry{e.state, e.sharersMask, e.epoch};
+        _directory.bloomInsert(linePa);
+    }
+    e.residentDirty = false;
+    _directory.update(linePa, e);
+    _directory.setWbPending(linePa, false);
+
+    if (_evictionPendingRemoval.erase(linePa) != 0) {
+        _directory.forceRemove(linePa);
+    }
+    refreshPinnedBit(linePa);
+    replayResidentWaiters(linePa);
+}
+
+void
+UBCCController::onBackstoreDeleteAck(uint64_t linePa, bool existed)
+{
+    _backstore.erase(linePa);
+    _directory.bloomRemove(linePa);
+
+    DirEntry e;
+    if (_directory.lookup(linePa, e)) {
+        _directory.setFillPending(linePa, false);
+        _directory.setWbPending(linePa, false);
+        if (e.state == MESIState::G_I) {
+            _directory.forceRemove(linePa);
+        } else {
+            e.residentDirty = false;
+            _directory.update(linePa, e);
+        }
+    }
+    _evictionPendingRemoval.erase(linePa);
+    refreshPinnedBit(linePa);
+    replayResidentWaiters(linePa);
+    (void)existed;
+}
+
+std::string
+UBCCController::inspectOffloadLineForTest(uint64_t linePa) const
+{
+    DirEntry e;
+    bool present = _directory.lookup(linePa, e);
+    BackstoreEntry b;
+    bool backstorePresent = lookupBackstore(linePa, b);
+    auto wit = _residentWaiters.find(linePa);
+    size_t waiterDepth = (wit == _residentWaiters.end()) ? 0 : wit->second.size();
+
+    std::ostringstream oss;
+    oss << "{";
+    oss << "\"resident_present\":" << (present ? "true" : "false") << ",";
+    oss << "\"resident_state\":" << (present ? static_cast<int>(e.state) : -1) << ",";
+    oss << "\"resident_sharers_mask\":" << (present ? e.sharersMask : 0) << ",";
+    oss << "\"resident_epoch\":" << (present ? e.epoch : 0) << ",";
+    oss << "\"resident_dirty\":" << (present && e.residentDirty ? "true" : "false") << ",";
+    oss << "\"bf_positive\":" << (_directory.bloomMayContain(linePa) ? "true" : "false") << ",";
+    oss << "\"fill_pending\":" << (_directory.fillPending(linePa) ? "true" : "false") << ",";
+    oss << "\"wb_pending\":" << (_directory.wbPending(linePa) ? "true" : "false") << ",";
+    oss << "\"pinned\":" << (_directory.pinned(linePa) ? "true" : "false") << ",";
+    oss << "\"backstore_present\":" << (backstorePresent ? "true" : "false") << ",";
+    oss << "\"backstore_state\":" << (backstorePresent ? static_cast<int>(b.state) : -1) << ",";
+    oss << "\"backstore_sharers_mask\":" << (backstorePresent ? b.sharersMask : 0) << ",";
+    oss << "\"backstore_epoch\":" << (backstorePresent ? b.epoch : 0) << ",";
+    oss << "\"resident_waiter_depth\":" << waiterDepth;
+    oss << "}";
+    return oss.str();
+}
+
+bool
+UBCCController::debugSeedBackstoreForTest(
+    uint64_t linePa, int mesi, uint64_t sharersMask, uint64_t epoch)
+{
+    if (mesi < 0 || mesi > 3) {
+        return false;
+    }
+    BackstoreEntry e{static_cast<MESIState>(mesi), sharersMask, epoch};
+    _backstore[linePa] = e;
+    _directory.bloomInsert(linePa);
+    return true;
+}
+
+bool
+UBCCController::debugSeedResidentForTest(
+    uint64_t linePa, int mesi, uint64_t sharersMask, uint64_t epoch,
+    bool residentDirty)
+{
+    if (mesi < 0 || mesi > 3) {
+        return false;
+    }
+    DirEntry e;
+    e.lineAddr = linePa;
+    e.state = static_cast<MESIState>(mesi);
+    e.sharersMask = sharersMask;
+    e.epoch = epoch;
+    e.residentDirty = residentDirty;
+    if (!_directory.lookup(linePa, e)) {
+        _directory.insert(linePa, e);
+    }
+    _directory.update(linePa, e);
+    _directory.touch(linePa);
+    if (e.state != MESIState::G_I) {
+        _directory.bloomInsert(linePa);
+    }
+    refreshPinnedBit(linePa);
+    return true;
+}
+
+bool
+UBCCController::debugForceResidentEvictForTest(uint64_t linePa)
+{
+    DirEntry e;
+    if (!_directory.lookup(linePa, e)) {
+        return false;
+    }
+    _directory.setPinned(linePa, false);
+    if (!e.residentDirty) {
+        return _directory.forceRemove(linePa);
+    }
+    _directory.setWbPending(linePa, true);
+    _directory.setPinned(linePa, true);
+    _evictionPendingRemoval.insert(linePa);
+    if (e.state == MESIState::G_I) {
+        scheduleBackstoreDelete(linePa);
+    } else {
+        scheduleBackstoreWrite(linePa);
+    }
+    return true;
+}
+
 // ---- recall_done_fix.md §5: Replay queued pending requesters ----
 void
 UBCCController::replayPendingRequesters(uint64_t linePa)
@@ -1887,10 +2324,9 @@ UBCCController::replayPendingRequesters(uint64_t linePa)
         return;
 
     // Get current committed entry (just committed by Clear or UpgradeDone)
-    auto dit = _directory.find(linePa);
-    if (dit == _directory.end())
+    DirEntry entry;
+    if (!_directory.lookup(linePa, entry))
         return;
-    DirEntry &entry = dit->second;
 
     // Replay all queued entries one by one, each as a fresh processOuterRequest
     // with rebased epoch against the NEW committed state.
@@ -1921,7 +2357,8 @@ UBCCController::replayPendingRequesters(uint64_t linePa)
         //   G_E/G_M + RS/RU → new RECALL + GRANT_HANDSHAKE
         processOuterRequest(linePa, pr.reqType, pr.writeIntent,
                             pr.node, rebaseEpoch, pr.reqId,
-                            nullptr, nullptr, nullptr, nullptr, nullptr);
+                            nullptr, nullptr, nullptr, nullptr, nullptr,
+                            nullptr);
 
         // If the replay created a new live outstanding, stop here.
         // The remainder of the queue will be replayed when that outstanding's

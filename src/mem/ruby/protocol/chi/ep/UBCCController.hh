@@ -7,10 +7,12 @@
 #include <map>
 #include <set>
 #include <string>
+#include <unordered_map>
 
 #include "base/types.hh"
 #include "mem/ruby/common/DataBlock.hh"
 #include "mem/ruby/protocol/chi/ep/EPBackend.hh"  // F3: GrantDataSource
+#include "mem/ruby/protocol/chi/ep/ResidentDir.hh"
 
 namespace gem5
 {
@@ -20,6 +22,7 @@ namespace ruby
 
 class RubySystem;
 class UBRouter;
+class EPBackend;
 
 // Forward declarations for M5 outer protocol types.
 // These mirror the enums in EPBackend.hh but are used internally.
@@ -50,13 +53,8 @@ enum class UBCC_UpgradeCause {
     LocalStoreUpgrade    // Local store-triggered upgrade
 };
 
-// ---- M5: Home MESI directory states (moved before OutstandingRequest for visibility) ----
-enum class MESIState {
-    G_I,  // Invalid: no sharer, no owner
-    G_S,  // Shared: one or more sharers, no owner
-    G_E,  // Exclusive: one clean exclusive owner
-    G_M   // Modified: one dirty modified owner
-};
+using MESIState = UBCCMESIState;
+using DirEntry = UBCCDirEntry;
 
 // ---- Phase 1: Outstanding request state machine (v4 expanded) ----
 // Per §4.1.5: normative state machine for all four operation types.
@@ -202,7 +200,9 @@ class UBCCController
     static constexpr size_t MAX_PENDING_PER_PA = 4;
 
     UBCCController(int node_id, RubySystem *ruby_system = nullptr,
-                   uint32_t epoch_bits = 64);
+                   uint32_t epoch_bits = 64,
+                   uint32_t resident_bf_bytes = ResidentDir::DefaultBloomBytes,
+                   uint32_t resident_force_entries = 0);
     ~UBCCController();
 
     int nodeId() const { return _nodeId; }
@@ -211,6 +211,13 @@ class UBCCController
 
     /** Set the local router for sending messages (e.g., UpgradeAckNotify). */
     void setRouter(UBRouter *router) { _router = router; }
+    void setBackend(EPBackend *backend) { _backend = backend; }
+
+    struct BackstoreEntry {
+        MESIState state;
+        uint64_t sharersMask;
+        uint64_t epoch;
+    };
 
     // ---- Cross-Node Routing Registry ----
     // In single-gem5 prototype, all UBCC instances register themselves
@@ -499,38 +506,33 @@ class UBCCController
     void resetEpRnfSnoopCount() { _epRnfSnoopCount = 0; }
     void incrementEpRnfSnoopCount() { _epRnfSnoopCount++; }
 
-    // ---- M5/M6: Home directory entry (§7.1) ----
-    // Stripped of pendingOp / pendingRequester / pendingRecallTarget /
-    // pendingReqType / pendingWriteIntent / grantTick / invalidation tracking /
-    // materializedData — all moved to OutstandingRequest.
-    struct DirEntry {
-        uint64_t lineAddr;
-        MESIState state;
-        // Mask of node IDs that hold shared copies (bit i = node i)
-        uint64_t sharersMask;
-        // Node ID of the exclusive/modified owner (-1 if none)
-        int ownerNode;
-        // True if the owner holds dirty (modified) data
-        bool dirty;
-        // Epoch for stale detection (committed global epoch, monotonic)
-        uint64_t epoch;
-
-        DirEntry() : lineAddr(0), state(MESIState::G_I),
-                     sharersMask(0), ownerNode(-1),
-                     dirty(false), epoch(0) {}
-    };
-
     // ---- v4: Outstanding request API ----
     OutstandingRequest* findOutstanding(uint64_t linePa);
     OutstandingRequest* createOutstanding(uint64_t linePa, OpType opType,
                                           int requesterNode, int targetNode);
     void removeOutstanding(uint64_t linePa);
 
+    void onBackstoreFillComplete(uint64_t linePa, bool found,
+                                 const BackstoreEntry &entry);
+    void onBackstoreWriteAck(uint64_t linePa);
+    void onBackstoreDeleteAck(uint64_t linePa, bool existed);
+    bool lookupBackstore(uint64_t linePa, BackstoreEntry &entry) const;
+    bool snapshotResidentForBackstore(uint64_t linePa, BackstoreEntry &entry) const;
+
+    std::string inspectOffloadLineForTest(uint64_t linePa) const;
+    bool debugSeedBackstoreForTest(uint64_t linePa, int mesi,
+                                   uint64_t sharersMask, uint64_t epoch);
+    bool debugSeedResidentForTest(uint64_t linePa, int mesi,
+                                  uint64_t sharersMask, uint64_t epoch,
+                                  bool residentDirty);
+    bool debugForceResidentEvictForTest(uint64_t linePa);
+
    private:
     const int _nodeId;
 
     /** Local UBRouter for sending messages (e.g., UpgradeAckNotify). */
     UBRouter *_router = nullptr;
+    EPBackend *_backend = nullptr;
 
     // Q3: Estimated UBCC-to-remote-UBCC interconnect latency (ticks).
     // Controls how long pendingOp=3 blocks before grant is released.
@@ -539,7 +541,7 @@ class UBCCController
 
     // ---- M5: Home directory ----
     // Per-line directory entries for lines homed at this node.
-    std::map<uint64_t, DirEntry> _directory;
+    ResidentDir _directory;
 
     // ---- v4: Outstanding request table ----
     // Per-line in-flight operations.
@@ -556,6 +558,9 @@ class UBCCController
     // Foreign requesters that arrive while a live outstanding exists for
     // the same PA are queued here.  Replayed on Clear commit.
     std::map<uint64_t, std::deque<PendingRequester>> _pendingRequesters;
+    std::map<uint64_t, std::deque<PendingRequester>> _residentWaiters;
+    std::unordered_map<uint64_t, BackstoreEntry> _backstore;
+    std::set<uint64_t> _evictionPendingRemoval;
 
     // ---- v4: Tombstone window (configurable, default 100000 ticks) ----
     Tick _tombstoneWindowW = 100000;
@@ -589,6 +594,23 @@ class UBCCController
 
     // ---- M5 private helpers ----
     void ensureDirEntry(uint64_t line_pa);
+    enum class ResidentAccessResult {
+        Ready,
+        Queued,
+        Busy,
+    };
+    ResidentAccessResult ensureResidentForAccess(
+        uint64_t line_pa, UBCC_OuterReqType reqType, bool writeIntent,
+        int requesterNode, uint64_t baseEpoch, uint64_t reqId, DirEntry &entry);
+    ResidentAccessResult handleResidentMiss(
+        uint64_t line_pa, UBCC_OuterReqType reqType, bool writeIntent,
+        int requesterNode, uint64_t baseEpoch, uint64_t reqId, DirEntry &entry);
+    void enqueueResidentWaiter(uint64_t linePa, const PendingRequester &pr);
+    void replayResidentWaiters(uint64_t linePa);
+    void refreshPinnedBit(uint64_t linePa);
+    bool evictOneVictim(uint64_t avoidPa);
+    void scheduleBackstoreWrite(uint64_t linePa);
+    void scheduleBackstoreDelete(uint64_t linePa);
     const char* mesiStateName(MESIState s) const;
 
     // ---- M6 private helpers ----
