@@ -514,12 +514,10 @@ class UBCCController
         bool dirty;
         // Epoch for stale detection (committed global epoch, monotonic)
         uint64_t epoch;
-        // Monotonic local allocator for reqId (§7.1)
-        uint64_t nextReqId;
 
         DirEntry() : lineAddr(0), state(MESIState::G_I),
                      sharersMask(0), ownerNode(-1),
-                     dirty(false), epoch(0), nextReqId(1) {}
+                     dirty(false), epoch(0) {}
     };
 
     // ---- v4: Outstanding request API ----

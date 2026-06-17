@@ -690,8 +690,7 @@ UBCCController::inspectUbccDirForTest(uint64_t line_pa)
         << "\"sharersMask\":" << e.sharersMask << ","
         << "\"ownerNode\":" << e.ownerNode << ","
         << "\"dirty\":" << (e.dirty ? "true" : "false") << ","
-        << "\"epoch\":" << e.epoch << ","
-        << "\"nextReqId\":" << e.nextReqId;
+         << "\"epoch\":" << e.epoch;
 
     // v4: Outstanding state sourced from OutstandingRequest
     auto oit = _outstandingReqs.find(line_pa);
@@ -1791,12 +1790,6 @@ UBCCController::allocateReservedEpoch(DirEntry &entry)
 {
     // reservedEpoch = committed epoch + 1; committed epoch is NOT modified here
     return normalizeEpoch(entry.epoch + 1);
-}
-
-uint64_t
-UBCCController::allocateReqId(DirEntry &entry)
-{
-    return entry.nextReqId++;
 }
 
 void
