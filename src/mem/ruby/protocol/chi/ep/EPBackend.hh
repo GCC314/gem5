@@ -2,6 +2,7 @@
 #define __MEM_RUBY_PROTOCOL_CHI_EP_EPBACKEND_HH__
 
 #include <cstdint>
+#include <array>
 #include <map>
 #include <string>
 #include <vector>
@@ -446,12 +447,13 @@ class EPBackend : public SimObject
     bool handleWriteback(uint64_t line_pa, bool keepAsClean);
 
     /**
-     * Handle a clean evict from a sharer or clean owner (requester→home).
-     * Called by EPSNFController when HN sends an eviction.
+     * Called by EPSNFController when HN-F completes a WriteNoSnp write
+     * to DRAM. Notifies UBCC to release directory ownership.
      *
-     * @param line_pa     Physical address (requester's view)
-     * @return            True if evict was accepted by home
+     * @param homePa  Home-node physical address that was written to DRAM
      */
+    void handleHomeWritebackComplete(uint64_t homePa);
+
     bool handleEvict(uint64_t line_pa);
 
     /**
@@ -643,6 +645,18 @@ class EPBackend : public SimObject
     static EPBackend* getBackendInstance(int node_id);
 
   private:
+    using MetaLine = std::array<uint8_t, 64>;
+    struct MetaStoreDecoded {
+        int state;
+        uint64_t sharersMask;
+        uint64_t epoch;
+    };
+    uint64_t metadataBackstorePa(uint64_t homePa) const;
+    static MetaLine encodeMetaLine(uint64_t homePa, int state,
+                                   uint64_t sharersMask, uint64_t epoch);
+    static bool decodeMetaLine(uint64_t expectedHomePa, const MetaLine &line,
+                               MetaStoreDecoded &entry);
+
     const int _nodeId;
     NodeAddressMap _addrMap;
     UBCCController *_ubcc = nullptr;
@@ -650,6 +664,8 @@ class EPBackend : public SimObject
     UBAdapter *_ubAdapter = nullptr;  // Phase 2: message-path adapter
     EPRNFController *_epRnfCtrl = nullptr;
     RubySystem *_ruby_system = nullptr;
+    uint64_t _metadataPrivateBase = 0;
+    uint64_t _metadataPrivateSize = 0;
 
     // ---- Q1: Grant Data Buffer ----
     // Cache-line-sized buffer populated after each grant decision.

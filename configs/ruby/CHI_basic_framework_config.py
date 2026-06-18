@@ -91,6 +91,11 @@ class NodeConfig:
         self.local_private_end   = self.phy_base + 1 * seg_size
         self.ubcc_exclusive_base = self.phy_base + 1 * seg_size
         self.ubcc_exclusive_end  = self.phy_base + 2 * seg_size
+        self.metadata_private_base = self.phy_base + 5 * seg_size
+        self.metadata_private_size = 16 * 1024 * 1024
+        self.metadata_private_end = (
+            self.metadata_private_base + self.metadata_private_size
+        )
 
     @property
     def local_private_range(self):
@@ -99,6 +104,10 @@ class NodeConfig:
     @property
     def ubcc_exclusive_range(self):
         return AddrRange(self.ubcc_exclusive_base, size=self.seg_size)
+
+    @property
+    def metadata_private_range(self):
+        return AddrRange(self.metadata_private_base, size=self.metadata_private_size)
 
     @staticmethod
     def dsm_global_range(seg_size=DEFAULT_SEG_SIZE):

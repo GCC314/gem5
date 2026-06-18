@@ -153,6 +153,9 @@ UBRouter::drainReadyQueues()
                         case UBMsgType::ClearResp:
                         case UBMsgType::UpgradeAckNotify:
                             // Destination is local UBAdapter
+                            printf("[ROUTER-DELIVER-RESP] node=%d pa=0x%lx type=%s src=%d dst=%d\n",
+                                   _nodeId, msg.h.homeLinePa, ubMsgTypeName(msg.h.type),
+                                   msg.h.srcNode, msg.h.dstNode);
                             deliverToAdapter(msg);
                             break;
 
@@ -254,6 +257,9 @@ UBRouter::deliverToUbcc(const UBMsg &msg, UBMsg &response)
                 response.h.flags |= static_cast<uint32_t>(UB_FLAG_HAS_DATA);
             }
 
+            printf("[ROUTER-UBCC-RESP] home=%d pa=0x%lx grant=%d src=%d\n",
+                   _nodeId, msg.h.homeLinePa, static_cast<int>(ubccGrant),
+                   msg.h.srcNode);
             response.b.readResp.grantType =
                 static_cast<int8_t>(ubccGrant);
             response.b.readResp.dataSource =

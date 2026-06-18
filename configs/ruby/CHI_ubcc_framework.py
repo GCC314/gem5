@@ -121,7 +121,7 @@ def configure_l3_dsm_policy(hnf_cntrl):
     hnf_cntrl.alloc_on_readshared     = True
     hnf_cntrl.alloc_on_readunique     = True
     hnf_cntrl.alloc_on_readonce       = False  # v4: disable to prevent UBCC recall bypass
-    hnf_cntrl.alloc_on_writeback      = False
+    hnf_cntrl.alloc_on_writeback      = True
     hnf_cntrl.alloc_on_atomic         = False
     hnf_cntrl.dealloc_on_unique       = False
     hnf_cntrl.dealloc_on_shared       = False
@@ -208,14 +208,25 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
         # Q2 FIX: SNF controllers must be added to the SimObject tree
         # BEFORE the HN-F so their C++ objects exist when HN-F's
         # downstream_destinations param is resolved during instantiation.
-        l_backstore_range = AddrRange(cfg.local_private_base, size=2 * seg_size)
+        metadata_private_size = 16 * 1024 * 1024
+        cfg.metadata_private_size = metadata_private_size
+        cfg.metadata_private_end = cfg.metadata_private_base + metadata_private_size
+
+        l_backstore_range = AddrRange(
+            cfg.local_private_base,
+            size=(5 * seg_size + metadata_private_size),
+        )
         nd['l_memctrl'] = _make_dram_memctrl(l_backstore_range, system,
                                              f"l_mc_n{node_id}")
         nd['l_snf'] = chi_defs.CHI_SNF_MainMem(
             ruby_system, None, nd['l_memctrl'],
             # Q2 FIX: Pass explicit addr_ranges instead of relying on
             # getMemRange which may return a single value not a list.
-            addr_ranges=[cfg.local_private_range, cfg.ubcc_exclusive_range])
+            addr_ranges=[
+                cfg.local_private_range,
+                cfg.ubcc_exclusive_range,
+                cfg.metadata_private_range,
+            ])
         setattr(ruby_system, f"l_snf_node{node_id}", nd['l_snf'])
         network_nodes.append(nd['l_snf'])
         all_cntrls.extend(nd['l_snf'].getAllControllers())
@@ -235,21 +246,20 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
         # Phase 2: Create UBAdapter and UBRouter per node
         ub_router = UBRouter(node_id=node_id, ub_msg_latency="0ns")
         ub_adapter = UBAdapter(node_id=node_id, router=ub_router)
-        meta_rnf = MetaRNFController(
-            read_latency_ticks=ubcc_meta_read_ticks,
-            write_latency_ticks=ubcc_meta_write_ticks,
-            delete_latency_ticks=ubcc_meta_delete_ticks)
+        meta_rnf = None
         nd['ub_router'] = ub_router
         nd['ub_adapter'] = ub_adapter
         nd['meta_rnf'] = meta_rnf
 
         ep_backend = EPBackend(node_id=node_id, ruby_system=ruby_system,
-                               meta_rnf=meta_rnf,
+                               meta_rnf=NULL,
                                ub_adapter=ub_adapter,
                                ubcc_epoch_bits=ubcc_epoch_bits,
                                ubcc_bf_bytes=ubcc_bf_bytes,
                                ubcc_force_resident_entries=
-                                   ubcc_force_resident_entries)
+                                    ubcc_force_resident_entries,
+                               metadata_private_base=cfg.metadata_private_base,
+                               metadata_private_size=f"{metadata_private_size}B")
 
         nd['ep_snf_cntrl'] = EPSNFController(
             version=chi_defs.Versions.getVersion(chi_defs.CHI_Cache_Controller),
@@ -268,6 +278,7 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
         hnf_ranges = [
             cfg.local_private_range,
             cfg.ubcc_exclusive_range,
+            cfg.metadata_private_range,
         ]
         for nid in range(num_nodes):
             hnf_ranges.append(
@@ -278,6 +289,20 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
         setattr(ruby_system, f"hnf_node{node_id}", nd['hnf_wrapper'])
         network_nodes.append(nd['hnf_wrapper'])
         all_cntrls.append(nd['hnf_cntrl'])
+
+        nd['meta_rnf_cntrl'] = MetaRNFController(
+            version=chi_defs.Versions.getVersion(chi_defs.CHI_Cache_Controller),
+            ruby_system=ruby_system, node_id=node_id,
+            data_channel_size=params.data_width,
+            addr_ranges=[cfg.metadata_private_range],
+            metadata_private_range=cfg.metadata_private_range,
+            downstream_destinations=[nd['hnf_cntrl']])
+        nd['meta_rnf_wrapper'] = _make_ep_node(
+            ruby_system, nd['meta_rnf_cntrl'], node_id)
+        setattr(ruby_system, f"meta_rnf_node{node_id}", nd['meta_rnf_wrapper'])
+        network_nodes.append(nd['meta_rnf_wrapper'])
+        all_cntrls.append(nd['meta_rnf_cntrl'])
+        nd['meta_rnf'] = nd['meta_rnf_cntrl']
 
         nd['ep_rnf_cntrl'] = EPRNFController(
             version=chi_defs.Versions.getVersion(chi_defs.CHI_Cache_Controller),
@@ -331,6 +356,7 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
                 cntrl.addr_ranges = [
                     cfg.local_private_range,
                     cfg.ubcc_exclusive_range,
+                    cfg.metadata_private_range,
                 ] + dsm_ranges
 
     for node_id in range(num_nodes):

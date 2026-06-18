@@ -108,6 +108,8 @@ UBAdapter::sendReadReq(
     _router->sendMessage(req);
 
     if (!_lastResponseValid) {
+        printf("[ADAPTER-NO-RESP] node=%d pa=0x%lx epoch=%lu reqId=%lu home=%d\n",
+               _nodeId, homePa, epoch, reqId, homeNode);
         warn("UBAdapter node=%d: sendReadReq: no response received "
              "PA=0x%lx\n", _nodeId, homePa);
         return -1;
@@ -121,6 +123,8 @@ UBAdapter::sendReadReq(
     }
 
     int grant = static_cast<int>(resp.b.readResp.grantType);
+    printf("[ADAPTER-GRANT-OK] node=%d pa=0x%lx grant=%d\n",
+           _nodeId, homePa, grant);
 
     if (outGrantVisibleTick)
         *outGrantVisibleTick = resp.b.readResp.grantVisibleTick;
@@ -585,6 +589,14 @@ UBAdapter::recvFromRouter(const UBMsg &msg)
 
     switch (msg.h.type) {
         case UBMsgType::ReadResp:
+            printf("[ADAPTER-GOT-RESP] node=%d type=ReadResp pa=0x%lx src=%d "
+                   "grant=%d epoch=%lu reqId=%lu\n",
+                   _nodeId, msg.h.homeLinePa, msg.h.srcNode,
+                   static_cast<int>(msg.b.readResp.grantType),
+                   msg.h.epoch, msg.h.reqId);
+            _lastResponse = msg;
+            _lastResponseValid = true;
+            break;
         case UBMsgType::WritebackResp:
         case UBMsgType::EvictResp:
         case UBMsgType::UpgradeResp:

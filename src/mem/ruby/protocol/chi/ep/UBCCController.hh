@@ -348,6 +348,16 @@ class UBCCController
                           uint64_t epochVal, bool keepAsClean);
 
     /**
+     * Notify UBCC that dirty data for a home PA has been written to DRAM
+     * by the HN-F → EP-SNF path. Releases ownership by transitioning the
+     * directory entry to G_I. No epoch/owner validation needed — the HN-F
+     * has already committed the data to DRAM.
+     *
+     * @param homePa    Physical address (home node's view)
+     */
+    void notifyHomeWritebackComplete(uint64_t homePa);
+
+    /**
      * Process a GlobalEvict from a clean sharer or clean owner.
      * Removes the node from the directory.
      *
@@ -369,6 +379,11 @@ class UBCCController
      * Get the current epoch for a line (-1 if line not found).
      */
     uint64_t getEpochForLine(uint64_t line_pa) const;
+
+    /**
+     * Get the owner node for a line (-1 if no entry or no owner).
+     */
+    int getOwnerForLine(uint64_t line_pa) const;
 
     /**
      * Get the baseEpoch for an outstanding request (0 if not found).

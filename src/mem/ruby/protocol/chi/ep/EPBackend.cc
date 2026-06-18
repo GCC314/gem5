@@ -2,6 +2,8 @@
 
 #include <cstdio>
 #include <cstring>
+#include <cstdarg>
+#include <array>
 #include <execinfo.h>
 #include <sstream>
 #include <unistd.h>
@@ -29,6 +31,23 @@ namespace ruby
 
 namespace
 {
+
+void
+appendTmpLog(const char *file, const char *fmt, ...)
+{
+    char path[256];
+    std::snprintf(path, sizeof(path), "/workspace/tmp_logs/%s", file);
+    FILE *fp = std::fopen(path, "a");
+    if (!fp) {
+        return;
+    }
+
+    va_list ap;
+    va_start(ap, fmt);
+    std::vfprintf(fp, fmt, ap);
+    va_end(ap);
+    std::fclose(fp);
+}
 
 uint64_t
 makeRequesterReqId(int nodeId, uint64_t seq)
@@ -84,6 +103,8 @@ EPBackend::EPBackend(const Params &p)
     _metaRnf(p.meta_rnf),
     _ubAdapter(p.ub_adapter),
     _ruby_system(p.ruby_system),
+    _metadataPrivateBase(p.metadata_private_base),
+    _metadataPrivateSize(p.metadata_private_size),
     _lastGrantDataBlock(64),  // cache line size = 64 bytes
     _lastGrantDataValid(false),
     _lastSideband{false, 0, 0, false, -1, -1, -1},
@@ -107,6 +128,72 @@ EPBackend::EPBackend(const Params &p)
 
     // M6: Register this EPBackend in the static cross-node routing registry
     _backendInstances[_nodeId] = this;
+}
+
+uint64_t
+EPBackend::metadataBackstorePa(uint64_t homePa) const
+{
+    if (_metadataPrivateSize < 64) {
+        return _metadataPrivateBase;
+    }
+    const uint64_t slot_count = _metadataPrivateSize / 64;
+    const uint64_t line_idx = (homePa >> 6) % slot_count;
+    return _metadataPrivateBase + line_idx * 64;
+}
+
+EPBackend::MetaLine
+EPBackend::encodeMetaLine(uint64_t homePa, int state,
+                          uint64_t sharersMask, uint64_t epoch)
+{
+    MetaLine line{};
+    line[0] = 1; // valid
+    memcpy(line.data() + 8, &homePa, sizeof(homePa));
+    int64_t s = state;
+    memcpy(line.data() + 16, &s, sizeof(s));
+    memcpy(line.data() + 24, &sharersMask, sizeof(sharersMask));
+    memcpy(line.data() + 32, &epoch, sizeof(epoch));
+    return line;
+}
+
+bool
+EPBackend::decodeMetaLine(uint64_t expectedHomePa, const MetaLine &line,
+                          MetaStoreDecoded &entry)
+{
+    if (line[0] == 0) {
+        return false;
+    }
+
+    uint64_t key = 0;
+    memcpy(&key, line.data() + 8, sizeof(key));
+    if (key != expectedHomePa) {
+        return false;
+    }
+
+    int64_t st = 0;
+    memcpy(&st, line.data() + 16, sizeof(st));
+    memcpy(&entry.sharersMask, line.data() + 24, sizeof(entry.sharersMask));
+    memcpy(&entry.epoch, line.data() + 32, sizeof(entry.epoch));
+    entry.state = static_cast<int>(st);
+
+    if (entry.state < static_cast<int>(UBCCMESIState::G_I) ||
+        entry.state > static_cast<int>(UBCCMESIState::G_M)) {
+        return false;
+    }
+    if (entry.state == static_cast<int>(UBCCMESIState::G_I) &&
+        entry.sharersMask != 0) {
+        return false;
+    }
+    if (entry.state == static_cast<int>(UBCCMESIState::G_S) &&
+        entry.sharersMask == 0) {
+        return false;
+    }
+    if (entry.state == static_cast<int>(UBCCMESIState::G_E) ||
+        entry.state == static_cast<int>(UBCCMESIState::G_M)) {
+        if (__builtin_popcountll(entry.sharersMask) != 1) {
+            return false;
+        }
+    }
+    return true;
 }
 
 EPBackend::~EPBackend()
@@ -146,6 +233,10 @@ void
 EPBackend::init()
 {
     SimObject::init();
+
+    if (!_metaRnf) {
+        _metaRnf = MetaRNFController::getInstance(_nodeId);
+    }
 
     // Phase 2: Wire UBCC to UBRouter via UBAdapter.
     if (_ubAdapter && _ubcc) {
@@ -851,6 +942,7 @@ EPBackend::setMetaRnfController(MetaRNFController *ctrl)
 void
 EPBackend::issueBackstoreRead(uint64_t homePa)
 {
+    appendTmpLog("ep_backstore.log", "[BACKSTORE] read pa=0x%lx\n", homePa);
     if (!_ubcc) {
         return;
     }
@@ -861,10 +953,23 @@ EPBackend::issueBackstoreRead(uint64_t homePa)
         return;
     }
 
-    _metaRnf->issueRead(homePa,
-        [this, homePa](bool, const MetaBackstoreEntry&) {
+    const uint64_t metaPa = metadataBackstorePa(homePa);
+    _metaRnf->issueRead(metaPa,
+        [this, homePa](bool ok, const MetaLine &line) {
             UBCCController::BackstoreEntry e;
-            bool found = _ubcc->lookupBackstore(homePa, e);
+            bool found = false;
+            if (ok) {
+                MetaStoreDecoded decoded;
+                found = decodeMetaLine(homePa, line, decoded);
+                if (found) {
+                    e.state = static_cast<UBCCMESIState>(decoded.state);
+                    e.sharersMask = decoded.sharersMask;
+                    e.epoch = decoded.epoch;
+                }
+            }
+            if (!found) {
+                found = _ubcc->lookupBackstore(homePa, e);
+            }
             _ubcc->onBackstoreFillComplete(homePa, found, e);
         });
 }
@@ -872,6 +977,7 @@ EPBackend::issueBackstoreRead(uint64_t homePa)
 void
 EPBackend::issueBackstoreWrite(uint64_t homePa)
 {
+    appendTmpLog("ep_backstore.log", "[BACKSTORE] write pa=0x%lx\n", homePa);
     if (!_ubcc) {
         return;
     }
@@ -881,9 +987,14 @@ EPBackend::issueBackstoreWrite(uint64_t homePa)
     }
 
     UBCCController::BackstoreEntry e;
-    _ubcc->snapshotResidentForBackstore(homePa, e);
-    MetaBackstoreEntry me{static_cast<int>(e.state), e.sharersMask, e.epoch};
-    _metaRnf->issueWrite(homePa, me, [this, homePa]() {
+    if (!_ubcc->snapshotResidentForBackstore(homePa, e)) {
+        _ubcc->onBackstoreWriteAck(homePa);
+        return;
+    }
+    const uint64_t metaPa = metadataBackstorePa(homePa);
+    MetaLine line = encodeMetaLine(homePa, static_cast<int>(e.state),
+                                   e.sharersMask, e.epoch);
+    _metaRnf->issueWrite(metaPa, line, [this, homePa](bool) {
         _ubcc->onBackstoreWriteAck(homePa);
     });
 }
@@ -891,6 +1002,7 @@ EPBackend::issueBackstoreWrite(uint64_t homePa)
 void
 EPBackend::issueBackstoreDelete(uint64_t homePa)
 {
+    appendTmpLog("ep_backstore.log", "[BACKSTORE] delete pa=0x%lx\n", homePa);
     if (!_ubcc) {
         return;
     }
@@ -899,7 +1011,8 @@ EPBackend::issueBackstoreDelete(uint64_t homePa)
         return;
     }
 
-    _metaRnf->issueDelete(homePa, [this, homePa](bool existed) {
+    const uint64_t metaPa = metadataBackstorePa(homePa);
+    _metaRnf->issueDelete(metaPa, [this, homePa](bool existed) {
         _ubcc->onBackstoreDeleteAck(homePa, existed);
     });
 }
@@ -1126,6 +1239,16 @@ EPBackend::sendRecallResponse(const OuterRecallResponse &response)
 
 // ---- M7: Writeback / Evict ----
 
+void
+EPBackend::handleHomeWritebackComplete(uint64_t homePa)
+{
+    printf("[EP-HOME-WB] node=%d pa=0x%lx\n", _nodeId, homePa);
+    if (!_ubcc) {
+        return;
+    }
+    _ubcc->notifyHomeWritebackComplete(homePa);
+}
+
 bool
 EPBackend::handleWriteback(uint64_t line_pa, bool keepAsClean)
 {
@@ -1151,19 +1274,34 @@ EPBackend::handleWriteback(uint64_t line_pa, bool keepAsClean)
     uint64_t homePa = _addrMap.buildDsmPA(homeNode, homeNode, offset);
 
     // Look up requester entry to get epoch
+    // For home-local writebacks (called from EPSNF), fall back to UBCC
+    // directory which holds the authoritative epoch and owner.
     uint64_t epochVal = 0;
+    int requesterNode = _nodeId;
     auto it = _requesterLines.find(line_pa);
     if (it != _requesterLines.end()) {
         epochVal = it->second.epoch;
+    } else if (_ubcc) {
+        epochVal = _ubcc->getEpochForLine(line_pa);
+        if (epochVal == 0) {
+            _epochCounter++;
+            epochVal = _epochCounter;
+        }
+        int ownerNode = _ubcc->getOwnerForLine(line_pa);
+        if (ownerNode >= 0) {
+            requesterNode = ownerNode;
+        }
     } else {
-        // Use epoch counter if no entry exists
         _epochCounter++;
         epochVal = _epochCounter;
     }
 
+    printf("[EP-HANDLE-WB] node=%d pa=0x%lx epoch=%lu requester=%d keepAsClean=%d\n",
+           _nodeId, line_pa, epochVal, requesterNode, keepAsClean);
+
     // Build writeback message envelope
     _lastWritebackMsg.linePa = homePa;
-    _lastWritebackMsg.requesterNode = _nodeId;
+    _lastWritebackMsg.requesterNode = requesterNode;
     _lastWritebackMsg.homeNode = homeNode;
     _lastWritebackMsg.epoch = epochVal;
     _lastWritebackMsg.keepAsClean = keepAsClean;
@@ -1174,7 +1312,7 @@ EPBackend::handleWriteback(uint64_t line_pa, bool keepAsClean)
               _nodeId, line_pa, homeNode);
     }
     bool ok = _ubAdapter->sendWritebackReq(
-        homePa, _nodeId, epochVal, keepAsClean, homeNode);
+        homePa, requesterNode, epochVal, keepAsClean, homeNode);
 
     // Build ack envelope
     _lastAckMsg.linePa = homePa;

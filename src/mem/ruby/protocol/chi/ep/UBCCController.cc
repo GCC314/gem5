@@ -2,6 +2,7 @@
 
 #include <cstdio>
 #include <cstring>
+#include <cstdarg>
 #include <sstream>
 
 #include "base/logging.hh"
@@ -18,6 +19,28 @@ namespace gem5
 
 namespace ruby
 {
+
+namespace
+{
+
+void
+appendTmpLog(const char *file, const char *fmt, ...)
+{
+    char path[256];
+    std::snprintf(path, sizeof(path), "/workspace/tmp_logs/%s", file);
+    FILE *fp = std::fopen(path, "a");
+    if (!fp) {
+        return;
+    }
+
+    va_list ap;
+    va_start(ap, fmt);
+    std::vfprintf(fp, fmt, ap);
+    va_end(ap);
+    std::fclose(fp);
+}
+
+} // anonymous namespace
 
 // Static registry for cross-node UBCC routing
 std::map<int, UBCCController*> UBCCController::_instances;
@@ -354,6 +377,10 @@ UBCCController::processOuterRequest(
             "requesterNode=%d baseEpoch=%lu reqId=%lu\n",
             _nodeId, line_pa, static_cast<int>(reqType), writeIntent,
             requesterNode, baseEpoch, reqId);
+    printf("[UBCC-OUTER-REQ] home=%d pa=0x%lx req=%d write=%d requester=%d "
+           "baseEpoch=%lu reqId=%lu\n",
+           _nodeId, line_pa, static_cast<int>(reqType), writeIntent,
+           requesterNode, baseEpoch, reqId);
 
     // Initialize M6 recall outputs and F3 dataSource output
     if (outRecallNeeded)   *outRecallNeeded = false;
@@ -382,6 +409,10 @@ UBCCController::processOuterRequest(
     DirEntry entry;
     ResidentAccessResult r = ensureResidentForAccess(
         line_pa, reqType, writeIntent, requesterNode, baseEpoch, reqId, entry);
+    printf("[UBCC-OUTER-REQ] home=%d pa=0x%lx residentResult=%d state=%s "
+           "sharers=0x%lx epoch=%lu\n",
+           _nodeId, line_pa, static_cast<int>(r), mesiStateName(entry.state),
+           entry.sharersMask, entry.epoch);
     if (r != ResidentAccessResult::Ready) {
         return static_cast<UBCC_OuterGrantType>(-1);
     }
@@ -391,6 +422,13 @@ UBCCController::processOuterRequest(
     // Same requester with live outstanding → BUSY (no self-queue).
     OutstandingRequest *existing = findOutstanding(line_pa);
     if (existing) {
+        appendTmpLog(
+            "ubcc_outer_req.log",
+            "[OUTER-REQ] pa=0x%lx req=%d existing_op=%d existing_stage=%d "
+            "existing_requester=%d replayArmed=%d\n",
+            line_pa, static_cast<int>(reqType), static_cast<int>(existing->opType),
+            static_cast<int>(existing->stage), existing->requesterNode,
+            existing->replayArmed ? 1 : 0);
         // Non-terminal: still active (RECALL WAITING, INVALIDATE WAITING, etc.)
         if (existing->stage != OpStage::DONE &&
             existing->stage != OpStage::CANCELLED &&
@@ -604,6 +642,10 @@ UBCCController::processOuterRequest(
                 }
 
                 if (otherSharers != 0) {
+                    printf("[UBCC-INVALIDATE-CREATE] home=%d pa=0x%lx requester=%d "
+                           "otherSharers=0x%lx reservedEpoch=%lu writeIntent=%d\n",
+                           _nodeId, line_pa, requesterNode, otherSharers,
+                           reservedEpoch, writeIntent);
                     // v4: Create INVALIDATE + GRANT_HANDSHAKE
                     // INVALIDATE outstanding
                     OutstandingRequest *invOreq = createOutstanding(
@@ -612,6 +654,7 @@ UBCCController::processOuterRequest(
                         invOreq->reservedEpoch = reservedEpoch;
                         invOreq->reqId = reqId;
                         invOreq->baseEpoch = baseEpoch;
+                        invOreq->reqType = reqType;
                         invOreq->stage = OpStage::WAITING_ALL_ACKS;
                         invOreq->targetMask = otherSharers;
                         invOreq->totalMask = otherSharers;
@@ -879,6 +922,15 @@ UBCCController::processOuterRequest(
             mesiStateName(prevState),
             oreq ? mesiStateName(oreq->intendedState) : "none",
             static_cast<int>(grant), reservedEpoch);
+    printf("[UBCC-GRANT-READY] home=%d pa=0x%lx requester=%d grant=%d prev=%s "
+           "intended=%s baseEpoch=%lu reservedEpoch=%lu reqId=%lu dataSource=%d\n",
+           _nodeId, line_pa, requesterNode, static_cast<int>(grant),
+           mesiStateName(prevState),
+           oreq ? mesiStateName(oreq->intendedState) : "none",
+           oreq ? oreq->baseEpoch : 0,
+           oreq ? oreq->reservedEpoch : 0,
+           oreq ? oreq->reqId : 0,
+           oreq ? static_cast<int>(oreq->dataSource) : -1);
 
     if (outGrantVisibleTick)
         *outGrantVisibleTick = grantVisibleTick;
@@ -1221,11 +1273,21 @@ UBCCController::processInvalidationAck(uint64_t line_pa, int ackNode,
         ost->pendingAckCount--;
     }
 
-    // upgrade_invalidate_fix §4.2.2: do NOT modify committed entry.sharersMask
-    // for UPGRADE_PENDING. Only for INVALIDATE path.
+    // INVALIDATE path (not UPGRADE_PENDING): committed sharer set must track
+    // acked invalidations so later committed lookups do not observe stale sharers.
+    // Keep epoch/intended-result commit deferred to GRANT_HANDSHAKE Clear.
     if (isInvalidatePath) {
         entry.sharersMask &= ~nodeBit;
+        if (entry.state == MESIState::G_S && entry.sharersMask == 0) {
+            // Canonicalize shared-empty into G_I to satisfy ResidentDir
+            // invariant (G_S requires non-empty sharersMask).
+            entry.state = MESIState::G_I;
+        }
         _directory.update(line_pa, entry);
+        appendTmpLog(
+            "ubcc_inv_ack.log",
+            "[INV-ACK] pa=0x%lx node=%d remaining=%d ackMask=0x%lx\n",
+            line_pa, ackNode, ost->pendingAckCount, ost->ackMask);
     }
 
     DPRINTF(RubyEP,
@@ -1235,6 +1297,13 @@ UBCCController::processInvalidationAck(uint64_t line_pa, int ackNode,
             isUpgradePath ? "UPGRADE" : "INVALIDATE",
             isUpgradePath ? ost->upgradePendingAckCount : ost->pendingAckCount,
             effAckMask, effTargetMask);
+    printf("[UBCC-INV-ACK] home=%d pa=0x%lx ackNode=%d op=%s remaining=%d "
+           "ackMask=0x%lx targetMask=0x%lx dirState=%s dirSharers=0x%lx\n",
+           _nodeId, line_pa, ackNode,
+           isUpgradePath ? "UPGRADE" : "INVALIDATE",
+           isUpgradePath ? ost->upgradePendingAckCount : ost->pendingAckCount,
+           effAckMask, effTargetMask, mesiStateName(entry.state),
+           entry.sharersMask);
 
     _invalidationAckCount++;
 
@@ -1246,6 +1315,12 @@ UBCCController::processInvalidationAck(uint64_t line_pa, int ackNode,
         DPRINTF(RubyEP,
                 "UBCC node_id=%d: all invalidations complete PA=0x%lx\n",
                 _nodeId, line_pa);
+        printf("[UBCC-INV-DONE] home=%d pa=0x%lx op=%s requester=%d "
+               "intended=%s baseEpoch=%lu reservedEpoch=%lu reqId=%lu\n",
+               _nodeId, line_pa,
+               isUpgradePath ? "UPGRADE" : "INVALIDATE",
+               ost->requesterNode, mesiStateName(ost->intendedState),
+               ost->baseEpoch, ost->reservedEpoch, ost->reqId);
 
         if (isUpgradePath) {
             // upgrade_invalidate_fix D2: all acks in → now safe to Ack(true)
@@ -1313,10 +1388,20 @@ UBCCController::processInvalidationAck(uint64_t line_pa, int ackNode,
             // to avoid the create-then-remove race on the same linePa key.
             ost->opType = OpType::GRANT_HANDSHAKE;
             ost->stage = OpStage::WAITING_CLEAR;
+            ost->replayArmed = true;  // allow requester retry to match this grant
             // intendedState, intendedOwnerNode, intendedSharersMask, intendedDirty
             // are already set from when the INVALIDATE was created.
             ost->recallBarrierDone = false;
             ost->invalidateBarrierDone = true;  // INVALIDATE is now DONE
+            printf("[UBCC-INV-TO-GRANT] home=%d pa=0x%lx requester=%d stage=%d "
+                   "intended=%s baseEpoch=%lu reservedEpoch=%lu reqId=%lu\n",
+                   _nodeId, line_pa, ost->requesterNode,
+                   static_cast<int>(ost->stage), mesiStateName(ost->intendedState),
+                   ost->baseEpoch, ost->reservedEpoch, ost->reqId);
+            appendTmpLog(
+                "ubcc_inv_ack.log",
+                "[INV-DONE] pa=0x%lx converting to GRANT_HANDSHAKE\n",
+                line_pa);
         }
     }
 
@@ -1382,6 +1467,15 @@ UBCCController::getEpochForLine(uint64_t line_pa) const
     return normalizeEpoch(entry.epoch);
 }
 
+int
+UBCCController::getOwnerForLine(uint64_t line_pa) const
+{
+    DirEntry entry;
+    if (!_directory.lookup(line_pa, entry))
+        return -1;
+    return DirEntry::ownerFromSharers(entry);
+}
+
 uint64_t
 UBCCController::getOutstandingBaseEpoch(uint64_t line_pa) const
 {
@@ -1403,6 +1497,8 @@ UBCCController::processWriteback(uint64_t line_pa, int requesterNode,
             "UBCC node_id=%d: processWriteback PA=0x%lx "
             "requesterNode=%d epoch=%lu keepAsClean=%d\n",
             _nodeId, line_pa, requesterNode, epochVal, keepAsClean);
+    printf("[UBCC-WB-ENTER] home=%d pa=0x%lx node=%d keepAsClean=%d epoch=%lu\n",
+           _nodeId, line_pa, requesterNode, keepAsClean, epochVal);
 
     DirEntry entry;
     ResidentAccessResult rr = ensureResidentForAccess(
@@ -1471,11 +1567,46 @@ UBCCController::processWriteback(uint64_t line_pa, int requesterNode,
     _directory.update(line_pa, entry);
     _directory.touch(line_pa);
     refreshPinnedBit(line_pa);
-    if (entry.state == MESIState::G_I) {
-        scheduleBackstoreDelete(line_pa);
-    }
+    // v4-A3: Don't force-delete G_I — let ResidentDir eviction handle cleanup
 
     return true;
+}
+
+// ---- v4: Home Writeback Completion (HN-F→EP-SNF→DRAM) ----
+
+void
+UBCCController::notifyHomeWritebackComplete(uint64_t homePa)
+{
+    printf("[UBCC-HOME-WB] home=%d pa=0x%lx\n", _nodeId, homePa);
+    DirEntry entry;
+    if (!_directory.lookup(homePa, entry)) {
+        return;
+    }
+    if (entry.state == MESIState::G_I) {
+        return;
+    }
+
+    // Guard: if a new request is already in-flight for this PA,
+    // the stale writeback notification must not overwrite the state.
+    // The in-flight request will determine the correct final state.
+    if (isLineBusy(homePa)) {
+        printf("[UBCC-HOME-WB] home=%d pa=0x%lx BUSY — deferred\n",
+               _nodeId, homePa);
+        return;
+    }
+
+    int oldOwner = DirEntry::ownerFromSharers(entry);
+    printf("[UBCC-HOME-WB] home=%d pa=0x%lx oldState=%s owner=%d epoch=%lu\n",
+           _nodeId, homePa, mesiStateName(entry.state), oldOwner, entry.epoch);
+
+    entry.state = MESIState::G_I;
+    entry.sharersMask = 0;
+    entry.residentDirty = true;
+    _writebackCount++;
+
+    _directory.update(homePa, entry);
+    _directory.touch(homePa);
+    refreshPinnedBit(homePa);
 }
 
 // ---- M7: GlobalEvict (Clean Evict) ----
@@ -1590,9 +1721,7 @@ UBCCController::processEvict(uint64_t line_pa, int evictingNode,
     _directory.update(line_pa, entry);
     _directory.touch(line_pa);
     refreshPinnedBit(line_pa);
-    if (entry.state == MESIState::G_I) {
-        scheduleBackstoreDelete(line_pa);
-    }
+    // v4-A3: Don't force-delete G_I — let ResidentDir eviction handle cleanup
 
     return true;
 }
@@ -1827,6 +1956,10 @@ UBCCController::processClear(
     uint64_t epoch, uint64_t reqId)
 {
     epoch = normalizeEpoch(epoch);
+    appendTmpLog(
+        "ubcc_clear.log",
+        "[CLEAR] pa=0x%lx epoch=%lu reqId=%lu\n",
+        line_pa, epoch, reqId);
 
     DPRINTF(RubyEP,
             "UBCC node_id=%d: processClear PA=0x%lx "
@@ -2049,9 +2182,8 @@ UBCCController::commitIntendedResult(DirEntry &entry, const OutstandingRequest &
 
     if (entry.state != MESIState::G_I) {
         _directory.bloomInsert(ost.linePa);
-    } else {
-        scheduleBackstoreDelete(ost.linePa);
     }
+    // v4-A3: Don't force-delete G_I — let ResidentDir eviction handle cleanup
 }
 
 void
@@ -2172,6 +2304,14 @@ UBCCController::onBackstoreFillComplete(
         e.sharersMask = 0;
         e.residentDirty = false;
     }
+    appendTmpLog(
+        "ubcc_fill_complete.log",
+        "[FILL-COMPLETE] pa=0x%lx found=%d state=%d sharers=0x%lx\n",
+        linePa, found ? 1 : 0, static_cast<int>(e.state), e.sharersMask);
+    printf("[UBCC-FILL-DONE] home=%d pa=0x%lx found=%d state=%s sharers=0x%lx "
+           "epoch=%lu\n",
+           _nodeId, linePa, found ? 1 : 0, mesiStateName(e.state),
+           e.sharersMask, e.epoch);
     _directory.update(linePa, e);
     _directory.setFillPending(linePa, false);
     _directory.touch(linePa);

@@ -18,3 +18,5 @@ class EPBackend(SimObject):
     ubcc_force_resident_entries = Param.UInt32(
         0, "force resident entries for tests (0=auto)"
     )
+    metadata_private_base = Param.Addr(0, "metadata private DRAM base")
+    metadata_private_size = Param.MemorySize("16MB", "metadata private DRAM size")

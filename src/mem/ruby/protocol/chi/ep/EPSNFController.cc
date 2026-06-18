@@ -131,6 +131,8 @@ EPSNFController::print(std::ostream& out) const
 bool
 EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
 {
+    printf("[EPSNF-RECV] node=%d type=%d addr=0x%lx\n",
+           _nodeId, msg->m_type, msg->m_addr);
     DPRINTF(RubyCHIGeneric, "EP_SNF node_id=%d recvRequestMsg type=%s addr=0x%lx\n",
             _nodeId, msg->m_type, msg->m_addr);
     warn("EP_SNF node_id=%d recvRequestMsg type=%d addr=0x%lx "
@@ -477,6 +479,14 @@ EPSNFController::recvDataMsg(const CHIDataMsg *msg)
             Packet wrPkt(req, MemCmd::WriteReq);
             wrPkt.dataStatic(buf);
             phys_mem->functionalAccess(&wrPkt);
+
+            // v4: Follow WriteNoSnp through EPBackend chain to UBCC,
+            // same pattern as ReadNoSnp → handleRemoteMiss → UBCC.
+            // Notify UBCC that home data has been written to DRAM,
+            // releasing directory ownership.
+            if (_backend && _backend->isDsmAddr(writePa)) {
+                _backend->handleWriteback(writePa, false);
+            }
 
             DPRINTF(RubyCHIGeneric,
                     "EP_SNF node_id=%d: wrote data to DDR4 "
