@@ -12,3 +12,4 @@ class EPSNFController(EPController):
     abstract = False
 
     ep_backend = Param.EPBackend(NULL, "EPBackend for this endpoint")
+    socket_id = Param.Int(0, "v4-dual-socket: socket index")

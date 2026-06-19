@@ -36,6 +36,7 @@ class EPSNFController : public EPController
     bool recvDataMsg(const CHIDataMsg *msg) override;
 
     EPBackend *_backend = nullptr;
+    int _socketId = 0;  // v4-dual-socket
 
     // Q2: Pending write tracking — maps address → HN-F requestor.
     std::map<Addr, MachineID> _pendingWrites;

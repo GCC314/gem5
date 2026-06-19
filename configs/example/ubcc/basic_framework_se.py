@@ -45,11 +45,11 @@ def config_system(args):
         membus = SystemXBar()
         system.addChildByName(f"node{node_id}_membus", membus)
 
-        local_mem = SimpleMemory(range=cfg.local_private_range)
+        local_mem = SimpleMemory(range=cfg.local_private_range(0))
         local_mem.port = membus.mem_side_ports
         system.addChildByName(f"node{node_id}_local_mem", local_mem)
 
-        ubcc_mem = SimpleMemory(range=cfg.ubcc_exclusive_range)
+        ubcc_mem = SimpleMemory(range=cfg.metadata_private_range(0))
         ubcc_mem.port = membus.mem_side_ports
         system.addChildByName(f"node{node_id}_ubcc_mem", ubcc_mem)
 

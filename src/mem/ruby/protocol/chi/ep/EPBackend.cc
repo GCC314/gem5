@@ -120,6 +120,7 @@ EPBackend::EPBackend(const Params &p)
               _nodeId, _numSockets);
     }
     _ubAdapters.resize(_numSockets, nullptr);
+    _epSnfs.resize(_numSockets, nullptr);  // v4-dual-socket: per-socket EP-SNF slots
 
     auto *ruby_system = p.ruby_system;
     // v4-dual-socket: _ubcc retained for inspection/tests; main paths use message-passing.
@@ -137,6 +138,35 @@ EPBackend::EPBackend(const Params &p)
 
     // M6: Register this EPBackend in the static cross-node routing registry
     _backendInstances[_nodeId] = this;
+}
+
+// v4-dual-socket: per-socket EP-SNF registration (§3.6)
+void
+EPBackend::registerEpSnf(int socketId, EPSNFController *ctrl)
+{
+    if (socketId < 0) {
+        fatal("EPBackend node_id=%d: registerEpSnf socketId=%d < 0\n",
+              _nodeId, socketId);
+    }
+    if (socketId >= (int)_epSnfs.size()) {
+        _epSnfs.resize(socketId + 1, nullptr);
+    }
+    if (_epSnfs[socketId] && _epSnfs[socketId] != ctrl) {
+        fatal("EPBackend node_id=%d: registerEpSnf socket=%d already has "
+              "different controller (old=%p new=%p)\n",
+              _nodeId, socketId, (void*)_epSnfs[socketId], (void*)ctrl);
+    }
+    _epSnfs[socketId] = ctrl;
+    if (_numSockets < (int)_epSnfs.size())
+        _numSockets = _epSnfs.size();
+}
+
+EPSNFController*
+EPBackend::getEpSnf(int socketId) const
+{
+    if (socketId >= 0 && socketId < (int)_epSnfs.size())
+        return _epSnfs[socketId];
+    return nullptr;
 }
 
 uint64_t
@@ -257,6 +287,12 @@ EPBackend::init()
                 adapter->bindUbccToRouter(_ubcc);
             }
         }
+    }
+
+    // v4-dual-socket: EP-SNF completeness check (§3.6 change 3)
+    for (int s = 0; s < _numSockets; ++s) {
+        fatal_if(_epSnfs[s] == nullptr,
+                 "EPBackend node_id=%d: missing EP-SNF for socket %d", _nodeId, s);
     }
 
     // ---- M4 Sentinel Registration Self-Test ----

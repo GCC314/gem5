@@ -215,11 +215,12 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
             ruby_system, None, nd['l_memctrl'],
             # Q2 FIX: Pass explicit addr_ranges instead of relying on
             # getMemRange which may return a single value not a list.
-            addr_ranges=[
-                cfg.local_private_range,
-                cfg.ubcc_exclusive_range,
-                cfg.metadata_private_range,
-            ])
+            # v4-dual-socket: per-socket private + routing + backstore
+            addr_ranges=(
+                cfg.all_local_private_ranges()
+                + cfg.all_metadata_private_ranges()
+                + cfg.all_metadata_backstore_ranges()
+            ))
         setattr(ruby_system, f"l_snf_node{node_id}", nd['l_snf'])
         network_nodes.append(nd['l_snf'])
         all_cntrls.extend(nd['l_snf'].getAllControllers())
@@ -265,71 +266,108 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
                                 metadata_private_base=cfg.metadata_private_base,
                                 metadata_private_size=f"{metadata_private_size}B")
 
-        nd['ep_snf_cntrl'] = EPSNFController(
-            version=chi_defs.Versions.getVersion(chi_defs.CHI_Cache_Controller),
-            ruby_system=ruby_system, node_id=node_id,
-            data_channel_size=params.data_width,
-            ep_backend=ep_backend,
-            addr_ranges=[NodeConfig.dsm_range_for(nid, seg_size, cfg.phy_base,
-                                                    num_sockets, sid)
-                         for nid in range(num_nodes)
-                         for sid in range(num_sockets)])
-        nd['ep_snf_wrapper'] = _make_ep_node(
-            ruby_system, nd['ep_snf_cntrl'], node_id)
-        setattr(ruby_system, f"ep_snf_node{node_id}", nd['ep_snf_wrapper'])
-        network_nodes.append(nd['ep_snf_wrapper'])
-        all_cntrls.append(nd['ep_snf_cntrl'])
+        # v4-dual-socket: Create per-socket EP-SNF controllers (§3.2 change 2)
+        nd['ep_snf_cntrls'] = []
+        nd['ep_snf_wrappers'] = []
+        for sid in range(num_sockets):
+            # v4-dual-socket: pass socket_id to EPSNFController for self-registration
+            ep_snf = EPSNFController(
+                version=chi_defs.Versions.getVersion(chi_defs.CHI_Cache_Controller),
+                ruby_system=ruby_system, node_id=node_id,
+                socket_id=sid,
+                data_channel_size=params.data_width,
+                ep_backend=ep_backend,
+                addr_ranges=[NodeConfig.dsm_range_for(nid, seg_size, cfg.phy_base,
+                                                        num_sockets, sid)
+                             for nid in range(num_nodes)])
+            ep_snf_wrapper = _make_ep_node(ruby_system, ep_snf, node_id)
+            nd['ep_snf_cntrls'].append(ep_snf)
+            nd['ep_snf_wrappers'].append(ep_snf_wrapper)
+            if num_sockets == 1:
+                setattr(ruby_system, f"ep_snf_node{node_id}", ep_snf_wrapper)
+            else:
+                setattr(ruby_system, f"ep_snf_node{node_id}_s{sid}", ep_snf_wrapper)
+            network_nodes.append(ep_snf_wrapper)
+            all_cntrls.append(ep_snf)
+        if num_sockets == 1:
+            nd['ep_snf_cntrl'] = nd['ep_snf_cntrls'][0]
+            nd['ep_snf_wrapper'] = nd['ep_snf_wrappers'][0]
 
-        # ── Create HN-F BEFORE EP-RNF (needed for downstream_destinations) ──
-        hnf_ranges = [
-            cfg.local_private_range,
-            cfg.ubcc_exclusive_range,
-            cfg.metadata_private_range,
-        ]
-        for nid in range(num_nodes):
-            for sid in range(num_sockets):
-                hnf_ranges.append(
-                    NodeConfig.dsm_range_for(nid, seg_size, cfg.phy_base,
-                                              num_sockets, sid))
-        nd['hnf_wrapper'], nd['hnf_cntrl'] = _make_hnf(
-            ruby_system, hnf_ranges, HNFCache, node_id)
-        configure_l3_dsm_policy(nd['hnf_cntrl'])
-        setattr(ruby_system, f"hnf_node{node_id}", nd['hnf_wrapper'])
-        network_nodes.append(nd['hnf_wrapper'])
-        all_cntrls.append(nd['hnf_cntrl'])
+        # v4-dual-socket: Create per-socket HN-F controllers (§3.2 change 3)
+        nd['hnf_cntrls'] = []
+        nd['hnf_wrappers'] = []
+        for sid in range(num_sockets):
+            hnf_ranges = [
+                cfg.local_private_range(sid),
+                cfg.metadata_private_range(sid),
+                cfg.metadata_backstore_range(sid),
+            ] + [NodeConfig.dsm_range_for(nid, seg_size, cfg.phy_base,
+                                          num_sockets, sid)
+                 for nid in range(num_nodes)]
+            hnf_wrapper, hnf_cntrl = _make_hnf(
+                ruby_system, hnf_ranges, HNFCache, node_id)
+            configure_l3_dsm_policy(hnf_cntrl)
+            nd['hnf_cntrls'].append(hnf_cntrl)
+            nd['hnf_wrappers'].append(hnf_wrapper)
+            if num_sockets == 1:
+                setattr(ruby_system, f"hnf_node{node_id}", hnf_wrapper)
+            else:
+                setattr(ruby_system, f"hnf_node{node_id}_s{sid}", hnf_wrapper)
+            network_nodes.append(hnf_wrapper)
+            all_cntrls.append(hnf_cntrl)
+        if num_sockets == 1:
+            nd['hnf_cntrl'] = nd['hnf_cntrls'][0]
+            nd['hnf_wrapper'] = nd['hnf_wrappers'][0]
 
-        nd['meta_rnf_cntrl'] = MetaRNFController(
-            version=chi_defs.Versions.getVersion(chi_defs.CHI_Cache_Controller),
-            ruby_system=ruby_system, node_id=node_id,
-            socket_id=0,
-            data_channel_size=params.data_width,
-            addr_ranges=[cfg.metadata_private_range],
-            metadata_private_range=cfg.metadata_private_range,
-            downstream_destinations=[nd['hnf_cntrl']])
-        nd['meta_rnf_wrapper'] = _make_ep_node(
-            ruby_system, nd['meta_rnf_cntrl'], node_id)
-        setattr(ruby_system, f"meta_rnf_node{node_id}", nd['meta_rnf_wrapper'])
-        network_nodes.append(nd['meta_rnf_wrapper'])
-        all_cntrls.append(nd['meta_rnf_cntrl'])
-        nd['meta_rnf'] = nd['meta_rnf_cntrl']
+        # v4-dual-socket: Create per-socket MetaRNF controllers (§3.2 change 4)
+        nd['meta_rnf_cntrls'] = []
+        nd['meta_rnf_wrappers'] = []
+        for sid in range(num_sockets):
+            meta_rnf = MetaRNFController(
+                version=chi_defs.Versions.getVersion(chi_defs.CHI_Cache_Controller),
+                ruby_system=ruby_system, node_id=node_id,
+                socket_id=sid,
+                data_channel_size=params.data_width,
+                addr_ranges=[cfg.metadata_backstore_range(sid)],
+                metadata_private_range=cfg.metadata_backstore_range(sid),
+                downstream_destinations=[nd['hnf_cntrls'][sid]])
+            meta_rnf_wrapper = _make_ep_node(ruby_system, meta_rnf, node_id)
+            nd['meta_rnf_cntrls'].append(meta_rnf)
+            nd['meta_rnf_wrappers'].append(meta_rnf_wrapper)
+            if num_sockets == 1:
+                setattr(ruby_system, f"meta_rnf_node{node_id}", meta_rnf_wrapper)
+            else:
+                setattr(ruby_system, f"meta_rnf_node{node_id}_s{sid}", meta_rnf_wrapper)
+            network_nodes.append(meta_rnf_wrapper)
+            all_cntrls.append(meta_rnf)
+        if num_sockets == 1:
+            nd['meta_rnf_cntrl'] = nd['meta_rnf_cntrls'][0]
+            nd['meta_rnf_wrapper'] = nd['meta_rnf_wrappers'][0]
+            nd['meta_rnf'] = nd['meta_rnf_cntrls'][0]
+        else:
+            nd['meta_rnf'] = nd['meta_rnf_cntrls'][0]
 
+        # v4-dual-socket: EP-RNF binds ALL local HN-Fs (§3.2 change 5)
         nd['ep_rnf_cntrl'] = EPRNFController(
             version=chi_defs.Versions.getVersion(chi_defs.CHI_Cache_Controller),
             ruby_system=ruby_system, node_id=node_id,
             data_channel_size=params.data_width,
             ep_backend=ep_backend,
             addr_ranges=[NodeConfig.dsm_range_for(
-                node_id, seg_size, cfg.phy_base, num_sockets, 0)],
-            downstream_destinations=[nd['hnf_cntrl']])
+                node_id, seg_size, cfg.phy_base, num_sockets, sid)
+                for sid in range(num_sockets)],
+            downstream_destinations=[nd['hnf_cntrls'][sid]
+                                     for sid in range(num_sockets)])
         nd['ep_rnf_wrapper'] = _make_ep_node(
             ruby_system, nd['ep_rnf_cntrl'], node_id)
         setattr(ruby_system, f"ep_rnf_node{node_id}", nd['ep_rnf_wrapper'])
         network_nodes.append(nd['ep_rnf_wrapper'])
         all_cntrls.append(nd['ep_rnf_cntrl'])
 
-        # v4: Inject EP-RNF MachineVersion into HN-F so it can derive
+        # v4: Inject EP-RNF MachineVersion into all HN-Fs so they can derive
         # epRnfMachineID in initializeTBE for dir_sharers tracking.
-        nd['hnf_cntrl'].epRnfMachineVersion = nd['ep_rnf_cntrl'].version
+        for hnf_cntrl in nd['hnf_cntrls']:
+            hnf_cntrl.epRnfMachineVersion = nd['ep_rnf_cntrl'].version
 
         nd['clusters'] = []
         for cluster_i in range(DEFAULT_D):
@@ -337,10 +375,14 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
             cluster_base = node_cpu_base + cluster_i * DEFAULT_L
             cluster_cpus = cpus[cluster_base:cluster_base + DEFAULT_L]
 
+            # v4-dual-socket: explicit socket_id from cluster index
+            # TODO: derive from CPU object socket metadata when available
+            cluster_socket = cluster_i % num_sockets
             cluster = ClusterCHI_RNF(
                 cluster_cpus, ruby_system, cache_line,
                 l1i_assoc=2, l1d_assoc=2, l1i_size="32kB", l1d_size="32kB",
-                l2_assoc=8, l2_size="256kB")
+                l2_assoc=8, l2_size="256kB",
+                socket_id=cluster_socket)
             cluster.addPrivL2Cache()
             setattr(ruby_system,
                     f"cluster_n{node_id}_c{cluster_i}", cluster)
@@ -358,37 +400,39 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
         # in L1/L2 caches.  Without explicit DSM ranges, L1/L2
         # controllers' respondTo() returns false for DSM addresses,
         # causing RubySystem::functionalRead() to skip them.
+        # v4-dual-socket: per-socket private + routing + backstore + DSM
         dsm_ranges = [NodeConfig.dsm_range_for(nid, seg_size, cfg.phy_base,
                                                 num_sockets, sid)
                        for nid in range(num_nodes)
                        for sid in range(num_sockets)]
         for cluster in nd['clusters']:
             for cntrl in cluster.getAllControllers():
-                cntrl.addr_ranges = [
-                    cfg.local_private_range,
-                    cfg.ubcc_exclusive_range,
-                    cfg.metadata_private_range,
-                ] + dsm_ranges
+                cntrl.addr_ranges = (
+                    cfg.all_local_private_ranges()
+                    + cfg.all_metadata_private_ranges()
+                    + cfg.all_metadata_backstore_ranges()
+                    + dsm_ranges
+                )
 
     for node_id in range(num_nodes):
         nd = per_node[node_id]
-        hnf_c_list = [nd['hnf_cntrl']]
+        # v4-dual-socket: cluster downstream to ALL local HN-Fs (§3.2 change 8)
+        hnf_c_list = [nd['hnf_cntrls'][sid] for sid in range(num_sockets)]
         for cluster in nd['clusters']:
             cluster.setDownstream(hnf_c_list)
 
     for node_id in range(num_nodes):
         nd = per_node[node_id]
-        snf_dests = []
-        snf_dests.extend(nd['l_snf'].getAllControllers())
-        # F1: Route ALL DSM through EP_SNF as the SINGLE downstream.
-        # DL_SNF only serves local-private/ubcc-exclusive memory;
-        # DSM must not go through DL_SNF.
-        snf_dests.append(nd['ep_snf_cntrl'])
-        nd['hnf_wrapper'].setDownstream(snf_dests)
-        # Q2 FIX: Force re-evaluation of downstream_destinations param
-        # after the Python list was updated, so the C++ params struct
-        # picks up the correct values during m5.instantiate().
-        nd['hnf_cntrl'].unproxyParams()
+        # v4-dual-socket: each HN-F only connects to its socket's EP-SNF (§3.2 change 9)
+        for sid in range(num_sockets):
+            snf_dests = []
+            snf_dests.extend(nd['l_snf'].getAllControllers())
+            # F1: Route ALL DSM through EP_SNF as the SINGLE downstream.
+            # DL_SNF only serves local-private/routing/metadata memory;
+            # DSM must not go through DL_SNF.
+            snf_dests.append(nd['ep_snf_cntrls'][sid])
+            nd['hnf_wrappers'][sid].setDownstream(snf_dests)
+            nd['hnf_cntrls'][sid].unproxyParams()
 
     for cntrl in all_cntrls:
         cntrl.data_channel_size = params.data_width

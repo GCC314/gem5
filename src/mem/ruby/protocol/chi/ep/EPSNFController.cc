@@ -20,8 +20,13 @@ namespace ruby
 using namespace CHI;
 
 EPSNFController::EPSNFController(const Params &p)
-  : EPController(p), _backend(p.ep_backend)
+  : EPController(p), _backend(p.ep_backend),
+    _socketId(p.socket_id)
 {
+    // v4-dual-socket: self-register with EPBackend
+    if (_backend) {
+        _backend->registerEpSnf(_socketId, this);
+    }
 }
 
 void

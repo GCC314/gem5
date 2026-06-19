@@ -21,6 +21,7 @@ namespace ruby
 
 class UBCCController;
 class EPRNFController;
+class EPSNFController;
 class UBAdapter;
 class RubySystem;
 class MetaRNFController;
@@ -606,6 +607,10 @@ class EPBackend : public SimObject
     }
     int numSockets() const { return _numSockets; }
 
+    /** v4-dual-socket: register per-socket EP-SNF controller (§3.5) */
+    void registerEpSnf(int socketId, EPSNFController *ctrl);
+    EPSNFController* getEpSnf(int socketId) const;
+
     /** Handle QueryLineMetaResp from UBCC via UBAdapter (v4-dual-socket). */
     void handleQueryLineMetaResp(const UBMsg &msg);
 
@@ -692,6 +697,7 @@ class EPBackend : public SimObject
     UBCCController *_ubcc = nullptr;
     MetaRNFController *_metaRnf = nullptr;
     std::vector<UBAdapter*> _ubAdapters;  // v4-dual-socket: per-socket adapters
+    std::vector<EPSNFController*> _epSnfs; // v4-dual-socket: per-socket EP-SNF
     int _numSockets = 1;                   // v4-dual-socket
     EPRNFController *_epRnfCtrl = nullptr;
     RubySystem *_ruby_system = nullptr;

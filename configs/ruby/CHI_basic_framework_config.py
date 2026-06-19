@@ -104,28 +104,48 @@ class NodeConfig:
         self.addr_map = NodeAddressMap(num_nodes, seg_size, num_sockets)
         self.local_private_base = self.phy_base + 0 * seg_size
         self.local_private_end   = self.phy_base + 1 * seg_size
-        self.ubcc_exclusive_base = self.phy_base + 1 * seg_size
-        self.ubcc_exclusive_end  = self.phy_base + 2 * seg_size
+        # v4-dual-socket: metadata_private per-socket routing window at [SEG, 2*SEG)
+        # (replaces old ubcc_exclusive_range).  Split evenly by socket.
+        self.routing_window_base = self.phy_base + 1 * seg_size
+        self.routing_window_size = seg_size
         # v4-dual-socket: metadata_private_base is after all DSM segments
-        # DSM spans N * S segments starting at offset 2*seg
+        # (this is the 16MB metadata backstore, split by socket).
+        # Parameter name kept as metadata_private_* for EPBackend SimObject compat.
         dsm_count = num_nodes * num_sockets
         self.metadata_private_base = self.phy_base + (2 + dsm_count) * seg_size
         self.metadata_private_size = 16 * 1024 * 1024
         self.metadata_private_end = (
             self.metadata_private_base + self.metadata_private_size
         )
+        self._local_private_chunk = seg_size // num_sockets
+        self._routing_window_chunk = seg_size // num_sockets
+        self._backstore_chunk = self.metadata_private_size // num_sockets
 
-    @property
-    def local_private_range(self):
-        return AddrRange(self.local_private_base, size=self.seg_size)
+    # ---- v4-dual-socket: per-socket address helpers ----
 
-    @property
-    def ubcc_exclusive_range(self):
-        return AddrRange(self.ubcc_exclusive_base, size=self.seg_size)
+    def local_private_range(self, socket_id=0):
+        """Per-socket slice of local private memory [0, SEG)."""
+        base = self.local_private_base + socket_id * self._local_private_chunk
+        return AddrRange(base, size=self._local_private_chunk)
 
-    @property
-    def metadata_private_range(self):
-        return AddrRange(self.metadata_private_base, size=self.metadata_private_size)
+    def metadata_private_range(self, socket_id=0):
+        """Per-socket routing window [SEG, 2*SEG) — replaces ubcc_exclusive_range."""
+        base = self.routing_window_base + socket_id * self._routing_window_chunk
+        return AddrRange(base, size=self._routing_window_chunk)
+
+    def metadata_backstore_range(self, socket_id=0):
+        """Per-socket slice of 16MB metadata backstore."""
+        base = self.metadata_private_base + socket_id * self._backstore_chunk
+        return AddrRange(base, size=self._backstore_chunk)
+
+    def all_local_private_ranges(self):
+        return [self.local_private_range(s) for s in range(self.num_sockets)]
+
+    def all_metadata_private_ranges(self):
+        return [self.metadata_private_range(s) for s in range(self.num_sockets)]
+
+    def all_metadata_backstore_ranges(self):
+        return [self.metadata_backstore_range(s) for s in range(self.num_sockets)]
 
     @staticmethod
     def dsm_global_range(seg_size=DEFAULT_SEG_SIZE, num_nodes=DEFAULT_N,
@@ -146,13 +166,15 @@ class NodeConfig:
         base = phy_base + (2 + node_id * num_sockets + socket_id) * seg_size
         return AddrRange(base, size=seg_size)
 
-def get_all_system_ranges(seg_size=DEFAULT_SEG_SIZE, num_nodes=DEFAULT_N):
+def get_all_system_ranges(seg_size=DEFAULT_SEG_SIZE, num_nodes=DEFAULT_N,
+                         num_sockets=1):
+    """Collect all per-socket local/meta ranges plus global DSM for system view."""
     ranges = []
     for n in range(num_nodes):
-        cfg = NodeConfig(n, num_nodes, seg_size)
-        ranges.append(cfg.local_private_range)
-        ranges.append(cfg.ubcc_exclusive_range)
-    ranges.append(NodeConfig.dsm_global_range(seg_size))
+        cfg = NodeConfig(n, num_nodes, seg_size, num_sockets)
+        ranges.extend(cfg.all_local_private_ranges())
+        ranges.extend(cfg.all_metadata_private_ranges())
+    ranges.append(NodeConfig.dsm_global_range(seg_size, num_nodes, num_sockets))
     return ranges
 
 
@@ -161,8 +183,12 @@ class ClusterCHI_RNF(CHI_Node):
                  l1Icache_type=None, l1Dcache_type=None,
                  l1i_assoc=2, l1d_assoc=2,
                  l1i_size="32kB", l1d_size="32kB",
-                 l2_assoc=8, l2_size="256kB"):
+                 l2_assoc=8, l2_size="256kB",
+                 socket_id=0):
         super().__init__(ruby_system)
+
+        # v4-dual-socket: explicit socket_id for NUMA topology (non-SimObject attr)
+        self._socket_id = socket_id
 
         if l1Icache_type is None:
             l1Icache_type = L1ICache

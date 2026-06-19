@@ -12,6 +12,7 @@
 #include "mem/ruby/network/MessageBuffer.hh"
 #include "mem/ruby/protocol/AccessPermission.hh"
 #include "mem/ruby/protocol/chi/ep/EPBackend.hh"
+#include "mem/ruby/protocol/chi/ep/NodeAddressMap.hh"
 #include "mem/ruby/slicc_interface/AbstractController.hh"
 #include "mem/ruby/system/CacheRecorder.hh"
 #include "mem/ruby/system/RubySystem.hh"
@@ -354,6 +355,16 @@ class EPRNFController : public EPController
     bool sendChiRequest(uint64_t linePa, CHI::CHIRequestType reqType,
                         CHI::EpProxyOp proxyOp = CHI::EpProxyOp_NoProxyOp);
 
+    // v4-dual-socket: PA → socket → HN-F routing helpers (§3.3)
+    int decodeHomeSocket(uint64_t linePa) const {
+        int s = _addrMap.homeSocket(_nodeId, linePa);
+        if (s < 0 || s >= _numSockets) return 0;
+        return s;
+    }
+    MachineID selectHnfDestination(uint64_t linePa) const {
+        return _downstreamBySocket[decodeHomeSocket(linePa)];
+    }
+
     /** Send CompAck to HN-F via rspOut after receiving a response. */
     void sendCompAck(uint64_t linePa, MachineID dest);
 
@@ -433,13 +444,17 @@ class EPRNFController : public EPController
     /** Count of Cache-type controllers (for reference). */
     int _numCacheControllers;
 
-    /** HN-F controller version number (set from config). */
-    int _hnfVersion;
+    // v4-dual-socket: per-socket HN-F version & destination arrays (§3.3)
+    int _numSockets;
+    NodeAddressMap _addrMap;
+    std::vector<int> _hnfVersions;               // index == socket_id
+    std::vector<MachineID> _downstreamBySocket;  // index == socket_id
 
     // ---- Q3: Serialization of CHI requests to HN-F ----
     // Prevents multiple CHI requests being sent to HN-F in the same
     // event-processing cycle, which can cause TBE reservation exhaustion
     // and trigger `decrementReserved(): m_reserved > 0` assertion.
+    // v4-dual-socket: _chiRequestInFlight remains GLOBAL — no per-socket parallelism.
     bool _chiRequestInFlight;
     // Queue of deferred CHI requests waiting for the current one to complete
     struct DeferredChiRequest {

@@ -217,14 +217,20 @@ EPController::functionalReadBuffers(PacketPtr& pkt, WriteMask &mask)
 EPRNFController::EPRNFController(const Params &p)
   : EPController(p), _backend(p.ep_backend),
     _numCacheControllers(0),
-    _hnfVersion(-1),
+    _numSockets(p.downstream_destinations.size()),
+    _addrMap(3, _numSockets, 128ULL * 1024 * 1024),
     _chiRequestInFlight(false),
     _pendingHnResponseCount(0),
     _delayedResolvedCount(0)
 {
-    // Derive HN-F version from the first downstream destination controller
-    if (!p.downstream_destinations.empty()) {
-        _hnfVersion = p.downstream_destinations[0]->getVersion();
+    // v4-dual-socket: array-ify HN-F versions from downstream destinations (§3.4)
+    _hnfVersions.resize(_numSockets, -1);
+    _downstreamBySocket.resize(_numSockets);
+    for (int s = 0; s < _numSockets; ++s) {
+        if (p.downstream_destinations[s]) {
+            _hnfVersions[s] = p.downstream_destinations[s]->getVersion();
+            _downstreamBySocket[s] = MachineID{MachineType_Cache, _hnfVersions[s]};
+        }
     }
 
     // Register EP_RNF with EPBackend for delayed response support
@@ -261,13 +267,29 @@ EPRNFController::init()
     EPController::init();
     fatal_if(!_backend, "EP_RNF node_id=%d: no backend attached", _nodeId);
 
+    // v4-dual-socket: strict completeness check (§3.4 change 2)
+    // num_sockets > 1 且 downstream_destinations.size() != num_sockets -> fatal
+    // 任一 _hnfVersions[s] < 0 -> fatal
+    for (int s = 0; s < _numSockets; ++s) {
+        fatal_if(_hnfVersions[s] < 0,
+                 "EP_RNF node_id=%d: missing HN-F for socket %d "
+                 "(_hnfVersions[%d]=%d < 0)", _nodeId, s, s, _hnfVersions[s]);
+    }
+    fatal_if(_numSockets > 1 && (int)_hnfVersions.size() != _numSockets,
+             "EP_RNF node_id=%d: num_sockets=%d but only %zu HN-F versions",
+             _nodeId, _numSockets, _hnfVersions.size());
+
     // Compute count of other Cache-type controllers for reference
     _numCacheControllers = m_ruby_system->m_num_controllers[MachineType_Cache];
 
     DPRINTF(RubyCHIGeneric,
             "EP_RNF node_id=%d: init done, cacheControllers=%d, "
-            "hnfVersion=%d\n",
-            _nodeId, _numCacheControllers, _hnfVersion);
+            "numSockets=%d, hnfVersions=[",
+            _nodeId, _numCacheControllers, _numSockets);
+    for (int s = 0; s < _numSockets; ++s) {
+        DPRINTFR(RubyCHIGeneric, "%s%d", (s ? "," : ""), _hnfVersions[s]);
+    }
+    DPRINTFR(RubyCHIGeneric, "]\n");
 
     // F4: selfTest disabled — manual snoop injection causes init-phase
     // SnpShared→EP-RNF fatal before any workload runs (§gap_analysis).
@@ -959,10 +981,9 @@ EPRNFController::sendChiRequest(uint64_t linePa, CHIRequestType reqType,
     // v4: Set ep_proxy_op sideband for special completion (§4.5.4)
     req->m_ep_proxy_op = proxyOp;
 
-    // Use HN-F version from config (no dynamic mapping)
-    MachineID hnfId;
-    hnfId.type = MachineType_Cache;
-    hnfId.num = _hnfVersion;
+    // v4-dual-socket: select HN-F destination by PA.homeSocket (§3.4 change 3)
+    int homeSocket = decodeHomeSocket(linePa);
+    MachineID hnfId = _downstreamBySocket[homeSocket];
     req->m_Destination.clear();
     req->m_Destination.add(hnfId);
 
@@ -977,9 +998,9 @@ EPRNFController::sendChiRequest(uint64_t linePa, CHIRequestType reqType,
 
     DPRINTF(RubyCHIGeneric,
             "EP_RNF node_id=%d: sendChiRequest addr=0x%lx type=%d "
-            "dest=(type=%d num=%d) sent=%d inFlight=%d\n",
+            "homeSocket=%d dest=(type=%d num=%d) sent=%d inFlight=%d\n",
             _nodeId, linePa, static_cast<int>(reqType),
-            hnfId.getType(), hnfId.getNum(), sent, _chiRequestInFlight);
+            homeSocket, hnfId.getType(), hnfId.getNum(), sent, _chiRequestInFlight);
 
     return sent;
 }
