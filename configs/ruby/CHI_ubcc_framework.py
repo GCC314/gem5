@@ -51,56 +51,48 @@ def _make_hnf(ruby_system, addr_ranges, llcache_type, node_id):
 # This ensures ARM workload ldr/str to DSM VA addresses correctly traverse
 # the page table to the CHI Ruby physical address space.
 
-def setup_dsm_va_mapping(processes, num_nodes=DEFAULT_N, seg_size=DEFAULT_SEG_SIZE):
+def setup_dsm_va_mapping(processes, num_nodes=DEFAULT_N, seg_size=DEFAULT_SEG_SIZE,
+                         num_sockets=1):
     """Install VA→PA mappings for DSM regions on all processes.
 
     Each process gets VA range [DSM_VA_BASE + k*SEG, DSM_VA_BASE + (k+1)*SEG)
     mapped to the REQUESTING NODE's DSM PA base for home node k.
 
-    For process on node i accessing DSM data homed at node k,
-    the PA must be in node i's DSM_k range:
-        PA = (i << 40) + (2 + k) * seg_size
-
-    This ensures the local RNF recognizes the address as DSM and
-    forwards it correctly through the CHI EP layer.
+    v4-dual-socket: DSM segments are indexed by (homeNode, homeSocket).
+    With num_sockets=1, homeSocket=0 and layout degenerates to original.
 
     Args:
         processes: List of Process objects (ordered by CPU index, one per CPU).
         num_nodes: Number of nodes (default 3).
         seg_size: Segment size in bytes (default 128MB).
-
-    Usage in test script:
-        from ruby.CHI_ubcc_framework import setup_dsm_va_mapping
-        setup_dsm_va_mapping([proc for cpu in cpus for proc in cpu.workload])
+        num_sockets: Number of sockets per node (default 1).
     """
-    addr_map = NodeAddressMap(num_nodes, seg_size)
+    addr_map = NodeAddressMap(num_nodes, seg_size, num_sockets)
 
-    # DSM_VA_BASE = (MaxAddr + 1) - 4 * SEG_SIZE
+    # DSM_VA_BASE = (MaxAddr + 1) - (num_nodes * num_sockets + 1) * SEG_SIZE
     # Must be page-aligned for EmulationPageTable::map() assertion.
-    # (0xFFFFFFFFFFFF + 1) = 0x1000000000000 for 48-bit VA max.
-    # Each node k's DSM_k window is at DSM_VA_BASE + k * SEG_SIZE
-    dsm_va_base = (0xFFFFFFFFFFFF + 1) - 4 * seg_size
+    total_dsm_segs = num_nodes * num_sockets
+    dsm_va_base = (0xFFFFFFFFFFFF + 1) - (total_dsm_segs + 1) * seg_size
 
     # Compute CPUs per node for node_id assignment.
-    # Processes are ordered by CPU index: proc[i] belongs to CPU i.
-    # CPU i belongs to node i // cpus_per_node.
     _cpus_per_node = len(processes) // num_nodes if num_nodes > 0 else 1
 
     for _proc_idx, proc in enumerate(processes):
         if proc is None:
             continue
-        # Determine which node this process/CPU is on
         _req_node_id = _proc_idx // _cpus_per_node
         _req_node_base = _req_node_id << addr_map.node_shift
 
+        seg_idx = 0
         for nid in range(num_nodes):
-            # PA must be in the REQUESTOR node's DSM_k range:
-            #   req_node_base + (2 + nid) * seg_size
-            dsm_pa_base = _req_node_base + (2 + nid) * seg_size
-            dsm_va = dsm_va_base + nid * seg_size
-            proc.map(dsm_va, dsm_pa_base, seg_size, cacheable=True)
+            for sid in range(num_sockets):
+                dsm_pa_base = _req_node_base + (2 + seg_idx) * seg_size
+                dsm_va = dsm_va_base + seg_idx * seg_size
+                proc.map(dsm_va, dsm_pa_base, seg_size, cacheable=True)
+                seg_idx += 1
 
     print(f"[Q1-DSM-MAP] Installed DSM VA→PA mappings for {num_nodes} nodes, "
+           f"{num_sockets} sockets/node ({total_dsm_segs} DSM segments), "
            f"base VA=0x{dsm_va_base:x}, {len(processes)} processes "
            f"({_cpus_per_node} CPUs/node)")
 
@@ -171,6 +163,7 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
 
     num_nodes = DEFAULT_N
     seg_size = DEFAULT_SEG_SIZE
+    num_sockets = int(os.environ.get("UBCC_NUM_SOCKETS", "1"))
     ubcc_epoch_bits = int(os.environ.get("UBCC_EPOCH_BITS", "64"))
     ubcc_bf_bytes = int(os.environ.get("UBCC_BF_BYTES", "65536"))
     ubcc_force_resident_entries = int(
@@ -179,13 +172,13 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
     ubcc_meta_write_ticks = int(os.environ.get("UBCC_META_WRITE_TICKS", "7500"))
     ubcc_meta_delete_ticks = int(os.environ.get("UBCC_META_DELETE_TICKS", "7500"))
     cache_line = system.cache_line_size.value
-    print(f"[UBCC-CONFIG] epoch_bits={ubcc_epoch_bits}")
-    addr_map = NodeAddressMap(num_nodes, seg_size)
+    print(f"[UBCC-CONFIG] epoch_bits={ubcc_epoch_bits} num_sockets={num_sockets}")
+    addr_map = NodeAddressMap(num_nodes, seg_size, num_sockets)
     params = chi_defs.NoC_Params
 
     class HNFCache(RubyCache):
-        dataAccessLatency = 10
-        tagAccessLatency = 2
+        dataAccessLatency = 30
+        tagAccessLatency = 6
         size = getattr(options, "l3_size", "256kB")
         assoc = getattr(options, "l3_assoc", 16)
 
@@ -202,7 +195,7 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
 
     for node_id in range(num_nodes):
         nd = per_node[node_id]
-        cfg = NodeConfig(node_id, num_nodes, seg_size)
+        cfg = NodeConfig(node_id, num_nodes, seg_size, num_sockets)
 
         # ── Create SNFs FIRST (before HN-F) ─────────────────────────
         # Q2 FIX: SNF controllers must be added to the SimObject tree
@@ -214,7 +207,7 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
 
         l_backstore_range = AddrRange(
             cfg.local_private_base,
-            size=(5 * seg_size + metadata_private_size),
+            size=((2 + num_nodes * num_sockets) * seg_size + metadata_private_size),
         )
         nd['l_memctrl'] = _make_dram_memctrl(l_backstore_range, system,
                                              f"l_mc_n{node_id}")
@@ -243,31 +236,44 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
         all_cntrls.extend(nd['dl_snf'].getAllControllers())
         mem_backstores.append(nd['dl_memctrl'])
 
-        # Phase 2: Create UBAdapter and UBRouter per node
-        ub_router = UBRouter(node_id=node_id, ub_msg_latency="0ns")
-        ub_adapter = UBAdapter(node_id=node_id, router=ub_router)
-        meta_rnf = None
-        nd['ub_router'] = ub_router
-        nd['ub_adapter'] = ub_adapter
-        nd['meta_rnf'] = meta_rnf
+        # v4-dual-socket: Create per-socket UBRouters and UBAdapters.
+        # For num_sockets=1, socket_id=0 and behavior is identical to before.
+        nd['ub_routers'] = []
+        nd['ub_adapters'] = []
+        nd['meta_rnfs'] = []
+        for socket_id in range(num_sockets):
+            ub_router = UBRouter(node_id=node_id, socket_id=socket_id,
+                                 ub_msg_latency="500ns")
+            ub_adapter = UBAdapter(node_id=node_id, socket_id=socket_id,
+                                   router=ub_router)
+            nd['ub_routers'].append(ub_router)
+            nd['ub_adapters'].append(ub_adapter)
+
+        # Backward-compat aliases for first socket
+        nd['ub_router'] = nd['ub_routers'][0] if nd['ub_routers'] else None
+        nd['ub_adapter'] = nd['ub_adapters'][0] if nd['ub_adapters'] else None
+        nd['meta_rnf'] = None
 
         ep_backend = EPBackend(node_id=node_id, ruby_system=ruby_system,
-                               meta_rnf=NULL,
-                               ub_adapter=ub_adapter,
-                               ubcc_epoch_bits=ubcc_epoch_bits,
-                               ubcc_bf_bytes=ubcc_bf_bytes,
-                               ubcc_force_resident_entries=
-                                    ubcc_force_resident_entries,
-                               metadata_private_base=cfg.metadata_private_base,
-                               metadata_private_size=f"{metadata_private_size}B")
+                                meta_rnf=NULL,
+                                ub_adapter=nd['ub_adapter'],
+                                num_sockets=num_sockets,
+                                ubcc_epoch_bits=ubcc_epoch_bits,
+                                ubcc_bf_bytes=ubcc_bf_bytes,
+                                ubcc_force_resident_entries=
+                                     ubcc_force_resident_entries,
+                                metadata_private_base=cfg.metadata_private_base,
+                                metadata_private_size=f"{metadata_private_size}B")
 
         nd['ep_snf_cntrl'] = EPSNFController(
             version=chi_defs.Versions.getVersion(chi_defs.CHI_Cache_Controller),
             ruby_system=ruby_system, node_id=node_id,
             data_channel_size=params.data_width,
             ep_backend=ep_backend,
-            addr_ranges=[NodeConfig.dsm_range_for(nid, seg_size, cfg.phy_base)
-                         for nid in range(num_nodes)])
+            addr_ranges=[NodeConfig.dsm_range_for(nid, seg_size, cfg.phy_base,
+                                                    num_sockets, sid)
+                         for nid in range(num_nodes)
+                         for sid in range(num_sockets)])
         nd['ep_snf_wrapper'] = _make_ep_node(
             ruby_system, nd['ep_snf_cntrl'], node_id)
         setattr(ruby_system, f"ep_snf_node{node_id}", nd['ep_snf_wrapper'])
@@ -281,8 +287,10 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
             cfg.metadata_private_range,
         ]
         for nid in range(num_nodes):
-            hnf_ranges.append(
-                NodeConfig.dsm_range_for(nid, seg_size, cfg.phy_base))
+            for sid in range(num_sockets):
+                hnf_ranges.append(
+                    NodeConfig.dsm_range_for(nid, seg_size, cfg.phy_base,
+                                              num_sockets, sid))
         nd['hnf_wrapper'], nd['hnf_cntrl'] = _make_hnf(
             ruby_system, hnf_ranges, HNFCache, node_id)
         configure_l3_dsm_policy(nd['hnf_cntrl'])
@@ -293,6 +301,7 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
         nd['meta_rnf_cntrl'] = MetaRNFController(
             version=chi_defs.Versions.getVersion(chi_defs.CHI_Cache_Controller),
             ruby_system=ruby_system, node_id=node_id,
+            socket_id=0,
             data_channel_size=params.data_width,
             addr_ranges=[cfg.metadata_private_range],
             metadata_private_range=cfg.metadata_private_range,
@@ -310,7 +319,7 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
             data_channel_size=params.data_width,
             ep_backend=ep_backend,
             addr_ranges=[NodeConfig.dsm_range_for(
-                node_id, seg_size, cfg.phy_base)],
+                node_id, seg_size, cfg.phy_base, num_sockets, 0)],
             downstream_destinations=[nd['hnf_cntrl']])
         nd['ep_rnf_wrapper'] = _make_ep_node(
             ruby_system, nd['ep_rnf_cntrl'], node_id)
@@ -349,8 +358,10 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
         # in L1/L2 caches.  Without explicit DSM ranges, L1/L2
         # controllers' respondTo() returns false for DSM addresses,
         # causing RubySystem::functionalRead() to skip them.
-        dsm_ranges = [NodeConfig.dsm_range_for(nid, seg_size, cfg.phy_base)
-                      for nid in range(num_nodes)]
+        dsm_ranges = [NodeConfig.dsm_range_for(nid, seg_size, cfg.phy_base,
+                                                num_sockets, sid)
+                       for nid in range(num_nodes)
+                       for sid in range(num_sockets)]
         for cluster in nd['clusters']:
             for cntrl in cluster.getAllControllers():
                 cntrl.addr_ranges = [
@@ -406,6 +417,6 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
     # Collect all Process objects across all CPUs and map DSM VA regions
     # to the corresponding home node's DSM PA base for each node.
     processes = [proc for cpu in cpus for proc in cpu.workload]
-    setup_dsm_va_mapping(processes, num_nodes, seg_size)
+    setup_dsm_va_mapping(processes, num_nodes, seg_size, num_sockets)
 
     return (cpu_sequencers, [], topology)

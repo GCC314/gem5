@@ -43,26 +43,28 @@ appendTmpLog(const char *file, const char *fmt, ...)
 } // anonymous namespace
 
 // Static registry for cross-node UBCC routing
-std::map<int, UBCCController*> UBCCController::_instances;
+std::map<std::pair<int,int>, UBCCController*> UBCCController::_instances;
 
 void
-UBCCController::registerInstance(int node_id, UBCCController *ubcc)
+UBCCController::registerInstance(int node_id, int socket_id, UBCCController *ubcc)
 {
-    _instances[node_id] = ubcc;
+    _instances[{node_id, socket_id}] = ubcc;
 }
 
 UBCCController*
-UBCCController::getInstance(int node_id)
+UBCCController::getInstance(int node_id, int socket_id)
 {
-    auto it = _instances.find(node_id);
+    auto it = _instances.find({node_id, socket_id});
     return (it != _instances.end()) ? it->second : nullptr;
 }
 
-UBCCController::UBCCController(int node_id, RubySystem *ruby_system,
+UBCCController::UBCCController(int node_id, int socket_id,
+                               RubySystem *ruby_system,
                                uint32_t epoch_bits,
                                uint32_t resident_bf_bytes,
                                uint32_t resident_force_entries)
   : _nodeId(node_id),
+    _socketId(socket_id),
     _interconnectLatency(200),
     _directory(resident_bf_bytes, resident_force_entries),
     _epochBits(epoch_bits),
@@ -79,27 +81,32 @@ UBCCController::UBCCController(int node_id, RubySystem *ruby_system,
     _dsmSegSize(0)
 {
     if (_epochBits == 0 || _epochBits > 64) {
-        fatal("UBCC node_id=%d: epoch_bits=%u out of range (1..64)\n",
-              _nodeId, _epochBits);
+        fatal("UBCC node_id=%d socket=%d: epoch_bits=%u out of range (1..64)\n",
+              _nodeId, _socketId, _epochBits);
     }
 
     // Precompute DSM local range for isDsmAddr()
+    // v4-dual-socket: DSM_(homeNode, homeSocket) layout
     // Hardcoded prototype constants: num_nodes=3, segSize=128MB, NODE_ADDR_SHIFT=40
     constexpr uint64_t kSegSize = 128ULL * 1024 * 1024;
     constexpr int kNodeAddrShift = 40;
+    constexpr int kNumSockets = 1; // v4-dual-socket: default single socket
     uint64_t nodeBase = static_cast<uint64_t>(node_id) << kNodeAddrShift;
-    _dsmLocalBase = nodeBase + 2 * kSegSize + node_id * kSegSize;
+    // DSM base = phy_base + 2*seg + (node_id * numSockets + socket_id) * seg
+    _dsmLocalBase = nodeBase + 2 * kSegSize
+                    + (node_id * kNumSockets + socket_id) * kSegSize;
     _dsmSegSize = kSegSize;
     DPRINTF(RubyEP,
-            "UBCC node_id=%d: initialized with epoch_bits=%u mask=0x%lx\n",
-            _nodeId, _epochBits, epochMask());
+            "UBCC node_id=%d socket=%d: initialized with epoch_bits=%u "
+            "dsmBase=0x%lx dsmSize=0x%lx\n",
+            _nodeId, _socketId, _epochBits, _dsmLocalBase, _dsmSegSize);
 
-    registerInstance(node_id, this);
+    registerInstance(node_id, socket_id, this);
 }
 
 UBCCController::~UBCCController()
 {
-    _instances.erase(_nodeId);
+    _instances.erase({_nodeId, _socketId});
 }
 
 void
@@ -2575,6 +2582,89 @@ void
 UBCCController::removeOutstanding(uint64_t linePa)
 {
     _outstandingReqs.erase(linePa);
+}
+
+// ---- v4-dual-socket: Query Line Metadata (read-only snapshot) ----
+
+void
+UBCCController::queryLineMeta(uint64_t linePa,
+                               uint64_t &outEpoch,
+                               int &outOwnerNode,
+                               MESIState &outState,
+                               bool &outFound) const
+{
+    outFound = false;
+    outEpoch = 0;
+    outOwnerNode = -1;
+    outState = MESIState::G_I;
+
+    DirEntry entry;
+    if (_directory.lookup(linePa, entry)) {
+        outFound = true;
+        outEpoch = normalizeEpoch(entry.epoch);
+        outOwnerNode = DirEntry::ownerFromSharers(entry);
+        outState = entry.state;
+    }
+    // Note: Does not check backstore or create resident placeholder.
+    // Returns committed snapshot only.
+}
+
+// ---- v4-dual-socket: HomeWritebackNotify handler ----
+
+void
+UBCCController::processHomeWritebackNotify(uint64_t homePa, uint64_t notifyEpoch)
+{
+    notifyEpoch = normalizeEpoch(notifyEpoch);
+
+    printf("[UBCC-HOME-WB-NOTIFY] home=%d socket=%d pa=0x%lx epoch=%lu\n",
+           _nodeId, _socketId, homePa, notifyEpoch);
+
+    DirEntry entry;
+    if (!_directory.lookup(homePa, entry)) {
+        DPRINTF(RubyEP,
+                "UBCC node_id=%d socket=%d: HomeWritebackNotify PA=0x%lx "
+                "no directory entry — ignored\n",
+                _nodeId, _socketId, homePa);
+        return;
+    }
+
+    if (entry.state == MESIState::G_I) {
+        DPRINTF(RubyEP,
+                "UBCC node_id=%d socket=%d: HomeWritebackNotify PA=0x%lx "
+                "already G_I — ignored\n",
+                _nodeId, _socketId, homePa);
+        return;
+    }
+
+    // Guard: if a new request is already in-flight, drop stale notify
+    if (isLineBusy(homePa)) {
+        printf("[UBCC-HOME-WB-NOTIFY] home=%d socket=%d pa=0x%lx BUSY — deferred\n",
+               _nodeId, _socketId, homePa);
+        return;
+    }
+
+    // Optimistic stale epoch check
+    if (notifyEpoch != 0 && !checkEpochForLine(homePa, notifyEpoch)) {
+        printf("[UBCC-HOME-WB-NOTIFY] home=%d socket=%d pa=0x%lx "
+               "STALE epoch notify=%lu dir=%lu — dropped\n",
+               _nodeId, _socketId, homePa, notifyEpoch, entry.epoch);
+        return;
+    }
+
+    // Release directory ownership
+    int oldOwner = DirEntry::ownerFromSharers(entry);
+    printf("[UBCC-HOME-WB-NOTIFY] home=%d socket=%d pa=0x%lx "
+           "oldState=%s owner=%d — releasing to G_I\n",
+           _nodeId, _socketId, homePa, mesiStateName(entry.state), oldOwner);
+
+    entry.state = MESIState::G_I;
+    entry.sharersMask = 0;
+    entry.residentDirty = true;
+    _writebackCount++;
+
+    _directory.update(homePa, entry);
+    _directory.touch(homePa);
+    refreshPinnedBit(homePa);
 }
 
 } // namespace ruby

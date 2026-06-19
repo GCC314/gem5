@@ -24,6 +24,7 @@ class EPRNFController;
 class UBAdapter;
 class RubySystem;
 class MetaRNFController;
+struct UBMsg;       // v4-dual-socket: forward decl for handleQueryLineMetaResp
 
 // ---- M5 Outer Protocol Types ----
 // Outer protocol request types sent from EP_SNF (requester) to home UBCC.
@@ -336,6 +337,10 @@ class EPBackend : public SimObject
     int handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
                          int& outHomeNode);
 
+    // v4-dual-socket: overload with ingressSocket from EP-SNF sideband.
+    int handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
+                         int ingressSocket, int& outHomeNode);
+
     // Called after home UBCC makes a grant decision.
     // Returns the OuterGrantType that was granted.
     OuterGrantType handleGrant(uint64_t line_pa, OuterGrantType grant,
@@ -580,9 +585,32 @@ class EPBackend : public SimObject
     /** Access to UBCCController for Python inspection */
     UBCCController* getUBCC() const { return _ubcc; }
 
-    /** Bind the UBAdapter for message-path access to UBCC. */
-    void setUBAdapter(UBAdapter *adapter) { _ubAdapter = adapter; }
-    UBAdapter* getUBAdapter() const { return _ubAdapter; }
+    /** Bind the UBAdapter for message-path access to UBCC (legacy single-socket). */
+    void setUBAdapter(UBAdapter *adapter) {
+        if (_ubAdapters.empty()) {
+            _ubAdapters.resize(_numSockets, nullptr);
+        }
+        _ubAdapters[0] = adapter;
+    }
+    /** Get UBAdapter for socket (default 0 for backward compat). */
+    UBAdapter* getUBAdapter(int socket = 0) const {
+        if (socket >= 0 && socket < (int)_ubAdapters.size())
+            return _ubAdapters[socket];
+        return nullptr;
+    }
+    /** Register a per-socket UBAdapter (v4-dual-socket). */
+    void registerAdapter(int socketId, UBAdapter *adapter) {
+        if (socketId >= (int)_ubAdapters.size())
+            _ubAdapters.resize(socketId + 1, nullptr);
+        _ubAdapters[socketId] = adapter;
+    }
+    int numSockets() const { return _numSockets; }
+
+    /** Handle QueryLineMetaResp from UBCC via UBAdapter (v4-dual-socket). */
+    void handleQueryLineMetaResp(const UBMsg &msg);
+
+    /** Send HomeWritebackNotify to home UBCC (v4-dual-socket). */
+    void sendHomeWritebackNotify(uint64_t homePa, int homeSocket);
 
     // ---- M5 Inspection API ----
     /** Inspect requester-side bookkeeping for a given line. */
@@ -659,9 +687,12 @@ class EPBackend : public SimObject
 
     const int _nodeId;
     NodeAddressMap _addrMap;
+    // v4-dual-socket: _ubcc retained for backward compatibility (tests/inspection).
+    // Main protocol paths MUST use _ubAdapters[] → UBRouter → UBCC message-passing.
     UBCCController *_ubcc = nullptr;
     MetaRNFController *_metaRnf = nullptr;
-    UBAdapter *_ubAdapter = nullptr;  // Phase 2: message-path adapter
+    std::vector<UBAdapter*> _ubAdapters;  // v4-dual-socket: per-socket adapters
+    int _numSockets = 1;                   // v4-dual-socket
     EPRNFController *_epRnfCtrl = nullptr;
     RubySystem *_ruby_system = nullptr;
     uint64_t _metadataPrivateBase = 0;

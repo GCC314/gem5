@@ -43,6 +43,7 @@ class UBAdapter : public SimObject
     void init() override;
 
     int nodeId() const { return _nodeId; }
+    int socketId() const { return _socketId; }
 
     /** Bind the EPBackend that owns this adapter. */
     void bindBackend(EPBackend *backend) { _backend = backend; }
@@ -63,13 +64,12 @@ class UBAdapter : public SimObject
      * the local UBRouter, waits for the ReadResp, and returns the
      * grant decision.
      *
-     * This is the ONLY entry point for processOuterRequest in Phase 2.
-     * All other UBCC access paths remain unchanged (direct calls).
+     * v4-dual-socket: adds ingressSocket and homeSocket parameters.
      */
     int sendReadReq(
         uint64_t homePa, int reqType, bool writeIntent,
         int requesterNode, uint64_t epoch, uint64_t reqId,
-        int homeNode,
+        int homeNode, int ingressSocket, int homeSocket,
         Tick *outGrantVisibleTick, Tick *outSentinelVisibleTick,
         bool *outRecallNeeded, int *outRecallOwnerNode,
         int *outDataSource, uint64_t *outAuthEpoch,
@@ -80,41 +80,58 @@ class UBAdapter : public SimObject
     // ---- Phase 3: EPBackend→UBCC synchronous paths ----
     bool sendWritebackReq(uint64_t homePa, int requesterNode,
                           uint64_t epochVal, bool keepAsClean,
-                          int homeNode);
+                          int homeNode, int homeSocket);
 
     bool sendEvictReq(uint64_t homePa, int evictingNode,
-                      uint64_t epochVal, int homeNode);
+                      uint64_t epochVal, int homeNode, int homeSocket);
 
     bool sendUpgradeReq(uint64_t homePa, int requesterNode,
                         uint64_t epoch, uint64_t reqId,
                         int desiredPerm, int cause,
                         uint64_t *outUpgradeTargetMask,
                         uint64_t *outCommittedEpoch,
-                        int homeNode);
+                        int homeNode, int homeSocket);
 
     bool sendUpgradeDoneReq(uint64_t homePa, int requesterNode,
                             uint64_t epoch, uint64_t reqId,
-                            int homeNode);
+                            int homeNode, int homeSocket);
 
     bool sendClearReq(uint64_t linePa, int srcNode,
                       uint64_t epoch, uint64_t reqId,
-                      int homeNode);
+                      int homeNode, int homeSocket);
 
     // Cross-node EPBackend→EPBackend (fire-and-forget via router)
     void sendRecallReqToOwner(int targetNode,
-                              const OuterRecallMsg &recallMsg);
+                              const OuterRecallMsg &recallMsg,
+                              int homeSocket);
     void sendInvalidateReqToSharer(int targetNode,
-                                   const OuterInvalidateMsg &invMsg);
+                                    const OuterInvalidateMsg &invMsg,
+                                    int homeSocket);
 
     // EPBackend→UBCC fire-and-forget messages
     bool sendRecallResp(uint64_t linePa, int ownerNode,
                         bool dataReturned, uint64_t epoch,
                         uint64_t reqId,
                         const DataBlock *dataBlk,
-                        int homeNode);
+                        int homeNode, int homeSocket);
     bool sendInvalidateAck(uint64_t linePa, int ackNode,
-                           uint64_t epoch, uint64_t reqId,
-                           int homeNode);
+                            uint64_t epoch, uint64_t reqId,
+                            int homeNode, int homeSocket);
+
+    // ---- v4-dual-socket: new message types ----
+    /**
+     * Query line metadata (epoch, ownerNode) from home UBCC.
+     * Used for writeback fallback when _requesterLines has no entry.
+     */
+    int sendQueryLineMetaReq(uint64_t homePa, int homeNode, int homeSocket,
+                              uint64_t &outEpoch, int &outOwnerNode,
+                              bool &outFound);
+
+    /**
+     * Send HomeWritebackNotify to home UBCC after HN-F DDR4 write complete.
+     */
+    void sendHomeWritebackNotify(uint64_t homePa, uint64_t epoch,
+                                  int homeNode, int homeSocket);
 
     /**
      * Receive a message from the local UBRouter.
@@ -130,6 +147,7 @@ class UBAdapter : public SimObject
 
   private:
     int _nodeId;
+    int _socketId;
     EPBackend *_backend = nullptr;
     UBRouter *_router = nullptr;
     NodeAddressMap _addrMap;

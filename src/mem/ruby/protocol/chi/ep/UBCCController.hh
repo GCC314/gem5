@@ -199,19 +199,52 @@ class UBCCController
     // Maximum pending requesters per PA (configurable queue depth)
     static constexpr size_t MAX_PENDING_PER_PA = 4;
 
-    UBCCController(int node_id, RubySystem *ruby_system = nullptr,
+    // v4-dual-socket: constructor now takes socket_id.
+    UBCCController(int node_id, int socket_id = 0,
+                   RubySystem *ruby_system = nullptr,
                    uint32_t epoch_bits = 64,
                    uint32_t resident_bf_bytes = ResidentDir::DefaultBloomBytes,
                    uint32_t resident_force_entries = 0);
     ~UBCCController();
 
     int nodeId() const { return _nodeId; }
+    int socketId() const { return _socketId; }
 
     void wakeup();
 
     /** Set the local router for sending messages (e.g., UpgradeAckNotify). */
     void setRouter(UBRouter *router) { _router = router; }
     void setBackend(EPBackend *backend) { _backend = backend; }
+
+    // ---- v4-dual-socket: Query Line Metadata (read-only snapshot) ----
+    /**
+     * Query committed directory metadata for a line without creating
+     * an outstanding request or modifying any state.
+     * Used by EPBackend for writeback fallback when _requesterLines miss.
+     *
+     * @param linePa      Home PA
+     * @param outEpoch    Output: committed epoch (0 if not found)
+     * @param outOwnerNode Output: owner node (-1 if none)
+     * @param outState    Output: committed MESI state
+     * @param outFound    Output: true if entry exists
+     */
+    void queryLineMeta(uint64_t linePa,
+                       uint64_t &outEpoch,
+                       int &outOwnerNode,
+                       MESIState &outState,
+                       bool &outFound) const;
+
+    // ---- v4-dual-socket: HomeWritebackNotify handler ----
+    /**
+     * Process a HomeWritebackNotify from HN-F via EPBackend.
+     * Releases directory ownership after DDR4 writeback completes.
+     * Implements optimistic stale drop: if epoch no longer matches,
+     * the notification is silently dropped.
+     *
+     * @param homePa      Home PA that was written to DRAM
+     * @param notifyEpoch Epoch from the notify message (for stale check)
+     */
+    void processHomeWritebackNotify(uint64_t homePa, uint64_t notifyEpoch);
 
     struct BackstoreEntry {
         MESIState state;
@@ -220,10 +253,9 @@ class UBCCController
     };
 
     // ---- Cross-Node Routing Registry ----
-    // In single-gem5 prototype, all UBCC instances register themselves
-    // so that requester nodes can find the home node's UBCC.
-    static void registerInstance(int node_id, UBCCController *ubcc);
-    static UBCCController* getInstance(int node_id);
+    // v4-dual-socket: keyed by (node_id, socket_id) pair.
+    static void registerInstance(int node_id, int socket_id, UBCCController *ubcc);
+    static UBCCController* getInstance(int node_id, int socket_id = 0);
 
     // ---- M5: Home UBCC Grant Decision (v4: reserve-then-commit) ----
     /**
@@ -544,6 +576,7 @@ class UBCCController
 
    private:
     const int _nodeId;
+    int _socketId;                // v4-dual-socket
 
     /** Local UBRouter for sending messages (e.g., UpgradeAckNotify). */
     UBRouter *_router = nullptr;
@@ -605,7 +638,8 @@ class UBCCController
     uint64_t _dsmSegSize = 0;
 
     // ---- Cross-Node Routing Registry ----
-    static std::map<int, UBCCController*> _instances;
+    // v4-dual-socket: keyed by (nodeId, socketId) pair.
+    static std::map<std::pair<int,int>, UBCCController*> _instances;
 
     // ---- M5 private helpers ----
     void ensureDirEntry(uint64_t line_pa);

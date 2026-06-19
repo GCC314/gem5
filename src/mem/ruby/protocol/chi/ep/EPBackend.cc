@@ -99,9 +99,9 @@ EPBackend* EPBackend::getBackendInstance(int node_id)
 EPBackend::EPBackend(const Params &p)
   : SimObject(p),
     _nodeId(p.node_id),
-    _addrMap(3, 128ULL * 1024 * 1024),
+    _addrMap(3, 1, 128ULL * 1024 * 1024),
     _metaRnf(p.meta_rnf),
-    _ubAdapter(p.ub_adapter),
+    _numSockets(p.num_sockets),
     _ruby_system(p.ruby_system),
     _metadataPrivateBase(p.metadata_private_base),
     _metadataPrivateSize(p.metadata_private_size),
@@ -115,15 +115,24 @@ EPBackend::EPBackend(const Params &p)
     _invalidationReceivedCount(0),
     _invalidationAckSentCount(0)
 {
+    if (_numSockets < 1) {
+        fatal("EPBackend node_id=%d: num_sockets=%d must be >= 1\n",
+              _nodeId, _numSockets);
+    }
+    _ubAdapters.resize(_numSockets, nullptr);
+
     auto *ruby_system = p.ruby_system;
-    _ubcc = new UBCCController(_nodeId, ruby_system, p.ubcc_epoch_bits,
+    // v4-dual-socket: _ubcc retained for inspection/tests; main paths use message-passing.
+    _ubcc = new UBCCController(_nodeId, 0, ruby_system,
+                               p.ubcc_epoch_bits,
                                p.ubcc_bf_bytes,
                                p.ubcc_force_resident_entries);
     _ubcc->setBackend(this);
 
-    // Phase 2: Bind EPBackend to UBAdapter for message-path access
-    if (_ubAdapter) {
-        _ubAdapter->bindBackend(this);
+    // v4-dual-socket: Register legacy single adapter into slot 0 if provided.
+    UBAdapter *legacyAdapter = p.ub_adapter;
+    if (legacyAdapter) {
+        registerAdapter(0, legacyAdapter);
     }
 
     // M6: Register this EPBackend in the static cross-node routing registry
@@ -235,12 +244,19 @@ EPBackend::init()
     SimObject::init();
 
     if (!_metaRnf) {
-        _metaRnf = MetaRNFController::getInstance(_nodeId);
+        _metaRnf = MetaRNFController::getInstance(_nodeId, 0);
     }
 
-    // Phase 2: Wire UBCC to UBRouter via UBAdapter.
-    if (_ubAdapter && _ubcc) {
-        _ubAdapter->bindUbccToRouter(_ubcc);
+    // v4-dual-socket: Wire UBCC to UBRouter via each socket's adapter.
+    // For single-socket (legacy), only index 0 is used.
+    for (int s = 0; s < _numSockets; s++) {
+        UBAdapter *adapter = getUBAdapter(s);
+        if (adapter) {
+            adapter->bindBackend(this);
+            if (_ubcc) {
+                adapter->bindUbccToRouter(_ubcc);
+            }
+        }
     }
 
     // ---- M4 Sentinel Registration Self-Test ----
@@ -381,6 +397,17 @@ int
 EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
                              int& outHomeNode)
 {
+    // v4-dual-socket: default ingressSocket=0 for backward compat.
+    // Callers should use the overload with ingressSocket parameter.
+    return handleRemoteMiss(line_pa, neededPerm, writeIntent,
+                             0, outHomeNode);
+}
+
+int
+EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
+                             int ingressSocket,
+                             int& outHomeNode)
+{
     DPRINTF(RubyCHIGeneric,
             "EPBackend node_id=%d: handleRemoteMiss PA=0x%lx "
             "neededPerm=%d writeIntent=%d\n",
@@ -418,14 +445,28 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
     //  caused the HN-F to deadlock waiting for CompData.)
     outHomeNode = homeNode;
 
+    // v4-dual-socket: derive homeSocket from PA encoding.
+    // With num_sockets=1, this always returns 0.
+    int homeSocket = _addrMap.homeSocket(_nodeId, line_pa);
+    if (homeSocket < 0) homeSocket = 0;
+
+    // Determine adapter to use based on ingressSocket
+    int adapterIdx = (ingressSocket >= 0 && ingressSocket < _numSockets)
+                         ? ingressSocket : 0;
+    UBAdapter *adapter = getUBAdapter(adapterIdx);
+    if (!adapter) {
+        fatal("EPBackend node_id=%d: no UBAdapter for socket %d\n",
+              _nodeId, adapterIdx);
+    }
+
     // Translate PA from requester's view to home node's view.
     uint64_t offset = _addrMap.dsmOffset(line_pa);
     uint64_t homePa = _addrMap.buildDsmPA(homeNode, homeNode, offset);
 
     DPRINTF(RubyCHIGeneric,
             "EPBackend node_id=%d: translating PA 0x%lx -> home PA 0x%lx "
-            "homeNode=%d offset=0x%lx\n",
-            _nodeId, line_pa, homePa, homeNode, offset);
+            "homeNode=%d homeSocket=%d ingressSocket=%d offset=0x%lx\n",
+            _nodeId, line_pa, homePa, homeNode, homeSocket, ingressSocket, offset);
 
     // Map sideband to outer request type
     OuterReqType reqType;
@@ -489,7 +530,7 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
     }
     _requesterLines[line_pa] = entry;
 
-    if (!_ubAdapter) {
+    if (!adapter) {
         fatal("EPBackend node_id=%d: UBAdapter required for remote miss "
               "PA=0x%lx homeNode=%d\n",
               _nodeId, line_pa, homeNode);
@@ -542,9 +583,9 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
     uint64_t committedEpoch = 0;
     DataBlock routedGrantData(64);
     bool routedGrantDataValid = false;
-    int grantInt = _ubAdapter->sendReadReq(
+    int grantInt = adapter->sendReadReq(
         homePa, static_cast<int>(ubccReq), writeIntent, _nodeId,
-        entry.epoch, reqIdVal, homeNode,
+        entry.epoch, reqIdVal, homeNode, ingressSocket, homeSocket,
         &grantVisibleTick, &sentinelVisibleTick,
         &recallNeeded, &recallOwnerNode,
         reinterpret_cast<int*>(&dataSource), &authEpoch,
@@ -587,7 +628,7 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
                 "EPBackend node_id=%d: routing recall to owner "
                 "EPBackend node %d via UBAdapter\n",
                 _nodeId, recallOwnerNode);
-        _ubAdapter->sendRecallReqToOwner(recallOwnerNode, recallMsg);
+        getUBAdapter(0)->sendRecallReqToOwner(recallOwnerNode, recallMsg, homeSocket);
     }
 
     // ---- M8: Global Invalidation Routing ----
@@ -626,7 +667,7 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
                     DPRINTF(RubyEP,
                             "EPBackend node_id=%d: routing invalidation "
                             "to node %d via UBAdapter\n", _nodeId, s);
-                    _ubAdapter->sendInvalidateReqToSharer(s, invMsg);
+                    getUBAdapter(0)->sendInvalidateReqToSharer(s, invMsg, 0);
                 }
             }
         }
@@ -1218,16 +1259,16 @@ EPBackend::sendRecallResponse(const OuterRecallResponse &response)
                installed, response.hasDataPayload);
     }
 
-    if (!_ubAdapter) {
+    if (!getUBAdapter(0)) {
         fatal("EPBackend node_id=%d: UBAdapter required for recall response "
               "PA=0x%lx homeNode=%d\n",
               _nodeId, response.linePa, response.homeNode);
     }
-    bool ok = _ubAdapter->sendRecallResp(
+    bool ok = getUBAdapter(0)->sendRecallResp(
         response.linePa, response.ownerNode, response.dataReturned,
         response.epoch, response.reqId,
         response.hasDataPayload ? &response.dataPayload : nullptr,
-        response.homeNode);
+        response.homeNode, 0 /* homeSocket */);
 
     if (!ok) {
         warn("EPBackend node_id=%d: home UBCC rejected recall response "
@@ -1243,10 +1284,12 @@ void
 EPBackend::handleHomeWritebackComplete(uint64_t homePa)
 {
     printf("[EP-HOME-WB] node=%d pa=0x%lx\n", _nodeId, homePa);
-    if (!_ubcc) {
-        return;
-    }
-    _ubcc->notifyHomeWritebackComplete(homePa);
+    // v4-dual-socket: Send HomeWritebackNotify through adapter instead of
+    // calling _ubcc->notifyHomeWritebackComplete() directly.
+    // For single-socket backward compat, homeSocket = 0.
+    int homeSocket = _addrMap.homeSocket(_nodeId, homePa);
+    if (homeSocket < 0) homeSocket = 0;
+    sendHomeWritebackNotify(homePa, homeSocket);
 }
 
 bool
@@ -1273,9 +1316,15 @@ EPBackend::handleWriteback(uint64_t line_pa, bool keepAsClean)
     uint64_t offset = _addrMap.dsmOffset(line_pa);
     uint64_t homePa = _addrMap.buildDsmPA(homeNode, homeNode, offset);
 
+    // v4-dual-socket: derive homeSocket from PA (always 0 for single-socket)
+    int homeSocket = _addrMap.homeSocket(_nodeId, line_pa);
+    if (homeSocket < 0) homeSocket = 0;
+
     // Look up requester entry to get epoch
     // For home-local writebacks (called from EPSNF), fall back to UBCC
     // directory which holds the authoritative epoch and owner.
+    // v4-dual-socket TODO: replace direct _ubcc calls with QueryLineMetaReq/Resp
+    // when _requesterLines miss and multiple sockets are active.
     uint64_t epochVal = 0;
     int requesterNode = _nodeId;
     auto it = _requesterLines.find(line_pa);
@@ -1306,13 +1355,13 @@ EPBackend::handleWriteback(uint64_t line_pa, bool keepAsClean)
     _lastWritebackMsg.epoch = epochVal;
     _lastWritebackMsg.keepAsClean = keepAsClean;
 
-    if (!_ubAdapter) {
+    if (!getUBAdapter(0)) {
         fatal("EPBackend node_id=%d: UBAdapter required for writeback "
               "PA=0x%lx homeNode=%d\n",
               _nodeId, line_pa, homeNode);
     }
-    bool ok = _ubAdapter->sendWritebackReq(
-        homePa, requesterNode, epochVal, keepAsClean, homeNode);
+    bool ok = getUBAdapter(0)->sendWritebackReq(
+        homePa, requesterNode, epochVal, keepAsClean, homeNode, homeSocket);
 
     // Build ack envelope
     _lastAckMsg.linePa = homePa;
@@ -1381,12 +1430,12 @@ EPBackend::handleEvict(uint64_t line_pa)
     _lastEvictMsg.homeNode = homeNode;
     _lastEvictMsg.epoch = epochVal;
 
-    if (!_ubAdapter) {
+    if (!getUBAdapter(0)) {
         fatal("EPBackend node_id=%d: UBAdapter required for evict "
               "PA=0x%lx homeNode=%d\n",
               _nodeId, line_pa, homeNode);
     }
-    bool ok = _ubAdapter->sendEvictReq(homePa, _nodeId, epochVal, homeNode);
+    bool ok = getUBAdapter(0)->sendEvictReq(homePa, _nodeId, epochVal, homeNode, 0 /* homeSocket */);
 
     // Build ack envelope
     _lastAckMsg.linePa = homePa;
@@ -1527,14 +1576,14 @@ EPBackend::sendInvalidationAck(const OuterInvalidationAck &ack)
     _lastInvalidationAck = ack;
     _invalidationAckSentCount++;
 
-    if (!_ubAdapter) {
+    if (!getUBAdapter(0)) {
         fatal("EPBackend node_id=%d: UBAdapter required for invalidation ack "
               "PA=0x%lx homeNode=%d\n",
               _nodeId, ack.linePa, ack.homeNode);
     }
-    bool ok = _ubAdapter->sendInvalidateAck(
+    bool ok = getUBAdapter(0)->sendInvalidateAck(
         ack.linePa, ack.ackNode, ack.epoch, ack.reqId,
-        ack.homeNode);
+        ack.homeNode, 0 /* homeSocket */);
 
     if (!ok) {
         warn("EPBackend node_id=%d: home UBCC rejected invalidation ack "
@@ -1565,7 +1614,7 @@ EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
     uint64_t epochVal = _epochCounter;
     uint64_t reqIdVal = makeRequesterReqId(_nodeId, _epochCounter);
 
-    if (!_ubAdapter) {
+    if (!getUBAdapter(0)) {
         fatal("EPBackend node_id=%d: UBAdapter required for upgrade "
               "PA=0x%lx homeNode=%d\n",
               _nodeId, line_pa, homeNode);
@@ -1589,10 +1638,10 @@ EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
 
     uint64_t upgradeTargetMask = 0;
     uint64_t committedEpoch = 0;
-    bool accepted = _ubAdapter->sendUpgradeReq(
+    bool accepted = getUBAdapter(0)->sendUpgradeReq(
         homePa, _nodeId, epochVal, reqIdVal,
         desiredPerm, static_cast<int>(ubccCause),
-        &upgradeTargetMask, &committedEpoch, homeNode);
+        &upgradeTargetMask, &committedEpoch, homeNode, 0 /* homeSocket */);
 
     if (accepted) {
         // Store returned values (reservedEpoch, echoed reqId)
@@ -1630,7 +1679,7 @@ EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
                     DPRINTF(RubyEP,
                             "EPBackend node_id=%d: upgrade fanout "
                             "invalidation to node %d via UBAdapter\n", _nodeId, s);
-                    _ubAdapter->sendInvalidateReqToSharer(s, invMsg);
+                    getUBAdapter(0)->sendInvalidateReqToSharer(s, invMsg, 0 /* homeSocket */);
                 }
             }
 
@@ -1685,7 +1734,7 @@ EPBackend::sendUpgradeDone(uint64_t line_pa, int homeNode,
     uint64_t offset = _addrMap.dsmOffset(line_pa);
     uint64_t homePa = _addrMap.buildDsmPA(homeNode, homeNode, offset);
 
-    if (!_ubAdapter) {
+    if (!getUBAdapter(0)) {
         fatal("EPBackend node_id=%d: UBAdapter required for upgrade done "
               "PA=0x%lx homeNode=%d\n",
               _nodeId, line_pa, homeNode);
@@ -1699,8 +1748,8 @@ EPBackend::sendUpgradeDone(uint64_t line_pa, int homeNode,
     doneMsg.reqId = reqId;
     _lastUpgradeDone = doneMsg;
 
-    bool accepted = _ubAdapter->sendUpgradeDoneReq(
-        homePa, _nodeId, epoch, reqId, homeNode);
+    bool accepted = getUBAdapter(0)->sendUpgradeDoneReq(
+        homePa, _nodeId, epoch, reqId, homeNode, 0 /* homeSocket */);
 
     OuterUpgradeDoneAck doneAck;
     doneAck.linePa = homePa;
@@ -1750,13 +1799,13 @@ EPBackend::sendClear(uint64_t line_pa, int homeNode,
     clearMsg.reason = ClearReason::GrantHandshake;
     _lastClearMsg = clearMsg;
 
-    if (!_ubAdapter) {
+    if (!getUBAdapter(0)) {
         fatal("EPBackend node_id=%d: UBAdapter required for clear "
               "PA=0x%lx homeNode=%d\n",
               _nodeId, line_pa, homeNode);
     }
-    bool accepted = _ubAdapter->sendClearReq(
-        line_pa, _nodeId, clearEpoch, reqId, homeNode);
+    bool accepted = getUBAdapter(0)->sendClearReq(
+        line_pa, _nodeId, clearEpoch, reqId, homeNode, 0 /* homeSocket */);
 
     printf("[TC5-CLEAR-TRACE] sendClearResult node=%d linePA=0x%lx homeNode=%d "
            "clearEpoch=%lu reqId=%lu accepted=%d\n",
@@ -1804,6 +1853,61 @@ EPBackend::notifyUpgradeAckReady(uint64_t linePa)
              "but no EPRNFController registered\n",
              _nodeId, linePa);
     }
+}
+
+// ---- v4-dual-socket: sendHomeWritebackNotify ----
+
+void
+EPBackend::sendHomeWritebackNotify(uint64_t homePa, int homeSocket)
+{
+    printf("[EP-HOME-WB-NOTIFY] node=%d pa=0x%lx homeSocket=%d\n",
+           _nodeId, homePa, homeSocket);
+
+    // Determine homeNode from PA
+    int homeNode = _addrMap.homeNode(_nodeId, homePa);
+    if (homeNode < 0) {
+        // Try cross-node
+        homeNode = homeNodeCrossNode(homePa);
+    }
+    if (homeNode < 0) {
+        warn("EPBackend node_id=%d: sendHomeWritebackNotify: cannot determine homeNode for PA=0x%lx\n",
+             _nodeId, homePa);
+        return;
+    }
+
+    // Use the adapter for homeSocket (or fall back to slot 0)
+    UBAdapter *adapter = getUBAdapter(homeSocket);
+    if (!adapter) {
+        adapter = getUBAdapter(0);
+    }
+    if (!adapter) {
+        warn("EPBackend node_id=%d: sendHomeWritebackNotify: no adapter for PA=0x%lx\n",
+             _nodeId, homePa);
+        return;
+    }
+
+    // Get current epoch from UBCC (for stale check at UBCC)
+    uint64_t epochVal = 0;
+    if (_ubcc) {
+        epochVal = _ubcc->getEpochForLine(homePa);
+    }
+
+    adapter->sendHomeWritebackNotify(homePa, epochVal, homeNode, homeSocket);
+}
+
+// ---- v4-dual-socket: handleQueryLineMetaResp ----
+
+void
+EPBackend::handleQueryLineMetaResp(const UBMsg &msg)
+{
+    // Called when UBAdapter receives a QueryLineMetaResp from the router.
+    // The response is already stored in _lastResponse by UBAdapter::recvFromRouter.
+    // This is a notification hook for future async query support.
+    printf("[EP-QLM-RESP] node=%d pa=0x%lx found=%d epoch=%lu ownerNode=%d\n",
+           _nodeId, msg.h.homeLinePa,
+           msg.b.queryLineMetaResp.found,
+           msg.b.queryLineMetaResp.epoch,
+           msg.b.queryLineMetaResp.ownerNode);
 }
 
 } // namespace ruby

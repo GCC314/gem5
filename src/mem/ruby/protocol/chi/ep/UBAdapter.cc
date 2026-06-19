@@ -17,10 +17,11 @@ namespace ruby
 UBAdapter::UBAdapter(const Params &p)
     : SimObject(p),
       _nodeId(p.node_id),
+      _socketId(p.socket_id),
       _router(p.router),
-      _addrMap(3, 128ULL * 1024 * 1024)
+      _addrMap(3, 1, 128ULL * 1024 * 1024)
 {
-    DPRINTF(RubyEP, "UBAdapter node=%d created\n", _nodeId);
+    DPRINTF(RubyEP, "UBAdapter node=%d socket=%d created\n", _nodeId, _socketId);
 }
 
 UBAdapter::~UBAdapter()
@@ -62,7 +63,7 @@ int
 UBAdapter::sendReadReq(
     uint64_t homePa, int reqType, bool writeIntent,
     int requesterNode, uint64_t epoch, uint64_t reqId,
-    int homeNode,
+    int homeNode, int ingressSocket, int homeSocket,
     Tick *outGrantVisibleTick, Tick *outSentinelVisibleTick,
     bool *outRecallNeeded, int *outRecallOwnerNode,
     int *outDataSource, uint64_t *outAuthEpoch,
@@ -71,22 +72,27 @@ UBAdapter::sendReadReq(
     DataBlock *outGrantData, bool *outGrantDataValid)
 {
     DPRINTF(RubyEP,
-            "UBAdapter node=%d: sendReadReq homePa=0x%lx "
-            "reqType=%d writeIntent=%d reqNode=%d epoch=%lu reqId=%lu homeNode=%d\n",
-            _nodeId, homePa, reqType, writeIntent,
-            requesterNode, epoch, reqId, homeNode);
+            "UBAdapter node=%d socket=%d: sendReadReq homePa=0x%lx "
+            "reqType=%d writeIntent=%d reqNode=%d epoch=%lu reqId=%lu "
+            "homeNode=%d ingressSocket=%d homeSocket=%d\n",
+            _nodeId, _socketId, homePa, reqType, writeIntent,
+            requesterNode, epoch, reqId, homeNode, ingressSocket, homeSocket);
 
     if (!_router) {
-        fatal("UBAdapter node=%d: sendReadReq called with no router bound\n",
-              _nodeId);
+        fatal("UBAdapter node=%d socket=%d: sendReadReq called with no router bound\n",
+              _nodeId, _socketId);
     }
 
     // Build ReadReq UBMsg
     UBMsg req;
     req.h.type = UBMsgType::ReadReq;
     req.h.srcNode = _nodeId;
+    req.h.srcSocket = _socketId;
     req.h.dstNode = homeNode;
+    req.h.dstSocket = homeSocket;
     req.h.homeNode = homeNode;
+    req.h.homeSocket = homeSocket;
+    req.h.ingressSocket = ingressSocket;
     req.h.requesterNode = requesterNode;
     req.h.targetNode = homeNode;
     req.h.flags = writeIntent ? static_cast<uint32_t>(UB_FLAG_WRITE_INTENT) : 0;
@@ -101,8 +107,8 @@ UBAdapter::sendReadReq(
     req.b.readReq.neededPerm = (reqType == 0) ? 0 : 1;
 
     DPRINTF(RubyEP,
-            "UBAdapter node=%d: sending ReadReq %s\n",
-            _nodeId, ubMsgToString(req).c_str());
+            "UBAdapter node=%d socket=%d: sending ReadReq %s\n",
+            _nodeId, _socketId, ubMsgToString(req).c_str());
 
     _lastResponseValid = false;
     _router->sendMessage(req);
@@ -168,23 +174,28 @@ UBAdapter::sendReadReq(
 bool
 UBAdapter::sendWritebackReq(uint64_t homePa, int requesterNode,
                              uint64_t epochVal, bool keepAsClean,
-                             int homeNode)
+                             int homeNode, int homeSocket)
 {
     DPRINTF(RubyEP,
-            "UBAdapter node=%d: sendWritebackReq homePa=0x%lx "
-            "reqNode=%d epoch=%lu keepAsClean=%d homeNode=%d\n",
-            _nodeId, homePa, requesterNode, epochVal, keepAsClean, homeNode);
+            "UBAdapter node=%d socket=%d: sendWritebackReq homePa=0x%lx "
+            "reqNode=%d epoch=%lu keepAsClean=%d homeNode=%d homeSocket=%d\n",
+            _nodeId, _socketId, homePa, requesterNode, epochVal, keepAsClean,
+            homeNode, homeSocket);
 
     if (!_router) {
-        fatal("UBAdapter node=%d: sendWritebackReq called with no router bound\n",
-              _nodeId);
+        fatal("UBAdapter node=%d socket=%d: sendWritebackReq called with no router bound\n",
+              _nodeId, _socketId);
     }
 
     UBMsg req;
     req.h.type = UBMsgType::WritebackReq;
     req.h.srcNode = _nodeId;
+    req.h.srcSocket = _socketId;
     req.h.dstNode = homeNode;
+    req.h.dstSocket = homeSocket;
     req.h.homeNode = homeNode;
+    req.h.homeSocket = homeSocket;
+    req.h.ingressSocket = _socketId;
     req.h.requesterNode = requesterNode;
     req.h.homeLinePa = homePa;
     req.h.epoch = epochVal;
@@ -217,23 +228,28 @@ UBAdapter::sendWritebackReq(uint64_t homePa, int requesterNode,
 
 bool
 UBAdapter::sendEvictReq(uint64_t homePa, int evictingNode, uint64_t epochVal,
-                         int homeNode)
+                         int homeNode, int homeSocket)
 {
     DPRINTF(RubyEP,
-            "UBAdapter node=%d: sendEvictReq homePa=0x%lx "
-            "evictingNode=%d epoch=%lu homeNode=%d\n",
-            _nodeId, homePa, evictingNode, epochVal, homeNode);
+            "UBAdapter node=%d socket=%d: sendEvictReq homePa=0x%lx "
+            "evictingNode=%d epoch=%lu homeNode=%d homeSocket=%d\n",
+            _nodeId, _socketId, homePa, evictingNode, epochVal,
+            homeNode, homeSocket);
 
     if (!_router) {
-        fatal("UBAdapter node=%d: sendEvictReq called with no router bound\n",
-              _nodeId);
+        fatal("UBAdapter node=%d socket=%d: sendEvictReq called with no router bound\n",
+              _nodeId, _socketId);
     }
 
     UBMsg req;
     req.h.type = UBMsgType::EvictReq;
     req.h.srcNode = _nodeId;
+    req.h.srcSocket = _socketId;
     req.h.dstNode = homeNode;
+    req.h.dstSocket = homeSocket;
     req.h.homeNode = homeNode;
+    req.h.homeSocket = homeSocket;
+    req.h.ingressSocket = _socketId;
     req.h.requesterNode = evictingNode;
     req.h.homeLinePa = homePa;
     req.h.epoch = epochVal;
@@ -268,23 +284,28 @@ UBAdapter::sendUpgradeReq(uint64_t homePa, int requesterNode,
                             int desiredPerm, int cause,
                             uint64_t *outUpgradeTargetMask,
                             uint64_t *outCommittedEpoch,
-                            int homeNode)
+                            int homeNode, int homeSocket)
 {
     DPRINTF(RubyEP,
-            "UBAdapter node=%d: sendUpgradeReq homePa=0x%lx "
-            "reqNode=%d epoch=%lu reqId=%lu desiredPerm=%d homeNode=%d\n",
-            _nodeId, homePa, requesterNode, epoch, reqId, desiredPerm, homeNode);
+            "UBAdapter node=%d socket=%d: sendUpgradeReq homePa=0x%lx "
+            "reqNode=%d epoch=%lu reqId=%lu desiredPerm=%d homeNode=%d homeSocket=%d\n",
+            _nodeId, _socketId, homePa, requesterNode, epoch, reqId,
+            desiredPerm, homeNode, homeSocket);
 
     if (!_router) {
-        fatal("UBAdapter node=%d: sendUpgradeReq called with no router bound\n",
-              _nodeId);
+        fatal("UBAdapter node=%d socket=%d: sendUpgradeReq called with no router bound\n",
+              _nodeId, _socketId);
     }
 
     UBMsg req;
     req.h.type = UBMsgType::UpgradeReq;
     req.h.srcNode = _nodeId;
+    req.h.srcSocket = _socketId;
     req.h.dstNode = homeNode;
+    req.h.dstSocket = homeSocket;
     req.h.homeNode = homeNode;
+    req.h.homeSocket = homeSocket;
+    req.h.ingressSocket = _socketId;
     req.h.requesterNode = requesterNode;
     req.h.homeLinePa = homePa;
     req.h.epoch = epoch;
@@ -330,23 +351,28 @@ UBAdapter::sendUpgradeReq(uint64_t homePa, int requesterNode,
 bool
 UBAdapter::sendUpgradeDoneReq(uint64_t homePa, int requesterNode,
                                uint64_t epoch, uint64_t reqId,
-                               int homeNode)
+                               int homeNode, int homeSocket)
 {
     DPRINTF(RubyEP,
-            "UBAdapter node=%d: sendUpgradeDoneReq homePa=0x%lx "
-            "reqNode=%d epoch=%lu reqId=%lu homeNode=%d\n",
-            _nodeId, homePa, requesterNode, epoch, reqId, homeNode);
+            "UBAdapter node=%d socket=%d: sendUpgradeDoneReq homePa=0x%lx "
+            "reqNode=%d epoch=%lu reqId=%lu homeNode=%d homeSocket=%d\n",
+            _nodeId, _socketId, homePa, requesterNode, epoch, reqId,
+            homeNode, homeSocket);
 
     if (!_router) {
-        fatal("UBAdapter node=%d: sendUpgradeDoneReq called with no router bound\n",
-              _nodeId);
+        fatal("UBAdapter node=%d socket=%d: sendUpgradeDoneReq called with no router bound\n",
+              _nodeId, _socketId);
     }
 
     UBMsg req;
     req.h.type = UBMsgType::UpgradeDoneReq;
     req.h.srcNode = _nodeId;
+    req.h.srcSocket = _socketId;
     req.h.dstNode = homeNode;
+    req.h.dstSocket = homeSocket;
     req.h.homeNode = homeNode;
+    req.h.homeSocket = homeSocket;
+    req.h.ingressSocket = _socketId;
     req.h.requesterNode = requesterNode;
     req.h.homeLinePa = homePa;
     req.h.epoch = epoch;
@@ -379,23 +405,28 @@ UBAdapter::sendUpgradeDoneReq(uint64_t homePa, int requesterNode,
 bool
 UBAdapter::sendClearReq(uint64_t linePa, int srcNode,
                          uint64_t epoch, uint64_t reqId,
-                         int homeNode)
+                         int homeNode, int homeSocket)
 {
     DPRINTF(RubyEP,
-            "UBAdapter node=%d: sendClearReq PA=0x%lx "
-            "srcNode=%d epoch=%lu reqId=%lu homeNode=%d\n",
-            _nodeId, linePa, srcNode, epoch, reqId, homeNode);
+            "UBAdapter node=%d socket=%d: sendClearReq PA=0x%lx "
+            "srcNode=%d epoch=%lu reqId=%lu homeNode=%d homeSocket=%d\n",
+            _nodeId, _socketId, linePa, srcNode, epoch, reqId,
+            homeNode, homeSocket);
 
     if (!_router) {
-        fatal("UBAdapter node=%d: sendClearReq called with no router bound\n",
-              _nodeId);
+        fatal("UBAdapter node=%d socket=%d: sendClearReq called with no router bound\n",
+              _nodeId, _socketId);
     }
 
     UBMsg req;
     req.h.type = UBMsgType::ClearReq;
     req.h.srcNode = _nodeId;
+    req.h.srcSocket = _socketId;
     req.h.dstNode = homeNode;
+    req.h.dstSocket = homeSocket;
     req.h.homeNode = homeNode;
+    req.h.homeSocket = homeSocket;
+    req.h.ingressSocket = _socketId;
     req.h.requesterNode = srcNode;
     req.h.homeLinePa = linePa;
     req.h.epoch = epoch;
@@ -432,23 +463,28 @@ UBAdapter::sendRecallResp(uint64_t linePa, int ownerNode,
                            bool dataReturned, uint64_t epoch,
                            uint64_t reqId,
                            const DataBlock *dataBlk,
-                           int homeNode)
+                           int homeNode, int homeSocket)
 {
     DPRINTF(RubyEP,
-            "UBAdapter node=%d: sendRecallResp PA=0x%lx "
-            "owner=%d dataReturned=%d epoch=%lu reqId=%lu homeNode=%d\n",
-            _nodeId, linePa, ownerNode, dataReturned, epoch, reqId, homeNode);
+            "UBAdapter node=%d socket=%d: sendRecallResp PA=0x%lx "
+            "owner=%d dataReturned=%d epoch=%lu reqId=%lu homeNode=%d homeSocket=%d\n",
+            _nodeId, _socketId, linePa, ownerNode, dataReturned, epoch, reqId,
+            homeNode, homeSocket);
 
     if (!_router) {
-        fatal("UBAdapter node=%d: sendRecallResp called with no router bound\n",
-              _nodeId);
+        fatal("UBAdapter node=%d socket=%d: sendRecallResp called with no router bound\n",
+              _nodeId, _socketId);
     }
 
     UBMsg req;
     req.h.type = UBMsgType::RecallResp;
     req.h.srcNode = _nodeId;
+    req.h.srcSocket = _socketId;
     req.h.dstNode = homeNode;
+    req.h.dstSocket = homeSocket;
     req.h.homeNode = homeNode;
+    req.h.homeSocket = homeSocket;
+    req.h.ingressSocket = _socketId;
     req.h.requesterNode = ownerNode;
     req.h.homeLinePa = linePa;
     req.h.epoch = epoch;
@@ -474,23 +510,28 @@ UBAdapter::sendRecallResp(uint64_t linePa, int ownerNode,
 bool
 UBAdapter::sendInvalidateAck(uint64_t linePa, int ackNode,
                               uint64_t epoch, uint64_t reqId,
-                              int homeNode)
+                              int homeNode, int homeSocket)
 {
     DPRINTF(RubyEP,
-            "UBAdapter node=%d: sendInvalidateAck PA=0x%lx "
-            "ackNode=%d epoch=%lu reqId=%lu homeNode=%d\n",
-            _nodeId, linePa, ackNode, epoch, reqId, homeNode);
+            "UBAdapter node=%d socket=%d: sendInvalidateAck PA=0x%lx "
+            "ackNode=%d epoch=%lu reqId=%lu homeNode=%d homeSocket=%d\n",
+            _nodeId, _socketId, linePa, ackNode, epoch, reqId,
+            homeNode, homeSocket);
 
     if (!_router) {
-        fatal("UBAdapter node=%d: sendInvalidateAck called with no router bound\n",
-              _nodeId);
+        fatal("UBAdapter node=%d socket=%d: sendInvalidateAck called with no router bound\n",
+              _nodeId, _socketId);
     }
 
     UBMsg req;
     req.h.type = UBMsgType::InvalidateAck;
     req.h.srcNode = _nodeId;
+    req.h.srcSocket = _socketId;
     req.h.dstNode = homeNode;
+    req.h.dstSocket = homeSocket;
     req.h.homeNode = homeNode;
+    req.h.homeSocket = homeSocket;
+    req.h.ingressSocket = _socketId;
     req.h.requesterNode = ackNode;
     req.h.homeLinePa = linePa;
     req.h.epoch = epoch;
@@ -508,22 +549,27 @@ UBAdapter::sendInvalidateAck(uint64_t linePa, int ackNode,
 
 void
 UBAdapter::sendRecallReqToOwner(int targetNode,
-                                 const OuterRecallMsg &recallMsg)
+                                 const OuterRecallMsg &recallMsg,
+                                 int homeSocket)
 {
     DPRINTF(RubyEP,
-            "UBAdapter node=%d: sendRecallReqToOwner target=%d PA=0x%lx\n",
-            _nodeId, targetNode, recallMsg.linePa);
+            "UBAdapter node=%d socket=%d: sendRecallReqToOwner target=%d PA=0x%lx homeSocket=%d\n",
+            _nodeId, _socketId, targetNode, recallMsg.linePa, homeSocket);
 
     if (!_router) {
-        fatal("UBAdapter node=%d: sendRecallReqToOwner called with no router bound\n",
-              _nodeId);
+        fatal("UBAdapter node=%d socket=%d: sendRecallReqToOwner called with no router bound\n",
+              _nodeId, _socketId);
     }
 
     UBMsg req;
     req.h.type = UBMsgType::RecallReq;
     req.h.srcNode = _nodeId;
+    req.h.srcSocket = homeSocket;  // home's socket plane for sharer routing
     req.h.dstNode = targetNode;
+    req.h.dstSocket = homeSocket;  // route through home's socket plane
     req.h.homeNode = recallMsg.homeNode;
+    req.h.homeSocket = homeSocket;
+    req.h.ingressSocket = homeSocket;
     req.h.requesterNode = _nodeId;
     req.h.targetNode = targetNode;
     req.h.homeLinePa = recallMsg.linePa;
@@ -547,28 +593,121 @@ UBAdapter::sendRecallReqToOwner(int targetNode,
 
 void
 UBAdapter::sendInvalidateReqToSharer(int targetNode,
-                                      const OuterInvalidateMsg &invMsg)
+                                      const OuterInvalidateMsg &invMsg,
+                                      int homeSocket)
 {
     DPRINTF(RubyEP,
-            "UBAdapter node=%d: sendInvalidateReqToSharer target=%d PA=0x%lx\n",
-            _nodeId, targetNode, invMsg.linePa);
+            "UBAdapter node=%d socket=%d: sendInvalidateReqToSharer target=%d PA=0x%lx homeSocket=%d\n",
+            _nodeId, _socketId, targetNode, invMsg.linePa, homeSocket);
 
     if (!_router) {
-        fatal("UBAdapter node=%d: sendInvalidateReqToSharer called with no router bound\n",
-              _nodeId);
+        fatal("UBAdapter node=%d socket=%d: sendInvalidateReqToSharer called with no router bound\n",
+              _nodeId, _socketId);
     }
 
     UBMsg req;
     req.h.type = UBMsgType::InvalidateReq;
     req.h.srcNode = _nodeId;
+    req.h.srcSocket = homeSocket;  // home's socket plane
     req.h.dstNode = targetNode;
+    req.h.dstSocket = homeSocket;  // route through home's socket plane
     req.h.homeNode = invMsg.homeNode;
+    req.h.homeSocket = homeSocket;
+    req.h.ingressSocket = homeSocket;
     req.h.requesterNode = _nodeId;
     req.h.targetNode = targetNode;
     req.h.homeLinePa = invMsg.linePa;
     req.h.localLinePa = invMsg.sharerLocalPa;
     req.h.epoch = invMsg.epoch;
     req.h.reqId = invMsg.reqId;
+    req.h.seqNum = _nextSeq++;
+    req.h.enqueueTick = curTick();
+    req.h.readyTick = curTick();
+
+    // Fire-and-forget
+    _router->sendMessage(req);
+}
+
+// ---- v4-dual-socket: QueryLineMetaReq (synchronous query) ----
+
+int
+UBAdapter::sendQueryLineMetaReq(uint64_t homePa, int homeNode, int homeSocket,
+                                 uint64_t &outEpoch, int &outOwnerNode,
+                                 bool &outFound)
+{
+    DPRINTF(RubyEP,
+            "UBAdapter node=%d socket=%d: sendQueryLineMetaReq homePa=0x%lx "
+            "homeNode=%d homeSocket=%d\n",
+            _nodeId, _socketId, homePa, homeNode, homeSocket);
+
+    if (!_router) {
+        fatal("UBAdapter node=%d socket=%d: sendQueryLineMetaReq called with no router bound\n",
+              _nodeId, _socketId);
+    }
+
+    UBMsg req;
+    req.h.type = UBMsgType::QueryLineMetaReq;
+    req.h.srcNode = _nodeId;
+    req.h.srcSocket = _socketId;
+    req.h.dstNode = homeNode;
+    req.h.dstSocket = homeSocket;
+    req.h.homeNode = homeNode;
+    req.h.homeSocket = homeSocket;
+    req.h.ingressSocket = _socketId;
+    req.h.homeLinePa = homePa;
+    req.h.seqNum = _nextSeq++;
+    req.h.enqueueTick = curTick();
+    req.h.readyTick = curTick();
+
+    _lastResponseValid = false;
+    _router->sendMessage(req);
+
+    if (!_lastResponseValid) {
+        warn("UBAdapter node=%d socket=%d: sendQueryLineMetaReq: no response PA=0x%lx\n",
+             _nodeId, _socketId, homePa);
+        return -1;
+    }
+
+    const UBMsg &resp = _lastResponse;
+    if (resp.h.type != UBMsgType::QueryLineMetaResp) {
+        warn("UBAdapter node=%d socket=%d: sendQueryLineMetaReq: unexpected response type %s\n",
+             _nodeId, _socketId, ubMsgTypeName(resp.h.type));
+        return -1;
+    }
+
+    outFound = resp.b.queryLineMetaResp.found;
+    outEpoch = resp.b.queryLineMetaResp.epoch;
+    outOwnerNode = resp.b.queryLineMetaResp.ownerNode;
+    return outFound ? 0 : -1;
+}
+
+// ---- v4-dual-socket: HomeWritebackNotify (fire-and-forget) ----
+
+void
+UBAdapter::sendHomeWritebackNotify(uint64_t homePa, uint64_t epoch,
+                                    int homeNode, int homeSocket)
+{
+    DPRINTF(RubyEP,
+            "UBAdapter node=%d socket=%d: sendHomeWritebackNotify homePa=0x%lx "
+            "epoch=%lu homeNode=%d homeSocket=%d\n",
+            _nodeId, _socketId, homePa, epoch, homeNode, homeSocket);
+
+    if (!_router) {
+        fatal("UBAdapter node=%d socket=%d: sendHomeWritebackNotify called with no router bound\n",
+              _nodeId, _socketId);
+    }
+
+    UBMsg req;
+    req.h.type = UBMsgType::HomeWritebackNotify;
+    req.h.srcNode = _nodeId;
+    req.h.srcSocket = _socketId;
+    req.h.dstNode = homeNode;
+    req.h.dstSocket = homeSocket;
+    req.h.homeNode = homeNode;
+    req.h.homeSocket = homeSocket;
+    req.h.ingressSocket = _socketId;
+    req.h.homeLinePa = homePa;
+    req.h.epoch = epoch;
     req.h.seqNum = _nextSeq++;
     req.h.enqueueTick = curTick();
     req.h.readyTick = curTick();
@@ -602,6 +741,7 @@ UBAdapter::recvFromRouter(const UBMsg &msg)
         case UBMsgType::UpgradeResp:
         case UBMsgType::UpgradeDoneResp:
         case UBMsgType::ClearResp:
+        case UBMsgType::QueryLineMetaResp:
             // Synchronous response — store for caller
             _lastResponse = msg;
             _lastResponseValid = true;

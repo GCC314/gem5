@@ -12,7 +12,7 @@ namespace ruby
 
 using namespace CHI;
 
-std::map<int, MetaRNFController*> MetaRNFController::_instances;
+std::map<std::pair<int,int>, MetaRNFController*> MetaRNFController::_instances;
 
 MetaRNFController::MetaRNFController(const Params &p)
   : EPController(p),
@@ -23,18 +23,19 @@ MetaRNFController::MetaRNFController(const Params &p)
     if (!p.downstream_destinations.empty()) {
         _hnfVersion = p.downstream_destinations[0]->getVersion();
     }
-    _instances[_nodeId] = this;
+    // v4-dual-socket: register with (node_id, socket_id) key
+    _instances[{_nodeId, p.socket_id}] = this;
 }
 
 MetaRNFController::~MetaRNFController()
 {
-    _instances.erase(_nodeId);
+    _instances.erase({_nodeId, 0});  // v4-dual-socket: socket_id not stored as member, but default 0
 }
 
 MetaRNFController*
-MetaRNFController::getInstance(int node_id)
+MetaRNFController::getInstance(int node_id, int socket_id)
 {
-    auto it = _instances.find(node_id);
+    auto it = _instances.find({node_id, socket_id});
     return (it == _instances.end()) ? nullptr : it->second;
 }
 

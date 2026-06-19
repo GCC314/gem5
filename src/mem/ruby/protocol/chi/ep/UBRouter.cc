@@ -15,17 +15,17 @@ namespace ruby
 {
 
 // ---- Static registry ----
-std::map<int, UBRouter*> UBRouter::_routers;
+std::map<UBRouter::RouterKey, UBRouter*> UBRouter::_routers;
 
-UBRouter* UBRouter::getRouter(int nodeId)
+UBRouter* UBRouter::getRouter(int nodeId, int socketId)
 {
-    auto it = _routers.find(nodeId);
+    auto it = _routers.find({nodeId, socketId});
     return (it != _routers.end()) ? it->second : nullptr;
 }
 
-void UBRouter::registerRouter(int nodeId, UBRouter *router)
+void UBRouter::registerRouter(int nodeId, int socketId, UBRouter *router)
 {
-    _routers[nodeId] = router;
+    _routers[{nodeId, socketId}] = router;
 }
 
 // ---- Constructor / Destructor ----
@@ -33,17 +33,18 @@ void UBRouter::registerRouter(int nodeId, UBRouter *router)
 UBRouter::UBRouter(const Params &p)
     : SimObject(p),
       _nodeId(p.node_id),
+      _socketId(p.socket_id),
       _defaultLatency(p.ub_msg_latency),
       _drainEvent([this]{ drainReadyQueues(); }, name() + ".drainEvent")
 {
-    registerRouter(_nodeId, this);
-    DPRINTF(RubyEP, "UBRouter node=%d created, defaultLatency=%lu\n",
-            _nodeId, _defaultLatency);
+    registerRouter(_nodeId, _socketId, this);
+    DPRINTF(RubyEP, "UBRouter node=%d socket=%d created, defaultLatency=%lu\n",
+            _nodeId, _socketId, _defaultLatency);
 }
 
 UBRouter::~UBRouter()
 {
-    _routers.erase(_nodeId);
+    _routers.erase({_nodeId, _socketId});
     for (auto &kv : _pairQueues) {
         delete kv.second;
     }
@@ -58,14 +59,26 @@ UBRouter::init()
 
 // ---- Queue management ----
 
-UBMsgQueue*
-UBRouter::getOrCreateQueue(int src, int dst)
+// Pack (srcNode,srcSocket,dstNode,dstSocket) into a QueueKey.
+// key.first  = (srcNode<<16) | srcSocket
+// key.second = (dstNode<<16) | dstSocket
+static inline UBRouter::QueueKey
+makeQueueKey(int srcNode, int srcSocket, int dstNode, int dstSocket)
 {
-    auto key = std::make_pair(src, dst);
+    return std::make_pair(
+        (srcNode << 16) | (srcSocket & 0xffff),
+        (dstNode << 16) | (dstSocket & 0xffff));
+}
+
+UBMsgQueue*
+UBRouter::getOrCreateQueue(int srcNode, int srcSocket,
+                             int dstNode, int dstSocket)
+{
+    auto key = makeQueueKey(srcNode, srcSocket, dstNode, dstSocket);
     auto it = _pairQueues.find(key);
     if (it == _pairQueues.end()) {
         UBMsgQueue *q = new UBMsgQueue();
-        q->setLatency(_defaultLatency);
+        q->setLatency(0);
         _pairQueues[key] = q;
         return q;
     }
@@ -75,16 +88,24 @@ UBRouter::getOrCreateQueue(int src, int dst)
 // ---- Main send path ----
 
 void
-UBRouter::sendMessage(const UBMsg &msg)
+UBRouter::sendMessage(const UBMsg &msg, Tick forcedLatency)
 {
     DPRINTF(RubyEP,
-            "UBRouter node=%d: sendMessage %s src=%d dst=%d\n",
-            _nodeId, ubMsgTypeName(msg.h.type),
-            msg.h.srcNode, msg.h.dstNode);
+            "UBRouter node=%d socket=%d: sendMessage %s src=(%d,%d) dst=(%d,%d)\n",
+            _nodeId, _socketId, ubMsgTypeName(msg.h.type),
+            msg.h.srcNode, msg.h.srcSocket, msg.h.dstNode, msg.h.dstSocket);
 
-    // Synchronous processing: enqueue and immediately drain
-    UBMsgQueue *q = getOrCreateQueue(msg.h.srcNode, msg.h.dstNode);
-    q->enqueue(msg, curTick(), 0);
+    // forcedLatency >=0 means caller specifies latency; -1 means use queue default
+    UBMsgQueue *q = getOrCreateQueue(
+        msg.h.srcNode, msg.h.srcSocket, msg.h.dstNode, msg.h.dstSocket);
+    Tick lat;
+    if (forcedLatency >= 0) {
+        lat = forcedLatency;
+    } else {
+        // Cross-node latency applies when srcNode != dstNode
+        lat = (msg.h.srcNode != msg.h.dstNode) ? _defaultLatency : 0;
+    }
+    q->enqueue(msg, curTick(), lat);
 
     drainReadyQueues();
 }
@@ -115,7 +136,7 @@ UBRouter::drainReadyQueues()
                         _nodeId, ubMsgTypeName(msg.h.type),
                         msg.h.srcNode, msg.h.dstNode);
 
-                if (msg.h.dstNode == _nodeId) {
+                if (msg.h.dstNode == _nodeId && msg.h.dstSocket == _socketId) {
                     // Local delivery — route to UBCC or Adapter
                     switch (msg.h.type) {
                         case UBMsgType::ReadReq:
@@ -126,6 +147,8 @@ UBRouter::drainReadyQueues()
                         case UBMsgType::ClearReq:
                         case UBMsgType::RecallResp:
                         case UBMsgType::InvalidateAck:
+                        case UBMsgType::QueryLineMetaReq:
+                        case UBMsgType::HomeWritebackNotify:
                             // Destination is local UBCC
                             {
                                 UBMsg response;
@@ -136,8 +159,10 @@ UBRouter::drainReadyQueues()
                                     msg.h.type == UBMsgType::InvalidateAck) {
                                     // Fire-and-forget: no response needed
                                 } else if (response.h.type != UBMsgType::ReadReq) {
+                                    // Response enqueue: reverse direction, same sockets
                                     UBMsgQueue *revQ = getOrCreateQueue(
-                                        _nodeId, msg.h.srcNode);
+                                        _nodeId, _socketId,
+                                        msg.h.srcNode, msg.h.srcSocket);
                                     revQ->enqueue(response, now, 0);
                                 }
                             }
@@ -152,10 +177,11 @@ UBRouter::drainReadyQueues()
                         case UBMsgType::UpgradeDoneResp:
                         case UBMsgType::ClearResp:
                         case UBMsgType::UpgradeAckNotify:
+                        case UBMsgType::QueryLineMetaResp:
                             // Destination is local UBAdapter
-                            printf("[ROUTER-DELIVER-RESP] node=%d pa=0x%lx type=%s src=%d dst=%d\n",
-                                   _nodeId, msg.h.homeLinePa, ubMsgTypeName(msg.h.type),
-                                   msg.h.srcNode, msg.h.dstNode);
+                         printf("[ROUTER-DELIVER-RESP] node=%d socket=%d pa=0x%lx type=%s src=(%d,%d) dst=(%d,%d)\n",
+                                _nodeId, _socketId, msg.h.homeLinePa, ubMsgTypeName(msg.h.type),
+                                msg.h.srcNode, msg.h.srcSocket, msg.h.dstNode, msg.h.dstSocket);
                             deliverToAdapter(msg);
                             break;
 
@@ -166,25 +192,30 @@ UBRouter::drainReadyQueues()
                             break;
                     }
                 } else {
-                    // Remote delivery — find destination router
+                    // Remote delivery — find destination router by (node,socket)
                     DPRINTF(RubyEP,
-                            "UBRouter node=%d: remote delivery to node %d\n",
-                            _nodeId, msg.h.dstNode);
-                    UBRouter *dstRouter = getRouter(msg.h.dstNode);
+                            "UBRouter node=%d socket=%d: remote delivery to (node=%d,socket=%d)\n",
+                            _nodeId, _socketId, msg.h.dstNode, msg.h.dstSocket);
+                    UBRouter *dstRouter = getRouter(msg.h.dstNode, msg.h.dstSocket);
                     if (dstRouter) {
-                        dstRouter->sendMessage(msg);
+                        dstRouter->sendMessage(msg, 0);
                     } else {
-                        warn("UBRouter node=%d: no router for dst node %d\n",
-                             _nodeId, msg.h.dstNode);
+                        warn("UBRouter node=%d socket=%d: no router for dst (node=%d,socket=%d)\n",
+                             _nodeId, _socketId, msg.h.dstNode, msg.h.dstSocket);
                     }
                 }
             }
         }
     }
 
-    if (drained >= maxDrainPerWakeup) {
+    // v4-latency: reschedule drain if any queue has pending (not-yet-ready) messages
+    bool hasPending = false;
+    for (auto &kv : _pairQueues) {
+        if (kv.second->size() > 0) { hasPending = true; break; }
+    }
+    if (drained >= maxDrainPerWakeup || hasPending) {
         DPRINTF(RubyEP,
-                "UBRouter node=%d: max drain reached (%d), "
+                "UBRouter node=%d: max drain reached (%d) or pending, "
                 "scheduling next drain\n",
                 _nodeId, maxDrainPerWakeup);
         schedule(_drainEvent, curTick() + 1);
@@ -203,8 +234,8 @@ UBRouter::deliverToUbcc(const UBMsg &msg, UBMsg &response)
     }
 
     DPRINTF(RubyEP,
-            "UBRouter node=%d: deliverToUbcc type=%s\n",
-            _nodeId, ubMsgTypeName(msg.h.type));
+            "UBRouter node=%d socket=%d: deliverToUbcc type=%s\n",
+            _nodeId, _socketId, ubMsgTypeName(msg.h.type));
 
     switch (msg.h.type) {
         case UBMsgType::ReadReq: {
@@ -246,8 +277,12 @@ UBRouter::deliverToUbcc(const UBMsg &msg, UBMsg &response)
 
             response.h.type = UBMsgType::ReadResp;
             response.h.srcNode = _nodeId;
+            response.h.srcSocket = _socketId;
             response.h.dstNode = msg.h.srcNode;
+            response.h.dstSocket = msg.h.srcSocket;
             response.h.homeNode = _nodeId;
+            response.h.homeSocket = _socketId;
+            response.h.ingressSocket = msg.h.ingressSocket;
             response.h.requesterNode = msg.h.requesterNode;
             response.h.homeLinePa = msg.h.homeLinePa;
             response.h.epoch = msg.h.epoch;
@@ -257,9 +292,9 @@ UBRouter::deliverToUbcc(const UBMsg &msg, UBMsg &response)
                 response.h.flags |= static_cast<uint32_t>(UB_FLAG_HAS_DATA);
             }
 
-            printf("[ROUTER-UBCC-RESP] home=%d pa=0x%lx grant=%d src=%d\n",
-                   _nodeId, msg.h.homeLinePa, static_cast<int>(ubccGrant),
-                   msg.h.srcNode);
+            printf("[ROUTER-UBCC-RESP] home=%d socket=%d pa=0x%lx grant=%d src=(%d,%d)\n",
+                   _nodeId, _socketId, msg.h.homeLinePa, static_cast<int>(ubccGrant),
+                   msg.h.srcNode, msg.h.srcSocket);
             response.b.readResp.grantType =
                 static_cast<int8_t>(ubccGrant);
             response.b.readResp.dataSource =
@@ -288,7 +323,9 @@ UBRouter::deliverToUbcc(const UBMsg &msg, UBMsg &response)
 
             response.h.type = UBMsgType::WritebackResp;
             response.h.srcNode = _nodeId;
+            response.h.srcSocket = _socketId;
             response.h.dstNode = msg.h.srcNode;
+            response.h.dstSocket = msg.h.srcSocket;
             response.h.homeLinePa = msg.h.homeLinePa;
             response.h.epoch = msg.h.epoch;
             response.h.reqId = msg.h.reqId;
@@ -303,7 +340,9 @@ UBRouter::deliverToUbcc(const UBMsg &msg, UBMsg &response)
 
             response.h.type = UBMsgType::EvictResp;
             response.h.srcNode = _nodeId;
+            response.h.srcSocket = _socketId;
             response.h.dstNode = msg.h.srcNode;
+            response.h.dstSocket = msg.h.srcSocket;
             response.h.homeLinePa = msg.h.homeLinePa;
             response.h.epoch = msg.h.epoch;
             response.h.reqId = msg.h.reqId;
@@ -327,7 +366,9 @@ UBRouter::deliverToUbcc(const UBMsg &msg, UBMsg &response)
 
             response.h.type = UBMsgType::UpgradeResp;
             response.h.srcNode = _nodeId;
+            response.h.srcSocket = _socketId;
             response.h.dstNode = msg.h.srcNode;
+            response.h.dstSocket = msg.h.srcSocket;
             response.h.homeLinePa = msg.h.homeLinePa;
             response.h.epoch = msg.h.epoch;
             response.h.reqId = msg.h.reqId;
@@ -346,7 +387,9 @@ UBRouter::deliverToUbcc(const UBMsg &msg, UBMsg &response)
 
             response.h.type = UBMsgType::UpgradeDoneResp;
             response.h.srcNode = _nodeId;
+            response.h.srcSocket = _socketId;
             response.h.dstNode = msg.h.srcNode;
+            response.h.dstSocket = msg.h.srcSocket;
             response.h.homeLinePa = msg.h.homeLinePa;
             response.h.epoch = msg.h.epoch;
             response.h.reqId = msg.h.reqId;
@@ -361,7 +404,9 @@ UBRouter::deliverToUbcc(const UBMsg &msg, UBMsg &response)
 
             response.h.type = UBMsgType::ClearResp;
             response.h.srcNode = _nodeId;
+            response.h.srcSocket = _socketId;
             response.h.dstNode = msg.h.srcNode;
+            response.h.dstSocket = msg.h.srcSocket;
             response.h.homeLinePa = msg.h.homeLinePa;
             response.h.epoch = msg.h.epoch;
             response.h.reqId = msg.h.reqId;
@@ -398,9 +443,40 @@ UBRouter::deliverToUbcc(const UBMsg &msg, UBMsg &response)
             break;
         }
 
+        case UBMsgType::QueryLineMetaReq: {
+            // v4-dual-socket: EPBackend queries UBCC for {epoch, ownerNode}
+            uint64_t qEpoch = 0;
+            int qOwnerNode = -1;
+            MESIState qState = MESIState::G_I;
+            bool qFound = false;
+            _localUbcc->queryLineMeta(msg.h.homeLinePa, qEpoch, qOwnerNode,
+                                       qState, qFound);
+
+            response.h.type = UBMsgType::QueryLineMetaResp;
+            response.h.srcNode = _nodeId;
+            response.h.srcSocket = _socketId;
+            response.h.dstNode = msg.h.srcNode;
+            response.h.dstSocket = msg.h.srcSocket;
+            response.h.homeLinePa = msg.h.homeLinePa;
+            response.h.epoch = msg.h.epoch;
+            response.h.reqId = msg.h.reqId;
+            response.b.queryLineMetaResp.found = qFound;
+            response.b.queryLineMetaResp.epoch = qEpoch;
+            response.b.queryLineMetaResp.ownerNode = qOwnerNode;
+            break;
+        }
+
+        case UBMsgType::HomeWritebackNotify: {
+            // v4-dual-socket: HN-F completed DDR4 writeback, notify UBCC
+            _localUbcc->processHomeWritebackNotify(
+                msg.h.homeLinePa, msg.h.epoch);
+            // Fire-and-forget: no response
+            break;
+        }
+
         default:
-            warn("UBRouter node=%d: deliverToUbcc unhandled type %s\n",
-                 _nodeId, ubMsgTypeName(msg.h.type));
+            warn("UBRouter node=%d socket=%d: deliverToUbcc unhandled type %s\n",
+                 _nodeId, _socketId, ubMsgTypeName(msg.h.type));
             break;
     }
 }
@@ -411,14 +487,14 @@ void
 UBRouter::deliverToAdapter(const UBMsg &msg)
 {
     if (!_localAdapter) {
-        warn("UBRouter node=%d: deliverToAdapter called but no local adapter\n",
-             _nodeId);
+        warn("UBRouter node=%d socket=%d: deliverToAdapter called but no local adapter\n",
+             _nodeId, _socketId);
         return;
     }
 
     DPRINTF(RubyEP,
-            "UBRouter node=%d: deliverToAdapter type=%s\n",
-            _nodeId, ubMsgTypeName(msg.h.type));
+            "UBRouter node=%d socket=%d: deliverToAdapter type=%s\n",
+            _nodeId, _socketId, ubMsgTypeName(msg.h.type));
 
     _localAdapter->recvFromRouter(msg);
 }

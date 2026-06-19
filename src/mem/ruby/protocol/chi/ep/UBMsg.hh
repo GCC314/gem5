@@ -32,6 +32,9 @@ enum class UBMsgType : uint16_t {
     ClearReq,
     ClearResp,
     UpgradeAckNotify,
+    QueryLineMetaReq,        // v4-dual-socket: EPBackend queries UBCC for epoch/owner
+    QueryLineMetaResp,       // v4-dual-socket: UBCC response
+    HomeWritebackNotify,     // v4-dual-socket: HN-F completes DDR4 writeback
 };
 
 // ---- Message Flags ----
@@ -49,8 +52,12 @@ enum UBMsgFlags : uint32_t {
 struct UBMsgHeader {
     UBMsgType type;
     uint16_t srcNode;
+    uint16_t srcSocket;       // v4-dual-socket: source socket
     uint16_t dstNode;
+    uint16_t dstSocket;       // v4-dual-socket: destination socket (homeSocket for requests)
     uint16_t homeNode;
+    uint16_t homeSocket;      // v4-dual-socket: home directory socket (from PA)
+    uint16_t ingressSocket;   // v4-dual-socket: request entry socket (NUMA hint)
     uint16_t requesterNode;
     uint16_t targetNode;
     uint32_t flags;
@@ -64,7 +71,8 @@ struct UBMsgHeader {
 
     UBMsgHeader()
         : type(UBMsgType::ReadReq),
-          srcNode(0), dstNode(0), homeNode(0),
+          srcNode(0), srcSocket(0), dstNode(0), dstSocket(0),
+          homeNode(0), homeSocket(0), ingressSocket(0),
           requesterNode(0), targetNode(0),
           flags(0),
           homeLinePa(0), localLinePa(0),
@@ -158,6 +166,24 @@ struct UBClearRespBody {
     UBClearRespBody() : accepted(false) {}
 };
 
+// v4-dual-socket new message bodies
+struct UBQueryLineMetaReqBody {
+    uint64_t homePa;
+    UBQueryLineMetaReqBody() : homePa(0) {}
+};
+
+struct UBQueryLineMetaRespBody {
+    bool found;
+    uint64_t epoch;
+    int ownerNode;
+    UBQueryLineMetaRespBody() : found(false), epoch(0), ownerNode(-1) {}
+};
+
+struct UBHomeWritebackNotifyBody {
+    uint64_t homePa;
+    UBHomeWritebackNotifyBody() : homePa(0) {}
+};
+
 union UBMsgBody {
     UBReadReqBody readReq;
     UBReadRespBody readResp;
@@ -175,6 +201,9 @@ union UBMsgBody {
     UBUpgradeDoneRespBody upgradeDoneResp;
     UBClearReqBody clearReq;
     UBClearRespBody clearResp;
+    UBQueryLineMetaReqBody queryLineMetaReq;
+    UBQueryLineMetaRespBody queryLineMetaResp;
+    UBHomeWritebackNotifyBody homeWritebackNotify;
 
     UBMsgBody() {} // value-initialized by UBMsg default ctor
 };
@@ -209,20 +238,27 @@ ubMsgTypeName(UBMsgType t)
         case UBMsgType::ClearReq:         return "ClearReq";
         case UBMsgType::ClearResp:        return "ClearResp";
         case UBMsgType::UpgradeAckNotify: return "UpgradeAckNotify";
-        default:                          return "Unknown";
+        case UBMsgType::QueryLineMetaReq:  return "QueryLineMetaReq";
+        case UBMsgType::QueryLineMetaResp: return "QueryLineMetaResp";
+        case UBMsgType::HomeWritebackNotify: return "HomeWritebackNotify";
+        default:                           return "Unknown";
     }
 }
 
 inline std::string
 ubMsgToString(const UBMsg &msg)
 {
-    char buf[256];
+    char buf[512];
     snprintf(buf, sizeof(buf),
-             "UBMsg{%s src=%u dst=%u home=%u reqNode=%u tgt=%u "
+             "UBMsg{%s src=(%u,%u) dst=(%u,%u) home=(%u,%u) ingress=%u "
+             "reqNode=%u tgt=%u "
              "flags=0x%x homePA=0x%lx localPA=0x%lx "
              "epoch=%lu reqId=%lu seq=%lu}",
              ubMsgTypeName(msg.h.type),
-             msg.h.srcNode, msg.h.dstNode, msg.h.homeNode,
+             msg.h.srcNode, msg.h.srcSocket,
+             msg.h.dstNode, msg.h.dstSocket,
+             msg.h.homeNode, msg.h.homeSocket,
+             msg.h.ingressSocket,
              msg.h.requesterNode, msg.h.targetNode,
              msg.h.flags, msg.h.homeLinePa, msg.h.localLinePa,
              msg.h.epoch, msg.h.reqId, msg.h.seqNum);

@@ -53,28 +53,28 @@ machine(MachineType:Cache, "Cache coherency protocol") :
   // Additional pipeline latency modeling for the different request types
   // When defined, these are applied after the initial tag array read and
   // sending necessary snoops.
-  Cycles read_hit_latency := 0;
-  Cycles read_miss_latency := 0;
+  Cycles read_hit_latency := 8;
+  Cycles read_miss_latency := 16;
   Cycles atomic_op_latency := 0;
-  Cycles write_fe_latency := 0; // Front-end: Rcv req -> Snd req
-  Cycles write_be_latency := 0; // Back-end: Rcv ack -> Snd data
-  Cycles fill_latency := 0; // Fill latency
-  Cycles snp_latency := 0; // Applied before handling any snoop
-  Cycles snp_inv_latency := 0; // Additional latency for invalidating snoops
+  Cycles write_fe_latency := 6; // Front-end: Rcv req -> Snd req
+  Cycles write_be_latency := 6; // Back-end: Rcv ack -> Snd data
+  Cycles fill_latency := 10; // Fill latency
+  Cycles snp_latency := 6; // Applied before handling any snoop
+  Cycles snp_inv_latency := 3; // Additional latency for invalidating snoops
 
   // Waits for cache data array write to complete before executing next action
   // Note a new write will always block if bank stalls are enabled in the cache
   bool wait_for_cache_wr := "False";
 
   // Request TBE allocation latency
-  Cycles allocation_latency := 0;
+  Cycles allocation_latency := 2;
 
   // Enqueue latencies for outgoing messages
   // NOTE: should remove this and only use parameters above?
-  Cycles request_latency := 1;
-  Cycles response_latency := 1;
-  Cycles snoop_latency := 1;
-  Cycles data_latency := 1;
+  Cycles request_latency := 2;
+  Cycles response_latency := 2;
+  Cycles snoop_latency := 2;
+  Cycles data_latency := 4;
   Cycles dvm_ext_tlbi_latency := 6;
 
   // When an SC fails, unique lines are locked to this controller for a period
@@ -141,13 +141,13 @@ machine(MachineType:Cache, "Cache coherency protocol") :
   // Use separate Comp/DBIDResp responses for WriteUnique
   bool comp_wu := "False";
   // additional latency for the WU Comp response
-  Cycles comp_wu_latency := 0;
+  Cycles comp_wu_latency := 4;
 
 
   // Use separate Comp/DBIDResp responses for AtomicNoResponse
   bool comp_anr := "False";
   // additional latency for the ANR Comp response
-  Cycles comp_anr_latency := 0;
+  Cycles comp_anr_latency := 4;
 
   // Controls cache clusivity for different request types.
   // set all alloc_on* to false to completelly disable caching

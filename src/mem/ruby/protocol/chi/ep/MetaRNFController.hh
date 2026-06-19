@@ -22,7 +22,7 @@ class MetaRNFController : public EPController
     MetaRNFController(const Params &p);
     ~MetaRNFController() override;
 
-    static MetaRNFController* getInstance(int node_id);
+    static MetaRNFController* getInstance(int node_id, int socket_id = 0);
 
     void init() override;
     void wakeup() override;
@@ -72,7 +72,7 @@ class MetaRNFController : public EPController
     bool _requestInFlight;
     std::map<uint64_t, PendingTxn> _pending;
 
-    static std::map<int, MetaRNFController*> _instances;
+    static std::map<std::pair<int,int>, MetaRNFController*> _instances;
 };
 
 } // namespace ruby
