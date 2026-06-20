@@ -184,6 +184,10 @@ struct UBHomeWritebackNotifyBody {
     UBHomeWritebackNotifyBody() : homePa(0) {}
 };
 
+struct UBUpgradeAckNotifyBody {
+    /* no extra fields — header-only notification */  // v4-P0 fix: FV-9 gap
+};
+
 union UBMsgBody {
     UBReadReqBody readReq;
     UBReadRespBody readResp;
@@ -204,6 +208,7 @@ union UBMsgBody {
     UBQueryLineMetaReqBody queryLineMetaReq;
     UBQueryLineMetaRespBody queryLineMetaResp;
     UBHomeWritebackNotifyBody homeWritebackNotify;
+    UBUpgradeAckNotifyBody upgradeAckNotify;  // v4-P0 fix: FV-9 gap
 
     UBMsgBody() {} // value-initialized by UBMsg default ctor
 };

@@ -103,7 +103,6 @@ struct OutstandingRequest {
     // Recall / Invalidate barrier flags
     bool     recallBarrierDone;
     bool     invalidateBarrierDone;
-    bool     clearAckCached;     // True if ClearAck has been cached for tombstone replay
     bool     replayArmed;        // True if this grant was created by replay (retry-hit allowed)
 
     // Timing
@@ -146,7 +145,7 @@ struct OutstandingRequest {
           reqType(UBCC_OuterReqType::GlobalReadShared),
           writeIntent(false),
           recallBarrierDone(false), invalidateBarrierDone(false),
-          clearAckCached(false), replayArmed(false),
+          replayArmed(false),
           createTick(0), respTick(0), deadlineTick(0),
           accepted(false), dataValid(false),
           dataSource(GrantDataSource::HomeMemory),  // F3

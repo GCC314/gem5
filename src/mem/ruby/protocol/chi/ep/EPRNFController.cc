@@ -521,6 +521,8 @@ EPRNFController::recvDataMsg(const CHIDataMsg *msg)
     // ReadUnique: HN-F returns CompData (dirty/clean data from old owner)
     // followed by Comp_UC (completion token).  Data beats arrive first;
     // completion is finalized when Comp_UC arrives and all beats counted.
+    // FV risk P1-R5: ReadUnique completes on last data beat (relaxed completion).
+    // TODO strict: wait for Comp_UC+CompAck before callback
     if (it->second.op == PendingChiOp::ReadUnique) {
         it->second.hnfDest = msg->m_responder;
         it->second.beatsReceived++;
@@ -633,15 +635,12 @@ EPRNFController::processSnoopImmediate(const CHIRequestMsg *msg)
             return handleSnpOnce(msg);
         case CHIRequestType_SnpShared:
         case CHIRequestType_SnpSharedFwd:
-            // F4 diagnostic: these should be unreachable but init-phase
-            // page-table setup triggers them on EP-RNF.  Use preserving
-            // response to unblock testing while root cause is traced.
-            // TODO: restore fatal after fixing init-phase EP-RNF-as-owner.
-            warn("EP_RNF node_id=%d: SnpShared/SnpSharedFwd at PA=0x%lx "
-                  "— defensive SnpResp_SC (F4 diagnostic)\n",
+            // R3: Restore fatal — preserving snoops must not target EP-RNF.
+            // Diagnostic warn+SnpResp_SC path hid routing bugs and could hang HN-F.
+            fatal("EP_RNF node_id=%d: unexpected SnpShared/SnpSharedFwd "
+                  "at PA=0x%lx (routing bug; preserving snoops must not "
+                  "target EP-RNF)\n",
                   _nodeId, msg->m_addr);
-            sendSnpRespSC(msg);
-            return true;
         default:
             // Unknown snoop: fallback to SnpResp_I
             DPRINTF(RubyCHIGeneric,
@@ -1113,7 +1112,8 @@ EPRNFController::startReadShared(uint64_t linePa,
     txn.needsCompAck = false;
     txn.recallDataValid = false;
     txn.outerTxnPending = false;
-    txn.callbackPayloadStable = false;
+    txn.readUniqueDataComplete = false;
+    txn.readUniqueCompUCSeen = false;
     txn.startTick = curTick();
     txn.onComplete = onComplete;
     _pendingChiTxns[linePa] = txn;
@@ -1161,7 +1161,8 @@ EPRNFController::startReadUnique(uint64_t linePa,
     txn.needsCompAck = false;
     txn.recallDataValid = false;
     txn.outerTxnPending = false;
-    txn.callbackPayloadStable = false;
+    txn.readUniqueDataComplete = false;
+    txn.readUniqueCompUCSeen = false;
     txn.startTick = curTick();
     txn.onComplete = onComplete;
     _pendingChiTxns[linePa] = txn;
@@ -1213,7 +1214,8 @@ EPRNFController::startCleanUnique(uint64_t linePa,
     txn.needsCompAck = true;  // F6: must send CompAck to unblock HN-F WaitCompAck
     txn.recallDataValid = false;
     txn.outerTxnPending = false;
-    txn.callbackPayloadStable = false;
+    txn.readUniqueDataComplete = false;
+    txn.readUniqueCompUCSeen = false;
     txn.startTick = curTick();
     txn.onComplete = onComplete;
     _pendingChiTxns[linePa] = txn;

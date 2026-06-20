@@ -99,10 +99,9 @@ struct OuterInvalidationAck {
     int homeNode;            // Home node that initiated the invalidation
     uint64_t epoch;          // Per-transaction epoch
     uint64_t reqId;          // v4: transaction ID
-    bool success;            // True if invalidation succeeded
 
     OuterInvalidationAck() : linePa(0), ackNode(-1), homeNode(-1),
-                              epoch(0), reqId(0), success(false) {}
+                              epoch(0), reqId(0) {}
 };
 
 // ---- M6: Outer Recall Message Types ----

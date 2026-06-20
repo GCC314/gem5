@@ -1218,6 +1218,8 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
         // Read recall: ReadShared to downgrade owner to R_S
         printf("[RECALL-DIAG] node=%d initiating ReadShared recall PA=0x%lx\n",
                _nodeId, recallMsg.linePa);
+        // R2: Clear stale recall capture data before initiating new recall
+        setRecallCaptureData(DataBlock(64), false);
         _epRnfCtrl->startReadShared(ownerLocalPa,
             [this, capturedMsg](bool success) {
                 printf("[RECALL-DIAG] node=%d ReadShared callback success=%d valid=%d\n",
@@ -1231,7 +1233,8 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
                 resp.ackReceived = success;
                 resp.dataReturned = capturedMsg.dataNeeded && success &&
                                     _recallCaptureDataValid;
-                if (_recallCaptureDataValid) {
+                // R2: Gate data payload on dataReturned (not raw _recallCaptureDataValid)
+                if (resp.dataReturned) {
                     resp.dataPayload = _recallCaptureDataBlock;
                     resp.hasDataPayload = true;
                 }
@@ -1241,6 +1244,8 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
         // Write recall: ReadUnique with RecallUnique proxy op
         printf("[RECALL-DIAG] node=%d initiating ReadUnique recall PA=0x%lx\n",
                _nodeId, recallMsg.linePa);
+        // R2: Clear stale recall capture data before initiating new recall
+        setRecallCaptureData(DataBlock(64), false);
         _epRnfCtrl->startReadUnique(ownerLocalPa,
             [this, capturedMsg](bool success) {
                 printf("[RECALL-DIAG] node=%d ReadUnique callback success=%d\n",
@@ -1254,7 +1259,8 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
                 resp.ackReceived = success;
                 resp.dataReturned = capturedMsg.dataNeeded && success &&
                                     _recallCaptureDataValid;
-                if (_recallCaptureDataValid) {
+                // R2: Gate data payload on dataReturned (not raw _recallCaptureDataValid)
+                if (resp.dataReturned) {
                     resp.dataPayload = _recallCaptureDataBlock;
                     resp.hasDataPayload = true;
                 }
@@ -1282,7 +1288,8 @@ EPBackend::sendRecallResponse(const OuterRecallResponse &response)
     _lastRecallResponse = response;
     _recallResponseSentCount++;
 
-    if (response.hasDataPayload) {
+    // R2: Require both dataReturned AND hasDataPayload before installing to home memory
+    if (response.dataReturned && response.hasDataPayload) {
         EPBackend *homeBackend = EPBackend::getBackendInstance(response.homeNode);
         RubySystem *homeRuby = homeBackend ? homeBackend->getRubySystem() : nullptr;
         auto *physMem = homeRuby ? homeRuby->getPhysMem() : nullptr;
@@ -1578,24 +1585,14 @@ EPBackend::handleInvalidationRequest(const OuterInvalidateMsg &invMsg)
                 ack.homeNode = capturedMsg.homeNode;
                 ack.epoch = capturedMsg.epoch;
                 ack.reqId = capturedMsg.reqId;
-                ack.success = ok;
                 sendInvalidationAck(ack);
             });
         return true;
     } else {
-        // Fallback: if no EP-RNF controller, ack directly (prototype mode)
-        warn("EPBackend node_id=%d: no EP-RNF controller, "
-             "sending invalidation ack directly (bypasses HN-F)\n",
-             _nodeId);
-        OuterInvalidationAck ack;
-        ack.linePa = invMsg.linePa;
-        ack.ackNode = _nodeId;
-        ack.homeNode = invMsg.homeNode;
-        ack.epoch = invMsg.epoch;
-        ack.reqId = invMsg.reqId;
-        ack.success = true;
-        sendInvalidationAck(ack);
-        return true;
+        fatal("EPBackend node_id=%d: invalidation path requires EP-RNF "
+              "controller; direct InvalidateAck would bypass CHI barrier "
+              "for PA=0x%lx\n",
+              _nodeId, invMsg.linePa);
     }
 }
 

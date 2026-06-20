@@ -261,7 +261,8 @@ class EPRNFController : public EPController
         int beatsReceived;       // v4: data beats received so far
         bool needsCompAck;       // CompAck not yet successfully sent
         bool outerTxnPending;    // v4: outer (UBCC) transaction in progress
-        bool callbackPayloadStable; // v4: callback data stabilized
+        bool readUniqueDataComplete; // P2-R8: last data beat received
+        bool readUniqueCompUCSeen;   // P2-R8: Comp_UC completion token seen
         // ---- Per-PA 1-entry snoop slot (§4.3.3) ----
         bool snoopSlotValid;     // v4: queued snoop in 1-entry slot
         CHI::CHIRequestType queuedSnoopType; // v4: type of queued snoop
@@ -278,7 +279,7 @@ class EPRNFController : public EPController
               proxyOp(CHI::EpProxyOp_NoProxyOp),
               beatsExpected(0), beatsReceived(0),
               needsCompAck(false), outerTxnPending(false),
-              callbackPayloadStable(false),
+              readUniqueDataComplete(false), readUniqueCompUCSeen(false),
               snoopSlotValid(false),
               queuedSnoopType(CHI::CHIRequestType_null),
               queuedRetToSrc(false), startTick(0),

@@ -1121,7 +1121,10 @@ UBCCController::processRecallResponse(uint64_t line_pa, int ownerNode,
             requesterNode, static_cast<int>(reqType),
             mesiStateName(entry.state), DirEntry::protoDirty(entry));
 
-    // v4: Release recall barrier
+    // v4: Release recall barrier (P6 — duplicate guard)
+    if (ost->recallBarrierDone) {
+        return true;  // idempotent: already processed
+    }
     ost->recallBarrierDone = true;
     ost->stage = OpStage::DONE;
     ost->respTick = curTick();
@@ -2564,7 +2567,6 @@ UBCCController::createOutstanding(uint64_t linePa, OpType opType,
     req.intendedDirty = false;
     req.recallBarrierDone = false;
     req.invalidateBarrierDone = false;
-    req.clearAckCached = false;
     req.createTick = curTick();
     req.respTick = 0;
     req.deadlineTick = curTick() + _interconnectLatency * 10;
