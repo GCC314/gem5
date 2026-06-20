@@ -249,6 +249,9 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
                                    router=ub_router)
             nd['ub_routers'].append(ub_router)
             nd['ub_adapters'].append(ub_adapter)
+            # Parent UBRouter under ruby_system so root.descendants()
+            # and attribute-based lookups can find it for fault injection.
+            setattr(ruby_system, f"ub_router_n{node_id}_s{socket_id}", ub_router)
 
         # Backward-compat aliases for first socket
         nd['ub_router'] = nd['ub_routers'][0] if nd['ub_routers'] else None

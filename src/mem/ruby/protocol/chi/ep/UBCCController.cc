@@ -2740,3 +2740,29 @@ UBCCController::processHomeWritebackNotify(uint64_t homePa, uint64_t notifyEpoch
 
 // ---- UBInvariant: runtime invariant checker (debug-only) ----
 
+void
+UBCCController::validateEpochMonotonic(uint64_t oldEpoch, uint64_t newEpoch,
+                                        uint64_t pa) const
+{
+    if (newEpoch < oldEpoch) {
+        panic("[UBInv] PA=0x%lx epoch DECREASED %lu -> %lu", pa, oldEpoch, newEpoch);
+    }
+}
+
+void
+UBCCController::validateSharersCanonical(uint64_t pa) const
+{
+    DirEntry entry;
+    if (!_directory.lookup(pa, entry)) return;
+    if (entry.state == MESIState::G_I && entry.sharersMask != 0)
+        panic("[UBInv] PA=0x%lx G_I with non-zero sharers 0x%lx", pa, entry.sharersMask);
+    if (entry.state == MESIState::G_S && entry.sharersMask == 0)
+        panic("[UBInv] PA=0x%lx G_S with zero sharers", pa);
+    if ((entry.state == MESIState::G_E || entry.state == MESIState::G_M)
+        && __builtin_popcountll(entry.sharersMask) != 1)
+        panic("[UBInv] PA=0x%lx G_E/G_M with non-one-hot sharers 0x%lx", pa, entry.sharersMask);
+}
+
+} // namespace ruby
+} // namespace gem5
+
