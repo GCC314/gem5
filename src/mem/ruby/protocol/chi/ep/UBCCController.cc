@@ -8,6 +8,7 @@
 #include "base/logging.hh"
 #include "debug/RubyCHIGeneric.hh"
 #include "debug/RubyEP.hh"
+#include "debug/UBLatency.hh"
 #include "mem/ruby/protocol/chi/ep/EPBackend.hh"
 #include "mem/ruby/protocol/chi/ep/NodeAddressMap.hh"
 #include "mem/ruby/protocol/chi/ep/UBRouter.hh"
@@ -943,6 +944,17 @@ UBCCController::processOuterRequest(
         *outGrantVisibleTick = grantVisibleTick;
     if (outSentinelVisibleTick)
         *outSentinelVisibleTick = sentinelVisibleTick;
+
+    // v4-latency: log OUTSTANDING state change
+    if (oreq) {
+        DPRINTF(UBLatency,
+                "[UBST] tick=%lu home=%d,%d pa=0x%lx old=%s new=%s epoch=%lu sharers=0x%lx action=OUTSTANDING\n",
+                curTick(), _nodeId, _socketId, line_pa,
+                mesiStateName(prevState),
+                mesiStateName(oreq->intendedState),
+                oreq->reservedEpoch,
+                oreq->intendedSharersMask);
+    }
 
     return grant;
 }
@@ -2077,8 +2089,18 @@ UBCCController::processClear(
     // GRANT_HANDSHAKE after all barriers (RECALL/INVALIDATE) have completed.
 
     // v4: §3.3, §3.5 — commit intended result to committed DirEntry
+    MESIState oldState = entry.state;
     commitIntendedResult(entry, *ost);
     _directory.update(line_pa, entry);
+
+    // v4-latency: log COMMIT state change
+    DPRINTF(UBLatency,
+            "[UBST] tick=%lu home=%d,%d pa=0x%lx old=%s new=%s epoch=%lu sharers=0x%lx action=COMMIT\n",
+            curTick(), _nodeId, _socketId, line_pa,
+            mesiStateName(oldState),
+            mesiStateName(entry.state),
+            entry.epoch,
+            entry.sharersMask);
 
     // Retire GRANT_HANDSHAKE to tombstone(W) for duplicate Clear replay
     retireToTombstone(*ost, true);
@@ -2216,6 +2238,15 @@ UBCCController::retireToTombstone(const OutstandingRequest &ost, bool accepted)
             _nodeId, ost.linePa, ost.baseEpoch, ost.reservedEpoch, ost.reqId,
             ts.expireTick,
             _tombstones[ost.linePa].size());
+
+    // v4-latency: log RETIRE state change
+    DPRINTF(UBLatency,
+            "[UBST] tick=%lu home=%d,%d pa=0x%lx old=%s new=%s epoch=%lu sharers=0x%lx action=RETIRE\n",
+            curTick(), _nodeId, _socketId, ost.linePa,
+            mesiStateName(ost.intendedState),
+            "Tombstone",
+            ost.baseEpoch,
+            ost.intendedSharersMask);
 }
 
 bool

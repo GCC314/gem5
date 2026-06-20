@@ -30,3 +30,4 @@ Source('M8SelfTest.cc')
 
 DebugFlag('RubyEP')
 DebugFlag('RubyEPVerbose')
+DebugFlag('UBLatency')

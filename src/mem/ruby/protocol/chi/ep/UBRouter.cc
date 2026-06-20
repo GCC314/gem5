@@ -5,6 +5,7 @@
 
 #include "base/logging.hh"
 #include "debug/RubyEP.hh"
+#include "debug/UBLatency.hh"
 #include "mem/ruby/protocol/chi/ep/UBAdapter.hh"
 #include "mem/ruby/protocol/chi/ep/UBCCController.hh"
 #include "sim/cur_tick.hh"
@@ -106,6 +107,10 @@ UBRouter::sendMessage(const UBMsg &msg, Tick forcedLatency)
         lat = (msg.h.srcNode != msg.h.dstNode) ? _defaultLatency : 0;
     }
     q->enqueue(msg, curTick(), lat);
+    DPRINTF(UBLatency,
+            "[UBLAT] tick=%lu src=%d,%d dst=%d,%d type=%s pa=0x%lx epoch=%lu reqId=%lu action=ENQUEUE\n",
+            curTick(), msg.h.srcNode, msg.h.srcSocket, msg.h.dstNode, msg.h.dstSocket,
+            ubMsgTypeName(msg.h.type), msg.h.homeLinePa, msg.h.epoch, msg.h.reqId);
 
     drainReadyQueues();
 }
@@ -135,9 +140,17 @@ UBRouter::drainReadyQueues()
                         "UBRouter node=%d: draining %s src=%d dst=%d\n",
                         _nodeId, ubMsgTypeName(msg.h.type),
                         msg.h.srcNode, msg.h.dstNode);
+                DPRINTF(UBLatency,
+                        "[UBLAT] tick=%lu src=%d,%d dst=%d,%d type=%s pa=0x%lx epoch=%lu reqId=%lu action=DEQUEUE\n",
+                        now, msg.h.srcNode, msg.h.srcSocket, msg.h.dstNode, msg.h.dstSocket,
+                        ubMsgTypeName(msg.h.type), msg.h.homeLinePa, msg.h.epoch, msg.h.reqId);
 
                 if (msg.h.dstNode == _nodeId && msg.h.dstSocket == _socketId) {
                     // Local delivery — route to UBCC or Adapter
+                    DPRINTF(UBLatency,
+                            "[UBLAT] tick=%lu src=%d,%d dst=%d,%d type=%s pa=0x%lx epoch=%lu reqId=%lu action=DELIVER\n",
+                            now, msg.h.srcNode, msg.h.srcSocket, msg.h.dstNode, msg.h.dstSocket,
+                            ubMsgTypeName(msg.h.type), msg.h.homeLinePa, msg.h.epoch, msg.h.reqId);
                     switch (msg.h.type) {
                         case UBMsgType::ReadReq:
                         case UBMsgType::WritebackReq:
@@ -164,6 +177,11 @@ UBRouter::drainReadyQueues()
                                         _nodeId, _socketId,
                                         msg.h.srcNode, msg.h.srcSocket);
                                     revQ->enqueue(response, now, 0);
+                                    DPRINTF(UBLatency,
+                                            "[UBLAT] tick=%lu src=%d,%d dst=%d,%d type=%s pa=0x%lx epoch=%lu reqId=%lu action=ENQUEUE\n",
+                                            now, _nodeId, _socketId, msg.h.srcNode, msg.h.srcSocket,
+                                            ubMsgTypeName(response.h.type), response.h.homeLinePa,
+                                            response.h.epoch, response.h.reqId);
                                 }
                             }
                             break;
