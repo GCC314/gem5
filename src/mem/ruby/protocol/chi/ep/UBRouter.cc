@@ -10,6 +10,8 @@
 #include "mem/ruby/protocol/chi/ep/UBCCController.hh"
 #include "sim/cur_tick.hh"
 
+#include <cstdio>
+
 namespace gem5
 {
 namespace ruby
@@ -41,6 +43,9 @@ UBRouter::UBRouter(const Params &p)
     registerRouter(_nodeId, _socketId, this);
     DPRINTF(RubyEP, "UBRouter node=%d socket=%d created, defaultLatency=%lu\n",
             _nodeId, _socketId, _defaultLatency);
+
+    // Parse fault rules from SimObject params (debug-only)
+    parseFaultRules(p.fault_rules);
 }
 
 UBRouter::~UBRouter()
@@ -96,6 +101,15 @@ UBRouter::sendMessage(const UBMsg &msg, Tick forcedLatency)
             _nodeId, _socketId, ubMsgTypeName(msg.h.type),
             msg.h.srcNode, msg.h.srcSocket, msg.h.dstNode, msg.h.dstSocket);
 
+#ifndef NDEBUG
+    // ── Debug Fault Injection (compile-time guarded) ──
+    int faultCopies = applyFaultRules(msg);
+    if (faultCopies == 0) {
+        // Dropped by fault rule — do not enqueue
+        return;
+    }
+#endif
+
     // forcedLatency >=0 means caller specifies latency; -1 means use queue default
     UBMsgQueue *q = getOrCreateQueue(
         msg.h.srcNode, msg.h.srcSocket, msg.h.dstNode, msg.h.dstSocket);
@@ -106,7 +120,19 @@ UBRouter::sendMessage(const UBMsg &msg, Tick forcedLatency)
         // Cross-node latency applies when srcNode != dstNode
         lat = (msg.h.srcNode != msg.h.dstNode) ? _defaultLatency : 0;
     }
+
+#ifndef NDEBUG
+    if (faultCopies >= 1) {
+        q->enqueue(msg, curTick(), lat);
+    }
+    if (faultCopies >= 2) {
+        // Duplicate: enqueue a second copy
+        q->enqueue(msg, curTick(), lat);
+    }
+#else
     q->enqueue(msg, curTick(), lat);
+#endif
+
     DPRINTF(UBLatency,
             "[UBLAT] tick=%lu src=%d,%d dst=%d,%d type=%s pa=0x%lx epoch=%lu reqId=%lu action=ENQUEUE\n",
             curTick(), msg.h.srcNode, msg.h.srcSocket, msg.h.dstNode, msg.h.dstSocket,
@@ -515,6 +541,173 @@ UBRouter::deliverToAdapter(const UBMsg &msg)
             _nodeId, _socketId, ubMsgTypeName(msg.h.type));
 
     _localAdapter->recvFromRouter(msg);
+}
+
+// ── Debug Fault Injection ──
+
+// Helper: parse a UBMsgType name string
+static UBMsgType parseMsgTypeName(const std::string &s)
+{
+    if (s == "*" || s == "any")  return UBMsgType::ReadReq; // wildcard
+    if (s == "ReadReq")          return UBMsgType::ReadReq;
+    if (s == "ReadResp")         return UBMsgType::ReadResp;
+    if (s == "WritebackReq")     return UBMsgType::WritebackReq;
+    if (s == "WritebackResp")    return UBMsgType::WritebackResp;
+    if (s == "EvictReq")         return UBMsgType::EvictReq;
+    if (s == "EvictResp")        return UBMsgType::EvictResp;
+    if (s == "RecallReq")        return UBMsgType::RecallReq;
+    if (s == "RecallResp")       return UBMsgType::RecallResp;
+    if (s == "InvalidateReq")    return UBMsgType::InvalidateReq;
+    if (s == "InvalidateAck")    return UBMsgType::InvalidateAck;
+    if (s == "UpgradeReq")       return UBMsgType::UpgradeReq;
+    if (s == "UpgradeResp")      return UBMsgType::UpgradeResp;
+    if (s == "UpgradeDoneReq")   return UBMsgType::UpgradeDoneReq;
+    if (s == "UpgradeDoneResp")  return UBMsgType::UpgradeDoneResp;
+    if (s == "ClearReq")         return UBMsgType::ClearReq;
+    if (s == "ClearResp")        return UBMsgType::ClearResp;
+    if (s == "UpgradeAckNotify") return UBMsgType::UpgradeAckNotify;
+    if (s == "QueryLineMetaReq") return UBMsgType::QueryLineMetaReq;
+    if (s == "QueryLineMetaResp") return UBMsgType::QueryLineMetaResp;
+    if (s == "HomeWritebackNotify") return UBMsgType::HomeWritebackNotify;
+    return UBMsgType::ReadReq; // default wildcard
+}
+
+void
+UBRouter::parseFaultRules(const std::vector<std::string> &rules)
+{
+    for (const auto &rule_str : rules) {
+        // Format: "name:type:src:dst:pa:action[:delayTicks[:matchCount]]"
+        DebugFaultRule rule;
+        // Simple colon-delimited parsing
+        std::vector<std::string> parts;
+        size_t pos = 0, next = 0;
+        while ((next = rule_str.find(':', pos)) != std::string::npos) {
+            parts.push_back(rule_str.substr(pos, next - pos));
+            pos = next + 1;
+        }
+        parts.push_back(rule_str.substr(pos));
+
+        if (parts.size() < 6) {
+            warn("UBRouter: malformed fault rule '%s' — skipping\n",
+                 rule_str.c_str());
+            continue;
+        }
+
+        rule.name       = parts[0];
+        rule.matchType  = parseMsgTypeName(parts[1]);
+        rule.matchSrcNode = std::stoi(parts[2]);
+        rule.matchDstNode = std::stoi(parts[3]);
+        rule.matchLinePa  = std::stoull(parts[4], nullptr, 0);
+
+        const std::string &action_str = parts[5];
+        if (action_str == "drop" || action_str == "Drop") {
+            rule.action = DebugFaultAction::Drop;
+        } else if (action_str == "delay" || action_str == "Delay") {
+            rule.action = DebugFaultAction::Delay;
+            rule.delayTicks = (parts.size() > 6) ? std::stoull(parts[6]) : 1000;
+        } else if (action_str == "dup" || action_str == "Duplicate") {
+            rule.action = DebugFaultAction::Duplicate;
+        } else {
+            warn("UBRouter: unknown fault action '%s' — skipping\n",
+                 action_str.c_str());
+            continue;
+        }
+
+        if (rule.action == DebugFaultAction::Delay && parts.size() > 6) {
+            rule.delayTicks = std::stoull(parts[6]);
+        }
+        if (parts.size() > 7) {
+            rule.matchCount = std::stoi(parts[7]);
+        }
+
+        addFaultRule(rule);
+    }
+}
+
+void
+UBRouter::addFaultRule(const DebugFaultRule &rule)
+{
+    _faultRules.push_back(rule);
+    DPRINTF(RubyEP,
+            "UBRouter node=%d socket=%d: added fault rule '%s' "
+            "type=%s action=%d\n",
+            _nodeId, _socketId, rule.name.c_str(),
+            ubMsgTypeName(rule.matchType), static_cast<int>(rule.action));
+}
+
+void
+UBRouter::clearFaultRules()
+{
+    _faultRules.clear();
+}
+
+int
+UBRouter::applyFaultRules(const UBMsg &msg)
+{
+    // Returns: 0 = drop, 1 = normal, 2 = duplicate
+    int copies = 1;
+    for (auto &rule : _faultRules) {
+        // Check match count limit
+        if (rule.matchCount > 0 && rule.firedCount >= rule.matchCount) {
+            continue;
+        }
+        // Check message type match (wildcard: matchType == ReadReq means "any")
+        if (rule.matchType != UBMsgType::ReadReq &&
+            rule.matchType != msg.h.type) {
+            continue;
+        }
+        // Check source node match
+        if (rule.matchSrcNode >= 0 && rule.matchSrcNode != msg.h.srcNode) {
+            continue;
+        }
+        // Check dest node match
+        if (rule.matchDstNode >= 0 && rule.matchDstNode != msg.h.dstNode) {
+            continue;
+        }
+        // Check PA match
+        if (rule.matchLinePa != 0 && rule.matchLinePa != msg.h.homeLinePa) {
+            continue;
+        }
+        // Rule matches!
+        rule.firedCount++;
+        switch (rule.action) {
+            case DebugFaultAction::Drop:
+                printf("[UBFAULT] node=%d rule='%s' action=Drop "
+                       "type=%s src=%d dst=%d pa=0x%lx\n",
+                       _nodeId, rule.name.c_str(),
+                       ubMsgTypeName(msg.h.type),
+                       msg.h.srcNode, msg.h.dstNode, msg.h.homeLinePa);
+                copies = 0;
+                break;
+            case DebugFaultAction::Delay:
+                printf("[UBFAULT] node=%d rule='%s' action=Delay ticks=%lu "
+                       "type=%s src=%d dst=%d pa=0x%lx\n",
+                       _nodeId, rule.name.c_str(), rule.delayTicks,
+                       ubMsgTypeName(msg.h.type),
+                       msg.h.srcNode, msg.h.dstNode, msg.h.homeLinePa);
+                // Delay is handled by scheduling a deferred enqueue
+                // For now, pass through normally (delay not implemented)
+                // TODO: implement deferred enqueue via event
+                copies = 1;
+                break;
+            case DebugFaultAction::Duplicate:
+                printf("[UBFAULT] node=%d rule='%s' action=Duplicate "
+                       "type=%s src=%d dst=%d pa=0x%lx\n",
+                       _nodeId, rule.name.c_str(),
+                       ubMsgTypeName(msg.h.type),
+                       msg.h.srcNode, msg.h.dstNode, msg.h.homeLinePa);
+                copies = 2;
+                break;
+        }
+    }
+    return copies;
+}
+
+void
+UBRouter::delayedEnqueue(UBMsg msg, UBMsgQueue *q, Tick lat)
+{
+    q->enqueue(msg, curTick(), lat);
+    drainReadyQueues();
 }
 
 } // namespace ruby

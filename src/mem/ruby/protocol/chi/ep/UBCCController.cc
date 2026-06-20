@@ -8,6 +8,7 @@
 #include "base/logging.hh"
 #include "debug/RubyCHIGeneric.hh"
 #include "debug/RubyEP.hh"
+#include "debug/UBInvariant.hh"
 #include "debug/UBLatency.hh"
 #include "mem/ruby/protocol/chi/ep/EPBackend.hh"
 #include "mem/ruby/protocol/chi/ep/NodeAddressMap.hh"
@@ -78,6 +79,8 @@ UBCCController::UBCCController(int node_id, int socket_id,
     _invalidationCount(0),
     _invalidationAckCount(0),
     _epRnfSnoopCount(0),
+    _tombstoneReplayCount(0),
+    _invariantWarnCount(0),
     _dsmLocalBase(0),
     _dsmSegSize(0)
 {
@@ -1306,6 +1309,8 @@ UBCCController::processInvalidationAck(uint64_t line_pa, int ackNode,
             entry.state = MESIState::G_I;
         }
         _directory.update(line_pa, entry);
+        // UBInvariant: validate canonical form after sharer eviction
+        validateSharersCanonical(line_pa);
         appendTmpLog(
             "ubcc_inv_ack.log",
             "[INV-ACK] pa=0x%lx node=%d remaining=%d ackMask=0x%lx\n",
@@ -1582,13 +1587,15 @@ UBCCController::processWriteback(uint64_t line_pa, int requesterNode,
 
     DPRINTF(RubyEP,
             "UBCC node_id=%d: processWriteback PA=0x%lx complete "
-            "newState=%s ownerNode=%d dirty=%d\n",
-            _nodeId, line_pa, mesiStateName(entry.state),
-            DirEntry::ownerFromSharers(entry), DirEntry::protoDirty(entry));
+             "newState=%s ownerNode=%d dirty=%d\n",
+             _nodeId, line_pa, mesiStateName(entry.state),
+             DirEntry::ownerFromSharers(entry), DirEntry::protoDirty(entry));
 
     _directory.update(line_pa, entry);
     _directory.touch(line_pa);
     refreshPinnedBit(line_pa);
+    // UBInvariant: validate canonical form after writeback
+    validateSharersCanonical(line_pa);
     // v4-A3: Don't force-delete G_I — let ResidentDir eviction handle cleanup
 
     return true;
@@ -1629,6 +1636,8 @@ UBCCController::notifyHomeWritebackComplete(uint64_t homePa)
     _directory.update(homePa, entry);
     _directory.touch(homePa);
     refreshPinnedBit(homePa);
+    // UBInvariant: validate canonical form after home WB complete
+    validateSharersCanonical(homePa);
 }
 
 // ---- M7: GlobalEvict (Clean Evict) ----
@@ -1735,14 +1744,16 @@ UBCCController::processEvict(uint64_t line_pa, int evictingNode,
     DPRINTF(RubyEP,
             "UBCC node_id=%d: processEvict PA=0x%lx complete "
             "removedSharer=%d removedOwner=%d newState=%s "
-            "sharersMask=0x%lx ownerNode=%d\n",
-            _nodeId, line_pa, removedFromSharer, removedFromOwner,
-            mesiStateName(entry.state),
-            entry.sharersMask, DirEntry::ownerFromSharers(entry));
+             "sharersMask=0x%lx ownerNode=%d\n",
+             _nodeId, line_pa, removedFromSharer, removedFromOwner,
+             mesiStateName(entry.state),
+             entry.sharersMask, DirEntry::ownerFromSharers(entry));
 
     _directory.update(line_pa, entry);
     _directory.touch(line_pa);
     refreshPinnedBit(line_pa);
+    // UBInvariant: validate canonical form after evict
+    validateSharersCanonical(line_pa);
     // v4-A3: Don't force-delete G_I — let ResidentDir eviction handle cleanup
 
     return true;
@@ -1947,6 +1958,8 @@ UBCCController::processOuterUpgradeDone(
     uint64_t reservedEp = ost->reservedEpoch;
     commitIntendedResult(entry, *ost);
     _directory.update(line_pa, entry);
+    // UBInvariant: validate canonical form after commit
+    validateSharersCanonical(line_pa);
 
     // Retire UPGRADE_PENDING
     ost->stage = OpStage::DONE;
@@ -1991,6 +2004,12 @@ UBCCController::processClear(
     // Check tombstone first (duplicate Clear within window W)
     bool tsAccepted = false;
     if (checkTombstone(line_pa, epoch, reqId, tsAccepted)) {
+        // UBInvariant: log tombstone replay (warning-level)
+        _tombstoneReplayCount++;
+        DPRINTF(UBInvariant,
+                "[UBINV-INFO] tombstone replay #%lu PA=0x%lx "
+                "epoch=%lu reqId=%lu accepted=%d\n",
+                _tombstoneReplayCount, line_pa, epoch, reqId, tsAccepted);
         DPRINTF(RubyEP,
                 "UBCC node_id=%d: tombstone replay PA=0x%lx "
                 "epoch=%lu reqId=%lu accepted=%d\n",
@@ -2092,6 +2111,8 @@ UBCCController::processClear(
     MESIState oldState = entry.state;
     commitIntendedResult(entry, *ost);
     _directory.update(line_pa, entry);
+    // UBInvariant: validate canonical form after commit
+    validateSharersCanonical(line_pa);
 
     // v4-latency: log COMMIT state change
     DPRINTF(UBLatency,
@@ -2186,6 +2207,21 @@ UBCCController::allocateReservedEpoch(DirEntry &entry)
 void
 UBCCController::commitIntendedResult(DirEntry &entry, const OutstandingRequest &ost)
 {
+    // UBInvariant: warn on double-commit (per-PA counter)
+    int &cnt = _commitCount[ost.linePa];
+    cnt++;
+    if (cnt > 1) {
+        _invariantWarnCount++;
+        DPRINTF(UBInvariant,
+                "[UBINV-WARN] double-commit #%u PA=0x%lx cnt=%d\n",
+                _invariantWarnCount, ost.linePa, cnt);
+        warn("[UBINV] double-commit PA=0x%lx cnt=%d (warn #%u)\n",
+             ost.linePa, cnt, _invariantWarnCount);
+    }
+
+    // UBInvariant: epoch monotonicity check before overwriting entry.epoch
+    validateEpochMonotonic(entry.epoch, ost.reservedEpoch, ost.linePa);
+
     entry.state = ost.intendedState;
     if (ost.intendedState == MESIState::G_E ||
         ost.intendedState == MESIState::G_M) {
@@ -2698,7 +2734,9 @@ UBCCController::processHomeWritebackNotify(uint64_t homePa, uint64_t notifyEpoch
     _directory.update(homePa, entry);
     _directory.touch(homePa);
     refreshPinnedBit(homePa);
+    // UBInvariant: validate canonical form after home WB notify
+    validateSharersCanonical(homePa);
 }
 
-} // namespace ruby
-} // namespace gem5
+// ---- UBInvariant: runtime invariant checker (debug-only) ----
+

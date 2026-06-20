@@ -2,8 +2,11 @@
 #define __MEM_RUBY_PROTOCOL_CHI_EP_UBROUTER_HH__
 
 #include <cstdint>
+#include <deque>
 #include <map>
+#include <string>
 #include <utility>
+#include <vector>
 
 #include "mem/ruby/protocol/chi/ep/UBMsg.hh"
 #include "mem/ruby/protocol/chi/ep/UBMsgQueue.hh"
@@ -18,6 +21,36 @@ namespace ruby
 
 class UBCCController;
 class UBAdapter;
+
+// ── Debug Fault Injection (debug-only, compile-time guarded) ──
+
+/** Action taken when a fault rule matches. */
+enum class DebugFaultAction : uint8_t {
+    Delay,      // Hold the message for N ticks before enqueue
+    Drop,       // Silently discard the message
+    Duplicate,  // Enqueue the message twice (original + copy)
+};
+
+/** Debug-only fault injection rule for transport-layer testing.
+ *  Matches against message type, source/dest nodes, or PA.
+ */
+struct DebugFaultRule {
+    std::string     name;          // Human-readable label for logging
+    UBMsgType       matchType;     // UBMsgType to match, or ReadReq as wildcard
+    int             matchSrcNode;  // -1 = any
+    int             matchDstNode;  // -1 = any
+    uint64_t        matchLinePa;   // 0 = any
+    DebugFaultAction action;       // What to do on match
+    Tick            delayTicks;    // Used only for Delay action
+    int             matchCount;    // How many times to fire (0 = infinite)
+    int             firedCount;    // Internal: times already fired
+
+    DebugFaultRule()
+        : name(""), matchType(UBMsgType::ReadReq),
+          matchSrcNode(-1), matchDstNode(-1), matchLinePa(0),
+          action(DebugFaultAction::Drop), delayTicks(0),
+          matchCount(0), firedCount(0) {}
+};
 
 /**
  * Per-(node,socket) message router.
@@ -40,6 +73,9 @@ class UBRouter : public SimObject
     ~UBRouter();
 
     void init() override;
+
+    /** Parse fault rule strings from Params and populate internal rule table. */
+    void parseFaultRules(const std::vector<std::string> &rules);
 
     int nodeId() const { return _nodeId; }
     int socketId() const { return _socketId; }
@@ -79,6 +115,16 @@ class UBRouter : public SimObject
     static UBRouter* getRouter(int nodeId, int socketId);
     static void registerRouter(int nodeId, int socketId, UBRouter *router);
 
+    // ── Debug Fault Injection API (debug-only) ──
+    /** Add a fault rule to this router's rule table. */
+    void addFaultRule(const DebugFaultRule &rule);
+
+    /** Clear all fault rules. */
+    void clearFaultRules();
+
+    /** Get the current number of fault rules. */
+    size_t faultRuleCount() const { return _faultRules.size(); }
+
   private:
     int _nodeId;
     int _socketId;
@@ -99,6 +145,16 @@ class UBRouter : public SimObject
 
     /** Drain all ready messages from all queues. */
     void drainReadyQueues();
+
+    // ── Debug Fault Injection internals ──
+    /** Apply fault rules to a message before enqueue.
+     *  Returns the number of copies to enqueue (0 = dropped, 1 = normal, 2 = dup). */
+    int applyFaultRules(const UBMsg &msg);
+    /** Deferred enqueue event for Delay action. */
+    void delayedEnqueue(UBMsg msg, UBMsgQueue *q, Tick lat);
+
+    /** Fault rule table (debug-only). */
+    std::vector<DebugFaultRule> _faultRules;
 
     /** static registry keyed by (nodeId, socketId) */
     static std::map<RouterKey, UBRouter*> _routers;

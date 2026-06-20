@@ -727,6 +727,31 @@ class UBCCController
      * Allocate a monotonic reqId from the directory.
      */
     uint64_t allocateReqId(DirEntry &entry);
+
+    // ---- UBInvariant: runtime invariant checker (debug-only) ----
+    /**
+     * Validate epoch monotonicity: assert newEpoch >= oldEpoch.
+     * Called before every epoch write to DirEntry.
+     * Fatal under --debug-flags=UBInvariant.
+     */
+    void validateEpochMonotonic(uint64_t oldEpoch, uint64_t newEpoch,
+                                uint64_t pa) const;
+
+    /**
+     * Validate SharersMask canonical form after _directory.update().
+     * Calls ResidentDir::validateCanonical explicitly.
+     * Enabled under --debug-flags=UBInvariant; otherwise no-op.
+     */
+    void validateSharersCanonical(uint64_t pa) const;
+
+    // Per-PA commit counter: warns on double-commit
+    std::map<uint64_t, int> _commitCount;
+
+    // Tombstone replay counter (warning-level)
+    uint64_t _tombstoneReplayCount;
+
+    // Generic invariant warning counter
+    uint64_t _invariantWarnCount;
 };
 
 } // namespace ruby
