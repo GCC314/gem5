@@ -11,4 +11,4 @@ class UBAdapter(SimObject):
 
     node_id = Param.Int(0, "Node ID for this adapter")
     socket_id = Param.Int(0, "Socket ID for this adapter")
-    router = Param.UBRouter(NULL, "Local UBRouter for message dispatch")
+    router = Param.UBIOModule(NULL, "Local UBIOModule for message dispatch")

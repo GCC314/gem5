@@ -6,7 +6,7 @@
 #include <map>
 
 #include "mem/ruby/common/DataBlock.hh"
-#include "mem/ruby/protocol/chi/ep/UBMsg.hh"
+#include "mem/ruby/protocol/chi/ep/CoherenceMessage.hh"
 #include "mem/ruby/protocol/chi/ep/NodeAddressMap.hh"
 #include "params/UBAdapter.hh"
 #include "sim/sim_object.hh"
@@ -17,7 +17,7 @@ namespace ruby
 {
 
 class EPBackend;
-class UBRouter;
+class UBIOModule;
 class UBCCController;
 
 // Forward-declare EPBackend message types (defined in EPBackend.hh)
@@ -29,7 +29,7 @@ struct OuterInvalidateMsg;
  *
  * UBAdapter is the ONLY interface EPBackend uses to access UBCC.
  * All calls (even local-home) go through:
- *   EPBackend → UBAdapter → UBRouter → UBCCController
+ *   EPBackend → UBAdapter → UBIOModule *→ UBCCController
  *
  * EPBackend 侧所有 UBCC 交互都必须经过这里的消息路径。
  */
@@ -48,8 +48,8 @@ class UBAdapter : public SimObject
     /** Bind the EPBackend that owns this adapter. */
     void bindBackend(EPBackend *backend) { _backend = backend; }
 
-    /** Bind the local UBRouter for message dispatch. */
-    void setRouter(UBRouter *router) { _router = router; }
+    /** Bind the local UBIOModule *for message dispatch. */
+    void setRouter(UBIOModule *router) { _router = router; }
 
     /**
      * Wire the local UBCC to the router.
@@ -60,8 +60,8 @@ class UBAdapter : public SimObject
     /**
      * Phase 2: Synchronous Read Request.
      *
-     * Packages an OuterRequest as a ReadReq UBMsg, sends it through
-     * the local UBRouter, waits for the ReadResp, and returns the
+     * Packages an OuterRequest as a ReadReq CoherenceMessage, sends it through
+     * the local UBIOModule *, waits for the ReadResp, and returns the
      * grant decision.
      *
      * v4-dual-socket: adds ingressSocket and homeSocket parameters.
@@ -134,22 +134,22 @@ class UBAdapter : public SimObject
                                   int homeNode, int homeSocket);
 
     /**
-     * Receive a message from the local UBRouter.
+     * Receive a message from the local UBIOModule *.
      * Routes to the appropriate handler based on message type.
      */
-    void recvFromRouter(const UBMsg &msg);
+    void recvFromRouter(const CoherenceMessage &msg);
 
     // ---- Accessors ----
     const NodeAddressMap& addrMap() const { return _addrMap; }
 
     /** The router for UBCC→Adapter messages. */
-    UBRouter* router() const { return _router; }
+    UBIOModule * router() const { return _router; }
 
   private:
     int _nodeId;
     int _socketId;
     EPBackend *_backend = nullptr;
-    UBRouter *_router = nullptr;
+    UBIOModule *_router = nullptr;
     NodeAddressMap _addrMap;
     uint64_t _nextSeq = 1;
 
@@ -158,14 +158,14 @@ class UBAdapter : public SimObject
      * Tracks in-flight requests waiting for responses.
      */
     struct PendingTxn {
-        UBMsgType reqType;
+        CoherenceMessageType reqType;
         uint64_t homeLinePa;
         uint64_t localLinePa;
         int homeNode;
-        std::function<void(const UBMsg&)> onResp;
+        std::function<void(const CoherenceMessage&)> onResp;
 
         PendingTxn()
-            : reqType(UBMsgType::ReadReq),
+            : reqType(CoherenceMessageType::ReadReq),
               homeLinePa(0), localLinePa(0),
               homeNode(-1) {}
     };
@@ -173,7 +173,7 @@ class UBAdapter : public SimObject
     std::map<uint64_t, PendingTxn> _pendingByReqId;
 
     /** Last response received from router (for synchronous callers). */
-    UBMsg _lastResponse;
+    CoherenceMessage _lastResponse;
     bool _lastResponseValid = false;
 };
 

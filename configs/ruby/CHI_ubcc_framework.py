@@ -240,24 +240,24 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
         all_cntrls.extend(nd['dl_snf'].getAllControllers())
         mem_backstores.append(nd['dl_memctrl'])
 
-        # v4-dual-socket: Create per-socket UBRouters and UBAdapters.
+        # v4-dual-socket: Create per-socket UBIOModules and UBAdapters.
         # For num_sockets=1, socket_id=0 and behavior is identical to before.
-        nd['ub_routers'] = []
+        nd['ubiomodules'] = []
         nd['ub_adapters'] = []
         nd['meta_rnfs'] = []
         for socket_id in range(num_sockets):
-            ub_router = UBRouter(node_id=node_id, socket_id=socket_id,
-                                 ub_msg_latency="500ns")
+            ubiomodule = UBIOModule(node_id=node_id, socket_id=socket_id,
+                                    ub_msg_latency="500ns")
             ub_adapter = UBAdapter(node_id=node_id, socket_id=socket_id,
-                                   router=ub_router)
-            nd['ub_routers'].append(ub_router)
+                                    router=ubiomodule)
+            nd['ubiomodules'].append(ubiomodule)
             nd['ub_adapters'].append(ub_adapter)
-            # Parent UBRouter under ruby_system so root.descendants()
+            # Parent UBIOModule under ruby_system so root.descendants()
             # and attribute-based lookups can find it for fault injection.
-            setattr(ruby_system, f"ub_router_n{node_id}_s{socket_id}", ub_router)
+            setattr(ruby_system, f"ubiomodule_n{node_id}_s{socket_id}", ubiomodule)
 
         # Backward-compat aliases for first socket
-        nd['ub_router'] = nd['ub_routers'][0] if nd['ub_routers'] else None
+        nd['ubiomodule'] = nd['ubiomodules'][0] if nd['ubiomodules'] else None
         nd['ub_adapter'] = nd['ub_adapters'][0] if nd['ub_adapters'] else None
         nd['meta_rnf'] = None
 

@@ -1,4 +1,4 @@
-#include "mem/ruby/protocol/chi/ep/UBRouter.hh"
+#include "mem/ruby/protocol/chi/ep/UBIOModule.hh"
 
 #include <cstring>
 #include <cstdio>
@@ -18,22 +18,22 @@ namespace ruby
 {
 
 // ---- Static registry ----
-std::map<UBRouter::RouterKey, UBRouter*> UBRouter::_routers;
+std::map<UBIOModule::RouterKey, UBIOModule *> UBIOModule::_routers;
 
-UBRouter* UBRouter::getRouter(int nodeId, int socketId)
+UBIOModule * UBIOModule::getRouter(int nodeId, int socketId)
 {
     auto it = _routers.find({nodeId, socketId});
     return (it != _routers.end()) ? it->second : nullptr;
 }
 
-void UBRouter::registerRouter(int nodeId, int socketId, UBRouter *router)
+void UBIOModule::registerRouter(int nodeId, int socketId, UBIOModule *router)
 {
     _routers[{nodeId, socketId}] = router;
 }
 
 // ---- Constructor / Destructor ----
 
-UBRouter::UBRouter(const Params &p)
+UBIOModule::UBIOModule(const Params &p)
     : SimObject(p),
       _nodeId(p.node_id),
       _socketId(p.socket_id),
@@ -41,14 +41,14 @@ UBRouter::UBRouter(const Params &p)
       _drainEvent([this]{ drainReadyQueues(); }, name() + ".drainEvent")
 {
     registerRouter(_nodeId, _socketId, this);
-    DPRINTF(RubyEP, "UBRouter node=%d socket=%d created, defaultLatency=%lu\n",
+    DPRINTF(RubyEP, "UBIOModule node=%d socket=%d created, defaultLatency=%lu\n",
             _nodeId, _socketId, _defaultLatency);
 
     // Parse fault rules from SimObject params (debug-only)
     parseFaultRules(p.fault_rules);
 }
 
-UBRouter::~UBRouter()
+UBIOModule::~UBIOModule()
 {
     _routers.erase({_nodeId, _socketId});
     for (auto &kv : _pairQueues) {
@@ -58,7 +58,7 @@ UBRouter::~UBRouter()
 }
 
 void
-UBRouter::init()
+UBIOModule::init()
 {
     SimObject::init();
 }
@@ -68,7 +68,7 @@ UBRouter::init()
 // Pack (srcNode,srcSocket,dstNode,dstSocket) into a QueueKey.
 // key.first  = (srcNode<<16) | srcSocket
 // key.second = (dstNode<<16) | dstSocket
-static inline UBRouter::QueueKey
+static inline UBIOModule::QueueKey
 makeQueueKey(int srcNode, int srcSocket, int dstNode, int dstSocket)
 {
     return std::make_pair(
@@ -76,14 +76,14 @@ makeQueueKey(int srcNode, int srcSocket, int dstNode, int dstSocket)
         (dstNode << 16) | (dstSocket & 0xffff));
 }
 
-UBMsgQueue*
-UBRouter::getOrCreateQueue(int srcNode, int srcSocket,
+CoherenceMessageQueue*
+UBIOModule::getOrCreateQueue(int srcNode, int srcSocket,
                              int dstNode, int dstSocket)
 {
     auto key = makeQueueKey(srcNode, srcSocket, dstNode, dstSocket);
     auto it = _pairQueues.find(key);
     if (it == _pairQueues.end()) {
-        UBMsgQueue *q = new UBMsgQueue();
+        CoherenceMessageQueue *q = new CoherenceMessageQueue();
         q->setLatency(0);
         _pairQueues[key] = q;
         return q;
@@ -94,11 +94,11 @@ UBRouter::getOrCreateQueue(int srcNode, int srcSocket,
 // ---- Main send path ----
 
 void
-UBRouter::sendMessage(const UBMsg &msg, Tick forcedLatency)
+UBIOModule::sendMessage(const CoherenceMessage &msg, Tick forcedLatency)
 {
     DPRINTF(RubyEP,
-            "UBRouter node=%d socket=%d: sendMessage %s src=(%d,%d) dst=(%d,%d)\n",
-            _nodeId, _socketId, ubMsgTypeName(msg.h.type),
+            "UBIOModule node=%d socket=%d: sendMessage %s src=(%d,%d) dst=(%d,%d)\n",
+            _nodeId, _socketId, coherenceMsgTypeName(msg.h.type),
             msg.h.srcNode, msg.h.srcSocket, msg.h.dstNode, msg.h.dstSocket);
 
 #ifndef NDEBUG
@@ -111,7 +111,7 @@ UBRouter::sendMessage(const UBMsg &msg, Tick forcedLatency)
 #endif
 
     // forcedLatency >=0 means caller specifies latency; -1 means use queue default
-    UBMsgQueue *q = getOrCreateQueue(
+    CoherenceMessageQueue *q = getOrCreateQueue(
         msg.h.srcNode, msg.h.srcSocket, msg.h.dstNode, msg.h.dstSocket);
     Tick lat;
     if (forcedLatency >= 0) {
@@ -136,7 +136,7 @@ UBRouter::sendMessage(const UBMsg &msg, Tick forcedLatency)
     DPRINTF(UBLatency,
             "[UBLAT] tick=%lu src=%d,%d dst=%d,%d type=%s pa=0x%lx epoch=%lu reqId=%lu action=ENQUEUE\n",
             curTick(), msg.h.srcNode, msg.h.srcSocket, msg.h.dstNode, msg.h.dstSocket,
-            ubMsgTypeName(msg.h.type), msg.h.homeLinePa, msg.h.epoch, msg.h.reqId);
+            coherenceMsgTypeName(msg.h.type), msg.h.homeLinePa, msg.h.epoch, msg.h.reqId);
 
     drainReadyQueues();
 }
@@ -144,7 +144,7 @@ UBRouter::sendMessage(const UBMsg &msg, Tick forcedLatency)
 // ---- Drain logic ----
 
 void
-UBRouter::drainReadyQueues()
+UBIOModule::drainReadyQueues()
 {
     Tick now = curTick();
     bool progress = true;
@@ -156,95 +156,95 @@ UBRouter::drainReadyQueues()
         progress = false;
 
         for (auto &kv : _pairQueues) {
-            UBMsgQueue *q = kv.second;
+            CoherenceMessageQueue *q = kv.second;
             while (q->hasReady(now) && drained < maxDrainPerWakeup) {
-                UBMsg msg = q->popReady(now);
+                CoherenceMessage msg = q->popReady(now);
                 drained++;
                 progress = true;
 
                 DPRINTF(RubyEP,
-                        "UBRouter node=%d: draining %s src=%d dst=%d\n",
-                        _nodeId, ubMsgTypeName(msg.h.type),
+                        "UBIOModule node=%d: draining %s src=%d dst=%d\n",
+                        _nodeId, coherenceMsgTypeName(msg.h.type),
                         msg.h.srcNode, msg.h.dstNode);
                 DPRINTF(UBLatency,
                         "[UBLAT] tick=%lu src=%d,%d dst=%d,%d type=%s pa=0x%lx epoch=%lu reqId=%lu action=DEQUEUE\n",
                         now, msg.h.srcNode, msg.h.srcSocket, msg.h.dstNode, msg.h.dstSocket,
-                        ubMsgTypeName(msg.h.type), msg.h.homeLinePa, msg.h.epoch, msg.h.reqId);
+                        coherenceMsgTypeName(msg.h.type), msg.h.homeLinePa, msg.h.epoch, msg.h.reqId);
 
                 if (msg.h.dstNode == _nodeId && msg.h.dstSocket == _socketId) {
                     // Local delivery — route to UBCC or Adapter
                     DPRINTF(UBLatency,
                             "[UBLAT] tick=%lu src=%d,%d dst=%d,%d type=%s pa=0x%lx epoch=%lu reqId=%lu action=DELIVER\n",
                             now, msg.h.srcNode, msg.h.srcSocket, msg.h.dstNode, msg.h.dstSocket,
-                            ubMsgTypeName(msg.h.type), msg.h.homeLinePa, msg.h.epoch, msg.h.reqId);
+                            coherenceMsgTypeName(msg.h.type), msg.h.homeLinePa, msg.h.epoch, msg.h.reqId);
                     switch (msg.h.type) {
-                        case UBMsgType::ReadReq:
-                        case UBMsgType::WritebackReq:
-                        case UBMsgType::EvictReq:
-                        case UBMsgType::UpgradeReq:
-                        case UBMsgType::UpgradeDoneReq:
-                        case UBMsgType::ClearReq:
-                        case UBMsgType::RecallResp:
-                        case UBMsgType::InvalidateAck:
-                        case UBMsgType::QueryLineMetaReq:
-                        case UBMsgType::HomeWritebackNotify:
+                        case CoherenceMessageType::ReadReq:
+                        case CoherenceMessageType::WritebackReq:
+                        case CoherenceMessageType::EvictReq:
+                        case CoherenceMessageType::UpgradeReq:
+                        case CoherenceMessageType::UpgradeDoneReq:
+                        case CoherenceMessageType::ClearReq:
+                        case CoherenceMessageType::RecallResp:
+                        case CoherenceMessageType::InvalidateAck:
+                        case CoherenceMessageType::QueryLineMetaReq:
+                        case CoherenceMessageType::HomeWritebackNotify:
                             // Destination is local UBCC
                             {
-                                UBMsg response;
+                                CoherenceMessage response;
                                 deliverToUbcc(msg, response);
                                 // Send response back through reverse queue
                                 // (only for request types that expect a response)
-                                if (msg.h.type == UBMsgType::RecallResp ||
-                                    msg.h.type == UBMsgType::InvalidateAck) {
+                                if (msg.h.type == CoherenceMessageType::RecallResp ||
+                                    msg.h.type == CoherenceMessageType::InvalidateAck) {
                                     // Fire-and-forget: no response needed
-                                } else if (response.h.type != UBMsgType::ReadReq) {
+                                } else if (response.h.type != CoherenceMessageType::ReadReq) {
                                     // Response enqueue: reverse direction, same sockets
-                                    UBMsgQueue *revQ = getOrCreateQueue(
+                                    CoherenceMessageQueue *revQ = getOrCreateQueue(
                                         _nodeId, _socketId,
                                         msg.h.srcNode, msg.h.srcSocket);
                                     revQ->enqueue(response, now, 0);
                                     DPRINTF(UBLatency,
                                             "[UBLAT] tick=%lu src=%d,%d dst=%d,%d type=%s pa=0x%lx epoch=%lu reqId=%lu action=ENQUEUE\n",
                                             now, _nodeId, _socketId, msg.h.srcNode, msg.h.srcSocket,
-                                            ubMsgTypeName(response.h.type), response.h.homeLinePa,
+                                            coherenceMsgTypeName(response.h.type), response.h.homeLinePa,
                                             response.h.epoch, response.h.reqId);
                                 }
                             }
                             break;
 
-                        case UBMsgType::RecallReq:
-                        case UBMsgType::InvalidateReq:
-                        case UBMsgType::ReadResp:
-                        case UBMsgType::WritebackResp:
-                        case UBMsgType::EvictResp:
-                        case UBMsgType::UpgradeResp:
-                        case UBMsgType::UpgradeDoneResp:
-                        case UBMsgType::ClearResp:
-                        case UBMsgType::UpgradeAckNotify:
-                        case UBMsgType::QueryLineMetaResp:
+                        case CoherenceMessageType::RecallReq:
+                        case CoherenceMessageType::InvalidateReq:
+                        case CoherenceMessageType::ReadResp:
+                        case CoherenceMessageType::WritebackResp:
+                        case CoherenceMessageType::EvictResp:
+                        case CoherenceMessageType::UpgradeResp:
+                        case CoherenceMessageType::UpgradeDoneResp:
+                        case CoherenceMessageType::ClearResp:
+                        case CoherenceMessageType::UpgradeAckNotify:
+                        case CoherenceMessageType::QueryLineMetaResp:
                             // Destination is local UBAdapter
                          printf("[ROUTER-DELIVER-RESP] node=%d socket=%d pa=0x%lx type=%s src=(%d,%d) dst=(%d,%d)\n",
-                                _nodeId, _socketId, msg.h.homeLinePa, ubMsgTypeName(msg.h.type),
+                                _nodeId, _socketId, msg.h.homeLinePa, coherenceMsgTypeName(msg.h.type),
                                 msg.h.srcNode, msg.h.srcSocket, msg.h.dstNode, msg.h.dstSocket);
                             deliverToAdapter(msg);
                             break;
 
                         default:
-                            warn("UBRouter node=%d: unhandled message type "
+                            warn("UBIOModule node=%d: unhandled message type "
                                  "for local delivery: %s\n",
-                                 _nodeId, ubMsgTypeName(msg.h.type));
+                                 _nodeId, coherenceMsgTypeName(msg.h.type));
                             break;
                     }
                 } else {
                     // Remote delivery — find destination router by (node,socket)
                     DPRINTF(RubyEP,
-                            "UBRouter node=%d socket=%d: remote delivery to (node=%d,socket=%d)\n",
+                            "UBIOModule node=%d socket=%d: remote delivery to (node=%d,socket=%d)\n",
                             _nodeId, _socketId, msg.h.dstNode, msg.h.dstSocket);
-                    UBRouter *dstRouter = getRouter(msg.h.dstNode, msg.h.dstSocket);
+                    UBIOModule *dstRouter = getRouter(msg.h.dstNode, msg.h.dstSocket);
                     if (dstRouter) {
                         dstRouter->sendMessage(msg, 0);
                     } else {
-                        warn("UBRouter node=%d socket=%d: no router for dst (node=%d,socket=%d)\n",
+                        warn("UBIOModule node=%d socket=%d: no router for dst (node=%d,socket=%d)\n",
                              _nodeId, _socketId, msg.h.dstNode, msg.h.dstSocket);
                     }
                 }
@@ -259,7 +259,7 @@ UBRouter::drainReadyQueues()
     }
     if (drained >= maxDrainPerWakeup || hasPending) {
         DPRINTF(RubyEP,
-                "UBRouter node=%d: max drain reached (%d) or pending, "
+                "UBIOModule node=%d: max drain reached (%d) or pending, "
                 "scheduling next drain\n",
                 _nodeId, maxDrainPerWakeup);
         schedule(_drainEvent, curTick() + 1);
@@ -269,22 +269,22 @@ UBRouter::drainReadyQueues()
 // ---- Delivery to local UBCC ----
 
 void
-UBRouter::deliverToUbcc(const UBMsg &msg, UBMsg &response)
+UBIOModule::deliverToUbcc(const CoherenceMessage &msg, CoherenceMessage &response)
 {
     if (!_localUbcc) {
-        warn("UBRouter node=%d: deliverToUbcc called but no local UBCC\n",
+        warn("UBIOModule node=%d: deliverToUbcc called but no local UBCC\n",
              _nodeId);
         return;
     }
 
     DPRINTF(RubyEP,
-            "UBRouter node=%d socket=%d: deliverToUbcc type=%s\n",
-            _nodeId, _socketId, ubMsgTypeName(msg.h.type));
+            "UBIOModule node=%d socket=%d: deliverToUbcc type=%s\n",
+            _nodeId, _socketId, coherenceMsgTypeName(msg.h.type));
 
     switch (msg.h.type) {
-        case UBMsgType::ReadReq: {
+        case CoherenceMessageType::ReadReq: {
             UBCC_OuterReqType ubccReq =
-                ((msg.h.flags & static_cast<uint32_t>(UB_FLAG_WRITE_INTENT)) || msg.b.readReq.neededPerm == 1)
+                ((msg.h.flags & static_cast<uint32_t>(CFLAG_WRITE_INTENT)) || msg.b.readReq.neededPerm == 1)
                     ? UBCC_OuterReqType::GlobalReadUnique
                     : UBCC_OuterReqType::GlobalReadShared;
 
@@ -298,7 +298,7 @@ UBRouter::deliverToUbcc(const UBMsg &msg, UBMsg &response)
             UBCC_OuterGrantType ubccGrant =
                 _localUbcc->processOuterRequest(
                     msg.h.homeLinePa, ubccReq,
-                    (msg.h.flags & static_cast<uint32_t>(UB_FLAG_WRITE_INTENT)) != 0,
+                    (msg.h.flags & static_cast<uint32_t>(CFLAG_WRITE_INTENT)) != 0,
                     msg.h.requesterNode,
                     msg.h.epoch, msg.h.reqId,
                     &grantVisibleTick, &sentinelVisibleTick,
@@ -319,7 +319,7 @@ UBRouter::deliverToUbcc(const UBMsg &msg, UBMsg &response)
                                                          grantData);
             }
 
-            response.h.type = UBMsgType::ReadResp;
+            response.h.type = CoherenceMessageType::ReadResp;
             response.h.srcNode = _nodeId;
             response.h.srcSocket = _socketId;
             response.h.dstNode = msg.h.srcNode;
@@ -333,7 +333,7 @@ UBRouter::deliverToUbcc(const UBMsg &msg, UBMsg &response)
             response.h.reqId = msg.h.reqId;
             response.h.flags = 0;
             if (hasGrantData) {
-                response.h.flags |= static_cast<uint32_t>(UB_FLAG_HAS_DATA);
+                response.h.flags |= static_cast<uint32_t>(CFLAG_HAS_DATA);
             }
 
             printf("[ROUTER-UBCC-RESP] home=%d socket=%d pa=0x%lx grant=%d src=(%d,%d)\n",
@@ -358,14 +358,14 @@ UBRouter::deliverToUbcc(const UBMsg &msg, UBMsg &response)
             break;
         }
 
-        case UBMsgType::WritebackReq: {
+        case CoherenceMessageType::WritebackReq: {
             bool keepAsClean =
-                (msg.h.flags & static_cast<uint32_t>(UB_FLAG_KEEP_AS_CLEAN)) != 0;
+                (msg.h.flags & static_cast<uint32_t>(CFLAG_KEEP_AS_CLEAN)) != 0;
             bool success = _localUbcc->processWriteback(
                 msg.h.homeLinePa, msg.h.requesterNode,
                 msg.h.epoch, keepAsClean);
 
-            response.h.type = UBMsgType::WritebackResp;
+            response.h.type = CoherenceMessageType::WritebackResp;
             response.h.srcNode = _nodeId;
             response.h.srcSocket = _socketId;
             response.h.dstNode = msg.h.srcNode;
@@ -377,12 +377,12 @@ UBRouter::deliverToUbcc(const UBMsg &msg, UBMsg &response)
             break;
         }
 
-        case UBMsgType::EvictReq: {
+        case CoherenceMessageType::EvictReq: {
             bool success = _localUbcc->processEvict(
                 msg.h.homeLinePa, msg.h.requesterNode,
                 msg.h.epoch);
 
-            response.h.type = UBMsgType::EvictResp;
+            response.h.type = CoherenceMessageType::EvictResp;
             response.h.srcNode = _nodeId;
             response.h.srcSocket = _socketId;
             response.h.dstNode = msg.h.srcNode;
@@ -394,7 +394,7 @@ UBRouter::deliverToUbcc(const UBMsg &msg, UBMsg &response)
             break;
         }
 
-        case UBMsgType::UpgradeReq: {
+        case CoherenceMessageType::UpgradeReq: {
             UBCC_UpgradeCause ubccCause =
                 (msg.b.upgradeReq.cause == 0)
                     ? UBCC_UpgradeCause::LocalCleanUnique
@@ -408,7 +408,7 @@ UBRouter::deliverToUbcc(const UBMsg &msg, UBMsg &response)
             uint64_t targetMask = _localUbcc->getUpgradePendingTargetMask(
                 msg.h.homeLinePa);
 
-            response.h.type = UBMsgType::UpgradeResp;
+            response.h.type = CoherenceMessageType::UpgradeResp;
             response.h.srcNode = _nodeId;
             response.h.srcSocket = _socketId;
             response.h.dstNode = msg.h.srcNode;
@@ -417,19 +417,19 @@ UBRouter::deliverToUbcc(const UBMsg &msg, UBMsg &response)
             response.h.epoch = msg.h.epoch;
             response.h.reqId = msg.h.reqId;
             response.h.flags = accepted
-                ? static_cast<uint32_t>(UB_FLAG_ACCEPTED) : 0;
+                ? static_cast<uint32_t>(CFLAG_ACCEPTED) : 0;
             response.b.upgradeResp.upgradeTargetMask = targetMask;
             response.b.upgradeResp.committedEpoch =
                 _localUbcc->getEpochForLine(msg.h.homeLinePa);
             break;
         }
 
-        case UBMsgType::UpgradeDoneReq: {
+        case CoherenceMessageType::UpgradeDoneReq: {
             bool accepted = _localUbcc->processOuterUpgradeDone(
                 msg.h.homeLinePa, msg.h.requesterNode,
                 msg.h.epoch, msg.h.reqId);
 
-            response.h.type = UBMsgType::UpgradeDoneResp;
+            response.h.type = CoherenceMessageType::UpgradeDoneResp;
             response.h.srcNode = _nodeId;
             response.h.srcSocket = _socketId;
             response.h.dstNode = msg.h.srcNode;
@@ -441,12 +441,12 @@ UBRouter::deliverToUbcc(const UBMsg &msg, UBMsg &response)
             break;
         }
 
-        case UBMsgType::ClearReq: {
+        case CoherenceMessageType::ClearReq: {
             bool accepted = _localUbcc->processClear(
                 msg.h.homeLinePa, msg.h.requesterNode,
                 msg.h.epoch, msg.h.reqId);
 
-            response.h.type = UBMsgType::ClearResp;
+            response.h.type = CoherenceMessageType::ClearResp;
             response.h.srcNode = _nodeId;
             response.h.srcSocket = _socketId;
             response.h.dstNode = msg.h.srcNode;
@@ -458,11 +458,11 @@ UBRouter::deliverToUbcc(const UBMsg &msg, UBMsg &response)
             break;
         }
 
-        case UBMsgType::RecallResp: {
+        case CoherenceMessageType::RecallResp: {
             bool dataReturned =
-                (msg.h.flags & static_cast<uint32_t>(UB_FLAG_DATA_RETURNED)) != 0;
+                (msg.h.flags & static_cast<uint32_t>(CFLAG_DATA_RETURNED)) != 0;
             bool hasData =
-                (msg.h.flags & static_cast<uint32_t>(UB_FLAG_HAS_DATA)) != 0;
+                (msg.h.flags & static_cast<uint32_t>(CFLAG_HAS_DATA)) != 0;
 
             DataBlock dataBlk(64);
             const DataBlock *dataPtr = nullptr;
@@ -479,7 +479,7 @@ UBRouter::deliverToUbcc(const UBMsg &msg, UBMsg &response)
             break;
         }
 
-        case UBMsgType::InvalidateAck: {
+        case CoherenceMessageType::InvalidateAck: {
             _localUbcc->processInvalidationAck(
                 msg.h.homeLinePa, msg.h.requesterNode,
                 msg.h.epoch, msg.h.reqId);
@@ -487,7 +487,7 @@ UBRouter::deliverToUbcc(const UBMsg &msg, UBMsg &response)
             break;
         }
 
-        case UBMsgType::QueryLineMetaReq: {
+        case CoherenceMessageType::QueryLineMetaReq: {
             // v4-dual-socket: EPBackend queries UBCC for {epoch, ownerNode}
             uint64_t qEpoch = 0;
             int qOwnerNode = -1;
@@ -496,7 +496,7 @@ UBRouter::deliverToUbcc(const UBMsg &msg, UBMsg &response)
             _localUbcc->queryLineMeta(msg.h.homeLinePa, qEpoch, qOwnerNode,
                                        qState, qFound);
 
-            response.h.type = UBMsgType::QueryLineMetaResp;
+            response.h.type = CoherenceMessageType::QueryLineMetaResp;
             response.h.srcNode = _nodeId;
             response.h.srcSocket = _socketId;
             response.h.dstNode = msg.h.srcNode;
@@ -510,7 +510,7 @@ UBRouter::deliverToUbcc(const UBMsg &msg, UBMsg &response)
             break;
         }
 
-        case UBMsgType::HomeWritebackNotify: {
+        case CoherenceMessageType::HomeWritebackNotify: {
             // v4-dual-socket: HN-F completed DDR4 writeback, notify UBCC
             _localUbcc->processHomeWritebackNotify(
                 msg.h.homeLinePa, msg.h.epoch);
@@ -519,8 +519,8 @@ UBRouter::deliverToUbcc(const UBMsg &msg, UBMsg &response)
         }
 
         default:
-            warn("UBRouter node=%d socket=%d: deliverToUbcc unhandled type %s\n",
-                 _nodeId, _socketId, ubMsgTypeName(msg.h.type));
+            warn("UBIOModule node=%d socket=%d: deliverToUbcc unhandled type %s\n",
+                 _nodeId, _socketId, coherenceMsgTypeName(msg.h.type));
             break;
     }
 }
@@ -528,52 +528,52 @@ UBRouter::deliverToUbcc(const UBMsg &msg, UBMsg &response)
 // ---- Delivery to local adapter ----
 
 void
-UBRouter::deliverToAdapter(const UBMsg &msg)
+UBIOModule::deliverToAdapter(const CoherenceMessage &msg)
 {
     if (!_localAdapter) {
-        warn("UBRouter node=%d socket=%d: deliverToAdapter called but no local adapter\n",
+        warn("UBIOModule node=%d socket=%d: deliverToAdapter called but no local adapter\n",
              _nodeId, _socketId);
         return;
     }
 
     DPRINTF(RubyEP,
-            "UBRouter node=%d socket=%d: deliverToAdapter type=%s\n",
-            _nodeId, _socketId, ubMsgTypeName(msg.h.type));
+            "UBIOModule node=%d socket=%d: deliverToAdapter type=%s\n",
+            _nodeId, _socketId, coherenceMsgTypeName(msg.h.type));
 
     _localAdapter->recvFromRouter(msg);
 }
 
 // ── Debug Fault Injection ──
 
-// Helper: parse a UBMsgType name string
-static UBMsgType parseMsgTypeName(const std::string &s)
+// Helper: parse a CoherenceMessageType name string
+static CoherenceMessageType parseMsgTypeName(const std::string &s)
 {
-    if (s == "*" || s == "any")  return UBMsgType::ReadReq; // wildcard
-    if (s == "ReadReq")          return UBMsgType::ReadReq;
-    if (s == "ReadResp")         return UBMsgType::ReadResp;
-    if (s == "WritebackReq")     return UBMsgType::WritebackReq;
-    if (s == "WritebackResp")    return UBMsgType::WritebackResp;
-    if (s == "EvictReq")         return UBMsgType::EvictReq;
-    if (s == "EvictResp")        return UBMsgType::EvictResp;
-    if (s == "RecallReq")        return UBMsgType::RecallReq;
-    if (s == "RecallResp")       return UBMsgType::RecallResp;
-    if (s == "InvalidateReq")    return UBMsgType::InvalidateReq;
-    if (s == "InvalidateAck")    return UBMsgType::InvalidateAck;
-    if (s == "UpgradeReq")       return UBMsgType::UpgradeReq;
-    if (s == "UpgradeResp")      return UBMsgType::UpgradeResp;
-    if (s == "UpgradeDoneReq")   return UBMsgType::UpgradeDoneReq;
-    if (s == "UpgradeDoneResp")  return UBMsgType::UpgradeDoneResp;
-    if (s == "ClearReq")         return UBMsgType::ClearReq;
-    if (s == "ClearResp")        return UBMsgType::ClearResp;
-    if (s == "UpgradeAckNotify") return UBMsgType::UpgradeAckNotify;
-    if (s == "QueryLineMetaReq") return UBMsgType::QueryLineMetaReq;
-    if (s == "QueryLineMetaResp") return UBMsgType::QueryLineMetaResp;
-    if (s == "HomeWritebackNotify") return UBMsgType::HomeWritebackNotify;
-    return UBMsgType::ReadReq; // default wildcard
+    if (s == "*" || s == "any")  return CoherenceMessageType::ReadReq; // wildcard
+    if (s == "ReadReq")          return CoherenceMessageType::ReadReq;
+    if (s == "ReadResp")         return CoherenceMessageType::ReadResp;
+    if (s == "WritebackReq")     return CoherenceMessageType::WritebackReq;
+    if (s == "WritebackResp")    return CoherenceMessageType::WritebackResp;
+    if (s == "EvictReq")         return CoherenceMessageType::EvictReq;
+    if (s == "EvictResp")        return CoherenceMessageType::EvictResp;
+    if (s == "RecallReq")        return CoherenceMessageType::RecallReq;
+    if (s == "RecallResp")       return CoherenceMessageType::RecallResp;
+    if (s == "InvalidateReq")    return CoherenceMessageType::InvalidateReq;
+    if (s == "InvalidateAck")    return CoherenceMessageType::InvalidateAck;
+    if (s == "UpgradeReq")       return CoherenceMessageType::UpgradeReq;
+    if (s == "UpgradeResp")      return CoherenceMessageType::UpgradeResp;
+    if (s == "UpgradeDoneReq")   return CoherenceMessageType::UpgradeDoneReq;
+    if (s == "UpgradeDoneResp")  return CoherenceMessageType::UpgradeDoneResp;
+    if (s == "ClearReq")         return CoherenceMessageType::ClearReq;
+    if (s == "ClearResp")        return CoherenceMessageType::ClearResp;
+    if (s == "UpgradeAckNotify") return CoherenceMessageType::UpgradeAckNotify;
+    if (s == "QueryLineMetaReq") return CoherenceMessageType::QueryLineMetaReq;
+    if (s == "QueryLineMetaResp") return CoherenceMessageType::QueryLineMetaResp;
+    if (s == "HomeWritebackNotify") return CoherenceMessageType::HomeWritebackNotify;
+    return CoherenceMessageType::ReadReq; // default wildcard
 }
 
 void
-UBRouter::parseFaultRules(const std::vector<std::string> &rules)
+UBIOModule::parseFaultRules(const std::vector<std::string> &rules)
 {
     for (const auto &rule_str : rules) {
         // Format: "name:type:src:dst:pa:action[:delayTicks[:matchCount]]"
@@ -588,7 +588,7 @@ UBRouter::parseFaultRules(const std::vector<std::string> &rules)
         parts.push_back(rule_str.substr(pos));
 
         if (parts.size() < 6) {
-            warn("UBRouter: malformed fault rule '%s' — skipping\n",
+            warn("UBIOModule *: malformed fault rule '%s' — skipping\n",
                  rule_str.c_str());
             continue;
         }
@@ -608,7 +608,7 @@ UBRouter::parseFaultRules(const std::vector<std::string> &rules)
         } else if (action_str == "dup" || action_str == "Duplicate") {
             rule.action = DebugFaultAction::Duplicate;
         } else {
-            warn("UBRouter: unknown fault action '%s' — skipping\n",
+            warn("UBIOModule *: unknown fault action '%s' — skipping\n",
                  action_str.c_str());
             continue;
         }
@@ -625,24 +625,24 @@ UBRouter::parseFaultRules(const std::vector<std::string> &rules)
 }
 
 void
-UBRouter::addFaultRule(const DebugFaultRule &rule)
+UBIOModule::addFaultRule(const DebugFaultRule &rule)
 {
     _faultRules.push_back(rule);
     DPRINTF(RubyEP,
-            "UBRouter node=%d socket=%d: added fault rule '%s' "
+            "UBIOModule node=%d socket=%d: added fault rule '%s' "
             "type=%s action=%d\n",
             _nodeId, _socketId, rule.name.c_str(),
-            ubMsgTypeName(rule.matchType), static_cast<int>(rule.action));
+            coherenceMsgTypeName(rule.matchType), static_cast<int>(rule.action));
 }
 
 void
-UBRouter::clearFaultRules()
+UBIOModule::clearFaultRules()
 {
     _faultRules.clear();
 }
 
 int
-UBRouter::applyFaultRules(const UBMsg &msg)
+UBIOModule::applyFaultRules(const CoherenceMessage &msg)
 {
     // Returns: 0 = drop, 1 = normal, 2 = duplicate
     int copies = 1;
@@ -652,7 +652,7 @@ UBRouter::applyFaultRules(const UBMsg &msg)
             continue;
         }
         // Check message type match (wildcard: matchType == ReadReq means "any")
-        if (rule.matchType != UBMsgType::ReadReq &&
+        if (rule.matchType != CoherenceMessageType::ReadReq &&
             rule.matchType != msg.h.type) {
             continue;
         }
@@ -675,7 +675,7 @@ UBRouter::applyFaultRules(const UBMsg &msg)
                 printf("[UBFAULT] node=%d rule='%s' action=Drop "
                        "type=%s src=%d dst=%d pa=0x%lx\n",
                        _nodeId, rule.name.c_str(),
-                       ubMsgTypeName(msg.h.type),
+                       coherenceMsgTypeName(msg.h.type),
                        msg.h.srcNode, msg.h.dstNode, msg.h.homeLinePa);
                 copies = 0;
                 break;
@@ -683,7 +683,7 @@ UBRouter::applyFaultRules(const UBMsg &msg)
                 printf("[UBFAULT] node=%d rule='%s' action=Delay ticks=%lu "
                        "type=%s src=%d dst=%d pa=0x%lx\n",
                        _nodeId, rule.name.c_str(), rule.delayTicks,
-                       ubMsgTypeName(msg.h.type),
+                       coherenceMsgTypeName(msg.h.type),
                        msg.h.srcNode, msg.h.dstNode, msg.h.homeLinePa);
                 // Delay is handled by scheduling a deferred enqueue
                 // For now, pass through normally (delay not implemented)
@@ -694,7 +694,7 @@ UBRouter::applyFaultRules(const UBMsg &msg)
                 printf("[UBFAULT] node=%d rule='%s' action=Duplicate "
                        "type=%s src=%d dst=%d pa=0x%lx\n",
                        _nodeId, rule.name.c_str(),
-                       ubMsgTypeName(msg.h.type),
+                       coherenceMsgTypeName(msg.h.type),
                        msg.h.srcNode, msg.h.dstNode, msg.h.homeLinePa);
                 copies = 2;
                 break;
@@ -704,7 +704,7 @@ UBRouter::applyFaultRules(const UBMsg &msg)
 }
 
 void
-UBRouter::delayedEnqueue(UBMsg msg, UBMsgQueue *q, Tick lat)
+UBIOModule::delayedEnqueue(CoherenceMessage msg, CoherenceMessageQueue *q, Tick lat)
 {
     q->enqueue(msg, curTick(), lat);
     drainReadyQueues();

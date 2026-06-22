@@ -10,6 +10,7 @@
 #include "mem/simple_mem.hh"
 #include "mem/ruby/common/DataBlock.hh"
 #include "mem/ruby/protocol/chi/ep/BackstoreOrganization.hh"
+#include "mem/ruby/protocol/chi/ep/CoherenceMessage.hh"
 #include "mem/ruby/protocol/chi/ep/NodeAddressMap.hh"
 #include "params/EPBackend.hh"
 #include "sim/sim_object.hh"
@@ -612,7 +613,7 @@ class EPBackend : public SimObject
     EPSNFController* getEpSnf(int socketId) const;
 
     /** Handle QueryLineMetaResp from UBCC via UBAdapter (v4-dual-socket). */
-    void handleQueryLineMetaResp(const UBMsg &msg);
+    void handleQueryLineMetaResp(const CoherenceMessage &msg);
 
     /** Send HomeWritebackNotify to home UBCC (v4-dual-socket). */
     void sendHomeWritebackNotify(uint64_t homePa, int homeSocket);
@@ -698,7 +699,7 @@ class EPBackend : public SimObject
     const int _nodeId;
     NodeAddressMap _addrMap;
     // v4-dual-socket: _ubcc retained for backward compatibility (tests/inspection).
-    // Main protocol paths MUST use _ubAdapters[] → UBRouter → UBCC message-passing.
+    // Main protocol paths MUST use _ubAdapters[] → UBIOModule *→ UBCC message-passing.
     UBCCController *_ubcc = nullptr;
     MetaRNFController *_metaRnf = nullptr;
     BackstoreOrganization *_org = nullptr;

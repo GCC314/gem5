@@ -20,7 +20,7 @@ namespace ruby
 {
 
 class RubySystem;
-class UBRouter;
+class UBIOModule;
 class EPBackend;
 
 // Forward declarations for M5 outer protocol types.
@@ -211,7 +211,7 @@ class UBCCController
     void wakeup();
 
     /** Set the local router for sending messages (e.g., UpgradeAckNotify). */
-    void setRouter(UBRouter *router) { _router = router; }
+    void setRouter(UBIOModule *router) { _router = router; }
     void setBackend(EPBackend *backend) { _backend = backend; }
 
     // ---- v4-dual-socket: Query Line Metadata (read-only snapshot) ----
@@ -579,8 +579,8 @@ class UBCCController
     const int _nodeId;
     int _socketId;                // v4-dual-socket
 
-    /** Local UBRouter for sending messages (e.g., UpgradeAckNotify). */
-    UBRouter *_router = nullptr;
+    /** Local UBIOModule *for sending messages (e.g., UpgradeAckNotify). */
+    UBIOModule *_router = nullptr;
     EPBackend *_backend = nullptr;
 
     // Q3: Estimated UBCC-to-remote-UBCC interconnect latency (ticks).

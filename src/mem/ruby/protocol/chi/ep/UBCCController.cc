@@ -12,7 +12,7 @@
 #include "debug/UBLatency.hh"
 #include "mem/ruby/protocol/chi/ep/EPBackend.hh"
 #include "mem/ruby/protocol/chi/ep/NodeAddressMap.hh"
-#include "mem/ruby/protocol/chi/ep/UBRouter.hh"
+#include "mem/ruby/protocol/chi/ep/UBIOModule.hh"
 #include "mem/ruby/system/RubySystem.hh"
 #include "sim/cur_tick.hh"
 
@@ -1370,8 +1370,8 @@ UBCCController::processInvalidationAck(uint64_t line_pa, int ackNode,
                       "PA=0x%lx requester=%d\n",
                       _nodeId, line_pa, ost->requesterNode);
             }
-            UBMsg notifyMsg;
-            notifyMsg.h.type = UBMsgType::UpgradeAckNotify;
+            CoherenceMessage notifyMsg;
+            notifyMsg.h.type = CoherenceMessageType::UpgradeAckNotify;
             notifyMsg.h.srcNode = _nodeId;
             notifyMsg.h.dstNode = ost->requesterNode;
             notifyMsg.h.homeNode = _nodeId;
@@ -1380,7 +1380,7 @@ UBCCController::processInvalidationAck(uint64_t line_pa, int ackNode,
             notifyMsg.h.epoch = ost->reservedEpoch;
             notifyMsg.h.reqId = ost->reqId;
             notifyMsg.h.flags =
-                static_cast<uint32_t>(gem5::ruby::UB_FLAG_ACCEPTED);
+                static_cast<uint32_t>(gem5::ruby::CFLAG_ACCEPTED);
             notifyMsg.h.seqNum = 0;
             notifyMsg.h.enqueueTick = curTick();
             notifyMsg.h.readyTick = curTick();

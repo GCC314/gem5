@@ -8,9 +8,9 @@
 #include <utility>
 #include <vector>
 
-#include "mem/ruby/protocol/chi/ep/UBMsg.hh"
-#include "mem/ruby/protocol/chi/ep/UBMsgQueue.hh"
-#include "params/UBRouter.hh"
+#include "mem/ruby/protocol/chi/ep/CoherenceMessage.hh"
+#include "mem/ruby/protocol/chi/ep/CoherenceMessageQueue.hh"
+#include "params/UBIOModule.hh"
 #include "sim/eventq.hh"
 #include "sim/sim_object.hh"
 
@@ -36,7 +36,7 @@ enum class DebugFaultAction : uint8_t {
  */
 struct DebugFaultRule {
     std::string     name;          // Human-readable label for logging
-    UBMsgType       matchType;     // UBMsgType to match, or ReadReq as wildcard
+    CoherenceMessageType       matchType;     // CoherenceMessageType to match, or ReadReq as wildcard
     int             matchSrcNode;  // -1 = any
     int             matchDstNode;  // -1 = any
     uint64_t        matchLinePa;   // 0 = any
@@ -46,7 +46,7 @@ struct DebugFaultRule {
     int             firedCount;    // Internal: times already fired
 
     DebugFaultRule()
-        : name(""), matchType(UBMsgType::ReadReq),
+        : name(""), matchType(CoherenceMessageType::ReadReq),
           matchSrcNode(-1), matchDstNode(-1), matchLinePa(0),
           action(DebugFaultAction::Drop), delayTicks(0),
           matchCount(0), firedCount(0) {}
@@ -55,12 +55,12 @@ struct DebugFaultRule {
 /**
  * Per-(node,socket) message router.
  *
- * Each (node,socket) pair has exactly one UBRouter.  It receives UBMsg
+ * Each (node,socket) pair has exactly one UBIOModule *.  It receives UBMsg
  * from the local UBAdapter, applies latency through per-pair MsgQueues,
  * and delivers the message to the destination UBCC or local UBAdapter.
  * v4-dual-socket: registry and queue keys expanded to include socketId.
  */
-class UBRouter : public SimObject
+class UBIOModule : public SimObject
 {
   public:
     using RouterKey = std::pair<int,int>; // (nodeId, socketId)
@@ -68,9 +68,9 @@ class UBRouter : public SimObject
                                           // packed as: key.first  = (srcNode<<16)|srcSocket
                                           //            key.second = (dstNode<<16)|dstSocket
 
-    PARAMS(UBRouter);
-    UBRouter(const Params &p);
-    ~UBRouter();
+    PARAMS(UBIOModule);
+    UBIOModule(const Params &p);
+    ~UBIOModule();
 
     void init() override;
 
@@ -98,22 +98,22 @@ class UBRouter : public SimObject
      * pair queue with configured latency, then drains ready messages
      * immediately for synchronous Phase 2 callers.
      */
-    void sendMessage(const UBMsg &msg, Tick forcedLatency = -1);
+    void sendMessage(const CoherenceMessage &msg, Tick forcedLatency = -1);
     Tick crossNodeLatency() const { return _defaultLatency; }
 
     /** Deliver a message to the local UBCC (called by drain). */
-    void deliverToUbcc(const UBMsg &msg, UBMsg &response);
+    void deliverToUbcc(const CoherenceMessage &msg, CoherenceMessage &response);
 
     /** Deliver a message to the local adapter (called by drain). */
-    void deliverToAdapter(const UBMsg &msg);
+    void deliverToAdapter(const CoherenceMessage &msg);
 
     /** Get or create the MsgQueue for a (srcNode,srcSocket,dstNode,dstSocket) tuple. */
-    UBMsgQueue* getOrCreateQueue(int srcNode, int srcSocket,
+    CoherenceMessageQueue* getOrCreateQueue(int srcNode, int srcSocket,
                                   int dstNode, int dstSocket);
 
     /** Static router registry for cross-node, cross-socket routing. */
-    static UBRouter* getRouter(int nodeId, int socketId);
-    static void registerRouter(int nodeId, int socketId, UBRouter *router);
+    static UBIOModule * getRouter(int nodeId, int socketId);
+    static void registerRouter(int nodeId, int socketId, UBIOModule *router);
 
     // ── Debug Fault Injection API (debug-only) ──
     /** Add a fault rule to this router's rule table. */
@@ -138,7 +138,7 @@ class UBRouter : public SimObject
      * Key packing: key.first  = (srcNode<<16) | srcSocket
      *              key.second = (dstNode<<16) | dstSocket
      */
-    std::map<QueueKey, UBMsgQueue*> _pairQueues;
+    std::map<QueueKey, CoherenceMessageQueue*> _pairQueues;
 
     /** Event for deferred queue drain. */
     EventFunctionWrapper _drainEvent;
@@ -149,15 +149,15 @@ class UBRouter : public SimObject
     // ── Debug Fault Injection internals ──
     /** Apply fault rules to a message before enqueue.
      *  Returns the number of copies to enqueue (0 = dropped, 1 = normal, 2 = dup). */
-    int applyFaultRules(const UBMsg &msg);
+    int applyFaultRules(const CoherenceMessage &msg);
     /** Deferred enqueue event for Delay action. */
-    void delayedEnqueue(UBMsg msg, UBMsgQueue *q, Tick lat);
+    void delayedEnqueue(CoherenceMessage msg, CoherenceMessageQueue *q, Tick lat);
 
     /** Fault rule table (debug-only). */
     std::vector<DebugFaultRule> _faultRules;
 
     /** static registry keyed by (nodeId, socketId) */
-    static std::map<RouterKey, UBRouter*> _routers;
+    static std::map<RouterKey, UBIOModule *> _routers;
 };
 
 } // namespace ruby

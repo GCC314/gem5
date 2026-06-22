@@ -1,13 +1,13 @@
-# UBRouter SimObject
+# UBIOModule SimObject
 
 from m5.SimObject import SimObject
 from m5.params import *
 
 
-class UBRouter(SimObject):
-    type = "UBRouter"
-    cxx_header = "mem/ruby/protocol/chi/ep/UBRouter.hh"
-    cxx_class = "gem5::ruby::UBRouter"
+class UBIOModule(SimObject):
+    type = "UBIOModule"
+    cxx_header = "mem/ruby/protocol/chi/ep/UBIOModule.hh"
+    cxx_class = "gem5::ruby::UBIOModule"
 
     node_id = Param.Int(0, "Node ID for this router")
     socket_id = Param.Int(0, "Socket ID for this router")

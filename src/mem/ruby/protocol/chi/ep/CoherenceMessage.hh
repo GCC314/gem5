@@ -14,7 +14,7 @@ namespace ruby
 {
 
 // ---- Message Type Enumeration ----
-enum class UBMsgType : uint16_t {
+enum class CoherenceMessageType : uint16_t {
     ReadReq,
     ReadResp,
     RecallReq,
@@ -38,19 +38,19 @@ enum class UBMsgType : uint16_t {
 };
 
 // ---- Message Flags ----
-enum UBMsgFlags : uint32_t {
-    UB_FLAG_WRITE_INTENT   = 1u << 0,
-    UB_FLAG_KEEP_AS_CLEAN  = 1u << 1,
-    UB_FLAG_ACCEPTED       = 1u << 2,
-    UB_FLAG_DATA_RETURNED  = 1u << 3,
-    UB_FLAG_HAS_DATA       = 1u << 4,
-    UB_FLAG_IS_READ_RECALL = 1u << 5,
-    UB_FLAG_BUSY            = 1u << 6,
+enum CoherenceMessageFlags : uint32_t {
+    CFLAG_WRITE_INTENT   = 1u << 0,
+    CFLAG_KEEP_AS_CLEAN  = 1u << 1,
+    CFLAG_ACCEPTED       = 1u << 2,
+    CFLAG_DATA_RETURNED  = 1u << 3,
+    CFLAG_HAS_DATA       = 1u << 4,
+    CFLAG_IS_READ_RECALL = 1u << 5,
+    CFLAG_BUSY            = 1u << 6,
 };
 
 // ---- Message Header (fixed envelope) ----
-struct UBMsgHeader {
-    UBMsgType type;
+struct CoherenceMessageHeader {
+    CoherenceMessageType type;
     uint16_t srcNode;
     uint16_t srcSocket;       // v4-dual-socket: source socket
     uint16_t dstNode;
@@ -69,8 +69,8 @@ struct UBMsgHeader {
     Tick enqueueTick;
     Tick readyTick;
 
-    UBMsgHeader()
-        : type(UBMsgType::ReadReq),
+    CoherenceMessageHeader()
+        : type(CoherenceMessageType::ReadReq),
           srcNode(0), srcSocket(0), dstNode(0), dstSocket(0),
           homeNode(0), homeSocket(0), ingressSocket(0),
           requesterNode(0), targetNode(0),
@@ -188,7 +188,7 @@ struct UBUpgradeAckNotifyBody {
     /* no extra fields — header-only notification */  // v4-P0 fix: FV-9 gap
 };
 
-union UBMsgBody {
+union CoherenceMessageBody {
     UBReadReqBody readReq;
     UBReadRespBody readResp;
     UBRecallReqBody recallReq;
@@ -210,56 +210,56 @@ union UBMsgBody {
     UBHomeWritebackNotifyBody homeWritebackNotify;
     UBUpgradeAckNotifyBody upgradeAckNotify;  // v4-P0 fix: FV-9 gap
 
-    UBMsgBody() {} // value-initialized by UBMsg default ctor
+    CoherenceMessageBody() {} // value-initialized by CoherenceMessage default ctor
 };
 
 // ---- Full Message ----
-struct UBMsg {
-    UBMsgHeader h;
-    UBMsgBody b;
+struct CoherenceMessage {
+    CoherenceMessageHeader h;
+    CoherenceMessageBody b;
 
-    UBMsg() = default;
+    CoherenceMessage() = default;
 };
 
 // ---- Debug helpers ----
 inline const char*
-ubMsgTypeName(UBMsgType t)
+coherenceMsgTypeName(CoherenceMessageType t)
 {
     switch (t) {
-        case UBMsgType::ReadReq:          return "ReadReq";
-        case UBMsgType::ReadResp:         return "ReadResp";
-        case UBMsgType::RecallReq:        return "RecallReq";
-        case UBMsgType::RecallResp:       return "RecallResp";
-        case UBMsgType::InvalidateReq:    return "InvalidateReq";
-        case UBMsgType::InvalidateAck:    return "InvalidateAck";
-        case UBMsgType::WritebackReq:     return "WritebackReq";
-        case UBMsgType::WritebackResp:    return "WritebackResp";
-        case UBMsgType::EvictReq:         return "EvictReq";
-        case UBMsgType::EvictResp:        return "EvictResp";
-        case UBMsgType::UpgradeReq:       return "UpgradeReq";
-        case UBMsgType::UpgradeResp:      return "UpgradeResp";
-        case UBMsgType::UpgradeDoneReq:   return "UpgradeDoneReq";
-        case UBMsgType::UpgradeDoneResp:  return "UpgradeDoneResp";
-        case UBMsgType::ClearReq:         return "ClearReq";
-        case UBMsgType::ClearResp:        return "ClearResp";
-        case UBMsgType::UpgradeAckNotify: return "UpgradeAckNotify";
-        case UBMsgType::QueryLineMetaReq:  return "QueryLineMetaReq";
-        case UBMsgType::QueryLineMetaResp: return "QueryLineMetaResp";
-        case UBMsgType::HomeWritebackNotify: return "HomeWritebackNotify";
+        case CoherenceMessageType::ReadReq:          return "ReadReq";
+        case CoherenceMessageType::ReadResp:         return "ReadResp";
+        case CoherenceMessageType::RecallReq:        return "RecallReq";
+        case CoherenceMessageType::RecallResp:       return "RecallResp";
+        case CoherenceMessageType::InvalidateReq:    return "InvalidateReq";
+        case CoherenceMessageType::InvalidateAck:    return "InvalidateAck";
+        case CoherenceMessageType::WritebackReq:     return "WritebackReq";
+        case CoherenceMessageType::WritebackResp:    return "WritebackResp";
+        case CoherenceMessageType::EvictReq:         return "EvictReq";
+        case CoherenceMessageType::EvictResp:        return "EvictResp";
+        case CoherenceMessageType::UpgradeReq:       return "UpgradeReq";
+        case CoherenceMessageType::UpgradeResp:      return "UpgradeResp";
+        case CoherenceMessageType::UpgradeDoneReq:   return "UpgradeDoneReq";
+        case CoherenceMessageType::UpgradeDoneResp:  return "UpgradeDoneResp";
+        case CoherenceMessageType::ClearReq:         return "ClearReq";
+        case CoherenceMessageType::ClearResp:        return "ClearResp";
+        case CoherenceMessageType::UpgradeAckNotify: return "UpgradeAckNotify";
+        case CoherenceMessageType::QueryLineMetaReq:  return "QueryLineMetaReq";
+        case CoherenceMessageType::QueryLineMetaResp: return "QueryLineMetaResp";
+        case CoherenceMessageType::HomeWritebackNotify: return "HomeWritebackNotify";
         default:                           return "Unknown";
     }
 }
 
 inline std::string
-ubMsgToString(const UBMsg &msg)
+ubMsgToString(const CoherenceMessage &msg)
 {
     char buf[512];
     snprintf(buf, sizeof(buf),
-             "UBMsg{%s src=(%u,%u) dst=(%u,%u) home=(%u,%u) ingress=%u "
+             "CoherenceMessage{src=(%u,%u) dst=(%u,%u) home=(%u,%u) ingress=%u "
              "reqNode=%u tgt=%u "
              "flags=0x%x homePA=0x%lx localPA=0x%lx "
              "epoch=%lu reqId=%lu seq=%lu}",
-             ubMsgTypeName(msg.h.type),
+             coherenceMsgTypeName(msg.h.type),
              msg.h.srcNode, msg.h.srcSocket,
              msg.h.dstNode, msg.h.dstSocket,
              msg.h.homeNode, msg.h.homeSocket,

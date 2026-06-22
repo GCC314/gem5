@@ -6,7 +6,7 @@
 #include <functional>
 
 #include "base/types.hh"
-#include "mem/ruby/protocol/chi/ep/UBMsg.hh"
+#include "mem/ruby/protocol/chi/ep/CoherenceMessage.hh"
 
 namespace gem5
 {
@@ -16,7 +16,7 @@ namespace ruby
 /**
  * Per-(srcNode,dstNode) FIFO message queue with configurable latency.
  *
- * Every UBAdapter->UBRouter message passes through exactly one MsgQueue,
+ * Every UBAdapter->UBIOModule *message passes through exactly one MsgQueue,
  * even when srcNode == dstNode (local home).  This guarantees that all
  * UBCC access is queued and never 0-tick short-circuited.
  *
@@ -24,15 +24,15 @@ namespace ruby
  * processReady() drains everything without scheduling — callers are
  * still synchronous.  Latency scheduling will be enabled in later phases.
  */
-class UBMsgQueue
+class CoherenceMessageQueue
 {
   public:
     struct Entry {
-        UBMsg msg;
+        CoherenceMessage msg;
         Tick readyTick;
     };
 
-    UBMsgQueue()
+    CoherenceMessageQueue()
         : _latency(0), _seqCounter(0) {}
 
     /**
@@ -42,7 +42,7 @@ class UBMsgQueue
      * @param latency  Delivery delay (ticks); 0 = immediate
      * @returns        The enqueued entry's sequence number
      */
-    uint64_t enqueue(const UBMsg &msg, Tick now, Tick latency);
+    uint64_t enqueue(const CoherenceMessage &msg, Tick now, Tick latency);
 
     /** Return true if at least one entry's readyTick <= now. */
     bool hasReady(Tick now) const;
@@ -51,7 +51,7 @@ class UBMsgQueue
      * Pop and return the ready message with the smallest
      * (readyTick, seqNum) tuple.
      */
-    UBMsg popReady(Tick now);
+    CoherenceMessage popReady(Tick now);
 
     /** Number of entries currently in the queue. */
     size_t size() const { return _fifo.size(); }
@@ -65,7 +65,7 @@ class UBMsgQueue
      * Calls handler for each ready message in FIFO order.
      * Used in Phase 2 for synchronous callers.
      */
-    void processAll(Tick now, std::function<void(const UBMsg&)> handler);
+    void processAll(Tick now, std::function<void(const CoherenceMessage &)> handler);
 
   private:
     std::deque<Entry> _fifo;
@@ -76,7 +76,7 @@ class UBMsgQueue
 // ---- Inline method definitions ----
 
 inline uint64_t
-UBMsgQueue::enqueue(const UBMsg &msg, Tick now, Tick latency)
+CoherenceMessageQueue::enqueue(const CoherenceMessage &msg, Tick now, Tick latency)
 {
     Entry entry;
     entry.msg = msg;
@@ -86,7 +86,7 @@ UBMsgQueue::enqueue(const UBMsg &msg, Tick now, Tick latency)
 }
 
 inline bool
-UBMsgQueue::hasReady(Tick now) const
+CoherenceMessageQueue::hasReady(Tick now) const
 {
     for (auto &e : _fifo) {
         if (e.readyTick <= now)
@@ -95,25 +95,25 @@ UBMsgQueue::hasReady(Tick now) const
     return false;
 }
 
-inline UBMsg
-UBMsgQueue::popReady(Tick now)
+inline CoherenceMessage
+CoherenceMessageQueue::popReady(Tick now)
 {
     // FIFO order — pop first ready entry from front
     for (size_t i = 0; i < _fifo.size(); ++i) {
         if (_fifo[i].readyTick <= now) {
-            UBMsg result = _fifo[i].msg;
+            CoherenceMessage result = _fifo[i].msg;
             _fifo.erase(_fifo.begin() + i);
             return result;
         }
     }
-    return UBMsg(); // should not reach here if hasReady() checked first
+    return CoherenceMessage(); // should not reach here if hasReady() checked first
 }
 
 inline void
-UBMsgQueue::processAll(Tick now, std::function<void(const UBMsg&)> handler)
+CoherenceMessageQueue::processAll(Tick now, std::function<void(const CoherenceMessage &)> handler)
 {
     while (hasReady(now)) {
-        UBMsg msg = popReady(now);
+        CoherenceMessage msg = popReady(now);
         handler(msg);
     }
 }

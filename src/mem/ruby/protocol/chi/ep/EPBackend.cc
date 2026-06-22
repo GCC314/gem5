@@ -299,7 +299,7 @@ EPBackend::init()
         _metaRnf = MetaRNFController::getInstance(_nodeId, 0);
     }
 
-    // v4-dual-socket: Wire UBCC to UBRouter via each socket's adapter.
+    // v4-dual-socket: Wire UBCC to UBIOModule *via each socket's adapter.
     // For single-socket (legacy), only index 0 is used.
     for (int s = 0; s < _numSockets; s++) {
         UBAdapter *adapter = getUBAdapter(s);
@@ -1956,7 +1956,7 @@ EPBackend::sendHomeWritebackNotify(uint64_t homePa, int homeSocket)
 // ---- v4-dual-socket: handleQueryLineMetaResp ----
 
 void
-EPBackend::handleQueryLineMetaResp(const UBMsg &msg)
+EPBackend::handleQueryLineMetaResp(const CoherenceMessage &msg)
 {
     // Called when UBAdapter receives a QueryLineMetaResp from the router.
     // The response is already stored in _lastResponse by UBAdapter::recvFromRouter.

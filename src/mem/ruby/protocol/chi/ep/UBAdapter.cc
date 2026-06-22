@@ -5,7 +5,7 @@
 #include "base/logging.hh"
 #include "debug/RubyEP.hh"
 #include "mem/ruby/protocol/chi/ep/EPBackend.hh"
-#include "mem/ruby/protocol/chi/ep/UBRouter.hh"
+#include "mem/ruby/protocol/chi/ep/UBIOModule.hh"
 #include "mem/ruby/protocol/chi/ep/UBCCController.hh"
 #include "sim/cur_tick.hh"
 
@@ -84,8 +84,8 @@ UBAdapter::sendReadReq(
     }
 
     // Build ReadReq UBMsg
-    UBMsg req;
-    req.h.type = UBMsgType::ReadReq;
+    CoherenceMessage req;
+    req.h.type = CoherenceMessageType::ReadReq;
     req.h.srcNode = _nodeId;
     req.h.srcSocket = _socketId;
     req.h.dstNode = homeNode;
@@ -95,7 +95,7 @@ UBAdapter::sendReadReq(
     req.h.ingressSocket = ingressSocket;
     req.h.requesterNode = requesterNode;
     req.h.targetNode = homeNode;
-    req.h.flags = writeIntent ? static_cast<uint32_t>(UB_FLAG_WRITE_INTENT) : 0;
+    req.h.flags = writeIntent ? static_cast<uint32_t>(CFLAG_WRITE_INTENT) : 0;
     req.h.homeLinePa = homePa;
     req.h.localLinePa = 0;
     req.h.epoch = epoch;
@@ -121,10 +121,10 @@ UBAdapter::sendReadReq(
         return -1;
     }
 
-    const UBMsg &resp = _lastResponse;
-    if (resp.h.type != UBMsgType::ReadResp) {
+    const CoherenceMessage &resp = _lastResponse;
+    if (resp.h.type != CoherenceMessageType::ReadResp) {
         warn("UBAdapter node=%d: sendReadReq: unexpected response type %s "
-             "PA=0x%lx\n", _nodeId, ubMsgTypeName(resp.h.type), homePa);
+             "PA=0x%lx\n", _nodeId, coherenceMsgTypeName(resp.h.type), homePa);
         return -1;
     }
 
@@ -152,10 +152,10 @@ UBAdapter::sendReadReq(
         *outCommittedEpoch = resp.b.readResp.committedEpoch;
     if (outGrantDataValid) {
         *outGrantDataValid =
-            (resp.h.flags & static_cast<uint32_t>(UB_FLAG_HAS_DATA)) != 0;
+            (resp.h.flags & static_cast<uint32_t>(CFLAG_HAS_DATA)) != 0;
     }
     if (outGrantData &&
-        (resp.h.flags & static_cast<uint32_t>(UB_FLAG_HAS_DATA)) != 0) {
+        (resp.h.flags & static_cast<uint32_t>(CFLAG_HAS_DATA)) != 0) {
         outGrantData->setData(resp.b.readResp.grantData, 0, 64);
     }
 
@@ -187,8 +187,8 @@ UBAdapter::sendWritebackReq(uint64_t homePa, int requesterNode,
               _nodeId, _socketId);
     }
 
-    UBMsg req;
-    req.h.type = UBMsgType::WritebackReq;
+    CoherenceMessage req;
+    req.h.type = CoherenceMessageType::WritebackReq;
     req.h.srcNode = _nodeId;
     req.h.srcSocket = _socketId;
     req.h.dstNode = homeNode;
@@ -203,7 +203,7 @@ UBAdapter::sendWritebackReq(uint64_t homePa, int requesterNode,
     req.h.enqueueTick = curTick();
     req.h.readyTick = curTick();
     if (keepAsClean)
-        req.h.flags |= static_cast<uint32_t>(UB_FLAG_KEEP_AS_CLEAN);
+        req.h.flags |= static_cast<uint32_t>(CFLAG_KEEP_AS_CLEAN);
 
     _lastResponseValid = false;
     _router->sendMessage(req);
@@ -214,10 +214,10 @@ UBAdapter::sendWritebackReq(uint64_t homePa, int requesterNode,
         return false;
     }
 
-    const UBMsg &resp = _lastResponse;
-    if (resp.h.type != UBMsgType::WritebackResp) {
+    const CoherenceMessage &resp = _lastResponse;
+    if (resp.h.type != CoherenceMessageType::WritebackResp) {
         warn("UBAdapter node=%d: sendWritebackReq: unexpected response type %s\n",
-             _nodeId, ubMsgTypeName(resp.h.type));
+             _nodeId, coherenceMsgTypeName(resp.h.type));
         return false;
     }
 
@@ -241,8 +241,8 @@ UBAdapter::sendEvictReq(uint64_t homePa, int evictingNode, uint64_t epochVal,
               _nodeId, _socketId);
     }
 
-    UBMsg req;
-    req.h.type = UBMsgType::EvictReq;
+    CoherenceMessage req;
+    req.h.type = CoherenceMessageType::EvictReq;
     req.h.srcNode = _nodeId;
     req.h.srcSocket = _socketId;
     req.h.dstNode = homeNode;
@@ -266,10 +266,10 @@ UBAdapter::sendEvictReq(uint64_t homePa, int evictingNode, uint64_t epochVal,
         return false;
     }
 
-    const UBMsg &resp = _lastResponse;
-    if (resp.h.type != UBMsgType::EvictResp) {
+    const CoherenceMessage &resp = _lastResponse;
+    if (resp.h.type != CoherenceMessageType::EvictResp) {
         warn("UBAdapter node=%d: sendEvictReq: unexpected response type %s\n",
-             _nodeId, ubMsgTypeName(resp.h.type));
+             _nodeId, coherenceMsgTypeName(resp.h.type));
         return false;
     }
 
@@ -297,8 +297,8 @@ UBAdapter::sendUpgradeReq(uint64_t homePa, int requesterNode,
               _nodeId, _socketId);
     }
 
-    UBMsg req;
-    req.h.type = UBMsgType::UpgradeReq;
+    CoherenceMessage req;
+    req.h.type = CoherenceMessageType::UpgradeReq;
     req.h.srcNode = _nodeId;
     req.h.srcSocket = _socketId;
     req.h.dstNode = homeNode;
@@ -326,14 +326,14 @@ UBAdapter::sendUpgradeReq(uint64_t homePa, int requesterNode,
         return false;
     }
 
-    const UBMsg &resp = _lastResponse;
-    if (resp.h.type != UBMsgType::UpgradeResp) {
+    const CoherenceMessage &resp = _lastResponse;
+    if (resp.h.type != CoherenceMessageType::UpgradeResp) {
         warn("UBAdapter node=%d: sendUpgradeReq: unexpected response type %s\n",
-             _nodeId, ubMsgTypeName(resp.h.type));
+             _nodeId, coherenceMsgTypeName(resp.h.type));
         return false;
     }
 
-    bool accepted = (resp.h.flags & static_cast<uint32_t>(UB_FLAG_ACCEPTED)) != 0;
+    bool accepted = (resp.h.flags & static_cast<uint32_t>(CFLAG_ACCEPTED)) != 0;
     if (outUpgradeTargetMask)
         *outUpgradeTargetMask = resp.b.upgradeResp.upgradeTargetMask;
     if (outCommittedEpoch)
@@ -364,8 +364,8 @@ UBAdapter::sendUpgradeDoneReq(uint64_t homePa, int requesterNode,
               _nodeId, _socketId);
     }
 
-    UBMsg req;
-    req.h.type = UBMsgType::UpgradeDoneReq;
+    CoherenceMessage req;
+    req.h.type = CoherenceMessageType::UpgradeDoneReq;
     req.h.srcNode = _nodeId;
     req.h.srcSocket = _socketId;
     req.h.dstNode = homeNode;
@@ -390,10 +390,10 @@ UBAdapter::sendUpgradeDoneReq(uint64_t homePa, int requesterNode,
         return false;
     }
 
-    const UBMsg &resp = _lastResponse;
-    if (resp.h.type != UBMsgType::UpgradeDoneResp) {
+    const CoherenceMessage &resp = _lastResponse;
+    if (resp.h.type != CoherenceMessageType::UpgradeDoneResp) {
         warn("UBAdapter node=%d: sendUpgradeDoneReq: unexpected response type %s\n",
-             _nodeId, ubMsgTypeName(resp.h.type));
+             _nodeId, coherenceMsgTypeName(resp.h.type));
         return false;
     }
 
@@ -418,8 +418,8 @@ UBAdapter::sendClearReq(uint64_t linePa, int srcNode,
               _nodeId, _socketId);
     }
 
-    UBMsg req;
-    req.h.type = UBMsgType::ClearReq;
+    CoherenceMessage req;
+    req.h.type = CoherenceMessageType::ClearReq;
     req.h.srcNode = _nodeId;
     req.h.srcSocket = _socketId;
     req.h.dstNode = homeNode;
@@ -446,10 +446,10 @@ UBAdapter::sendClearReq(uint64_t linePa, int srcNode,
         return false;
     }
 
-    const UBMsg &resp = _lastResponse;
-    if (resp.h.type != UBMsgType::ClearResp) {
+    const CoherenceMessage &resp = _lastResponse;
+    if (resp.h.type != CoherenceMessageType::ClearResp) {
         warn("UBAdapter node=%d: sendClearReq: unexpected response type %s\n",
-             _nodeId, ubMsgTypeName(resp.h.type));
+             _nodeId, coherenceMsgTypeName(resp.h.type));
         return false;
     }
 
@@ -476,8 +476,8 @@ UBAdapter::sendRecallResp(uint64_t linePa, int ownerNode,
               _nodeId, _socketId);
     }
 
-    UBMsg req;
-    req.h.type = UBMsgType::RecallResp;
+    CoherenceMessage req;
+    req.h.type = CoherenceMessageType::RecallResp;
     req.h.srcNode = _nodeId;
     req.h.srcSocket = _socketId;
     req.h.dstNode = homeNode;
@@ -494,9 +494,9 @@ UBAdapter::sendRecallResp(uint64_t linePa, int ownerNode,
     req.h.readyTick = curTick();
 
     if (dataReturned)
-        req.h.flags |= static_cast<uint32_t>(UB_FLAG_DATA_RETURNED);
+        req.h.flags |= static_cast<uint32_t>(CFLAG_DATA_RETURNED);
     if (dataBlk && dataReturned) {
-        req.h.flags |= static_cast<uint32_t>(UB_FLAG_HAS_DATA);
+        req.h.flags |= static_cast<uint32_t>(CFLAG_HAS_DATA);
         memcpy(req.b.recallResp.data, dataBlk->getData(0, 64), 64);
     }
 
@@ -523,8 +523,8 @@ UBAdapter::sendInvalidateAck(uint64_t linePa, int ackNode,
               _nodeId, _socketId);
     }
 
-    UBMsg req;
-    req.h.type = UBMsgType::InvalidateAck;
+    CoherenceMessage req;
+    req.h.type = CoherenceMessageType::InvalidateAck;
     req.h.srcNode = _nodeId;
     req.h.srcSocket = _socketId;
     req.h.dstNode = homeNode;
@@ -561,8 +561,8 @@ UBAdapter::sendRecallReqToOwner(int targetNode,
               _nodeId, _socketId);
     }
 
-    UBMsg req;
-    req.h.type = UBMsgType::RecallReq;
+    CoherenceMessage req;
+    req.h.type = CoherenceMessageType::RecallReq;
     req.h.srcNode = _nodeId;
     req.h.srcSocket = homeSocket;  // home's socket plane for sharer routing
     req.h.dstNode = targetNode;
@@ -581,9 +581,9 @@ UBAdapter::sendRecallReqToOwner(int targetNode,
     req.h.readyTick = curTick();
 
     if (recallMsg.isReadRequest)
-        req.h.flags |= static_cast<uint32_t>(UB_FLAG_IS_READ_RECALL);
+        req.h.flags |= static_cast<uint32_t>(CFLAG_IS_READ_RECALL);
     if (recallMsg.dataNeeded)
-        req.h.flags |= static_cast<uint32_t>(UB_FLAG_HAS_DATA);
+        req.h.flags |= static_cast<uint32_t>(CFLAG_HAS_DATA);
 
     // Fire-and-forget: no response expected from the remote adapter
     _router->sendMessage(req);
@@ -605,8 +605,8 @@ UBAdapter::sendInvalidateReqToSharer(int targetNode,
               _nodeId, _socketId);
     }
 
-    UBMsg req;
-    req.h.type = UBMsgType::InvalidateReq;
+    CoherenceMessage req;
+    req.h.type = CoherenceMessageType::InvalidateReq;
     req.h.srcNode = _nodeId;
     req.h.srcSocket = homeSocket;  // home's socket plane
     req.h.dstNode = targetNode;
@@ -645,8 +645,8 @@ UBAdapter::sendQueryLineMetaReq(uint64_t homePa, int homeNode, int homeSocket,
               _nodeId, _socketId);
     }
 
-    UBMsg req;
-    req.h.type = UBMsgType::QueryLineMetaReq;
+    CoherenceMessage req;
+    req.h.type = CoherenceMessageType::QueryLineMetaReq;
     req.h.srcNode = _nodeId;
     req.h.srcSocket = _socketId;
     req.h.dstNode = homeNode;
@@ -668,10 +668,10 @@ UBAdapter::sendQueryLineMetaReq(uint64_t homePa, int homeNode, int homeSocket,
         return -1;
     }
 
-    const UBMsg &resp = _lastResponse;
-    if (resp.h.type != UBMsgType::QueryLineMetaResp) {
+    const CoherenceMessage &resp = _lastResponse;
+    if (resp.h.type != CoherenceMessageType::QueryLineMetaResp) {
         warn("UBAdapter node=%d socket=%d: sendQueryLineMetaReq: unexpected response type %s\n",
-             _nodeId, _socketId, ubMsgTypeName(resp.h.type));
+             _nodeId, _socketId, coherenceMsgTypeName(resp.h.type));
         return -1;
     }
 
@@ -697,8 +697,8 @@ UBAdapter::sendHomeWritebackNotify(uint64_t homePa, uint64_t epoch,
               _nodeId, _socketId);
     }
 
-    UBMsg req;
-    req.h.type = UBMsgType::HomeWritebackNotify;
+    CoherenceMessage req;
+    req.h.type = CoherenceMessageType::HomeWritebackNotify;
     req.h.srcNode = _nodeId;
     req.h.srcSocket = _socketId;
     req.h.dstNode = homeNode;
@@ -719,15 +719,15 @@ UBAdapter::sendHomeWritebackNotify(uint64_t homePa, uint64_t epoch,
 // ---- Receive message from router ----
 
 void
-UBAdapter::recvFromRouter(const UBMsg &msg)
+UBAdapter::recvFromRouter(const CoherenceMessage &msg)
 {
     DPRINTF(RubyEP,
             "UBAdapter node=%d: recvFromRouter type=%s src=%d dst=%d\n",
-            _nodeId, ubMsgTypeName(msg.h.type),
+            _nodeId, coherenceMsgTypeName(msg.h.type),
             msg.h.srcNode, msg.h.dstNode);
 
     switch (msg.h.type) {
-        case UBMsgType::ReadResp:
+        case CoherenceMessageType::ReadResp:
             printf("[ADAPTER-GOT-RESP] node=%d type=ReadResp pa=0x%lx src=%d "
                    "grant=%d epoch=%lu reqId=%lu\n",
                    _nodeId, msg.h.homeLinePa, msg.h.srcNode,
@@ -736,18 +736,18 @@ UBAdapter::recvFromRouter(const UBMsg &msg)
             _lastResponse = msg;
             _lastResponseValid = true;
             break;
-        case UBMsgType::WritebackResp:
-        case UBMsgType::EvictResp:
-        case UBMsgType::UpgradeResp:
-        case UBMsgType::UpgradeDoneResp:
-        case UBMsgType::ClearResp:
-        case UBMsgType::QueryLineMetaResp:
+        case CoherenceMessageType::WritebackResp:
+        case CoherenceMessageType::EvictResp:
+        case CoherenceMessageType::UpgradeResp:
+        case CoherenceMessageType::UpgradeDoneResp:
+        case CoherenceMessageType::ClearResp:
+        case CoherenceMessageType::QueryLineMetaResp:
             // Synchronous response — store for caller
             _lastResponse = msg;
             _lastResponseValid = true;
             break;
 
-        case UBMsgType::UpgradeAckNotify: {
+        case CoherenceMessageType::UpgradeAckNotify: {
             // Async notification from UBCC: all invalidation acks received
             // for an upgrade. Forward to EPBackend::notifyUpgradeAckReady().
             if (_backend) {
@@ -759,8 +759,8 @@ UBAdapter::recvFromRouter(const UBMsg &msg)
             break;
         }
 
-        case UBMsgType::RecallReq: {
-            // Reconstruct OuterRecallMsg from UBMsg and deliver to EPBackend
+        case CoherenceMessageType::RecallReq: {
+            // Reconstruct OuterRecallMsg from CoherenceMessage and deliver to EPBackend
             OuterRecallMsg recallMsg;
             recallMsg.linePa = msg.h.homeLinePa;
             recallMsg.ownerLocalPa = msg.h.localLinePa;
@@ -769,9 +769,9 @@ UBAdapter::recvFromRouter(const UBMsg &msg)
             recallMsg.epoch = msg.h.epoch;
             recallMsg.reqId = msg.h.reqId;
             recallMsg.isReadRequest =
-                (msg.h.flags & static_cast<uint32_t>(UB_FLAG_IS_READ_RECALL)) != 0;
+                (msg.h.flags & static_cast<uint32_t>(CFLAG_IS_READ_RECALL)) != 0;
             recallMsg.dataNeeded =
-                (msg.h.flags & static_cast<uint32_t>(UB_FLAG_HAS_DATA)) != 0;
+                (msg.h.flags & static_cast<uint32_t>(CFLAG_HAS_DATA)) != 0;
 
             if (_backend) {
                 _backend->handleRecallRequest(recallMsg);
@@ -782,8 +782,8 @@ UBAdapter::recvFromRouter(const UBMsg &msg)
             break;
         }
 
-        case UBMsgType::InvalidateReq: {
-            // Reconstruct OuterInvalidateMsg from UBMsg and deliver to EPBackend
+        case CoherenceMessageType::InvalidateReq: {
+            // Reconstruct OuterInvalidateMsg from CoherenceMessage and deliver to EPBackend
             OuterInvalidateMsg invMsg;
             invMsg.linePa = msg.h.homeLinePa;
             invMsg.sharerLocalPa = msg.h.localLinePa;
@@ -803,7 +803,7 @@ UBAdapter::recvFromRouter(const UBMsg &msg)
 
         default:
             warn("UBAdapter node=%d: unhandled message type %s\n",
-                 _nodeId, ubMsgTypeName(msg.h.type));
+                 _nodeId, coherenceMsgTypeName(msg.h.type));
             break;
     }
 }
