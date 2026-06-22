@@ -18,6 +18,10 @@ namespace
 constexpr uint64_t kMask2 = (1ULL << 2) - 1;
 constexpr uint64_t kMask16 = (1ULL << 16) - 1;
 constexpr uint64_t kMask24 = (1ULL << 24) - 1;
+constexpr uint64_t kMask37 = (1ULL << 37) - 1;
+// epoch24 → epoch37: packed56 has 56-19=37 bits available for epoch.
+// Previously limited to 24 bits; expanded to full 37-bit range.
+// This matches _epochBits default (64) better and eliminates wrap at 2^24.
 constexpr uint64_t kMask56 = (1ULL << 56) - 1;
 constexpr uint8_t kCtrlFillPending = 1u << 0;
 constexpr uint8_t kCtrlWbPending = 1u << 1;
@@ -219,7 +223,7 @@ ResidentDir::encodeEntry(uint64_t pa, const UBCCDirEntry& in, uint64_t& out56) c
     const uint64_t mesi = static_cast<uint64_t>(in.state) & kMask2;
     const uint64_t dirty = in.residentDirty ? 1ULL : 0ULL;
     const uint64_t sharers = in.sharersMask & kMask16;
-    const uint64_t epoch = in.epoch & kMask24;
+    const uint64_t epoch = in.epoch & kMask37;
 
     // [1:0] MESI, [2] residentDirty, [18:3] sharers16, [42:19] epoch24.
     out56 = (mesi)
@@ -237,7 +241,7 @@ ResidentDir::decodeEntry(uint64_t pa, uint64_t packed56, UBCCDirEntry& out) cons
     out.state = static_cast<UBCCMESIState>(packed56 & kMask2);
     out.residentDirty = ((packed56 >> 2) & 0x1) != 0;
     out.sharersMask = (packed56 >> 3) & kMask16;
-    out.epoch = (packed56 >> 19) & kMask24;
+    out.epoch = (packed56 >> 19) & kMask37;
 }
 
 bool

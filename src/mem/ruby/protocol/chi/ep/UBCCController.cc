@@ -722,6 +722,7 @@ UBCCController::processOuterRequest(
             if (rit != _outstandingReqs.end() &&
                 rit->second.opType == OpType::RECALL &&
                 rit->second.requesterNode == requesterNode &&
+                rit->second.reqId == reqId &&
                 rit->second.stage == OpStage::DONE) {
                 recallAlreadyDone = true;
 
