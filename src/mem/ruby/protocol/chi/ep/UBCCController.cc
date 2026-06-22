@@ -118,6 +118,8 @@ UBCCController::wakeup()
 {
     // v4: Clean up expired tombstones on each wakeup
     cleanupTombstones();
+    // v4: Clean up expired RECALL orphans on each wakeup
+    cleanupExpiredRecalls();
 }
 
 // ---- isDsmAddr (pure computation, no SentinelHelper) ----
@@ -423,6 +425,11 @@ UBCCController::processOuterRequest(
     if (r != ResidentAccessResult::Ready) {
         return static_cast<UBCC_OuterGrantType>(-1);
     }
+
+    // v4: Lazy cleanup — if there's an expired RECALL, remove it before
+    // checking for existing outstanding so that the new request can proceed
+    // on the current committed DirEntry.
+    cleanupExpiredRecallIfNeeded(line_pa, false);
 
     // v4: Check for existing outstanding — if active and belongs to a different
     // requester, try to enqueue (§4.2, recall_done_fix.md).
@@ -2326,6 +2333,52 @@ UBCCController::cleanupTombstones()
             ++it;
         }
     }
+}
+
+// ---- Recall orphan cleanup (v4) ----
+
+bool
+UBCCController::isExpiredRecall(const OutstandingRequest &ost) const
+{
+    if (ost.opType != OpType::RECALL)
+        return false;
+    if (ost.stage != OpStage::WAITING_TARGET_RESP &&
+        ost.stage != OpStage::DONE)
+        return false;
+    return curTick() > ost.createTick + _recallTimeout;
+}
+
+bool
+UBCCController::cleanupExpiredRecallIfNeeded(uint64_t linePa,
+                                             bool replayWaiters)
+{
+    OutstandingRequest *ost = findOutstanding(linePa);
+    if (!ost || !isExpiredRecall(*ost))
+        return false;
+
+    DPRINTF(RubyEP,
+            "UBCC node_id=%d: expired RECALL cleanup PA=0x%lx stage=%d "
+            "age=%lu replayWaiters=%d\n",
+            _nodeId, linePa, static_cast<int>(ost->stage),
+            curTick() - ost->createTick, replayWaiters ? 1 : 0);
+
+    removeOutstanding(linePa);
+
+    if (replayWaiters)
+        replayPendingRequesters(linePa);
+    return true;
+}
+
+void
+UBCCController::cleanupExpiredRecalls()
+{
+    std::vector<uint64_t> expired;
+    for (const auto &kv : _outstandingReqs) {
+        if (isExpiredRecall(kv.second))
+            expired.push_back(kv.first);
+    }
+    for (uint64_t linePa : expired)
+        cleanupExpiredRecallIfNeeded(linePa, true);
 }
 
 bool

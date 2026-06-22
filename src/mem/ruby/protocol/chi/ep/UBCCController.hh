@@ -613,6 +613,9 @@ class UBCCController
     // ---- v4: Tombstone window (configurable, default 100000 ticks) ----
     Tick _tombstoneWindowW = 100000;
 
+    // ---- v4: Recall orphan timeout (configurable) ----
+    Tick _recallTimeout = 1000000;
+
     // Configurable epoch width for wrap-around experiments.
     uint32_t _epochBits = 64;
 
@@ -715,6 +718,13 @@ class UBCCController
      * Remove expired tombstones.
      */
     void cleanupTombstones();
+
+    /**
+     * Recall orphan cleanup — expire stale RECALL entries.
+     */
+    bool isExpiredRecall(const OutstandingRequest &ost) const;
+    bool cleanupExpiredRecallIfNeeded(uint64_t linePa, bool replayWaiters);
+    void cleanupExpiredRecalls();
 
     /**
      * Replay queued pending requesters after a Clear commit.
