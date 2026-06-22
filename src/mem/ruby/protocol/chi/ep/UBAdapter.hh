@@ -11,6 +11,8 @@
 #include "params/UBAdapter.hh"
 #include "sim/sim_object.hh"
 
+namespace pseudo { class PseudoMemPort; class PseudoManager; }
+
 namespace gem5
 {
 namespace ruby
@@ -50,6 +52,10 @@ class UBAdapter : public SimObject
 
     /** Bind the local UBIOModule *for message dispatch. */
     void setRouter(UBIOModule *router) { _router = router; }
+
+    /** Set PseudoMemPort for async message transport (multi-process path). */
+    void setPseudoPort(pseudo::PseudoMemPort *port) { _pseudoPort = port; }
+    pseudo::PseudoMemPort* pseudoPort() const { return _pseudoPort; }
 
     /**
      * Wire the local UBCC to the router.
@@ -150,6 +156,7 @@ class UBAdapter : public SimObject
     int _socketId;
     EPBackend *_backend = nullptr;
     UBIOModule *_router = nullptr;
+    pseudo::PseudoMemPort *_pseudoPort = nullptr;
     NodeAddressMap _addrMap;
     uint64_t _nextSeq = 1;
 
