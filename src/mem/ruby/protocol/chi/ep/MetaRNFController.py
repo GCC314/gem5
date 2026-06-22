@@ -12,3 +12,4 @@ class MetaRNFController(EPController):
         AddrRange(0, size="16MB"),
         "private metadata DRAM range"
     )
+    flight_slots = Param.Int(8, "Maximum concurrent metadata page requests")

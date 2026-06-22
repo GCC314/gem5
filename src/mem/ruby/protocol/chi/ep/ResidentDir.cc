@@ -1,6 +1,7 @@
 #include "mem/ruby/protocol/chi/ep/ResidentDir.hh"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
 
 #include "base/logging.hh"
@@ -52,11 +53,12 @@ UBCCDirEntry::canonicalOneHotRequired(const UBCCDirEntry &e)
 
 ResidentDir::ResidentDir(size_t bf_bytes, size_t force_entries)
     : _buf{0}, _capacity(0), _count(0), _bfOffset(0),
-      _bloomBytes(0), _bloomCounterCount(0), _lruTick(0)
+      _bloomBytes(0), _bloomBitCount(0), _lruTick(0)
 {
-    const size_t capped_bf = std::min(bf_bytes, SramBytes);
+    const size_t capped_bf = std::min(bf_bytes, SramBytes - DefaultIndexBytes);
     _bloomBytes = capped_bf;
-    _bfOffset = SramBytes - _bloomBytes;
+    const size_t totalOverhead = _bloomBytes + DefaultIndexBytes;
+    _bfOffset = SramBytes - totalOverhead;
     _capacity = _bfOffset / EntryBytes;
 
     if (force_entries > 0 && force_entries < _capacity) {
@@ -68,8 +70,12 @@ ResidentDir::ResidentDir(size_t bf_bytes, size_t force_entries)
     _dist.assign(_capacity, 0);
     _ctrl.assign(_capacity, 0);
 
-    _bloomCounterCount = _bloomBytes * 2; // 4-bit counters
-    _bloomCounters.assign(_bloomCounterCount, 0);
+    _bloomBitCount = _bloomBytes * 8;
+    _bloomBits.assign(_bloomBytes, 0);
+
+    for (int g = 0; g < BloomGroups; ++g)
+        _groupIndex[g] = GroupIndex();
+
     clear();
 }
 
@@ -115,36 +121,76 @@ ResidentDir::splitmix64(uint64_t x)
     return x ^ (x >> 31);
 }
 
+int
+ResidentDir::bloomGroup(uint64_t pa) const
+{
+    return static_cast<int>(splitmix64(pa >> 6) % BloomGroups);
+}
+
+int
+ResidentDir::groupForPa(uint64_t pa) const
+{
+    return bloomGroup(pa);
+}
+
 size_t
-ResidentDir::bloomCounterIndex(uint64_t pa, int hash_idx) const
+ResidentDir::bloomByteOffset(uint64_t pa, int hash_idx, int group) const
 {
     static constexpr uint64_t seeds[BloomHashes] = {
         0x243f6a8885a308d3ULL,
         0x13198a2e03707344ULL,
         0xa4093822299f31d0ULL,
+        0xc6e00bf33da88fc2ULL,
     };
-    if (_bloomCounterCount == 0) {
-        return 0;
-    }
-    return splitmix64(pa ^ seeds[hash_idx % BloomHashes]) % _bloomCounterCount;
+
+    size_t groupBytes = bloomGroupBytes();
+    if (groupBytes == 0) return 0;
+
+    uint64_t h = splitmix64(pa ^ seeds[hash_idx % BloomHashes]);
+    size_t off = (h % (groupBytes * 8)) / 8;
+    return static_cast<size_t>(group * groupBytes) + off;
 }
 
-uint8_t
-ResidentDir::bloomCounterRead(size_t idx) const
+size_t
+ResidentDir::bloomBitIndex(size_t byteOff, int bitSub) const
 {
-    if (idx >= _bloomCounters.size()) {
-        return 0;
-    }
-    return _bloomCounters[idx] & 0xf;
+    return byteOff * 8 + static_cast<size_t>(bitSub % 8);
+}
+
+bool
+ResidentDir::bloomBitTest(uint64_t pa, int hash_idx) const
+{
+    if (_bloomBitCount == 0) return false;
+
+    int group = bloomGroup(pa);
+    size_t byteOff = bloomByteOffset(pa, hash_idx, group);
+    if (byteOff >= _bloomBits.size()) return false;
+
+    uint64_t h = splitmix64(pa ^ static_cast<uint64_t>(hash_idx * 0x9e3779b9ULL));
+    int bitSub = static_cast<int>(h % 8);
+
+    size_t bitIdx = bloomBitIndex(byteOff, bitSub);
+    if (bitIdx >= _bloomBitCount) return false;
+
+    return (_bloomBits[bitIdx / 8] >> (bitIdx % 8)) & 1u;
 }
 
 void
-ResidentDir::bloomCounterWrite(size_t idx, uint8_t v)
+ResidentDir::bloomBitSet(uint64_t pa, int hash_idx)
 {
-    if (idx >= _bloomCounters.size()) {
-        return;
-    }
-    _bloomCounters[idx] = (v & 0xf);
+    if (_bloomBitCount == 0) return;
+
+    int group = bloomGroup(pa);
+    size_t byteOff = bloomByteOffset(pa, hash_idx, group);
+    if (byteOff >= _bloomBits.size()) return;
+
+    uint64_t h = splitmix64(pa ^ static_cast<uint64_t>(hash_idx * 0x9e3779b9ULL));
+    int bitSub = static_cast<int>(h % 8);
+
+    size_t bitIdx = bloomBitIndex(byteOff, bitSub);
+    if (bitIdx >= _bloomBitCount) return;
+
+    _bloomBits[bitIdx / 8] |= static_cast<uint8_t>(1u << (bitIdx % 8));
 }
 
 void
@@ -342,16 +388,17 @@ ResidentDir::forceRemove(uint64_t pa)
     return remove(pa);
 }
 
+// ---- Plain Bloom Filter (grouped) ----
+
 bool
 ResidentDir::bloomMayContain(uint64_t pa) const
 {
-    if (_bloomCounterCount == 0) {
+    if (_bloomBitCount == 0)
         return false;
-    }
+
     for (int i = 0; i < BloomHashes; ++i) {
-        if (bloomCounterRead(bloomCounterIndex(pa, i)) == 0) {
+        if (!bloomBitTest(pa, i))
             return false;
-        }
     }
     return true;
 }
@@ -359,38 +406,130 @@ ResidentDir::bloomMayContain(uint64_t pa) const
 void
 ResidentDir::bloomInsert(uint64_t pa)
 {
-    if (_bloomCounterCount == 0) {
+    if (_bloomBitCount == 0)
         return;
-    }
-    for (int i = 0; i < BloomHashes; ++i) {
-        size_t idx = bloomCounterIndex(pa, i);
-        uint8_t v = bloomCounterRead(idx);
-        if (v < 0xf) {
-            bloomCounterWrite(idx, v + 1);
-        }
-    }
+
+    int g = bloomGroup(pa);
+    for (int i = 0; i < BloomHashes; ++i)
+        bloomBitSet(pa, i);
+
+    _groupIndex[g].insert_count++;
 }
 
 void
 ResidentDir::bloomRemove(uint64_t pa)
 {
-    if (_bloomCounterCount == 0) {
-        return;
-    }
-    for (int i = 0; i < BloomHashes; ++i) {
-        size_t idx = bloomCounterIndex(pa, i);
-        uint8_t v = bloomCounterRead(idx);
-        if (v > 0) {
-            bloomCounterWrite(idx, v - 1);
-        }
-    }
+    int g = bloomGroup(pa);
+    _groupIndex[g].stale_delete_count++;
 }
 
 void
 ResidentDir::bloomClear()
 {
-    std::fill(_bloomCounters.begin(), _bloomCounters.end(), 0);
+    std::fill(_bloomBits.begin(), _bloomBits.end(), 0);
+    for (int g = 0; g < BloomGroups; ++g) {
+        _groupIndex[g] = GroupIndex();
+    }
 }
+
+// ---- Reconstruction ----
+
+bool
+ResidentDir::shouldReconstructGroup(int g) const
+{
+    if (g < 0 || g >= BloomGroups) return false;
+
+    const GroupIndex& gi = _groupIndex[g];
+
+    if (gi.insert_count > 0 && gi.insert_count % kReconstructPeriod == 0)
+        return true;
+
+    if (gi.live_count > 0 &&
+        static_cast<double>(gi.stale_delete_count) / gi.live_count > kReconstructStaleThreshold)
+        return true;
+
+    return false;
+}
+
+void
+ResidentDir::scanResidentForGroup(int g, std::vector<uint8_t>& shadowBF) const
+{
+    size_t groupBytes = bloomGroupBytes();
+    for (size_t i = 0; i < _capacity; ++i) {
+        if (!_used[i])
+            continue;
+
+        uint64_t pa = _keys[i];
+        if (bloomGroup(pa) != g)
+            continue;
+
+        uint64_t packed = loadPacked56(i);
+        UBCCMESIState st = static_cast<UBCCMESIState>(packed & kMask2);
+        bool dirty = ((packed >> 2) & 0x1) != 0;
+        if (st == UBCCMESIState::G_I && !dirty)
+            continue;
+
+        for (int h = 0; h < BloomHashes; ++h) {
+            size_t byteOff = bloomByteOffset(pa, h, g);
+            if (byteOff >= groupBytes) continue;
+
+            uint64_t hval = splitmix64(pa ^ static_cast<uint64_t>(h * 0x9e3779b9ULL));
+            int bitSub = static_cast<int>(hval % 8);
+            size_t bitIdx = bloomBitIndex(byteOff, bitSub);
+            if (bitIdx / 8 >= shadowBF.size()) continue;
+
+            shadowBF[bitIdx / 8] |= static_cast<uint8_t>(1u << (bitIdx % 8));
+        }
+    }
+}
+
+void
+ResidentDir::reconstructGroup(int g)
+{
+    if (g < 0 || g >= BloomGroups)
+        return;
+
+    size_t groupBytes = bloomGroupBytes();
+    if (groupBytes == 0) return;
+
+    std::vector<uint8_t> shadowBF(groupBytes, 0);
+
+    scanResidentForGroup(g, shadowBF);
+
+    size_t groupStart = static_cast<size_t>(g) * groupBytes;
+    std::memcpy(&_bloomBits[groupStart], shadowBF.data(), groupBytes);
+
+    _groupIndex[g].stale_delete_count = 0;
+}
+
+// ---- Diagnostics ----
+
+double
+ResidentDir::estimateFPR(int group) const
+{
+    size_t n = 0;
+    if (group < 0 || group >= BloomGroups) {
+        for (int g = 0; g < BloomGroups; ++g)
+            n += _groupIndex[g].live_count;
+    } else {
+        n = _groupIndex[group].live_count;
+    }
+
+    if (n == 0) return 0.0;
+
+    size_t m;
+    if (group < 0 || group >= BloomGroups) {
+        m = _bloomBitCount;
+    } else {
+        m = bloomGroupBytes() * 8;
+    }
+
+    int k = BloomHashes;
+    double nm = static_cast<double>(n) / static_cast<double>(m);
+    return std::pow(1.0 - std::exp(-static_cast<double>(k) * nm), static_cast<double>(k));
+}
+
+// ---- Control Flags (unchanged) ----
 
 uint8_t
 ResidentDir::control(size_t slot) const

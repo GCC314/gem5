@@ -14,6 +14,8 @@
 #include "mem/packet.hh"
 #include "mem/request.hh"
 #include "mem/simple_mem.hh"
+#include "mem/ruby/protocol/chi/ep/BackstoreSchemaA.hh"
+#include "mem/ruby/protocol/chi/ep/BackstoreSchemaC.hh"
 #include "mem/ruby/protocol/chi/ep/EPRNFController.hh"
 #include "mem/ruby/protocol/chi/ep/MetaRNFController.hh"
 #include "mem/ruby/protocol/chi/ep/UBCCController.hh"
@@ -105,6 +107,7 @@ EPBackend::EPBackend(const Params &p)
     _ruby_system(p.ruby_system),
     _metadataPrivateBase(p.metadata_private_base),
     _metadataPrivateSize(p.metadata_private_size),
+    _pageAllocCursor(p.metadata_private_base + (p.metadata_private_size / 2)),
     _lastGrantDataBlock(64),  // cache line size = 64 bytes
     _lastGrantDataValid(false),
     _lastSideband{false, 0, 0, false, -1, -1, -1},
@@ -129,6 +132,13 @@ EPBackend::EPBackend(const Params &p)
                                p.ubcc_bf_bytes,
                                p.ubcc_force_resident_entries);
     _ubcc->setBackend(this);
+
+    // v4: create backstore organization from config
+    if (p.ubcc_backstore_org == "schema_c") {
+        _org = new BackstoreSchemaC();
+    } else {
+        _org = new BackstoreSchemaA();
+    }
 
     // v4-dual-socket: Register legacy single adapter into slot 0 if provided.
     UBAdapter *legacyAdapter = p.ub_adapter;
@@ -178,6 +188,18 @@ EPBackend::metadataBackstorePa(uint64_t homePa) const
     const uint64_t slot_count = _metadataPrivateSize / 64;
     const uint64_t line_idx = (homePa >> 6) % slot_count;
     return _metadataPrivateBase + line_idx * 64;
+}
+
+uint64_t
+EPBackend::allocatePagePa()
+{
+    const uint64_t end = _metadataPrivateBase + _metadataPrivateSize;
+    if (_pageAllocCursor + BackstorePageSize > end)
+        return 0;
+
+    uint64_t pa = _pageAllocCursor;
+    _pageAllocCursor += BackstorePageSize;
+    return pa;
 }
 
 EPBackend::MetaLine
@@ -1019,15 +1041,20 @@ EPBackend::setMetaRnfController(MetaRNFController *ctrl)
 void
 EPBackend::issueBackstoreRead(uint64_t homePa)
 {
+    if (!_ubcc) return;
+
     appendTmpLog("ep_backstore.log", "[BACKSTORE] read pa=0x%lx\n", homePa);
-    if (!_ubcc) {
+
+    ResidentDir& dir = _ubcc->directory();
+
+    if (!dir.bloomMayContain(homePa)) {
+        UBCCController::BackstoreEntry empty{};
+        _ubcc->onBackstoreFillComplete(homePa, false, empty);
         return;
     }
+
     if (!_metaRnf) {
-        UBCCController::BackstoreEntry e;
-        bool found = _ubcc->lookupBackstore(homePa, e);
-        _ubcc->onBackstoreFillComplete(homePa, found, e);
-        return;
+        panic("MetaRNF required for backstore I/O; no software fallback");
     }
 
     const uint64_t metaPa = metadataBackstorePa(homePa);
@@ -1044,9 +1071,6 @@ EPBackend::issueBackstoreRead(uint64_t homePa)
                     e.epoch = decoded.epoch;
                 }
             }
-            if (!found) {
-                found = _ubcc->lookupBackstore(homePa, e);
-            }
             _ubcc->onBackstoreFillComplete(homePa, found, e);
         });
 }
@@ -1054,24 +1078,25 @@ EPBackend::issueBackstoreRead(uint64_t homePa)
 void
 EPBackend::issueBackstoreWrite(uint64_t homePa)
 {
+    if (!_ubcc) return;
+
     appendTmpLog("ep_backstore.log", "[BACKSTORE] write pa=0x%lx\n", homePa);
-    if (!_ubcc) {
-        return;
-    }
-    if (!_metaRnf) {
-        _ubcc->onBackstoreWriteAck(homePa);
-        return;
-    }
 
     UBCCController::BackstoreEntry e;
     if (!_ubcc->snapshotResidentForBackstore(homePa, e)) {
         _ubcc->onBackstoreWriteAck(homePa);
         return;
     }
+
+    if (!_metaRnf) {
+        panic("MetaRNF required for backstore I/O; no software fallback");
+    }
+
     const uint64_t metaPa = metadataBackstorePa(homePa);
     MetaLine line = encodeMetaLine(homePa, static_cast<int>(e.state),
-                                   e.sharersMask, e.epoch);
+                                    e.sharersMask, e.epoch);
     _metaRnf->issueWrite(metaPa, line, [this, homePa](bool) {
+        _ubcc->directory().bloomInsert(homePa);
         _ubcc->onBackstoreWriteAck(homePa);
     });
 }
@@ -1079,17 +1104,17 @@ EPBackend::issueBackstoreWrite(uint64_t homePa)
 void
 EPBackend::issueBackstoreDelete(uint64_t homePa)
 {
+    if (!_ubcc) return;
+
     appendTmpLog("ep_backstore.log", "[BACKSTORE] delete pa=0x%lx\n", homePa);
-    if (!_ubcc) {
-        return;
-    }
+
     if (!_metaRnf) {
-        _ubcc->onBackstoreDeleteAck(homePa, true);
-        return;
+        panic("MetaRNF required for backstore I/O; no software fallback");
     }
 
     const uint64_t metaPa = metadataBackstorePa(homePa);
     _metaRnf->issueDelete(metaPa, [this, homePa](bool existed) {
+        _ubcc->directory().bloomRemove(homePa);
         _ubcc->onBackstoreDeleteAck(homePa, existed);
     });
 }

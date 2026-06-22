@@ -168,6 +168,9 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
     ubcc_bf_bytes = int(os.environ.get("UBCC_BF_BYTES", "65536"))
     ubcc_force_resident_entries = int(
         os.environ.get("UBCC_FORCE_RESIDENT_ENTRIES", "0"))
+    ubcc_backstore_page_bytes = int(os.environ.get("UBCC_BACKSTORE_PAGE_BYTES", "64"))
+    ubcc_backstore_org = os.environ.get("UBCC_BACKSTORE_ORG", "schema_a")
+    ubcc_meta_max_flights = int(os.environ.get("UBCC_META_MAX_FLIGHTS", "8"))
     ubcc_meta_read_ticks = int(os.environ.get("UBCC_META_READ_TICKS", "8000"))
     ubcc_meta_write_ticks = int(os.environ.get("UBCC_META_WRITE_TICKS", "7500"))
     ubcc_meta_delete_ticks = int(os.environ.get("UBCC_META_DELETE_TICKS", "7500"))
@@ -266,6 +269,9 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
                                 ubcc_bf_bytes=ubcc_bf_bytes,
                                 ubcc_force_resident_entries=
                                      ubcc_force_resident_entries,
+                                ubcc_backstore_page_bytes=
+                                     ubcc_backstore_page_bytes,
+                                ubcc_backstore_org=ubcc_backstore_org,
                                 metadata_private_base=cfg.metadata_private_base,
                                 metadata_private_size=f"{metadata_private_size}B")
 
@@ -330,6 +336,7 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
                 version=chi_defs.Versions.getVersion(chi_defs.CHI_Cache_Controller),
                 ruby_system=ruby_system, node_id=node_id,
                 socket_id=sid,
+                flight_slots=ubcc_meta_max_flights,
                 data_channel_size=params.data_width,
                 addr_ranges=[cfg.metadata_backstore_range(sid)],
                 metadata_private_range=cfg.metadata_backstore_range(sid),

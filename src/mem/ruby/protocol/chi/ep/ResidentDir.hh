@@ -5,18 +5,13 @@
 #include <cstdint>
 #include <vector>
 
+#include "mem/ruby/protocol/chi/ep/BackstoreTypes.hh"
+
 namespace gem5
 {
 
 namespace ruby
 {
-
-enum class UBCCMESIState : uint8_t {
-    G_I = 0,
-    G_S = 1,
-    G_E = 2,
-    G_M = 3,
-};
 
 struct UBCCDirEntry {
     uint64_t lineAddr;
@@ -47,9 +42,10 @@ class ResidentDir
   public:
     static constexpr size_t SramBytes = 512 * 1024;
     static constexpr size_t EntryBytes = 7;
-    static constexpr size_t DefaultBloomBytes = 64 * 1024;
-    static constexpr int BloomHashes = 3;
-    static constexpr int CounterBits = 4;
+    static constexpr size_t DefaultBloomBytes = 60 * 1024;
+    static constexpr size_t DefaultIndexBytes = 4 * 1024;
+    static constexpr int    BloomHashes = 4;
+    static constexpr int    BloomGroups = 16;
 
     explicit ResidentDir(size_t bf_bytes = DefaultBloomBytes,
                          size_t force_entries = 0);
@@ -62,10 +58,23 @@ class ResidentDir
     bool forceRemove(uint64_t pa);
     void clear();
 
+    // ---- Plain Bloom Filter (grouped) ----
     bool bloomMayContain(uint64_t pa) const;
     void bloomInsert(uint64_t pa);
     void bloomRemove(uint64_t pa);
     void bloomClear();
+
+    // ---- Group Index ----
+    const GroupIndex& groupIndex(int g) const { return _groupIndex[g]; }
+    GroupIndex& groupIndex(int g) { return _groupIndex[g]; }
+    int groupForPa(uint64_t pa) const;
+
+    // ---- Reconstruction ----
+    bool shouldReconstructGroup(int g) const;
+    void reconstructGroup(int g);
+
+    // ---- Diagnostics ----
+    double estimateFPR(int group = -1) const;
 
     uint8_t control(size_t slot) const;
     void setFillPending(uint64_t pa, bool v);
@@ -94,10 +103,19 @@ class ResidentDir
     static int decodeOwner(uint8_t owner_code);
     static uint8_t encodeOwner(int owner_node);
     static uint64_t splitmix64(uint64_t x);
-    size_t bloomCounterIndex(uint64_t pa, int hash_idx) const;
-    uint8_t bloomCounterRead(size_t idx) const;
-    void bloomCounterWrite(size_t idx, uint8_t v);
+
+    // ---- Bloom Filter helpers ----
+    size_t bloomByteOffset(uint64_t pa, int hash_idx, int group) const;
+    size_t bloomBitIndex(size_t byteOff, int bitSub) const;
+    bool bloomBitTest(uint64_t pa, int hash_idx) const;
+    void bloomBitSet(uint64_t pa, int hash_idx);
+    int bloomGroup(uint64_t pa) const;
+    size_t bloomGroupBytes() const { return _bloomBytes / BloomGroups; }
+
     void validateCanonical(const UBCCDirEntry& in, uint64_t pa) const;
+
+    // Scan resident entries belonging to a group and insert into shadow BF.
+    void scanResidentForGroup(int g, std::vector<uint8_t>& shadowBF) const;
 
   private:
     uint8_t _buf[SramBytes];
@@ -105,14 +123,19 @@ class ResidentDir
     size_t _count;
     size_t _bfOffset;
     size_t _bloomBytes;
-    size_t _bloomCounterCount;
+    size_t _bloomBitCount;
     uint64_t _lruTick;
 
     std::vector<uint64_t> _keys;
     std::vector<uint8_t> _used;
     std::vector<uint8_t> _dist;
     std::vector<uint8_t> _ctrl;
-    std::vector<uint8_t> _bloomCounters;
+    std::vector<uint8_t> _bloomBits;
+
+    GroupIndex _groupIndex[BloomGroups];
+
+    static constexpr uint32_t kReconstructPeriod = 1024;
+    static constexpr double kReconstructStaleThreshold = 0.25;
 };
 
 } // namespace ruby

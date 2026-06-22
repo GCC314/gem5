@@ -9,6 +9,7 @@
 
 #include "mem/simple_mem.hh"
 #include "mem/ruby/common/DataBlock.hh"
+#include "mem/ruby/protocol/chi/ep/BackstoreOrganization.hh"
 #include "mem/ruby/protocol/chi/ep/NodeAddressMap.hh"
 #include "params/EPBackend.hh"
 #include "sim/sim_object.hh"
@@ -638,6 +639,8 @@ class EPBackend : public SimObject
     void clearSidebandSnapshot();
 
     void setMetaRnfController(MetaRNFController *ctrl);
+    void setBackstoreOrganization(BackstoreOrganization *org) { _org = org; }
+    BackstoreOrganization* backstoreOrganization() const { return _org; }
     void issueBackstoreRead(uint64_t homePa);
     void issueBackstoreWrite(uint64_t homePa);
     void issueBackstoreDelete(uint64_t homePa);
@@ -687,7 +690,10 @@ class EPBackend : public SimObject
     static MetaLine encodeMetaLine(uint64_t homePa, int state,
                                    uint64_t sharersMask, uint64_t epoch);
     static bool decodeMetaLine(uint64_t expectedHomePa, const MetaLine &line,
-                               MetaStoreDecoded &entry);
+                                MetaStoreDecoded &entry);
+
+    /** Allocate a new page PA in the metadata private range. Returns 0 if full. */
+    uint64_t allocatePagePa();
 
     const int _nodeId;
     NodeAddressMap _addrMap;
@@ -695,6 +701,7 @@ class EPBackend : public SimObject
     // Main protocol paths MUST use _ubAdapters[] → UBRouter → UBCC message-passing.
     UBCCController *_ubcc = nullptr;
     MetaRNFController *_metaRnf = nullptr;
+    BackstoreOrganization *_org = nullptr;
     std::vector<UBAdapter*> _ubAdapters;  // v4-dual-socket: per-socket adapters
     std::vector<EPSNFController*> _epSnfs; // v4-dual-socket: per-socket EP-SNF
     int _numSockets = 1;                   // v4-dual-socket
@@ -702,6 +709,7 @@ class EPBackend : public SimObject
     RubySystem *_ruby_system = nullptr;
     uint64_t _metadataPrivateBase = 0;
     uint64_t _metadataPrivateSize = 0;
+    uint64_t _pageAllocCursor = 0;         // next free metadata page PA
 
     // ---- Q1: Grant Data Buffer ----
     // Cache-line-sized buffer populated after each grant decision.

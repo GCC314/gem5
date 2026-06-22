@@ -3,6 +3,7 @@
 
 #include <array>
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <map>
 
@@ -36,6 +37,11 @@ class MetaRNFController : public EPController
     void issueWrite(uint64_t metadataPa, const MetaLine &line, WriteCallback cb);
     void issueDelete(uint64_t metadataPa, WriteCallback cb);
 
+    // ---- Multi-flight observability ----
+    int activeFlightCount() const;
+    int activeSlots() const { return activeFlightCount(); }
+    int maxFlightSlots() const { return _maxFlights; }
+
   protected:
     bool recvRequestMsg(const CHIRequestMsg *msg) override;
     bool recvSnoopMsg(const CHIRequestMsg *msg) override;
@@ -45,32 +51,54 @@ class MetaRNFController : public EPController
   private:
     enum class OpType { Read, Write, Delete };
 
-    struct PendingTxn {
-        OpType op;
-        uint64_t pa;
-        DataBlock writeData;
+    enum class SlotState { Free, Allocated, Sent, Waiting, Done };
+
+    struct FlightSlot {
+        SlotState state = SlotState::Free;
+        OpType op = OpType::Read;
+        uint64_t pa = 0;
+        DataBlock writeData{64};
         ReadCallback readCb;
         WriteCallback writeCb;
-        bool waitingCompAfterDbid;
+        bool waitingCompAfterDbid = false;
 
-        PendingTxn()
-            : op(OpType::Read), pa(0), writeData(64), waitingCompAfterDbid(false)
-        {}
+        void reset()
+        {
+            state = SlotState::Free;
+            pa = 0;
+            readCb = nullptr;
+            writeCb = nullptr;
+            waitingCompAfterDbid = false;
+        }
     };
+
+    struct QueuedOp {
+        OpType op;
+        uint64_t pa;
+        DataBlock writeData{64};
+        ReadCallback readCb;
+        WriteCallback writeCb;
+    };
+
+    int findFreeSlot() const;
+    void drainWaitQueue(uint64_t metadataPa);
 
     bool sendReadOnce(uint64_t pa);
     bool sendWriteUnique(uint64_t pa);
     bool sendWriteData(uint64_t pa, MachineID dst, uint64_t dbid);
     bool sendCompAck(uint64_t pa, MachineID dst);
     bool inMetadataRange(uint64_t pa) const;
-    void completeRead(uint64_t pa, bool success, const DataBlock *data);
-    void completeWrite(uint64_t pa, bool success);
+    void completeRead(int slotIdx, bool success, const DataBlock *data);
+    void completeWrite(int slotIdx, bool success);
 
   private:
     AddrRange _metadataRange;
     int _hnfVersion;
-    bool _requestInFlight;
-    std::map<uint64_t, PendingTxn> _pending;
+    int _maxFlights;
+
+    FlightSlot _flightSlots[8];
+    std::map<uint64_t, int> _scoreboard;
+    std::map<uint64_t, std::deque<QueuedOp>> _waitQueues;
 
     static std::map<std::pair<int,int>, MetaRNFController*> _instances;
 };

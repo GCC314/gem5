@@ -7,7 +7,6 @@
 #include <map>
 #include <set>
 #include <string>
-#include <unordered_map>
 
 #include "base/types.hh"
 #include "mem/ruby/common/DataBlock.hh"
@@ -562,7 +561,6 @@ class UBCCController
                                  const BackstoreEntry &entry);
     void onBackstoreWriteAck(uint64_t linePa);
     void onBackstoreDeleteAck(uint64_t linePa, bool existed);
-    bool lookupBackstore(uint64_t linePa, BackstoreEntry &entry) const;
     bool snapshotResidentForBackstore(uint64_t linePa, BackstoreEntry &entry) const;
 
     std::string inspectOffloadLineForTest(uint64_t linePa) const;
@@ -572,6 +570,10 @@ class UBCCController
                                   uint64_t sharersMask, uint64_t epoch,
                                   bool residentDirty);
     bool debugForceResidentEvictForTest(uint64_t linePa);
+
+    // ---- v4: Backstore Organization access ----
+    ResidentDir& directory() { return _directory; }
+    const ResidentDir& directory() const { return _directory; }
 
    private:
     const int _nodeId;
@@ -606,7 +608,6 @@ class UBCCController
     // the same PA are queued here.  Replayed on Clear commit.
     std::map<uint64_t, std::deque<PendingRequester>> _pendingRequesters;
     std::map<uint64_t, std::deque<PendingRequester>> _residentWaiters;
-    std::unordered_map<uint64_t, BackstoreEntry> _backstore;
     std::set<uint64_t> _evictionPendingRemoval;
 
     // ---- v4: Tombstone window (configurable, default 100000 ticks) ----

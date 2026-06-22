@@ -213,10 +213,6 @@ UBCCController::handleResidentMiss(
 
     if (_backend) {
         _backend->issueBackstoreRead(line_pa);
-    } else {
-        BackstoreEntry be;
-        bool found = lookupBackstore(line_pa, be);
-        onBackstoreFillComplete(line_pa, found, be);
     }
     return ResidentAccessResult::Queued;
 }
@@ -2333,17 +2329,6 @@ UBCCController::cleanupTombstones()
 }
 
 bool
-UBCCController::lookupBackstore(uint64_t linePa, BackstoreEntry &entry) const
-{
-    auto it = _backstore.find(linePa);
-    if (it == _backstore.end()) {
-        return false;
-    }
-    entry = it->second;
-    return true;
-}
-
-bool
 UBCCController::snapshotResidentForBackstore(
     uint64_t linePa, BackstoreEntry &entry) const
 {
@@ -2404,7 +2389,6 @@ UBCCController::onBackstoreWriteAck(uint64_t linePa)
         return;
     }
     if (e.state != MESIState::G_I) {
-        _backstore[linePa] = BackstoreEntry{e.state, e.sharersMask, e.epoch};
         _directory.bloomInsert(linePa);
     }
     e.residentDirty = false;
@@ -2421,7 +2405,6 @@ UBCCController::onBackstoreWriteAck(uint64_t linePa)
 void
 UBCCController::onBackstoreDeleteAck(uint64_t linePa, bool existed)
 {
-    _backstore.erase(linePa);
     _directory.bloomRemove(linePa);
 
     DirEntry e;
@@ -2446,8 +2429,6 @@ UBCCController::inspectOffloadLineForTest(uint64_t linePa) const
 {
     DirEntry e;
     bool present = _directory.lookup(linePa, e);
-    BackstoreEntry b;
-    bool backstorePresent = lookupBackstore(linePa, b);
     auto wit = _residentWaiters.find(linePa);
     size_t waiterDepth = (wit == _residentWaiters.end()) ? 0 : wit->second.size();
 
@@ -2462,10 +2443,6 @@ UBCCController::inspectOffloadLineForTest(uint64_t linePa) const
     oss << "\"fill_pending\":" << (_directory.fillPending(linePa) ? "true" : "false") << ",";
     oss << "\"wb_pending\":" << (_directory.wbPending(linePa) ? "true" : "false") << ",";
     oss << "\"pinned\":" << (_directory.pinned(linePa) ? "true" : "false") << ",";
-    oss << "\"backstore_present\":" << (backstorePresent ? "true" : "false") << ",";
-    oss << "\"backstore_state\":" << (backstorePresent ? static_cast<int>(b.state) : -1) << ",";
-    oss << "\"backstore_sharers_mask\":" << (backstorePresent ? b.sharersMask : 0) << ",";
-    oss << "\"backstore_epoch\":" << (backstorePresent ? b.epoch : 0) << ",";
     oss << "\"resident_waiter_depth\":" << waiterDepth;
     oss << "}";
     return oss.str();
@@ -2478,8 +2455,6 @@ UBCCController::debugSeedBackstoreForTest(
     if (mesi < 0 || mesi > 3) {
         return false;
     }
-    BackstoreEntry e{static_cast<MESIState>(mesi), sharersMask, epoch};
-    _backstore[linePa] = e;
     _directory.bloomInsert(linePa);
     return true;
 }
