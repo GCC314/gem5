@@ -2,8 +2,19 @@
 
 Import('*')
 
+import os
+
 if env['CONF']['PROTOCOL'] != 'CHI':
     Return()
+
+repo_root = os.path.abspath(os.path.join(Dir('#').abspath, '..'))
+zmq_include = os.path.join(repo_root, 'thirdparty/zeromq/include')
+zmq_lib = os.path.join(repo_root, 'thirdparty/zeromq/lib')
+
+env.Append(CPPPATH=[repo_root, zmq_include])
+env.Append(LIBPATH=[zmq_lib])
+env.Append(LIBS=['zmq'])
+env.Append(LINKFLAGS=['-pthread', f'-Wl,-rpath,{zmq_lib}'])
 
 SimObject('EPController.py', sim_objects=['EPController'])
 SimObject('EPRNFController.py', sim_objects=['EPRNFController'])
@@ -29,6 +40,7 @@ Source('M5SelfTest.cc')
 Source('M6SelfTest.cc')
 Source('M7SelfTest.cc')
 Source('M8SelfTest.cc')
+Source(File(os.path.join(repo_root, 'framework/Port.cc')))
 
 DebugFlag('RubyEP')
 DebugFlag('RubyEPVerbose')

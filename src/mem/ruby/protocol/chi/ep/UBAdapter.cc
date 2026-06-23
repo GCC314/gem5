@@ -1,9 +1,12 @@
 #include "mem/ruby/protocol/chi/ep/UBAdapter.hh"
 
 #include <cstdio>
+#include <limits>
 
 #include "base/logging.hh"
 #include "debug/RubyEP.hh"
+#include "framework/MemMessage.hh"
+#include "framework/Port.hh"
 #include "mem/ruby/protocol/chi/ep/EPBackend.hh"
 #include "mem/ruby/protocol/chi/ep/UBIOModule.hh"
 #include "mem/ruby/protocol/chi/ep/UBCCController.hh"
@@ -21,6 +24,9 @@ UBAdapter::UBAdapter(const Params &p)
       _router(p.router),
       _addrMap(3, 1, 128ULL * 1024 * 1024)
 {
+    fatal_if(sizeof(CoherenceMessage) > framework::kMaxPayloadSize,
+             "UBAdapter: CoherenceMessage size (%zu) exceeds MemMessage payload (%u)",
+             sizeof(CoherenceMessage), framework::kMaxPayloadSize);
     DPRINTF(RubyEP, "UBAdapter node=%d socket=%d created\n", _nodeId, _socketId);
 }
 
@@ -57,6 +63,92 @@ UBAdapter::bindUbccToRouter(UBCCController *ubcc)
     }
 }
 
+bool
+UBAdapter::transportSend(const CoherenceMessage &msg)
+{
+    if (_port) {
+        framework::MemMessage *buf = _port->sendAllocateBuffer(curTick());
+        if (!buf) {
+            warn("UBAdapter node=%d socket=%d: transportSend no tx buffer (reqId=%lu type=%s)",
+                 _nodeId, _socketId, msg.h.reqId, coherenceMsgTypeName(msg.h.type));
+            return false;
+        }
+
+        buf->hdr.type = static_cast<uint32_t>(framework::MemMessageType::COH_MSG);
+        buf->hdr.req_id = msg.h.reqId;
+        if (!buf->setPayload(msg)) {
+            warn("UBAdapter node=%d socket=%d: transportSend payload encode failed (reqId=%lu)",
+                 _nodeId, _socketId, msg.h.reqId);
+            return false;
+        }
+
+        if (!_port->send(buf)) {
+            warn("UBAdapter node=%d socket=%d: transportSend port send failed (reqId=%lu)",
+                 _nodeId, _socketId, msg.h.reqId);
+            return false;
+        }
+        return true;
+    }
+
+    if (!_router) {
+        fatal("UBAdapter node=%d socket=%d: transportSend called with no router bound\n",
+              _nodeId, _socketId);
+    }
+    _router->sendMessage(msg);
+    return true;
+}
+
+bool
+UBAdapter::transportRecv(CoherenceMessageType expectedType, uint64_t expectedReqId)
+{
+    if (!_port) {
+        if (!_lastResponseValid) {
+            return false;
+        }
+        if (_lastResponse.h.type != expectedType) {
+            return false;
+        }
+        return (expectedReqId == 0 || _lastResponse.h.reqId == expectedReqId);
+    }
+
+    static constexpr int kMaxPollIters = 200000;
+    const uint64_t visible = std::numeric_limits<uint64_t>::max();
+
+    for (int i = 0; i < kMaxPollIters; ++i) {
+        framework::MemMessage *m = _port->recv(visible);
+        if (!m) {
+            continue;
+        }
+
+        const auto msgType = static_cast<framework::MemMessageType>(m->hdr.type);
+        if (msgType == framework::MemMessageType::CONTROL_SYNC) {
+            continue;
+        }
+        if (msgType != framework::MemMessageType::COH_MSG) {
+            warn("UBAdapter node=%d socket=%d: transportRecv unexpected MemMessage type=%u",
+                 _nodeId, _socketId, m->hdr.type);
+            continue;
+        }
+
+        const CoherenceMessage *coh = m->getPayload<CoherenceMessage>();
+        if (!coh) {
+            warn("UBAdapter node=%d socket=%d: transportRecv bad payload size=%u",
+                 _nodeId, _socketId, m->payloadLen());
+            continue;
+        }
+
+        recvFromRouter(*coh);
+        if (_lastResponseValid && _lastResponse.h.type == expectedType &&
+            (expectedReqId == 0 || _lastResponse.h.reqId == expectedReqId)) {
+            return true;
+        }
+    }
+
+    warn("UBAdapter node=%d socket=%d: transportRecv timeout waiting type=%s reqId=%lu",
+         _nodeId, _socketId, coherenceMsgTypeName(expectedType), expectedReqId);
+    return false;
+}
+
 // ---- Phase 2: Synchronous Read Request ----
 
 int
@@ -78,8 +170,8 @@ UBAdapter::sendReadReq(
             _nodeId, _socketId, homePa, reqType, writeIntent,
             requesterNode, epoch, reqId, homeNode, ingressSocket, homeSocket);
 
-    if (!_router) {
-        fatal("UBAdapter node=%d socket=%d: sendReadReq called with no router bound\n",
+    if (!_router && !_port) {
+        fatal("UBAdapter node=%d socket=%d: sendReadReq called with no transport bound\n",
               _nodeId, _socketId);
     }
 
@@ -111,9 +203,11 @@ UBAdapter::sendReadReq(
             _nodeId, _socketId, ubMsgToString(req).c_str());
 
     _lastResponseValid = false;
-    _router->sendMessage(req);
+    if (!transportSend(req)) {
+        return -1;
+    }
 
-    if (!_lastResponseValid) {
+    if (!transportRecv(CoherenceMessageType::ReadResp, reqId)) {
         printf("[ADAPTER-NO-RESP] node=%d pa=0x%lx epoch=%lu reqId=%lu home=%d\n",
                _nodeId, homePa, epoch, reqId, homeNode);
         warn("UBAdapter node=%d: sendReadReq: no response received "
@@ -182,8 +276,8 @@ UBAdapter::sendWritebackReq(uint64_t homePa, int requesterNode,
             _nodeId, _socketId, homePa, requesterNode, epochVal, keepAsClean,
             homeNode, homeSocket);
 
-    if (!_router) {
-        fatal("UBAdapter node=%d socket=%d: sendWritebackReq called with no router bound\n",
+    if (!_router && !_port) {
+        fatal("UBAdapter node=%d socket=%d: sendWritebackReq called with no transport bound\n",
               _nodeId, _socketId);
     }
 
@@ -206,9 +300,11 @@ UBAdapter::sendWritebackReq(uint64_t homePa, int requesterNode,
         req.h.flags |= static_cast<uint32_t>(CFLAG_KEEP_AS_CLEAN);
 
     _lastResponseValid = false;
-    _router->sendMessage(req);
+    if (!transportSend(req)) {
+        return false;
+    }
 
-    if (!_lastResponseValid) {
+    if (!transportRecv(CoherenceMessageType::WritebackResp, req.h.reqId)) {
         warn("UBAdapter node=%d: sendWritebackReq: no response PA=0x%lx\n",
              _nodeId, homePa);
         return false;
@@ -236,8 +332,8 @@ UBAdapter::sendEvictReq(uint64_t homePa, int evictingNode, uint64_t epochVal,
             _nodeId, _socketId, homePa, evictingNode, epochVal,
             homeNode, homeSocket);
 
-    if (!_router) {
-        fatal("UBAdapter node=%d socket=%d: sendEvictReq called with no router bound\n",
+    if (!_router && !_port) {
+        fatal("UBAdapter node=%d socket=%d: sendEvictReq called with no transport bound\n",
               _nodeId, _socketId);
     }
 
@@ -258,9 +354,11 @@ UBAdapter::sendEvictReq(uint64_t homePa, int evictingNode, uint64_t epochVal,
     req.h.readyTick = curTick();
 
     _lastResponseValid = false;
-    _router->sendMessage(req);
+    if (!transportSend(req)) {
+        return false;
+    }
 
-    if (!_lastResponseValid) {
+    if (!transportRecv(CoherenceMessageType::EvictResp, req.h.reqId)) {
         warn("UBAdapter node=%d: sendEvictReq: no response PA=0x%lx\n",
              _nodeId, homePa);
         return false;
@@ -292,8 +390,8 @@ UBAdapter::sendUpgradeReq(uint64_t homePa, int requesterNode,
             _nodeId, _socketId, homePa, requesterNode, epoch, reqId,
             desiredPerm, homeNode, homeSocket);
 
-    if (!_router) {
-        fatal("UBAdapter node=%d socket=%d: sendUpgradeReq called with no router bound\n",
+    if (!_router && !_port) {
+        fatal("UBAdapter node=%d socket=%d: sendUpgradeReq called with no transport bound\n",
               _nodeId, _socketId);
     }
 
@@ -318,9 +416,11 @@ UBAdapter::sendUpgradeReq(uint64_t homePa, int requesterNode,
     req.b.upgradeReq.cause = static_cast<uint8_t>(cause);
 
     _lastResponseValid = false;
-    _router->sendMessage(req);
+    if (!transportSend(req)) {
+        return false;
+    }
 
-    if (!_lastResponseValid) {
+    if (!transportRecv(CoherenceMessageType::UpgradeResp, reqId)) {
         warn("UBAdapter node=%d: sendUpgradeReq: no response PA=0x%lx\n",
              _nodeId, homePa);
         return false;
@@ -359,8 +459,8 @@ UBAdapter::sendUpgradeDoneReq(uint64_t homePa, int requesterNode,
             _nodeId, _socketId, homePa, requesterNode, epoch, reqId,
             homeNode, homeSocket);
 
-    if (!_router) {
-        fatal("UBAdapter node=%d socket=%d: sendUpgradeDoneReq called with no router bound\n",
+    if (!_router && !_port) {
+        fatal("UBAdapter node=%d socket=%d: sendUpgradeDoneReq called with no transport bound\n",
               _nodeId, _socketId);
     }
 
@@ -382,9 +482,11 @@ UBAdapter::sendUpgradeDoneReq(uint64_t homePa, int requesterNode,
     req.h.readyTick = curTick();
 
     _lastResponseValid = false;
-    _router->sendMessage(req);
+    if (!transportSend(req)) {
+        return false;
+    }
 
-    if (!_lastResponseValid) {
+    if (!transportRecv(CoherenceMessageType::UpgradeDoneResp, reqId)) {
         warn("UBAdapter node=%d: sendUpgradeDoneReq: no response PA=0x%lx\n",
              _nodeId, homePa);
         return false;
@@ -413,8 +515,8 @@ UBAdapter::sendClearReq(uint64_t linePa, int srcNode,
             _nodeId, _socketId, linePa, srcNode, epoch, reqId,
             homeNode, homeSocket);
 
-    if (!_router) {
-        fatal("UBAdapter node=%d socket=%d: sendClearReq called with no router bound\n",
+    if (!_router && !_port) {
+        fatal("UBAdapter node=%d socket=%d: sendClearReq called with no transport bound\n",
               _nodeId, _socketId);
     }
 
@@ -438,9 +540,11 @@ UBAdapter::sendClearReq(uint64_t linePa, int srcNode,
     req.b.clearReq.reason = 0; // GrantHandshake
 
     _lastResponseValid = false;
-    _router->sendMessage(req);
+    if (!transportSend(req)) {
+        return false;
+    }
 
-    if (!_lastResponseValid) {
+    if (!transportRecv(CoherenceMessageType::ClearResp, reqId)) {
         warn("UBAdapter node=%d: sendClearReq: no response PA=0x%lx\n",
              _nodeId, linePa);
         return false;
@@ -471,8 +575,8 @@ UBAdapter::sendRecallResp(uint64_t linePa, int ownerNode,
             _nodeId, _socketId, linePa, ownerNode, dataReturned, epoch, reqId,
             homeNode, homeSocket);
 
-    if (!_router) {
-        fatal("UBAdapter node=%d socket=%d: sendRecallResp called with no router bound\n",
+    if (!_router && !_port) {
+        fatal("UBAdapter node=%d socket=%d: sendRecallResp called with no transport bound\n",
               _nodeId, _socketId);
     }
 
@@ -501,8 +605,7 @@ UBAdapter::sendRecallResp(uint64_t linePa, int ownerNode,
     }
 
     // Fire-and-forget: no response expected
-    _router->sendMessage(req);
-    return true;
+    return transportSend(req);
 }
 
 // ---- Invalidation Ack (fire-and-forget → home UBCC) ----
@@ -518,8 +621,8 @@ UBAdapter::sendInvalidateAck(uint64_t linePa, int ackNode,
             _nodeId, _socketId, linePa, ackNode, epoch, reqId,
             homeNode, homeSocket);
 
-    if (!_router) {
-        fatal("UBAdapter node=%d socket=%d: sendInvalidateAck called with no router bound\n",
+    if (!_router && !_port) {
+        fatal("UBAdapter node=%d socket=%d: sendInvalidateAck called with no transport bound\n",
               _nodeId, _socketId);
     }
 
@@ -541,8 +644,7 @@ UBAdapter::sendInvalidateAck(uint64_t linePa, int ackNode,
     req.h.readyTick = curTick();
 
     // Fire-and-forget
-    _router->sendMessage(req);
-    return true;
+    return transportSend(req);
 }
 
 // ---- Cross-node Recall Request (EPBackend → EPBackend via router) ----
@@ -556,8 +658,8 @@ UBAdapter::sendRecallReqToOwner(int targetNode,
             "UBAdapter node=%d socket=%d: sendRecallReqToOwner target=%d PA=0x%lx homeSocket=%d\n",
             _nodeId, _socketId, targetNode, recallMsg.linePa, homeSocket);
 
-    if (!_router) {
-        fatal("UBAdapter node=%d socket=%d: sendRecallReqToOwner called with no router bound\n",
+    if (!_router && !_port) {
+        fatal("UBAdapter node=%d socket=%d: sendRecallReqToOwner called with no transport bound\n",
               _nodeId, _socketId);
     }
 
@@ -586,7 +688,7 @@ UBAdapter::sendRecallReqToOwner(int targetNode,
         req.h.flags |= static_cast<uint32_t>(CFLAG_HAS_DATA);
 
     // Fire-and-forget: no response expected from the remote adapter
-    _router->sendMessage(req);
+    (void)transportSend(req);
 }
 
 // ---- Cross-node Invalidate Request (EPBackend → EPBackend via router) ----
@@ -600,8 +702,8 @@ UBAdapter::sendInvalidateReqToSharer(int targetNode,
             "UBAdapter node=%d socket=%d: sendInvalidateReqToSharer target=%d PA=0x%lx homeSocket=%d\n",
             _nodeId, _socketId, targetNode, invMsg.linePa, homeSocket);
 
-    if (!_router) {
-        fatal("UBAdapter node=%d socket=%d: sendInvalidateReqToSharer called with no router bound\n",
+    if (!_router && !_port) {
+        fatal("UBAdapter node=%d socket=%d: sendInvalidateReqToSharer called with no transport bound\n",
               _nodeId, _socketId);
     }
 
@@ -625,7 +727,7 @@ UBAdapter::sendInvalidateReqToSharer(int targetNode,
     req.h.readyTick = curTick();
 
     // Fire-and-forget
-    _router->sendMessage(req);
+    (void)transportSend(req);
 }
 
 // ---- v4-dual-socket: QueryLineMetaReq (synchronous query) ----
@@ -640,8 +742,8 @@ UBAdapter::sendQueryLineMetaReq(uint64_t homePa, int homeNode, int homeSocket,
             "homeNode=%d homeSocket=%d\n",
             _nodeId, _socketId, homePa, homeNode, homeSocket);
 
-    if (!_router) {
-        fatal("UBAdapter node=%d socket=%d: sendQueryLineMetaReq called with no router bound\n",
+    if (!_router && !_port) {
+        fatal("UBAdapter node=%d socket=%d: sendQueryLineMetaReq called with no transport bound\n",
               _nodeId, _socketId);
     }
 
@@ -660,9 +762,11 @@ UBAdapter::sendQueryLineMetaReq(uint64_t homePa, int homeNode, int homeSocket,
     req.h.readyTick = curTick();
 
     _lastResponseValid = false;
-    _router->sendMessage(req);
+    if (!transportSend(req)) {
+        return -1;
+    }
 
-    if (!_lastResponseValid) {
+    if (!transportRecv(CoherenceMessageType::QueryLineMetaResp, req.h.reqId)) {
         warn("UBAdapter node=%d socket=%d: sendQueryLineMetaReq: no response PA=0x%lx\n",
              _nodeId, _socketId, homePa);
         return -1;
@@ -692,8 +796,8 @@ UBAdapter::sendHomeWritebackNotify(uint64_t homePa, uint64_t epoch,
             "epoch=%lu homeNode=%d homeSocket=%d\n",
             _nodeId, _socketId, homePa, epoch, homeNode, homeSocket);
 
-    if (!_router) {
-        fatal("UBAdapter node=%d socket=%d: sendHomeWritebackNotify called with no router bound\n",
+    if (!_router && !_port) {
+        fatal("UBAdapter node=%d socket=%d: sendHomeWritebackNotify called with no transport bound\n",
               _nodeId, _socketId);
     }
 
@@ -713,7 +817,7 @@ UBAdapter::sendHomeWritebackNotify(uint64_t homePa, uint64_t epoch,
     req.h.readyTick = curTick();
 
     // Fire-and-forget
-    _router->sendMessage(req);
+    (void)transportSend(req);
 }
 
 // ---- Receive message from router ----

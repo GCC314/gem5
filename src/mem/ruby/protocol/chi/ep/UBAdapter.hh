@@ -12,6 +12,7 @@
 #include "sim/sim_object.hh"
 
 namespace pseudo { class PseudoMemPort; class PseudoManager; }
+namespace framework { class Port; }
 
 namespace gem5
 {
@@ -56,6 +57,10 @@ class UBAdapter : public SimObject
     /** Set PseudoMemPort for async message transport (multi-process path). */
     void setPseudoPort(pseudo::PseudoMemPort *port) { _pseudoPort = port; }
     pseudo::PseudoMemPort* pseudoPort() const { return _pseudoPort; }
+
+    /** Optional external transport port (injected by launcher/module). */
+    void setPort(framework::Port *port) { _port = port; }
+    framework::Port* port() const { return _port; }
 
     /**
      * Wire the local UBCC to the router.
@@ -157,8 +162,15 @@ class UBAdapter : public SimObject
     EPBackend *_backend = nullptr;
     UBIOModule *_router = nullptr;
     pseudo::PseudoMemPort *_pseudoPort = nullptr;
+    framework::Port *_port = nullptr;
     NodeAddressMap _addrMap;
     uint64_t _nextSeq = 1;
+
+    /** Send via injected framework::Port when available, else via router. */
+    bool transportSend(const CoherenceMessage &msg);
+
+    /** Poll injected framework::Port and dispatch to recvFromRouter(). */
+    bool transportRecv(CoherenceMessageType expectedType, uint64_t expectedReqId);
 
     /**
      * Per-transaction pending state.
