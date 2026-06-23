@@ -8,6 +8,8 @@
 #include "debug/UBLatency.hh"
 #include "mem/ruby/protocol/chi/ep/UBAdapter.hh"
 #include "mem/ruby/protocol/chi/ep/UBCCController.hh"
+#include <framework/Port.hh>
+#include <framework/MemMessage.hh>
 #include "sim/cur_tick.hh"
 
 #include <cstdio>
@@ -61,6 +63,20 @@ void
 UBIOModule::init()
 {
     SimObject::init();
+
+    // Step 5: Port integration gated behind env var
+    const char* portEnv = getenv("UBIO_PORT_ENABLE");
+    if (portEnv && _localAdapter) {
+        int enableNode = atoi(portEnv);
+        if (enableNode < 0 || _nodeId == enableNode) {
+            zmq::context_t* ctx = new zmq::context_t(1);
+            std::string ep = "ipc:///tmp/ubio_port_n" + std::to_string(_nodeId);
+            framework::Port* port = new framework::Port(
+                "gem5_ubio", _nodeId, 0, ep, true, *ctx, 100000);
+            _localAdapter->setPort(port);
+            std::printf("[STEP5] Port enabled node=%d ep=%s\n", _nodeId, ep.c_str());
+        }
+    }
 }
 
 // ---- Queue management ----
