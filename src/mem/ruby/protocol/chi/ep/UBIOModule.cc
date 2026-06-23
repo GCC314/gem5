@@ -70,7 +70,7 @@ UBIOModule::init()
         int enableNode = atoi(portEnv);
         if (enableNode < 0 || _nodeId == enableNode) {
             zmq::context_t* ctx = new zmq::context_t(1);
-            std::string ep = "ipc:///tmp/ubio_port_n" + std::to_string(_nodeId);
+            std::string ep = "ipc:///tmp/ubio_n" + std::to_string(_nodeId);
             framework::Port* port = new framework::Port(
                 "gem5_ubio", _nodeId, 0, ep, true, *ctx, 100000);
             _localAdapter->setPort(port);
