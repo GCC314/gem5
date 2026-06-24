@@ -649,6 +649,10 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
         reinterpret_cast<int*>(&dataSource), &authEpoch,
         &pendingInvCount, &pendingInvMask, &committedEpoch,
         &routedGrantData, &routedGrantDataValid);
+
+    // Port async path: -2 means response pending, callers will retry
+    if (grantInt == -2) return -2;
+
     ubccGrant = static_cast<UBCC_OuterGrantType>(grantInt);
 
     printf("[TC5-CLEAR-TRACE] handleRemoteMiss node=%d localPA=0x%lx homePA=0x%lx "

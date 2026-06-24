@@ -10,6 +10,7 @@
 #include "mem/ruby/protocol/chi/ep/NodeAddressMap.hh"
 #include "params/UBAdapter.hh"
 #include "sim/sim_object.hh"
+#include "sim/eventq.hh"
 
 namespace pseudo { class PseudoMemPort; class PseudoManager; }
 namespace framework { class Port; }
@@ -150,6 +151,10 @@ class UBAdapter : public SimObject
      */
     void recvFromRouter(const CoherenceMessage &msg);
 
+    /** Event-driven response processing. Replaces busy-poll transportRecv. */
+    void wakeup();
+    void checkResponseCallbacks();
+
     // ---- Accessors ----
     const NodeAddressMap& addrMap() const { return _addrMap; }
 
@@ -194,6 +199,14 @@ class UBAdapter : public SimObject
     /** Last response received from router (for synchronous callers). */
     CoherenceMessage _lastResponse;
     bool _lastResponseValid = false;
+
+    /** Event for periodic Port response polling. */
+    EventFunctionWrapper _responseCheckEvent;
+    uint64_t _safeTick = 0;
+    int _responseCheckCount = 0;
+    bool _eventArmed = false;
+
+    friend class UBIOModule;
 };
 
 } // namespace ruby

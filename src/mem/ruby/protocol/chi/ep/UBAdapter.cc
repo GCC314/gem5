@@ -22,7 +22,8 @@ UBAdapter::UBAdapter(const Params &p)
       _nodeId(p.node_id),
       _socketId(p.socket_id),
       _router(p.router),
-      _addrMap(3, 1, 128ULL * 1024 * 1024)
+      _addrMap(3, 1, 128ULL * 1024 * 1024),
+      _responseCheckEvent([this]{ wakeup(); }, name() + ".responseCheck")
 {
     fatal_if(sizeof(CoherenceMessage) > framework::kMaxPayloadSize,
              "UBAdapter: CoherenceMessage size (%zu) exceeds MemMessage payload (%u)",
@@ -202,9 +203,35 @@ UBAdapter::sendReadReq(
             "UBAdapter node=%d socket=%d: sending ReadReq %s\n",
             _nodeId, _socketId, ubMsgToString(req).c_str());
 
+    // Port async path: if response already cached, return it directly
+    if (_port && _lastResponseValid && _lastResponse.h.type == CoherenceMessageType::ReadResp
+        && _lastResponse.h.reqId == reqId) {
+        // Fill output pointers from cached response
+        if (outGrantVisibleTick) *outGrantVisibleTick = _lastResponse.b.readResp.grantVisibleTick;
+        if (outSentinelVisibleTick) *outSentinelVisibleTick = _lastResponse.b.readResp.sentinelVisibleTick;
+        if (outRecallNeeded) *outRecallNeeded = _lastResponse.b.readResp.recallNeeded;
+        if (outRecallOwnerNode) *outRecallOwnerNode = _lastResponse.b.readResp.recallOwnerNode;
+        if (outDataSource) *outDataSource = _lastResponse.b.readResp.dataSource;
+        if (outAuthEpoch) *outAuthEpoch = _lastResponse.b.readResp.authEpoch;
+        if (outPendingInvCount) *outPendingInvCount = _lastResponse.b.readResp.pendingInvCount;
+        if (outPendingInvMask) *outPendingInvMask = _lastResponse.b.readResp.pendingInvMask;
+        if (outCommittedEpoch) *outCommittedEpoch = _lastResponse.b.readResp.committedEpoch;
+        if (outGrantData && outGrantDataValid) {
+            *outGrantDataValid = _lastResponse.b.readResp.grantDataValid;
+            if (_lastResponse.b.readResp.grantDataValid)
+                memcpy(outGrantData->data, _lastResponse.b.readResp.grantData, 64);
+        }
+        return static_cast<int>(_lastResponse.b.readResp.grantType);
+    }
+
     _lastResponseValid = false;
     if (!transportSend(req)) {
         return -1;
+    }
+
+    if (_port) {
+        scheduleResponseCheck();
+        return -2;
     }
 
     if (!transportRecv(CoherenceMessageType::ReadResp, reqId)) {
@@ -909,6 +936,57 @@ UBAdapter::recvFromRouter(const CoherenceMessage &msg)
             warn("UBAdapter node=%d: unhandled message type %s\n",
                  _nodeId, coherenceMsgTypeName(msg.h.type));
             break;
+    }
+}
+
+// ---- Event-driven response processing (Step 1) ----
+
+void
+UBAdapter::wakeup()
+{
+    if (!_port) return;
+
+    // 1. Emit sync to let peer advance its next_visible_tick
+    _port->emitSync(curTick());
+
+    // 2. Drain all visible messages from Port
+    framework::MemMessage *m;
+    const uint64_t visible = curTick();
+    while ((m = _port->recv(visible)) != nullptr) {
+        if (m->hdr.type == static_cast<uint32_t>(framework::MemMessageType::CONTROL_SYNC))
+            continue;
+        if (m->hdr.type != static_cast<uint32_t>(framework::MemMessageType::COH_MSG))
+            continue;
+        const CoherenceMessage *coh = m->getPayload<CoherenceMessage>();
+        if (!coh) continue;
+        recvFromRouter(*coh);
+    }
+
+    // 3. Check for matched responses (for retry-based callers)
+    checkResponseCallbacks();
+
+    // 4. Schedule next wakeup
+    if (++_responseCheckCount < 100000) {
+        schedule(_responseCheckEvent, curTick() + 1000);
+        _eventArmed = true;
+    }
+}
+
+void
+UBAdapter::checkResponseCallbacks()
+{
+    // For now: legacy mode — _lastResponseValid is set by recvFromRouter.
+    // When full async refactoring (Step 2-3) is done, this will match
+    // _pendingByReqId entries against _lastResponse.
+    (void)this; // suppress unused warning
+}
+
+void
+UBAdapter::scheduleResponseCheck()
+{
+    if (!_eventArmed && _port) {
+        schedule(_responseCheckEvent, curTick() + 10);
+        _eventArmed = true;
     }
 }
 
