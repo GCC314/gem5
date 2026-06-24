@@ -217,9 +217,11 @@ UBAdapter::sendReadReq(
         if (outPendingInvMask) *outPendingInvMask = _lastResponse.b.readResp.pendingInvMask;
         if (outCommittedEpoch) *outCommittedEpoch = _lastResponse.b.readResp.committedEpoch;
         if (outGrantData && outGrantDataValid) {
-            *outGrantDataValid = _lastResponse.b.readResp.grantDataValid;
-            if (_lastResponse.b.readResp.grantDataValid)
-                memcpy(outGrantData->data, _lastResponse.b.readResp.grantData, 64);
+            *outGrantDataValid = (_lastResponse.b.readResp.grantType
+                                  == static_cast<int>(UBCC_OuterGrantType::GlobalGrantModified));
+            if (*outGrantDataValid)
+                memcpy(outGrantData->getDataMod(0),
+                       _lastResponse.b.readResp.grantData, 64);
         }
         return static_cast<int>(_lastResponse.b.readResp.grantType);
     }
@@ -946,28 +948,39 @@ UBAdapter::wakeup()
 {
     if (!_port) return;
 
-    // 1. Emit sync to let peer advance its next_visible_tick
+    // 1. Emit sync (heartbeat) to let peer advance its boundary
     _port->emitSync(curTick());
 
-    // 2. Drain all visible messages from Port
-    framework::MemMessage *m;
-    const uint64_t visible = curTick();
-    while ((m = _port->recv(visible)) != nullptr) {
-        if (m->hdr.type == static_cast<uint32_t>(framework::MemMessageType::CONTROL_SYNC))
+    // 2. Drain all ready messages (using three-state recv)
+    framework::ReceiveStatus st;
+    framework::MemMessage *m = _port->recv(curTick(), &st);
+    while (m && st == framework::ReceiveStatus::kMessage) {
+        if (m->hdr.type == static_cast<uint32_t>(framework::MemMessageType::CONTROL_SYNC)) {
+            m = _port->recv(curTick(), &st);
             continue;
-        if (m->hdr.type != static_cast<uint32_t>(framework::MemMessageType::COH_MSG))
+        }
+        if (m->hdr.type != static_cast<uint32_t>(framework::MemMessageType::COH_MSG)) {
+            m = _port->recv(curTick(), &st);
             continue;
-        const CoherenceMessage *coh = m->getPayload<CoherenceMessage>();
-        if (!coh) continue;
-        recvFromRouter(*coh);
+        }
+        // PortAsync: dispatch to handleResponse (pendingByReqId map)
+        if (_mode == TransportMode::PortAsync) {
+            handleResponse(m);
+        } else {
+            const CoherenceMessage *coh = m->getPayload<CoherenceMessage>();
+            if (coh) recvFromRouter(*coh);
+        }
+        m = _port->recv(curTick(), &st);
     }
 
     // 3. Check for matched responses (for retry-based callers)
     checkResponseCallbacks();
 
-    // 4. Schedule next wakeup
+    // 4. Schedule next wakeup using safeTs for conservative advancement
     if (++_responseCheckCount < 100000) {
-        schedule(_responseCheckEvent, curTick() + 1000);
+        uint64_t safeT = _port->safeTs(curTick());
+        if (safeT <= curTick()) safeT = curTick() + 1000;
+        schedule(_responseCheckEvent, safeT);
         _eventArmed = true;
     }
 }
@@ -975,10 +988,37 @@ UBAdapter::wakeup()
 void
 UBAdapter::checkResponseCallbacks()
 {
-    // For now: legacy mode — _lastResponseValid is set by recvFromRouter.
-    // When full async refactoring (Step 2-3) is done, this will match
-    // _pendingByReqId entries against _lastResponse.
-    (void)this; // suppress unused warning
+    if (_mode != TransportMode::PortAsync) return;
+    // Match _lastResponse against _pendingByReqId entries
+    if (!_lastResponseValid) return;
+    auto it = _pendingByReqId.find(_lastResponse.h.reqId);
+    if (it == _pendingByReqId.end()) return;
+    if (it->second.onResp) {
+        it->second.onResp(_lastResponse);
+    }
+    _pendingByReqId.erase(it);
+    _lastResponseValid = false;
+}
+
+void
+UBAdapter::handleResponse(framework::MemMessage *m)
+{
+    if (_mode != TransportMode::PortAsync) return;
+
+    const CoherenceMessage *coh = m->getPayload<CoherenceMessage>();
+    if (!coh) return;
+
+    // Dispatch via _pendingByReqId map
+    auto it = _pendingByReqId.find(m->hdr.req_id);
+    if (it != _pendingByReqId.end() && it->second.onResp) {
+        it->second.onResp(*coh);
+        _pendingByReqId.erase(it);
+        return;
+    }
+
+    // Fallback: store as lastResponse for retry-based callers
+    _lastResponse = *coh;
+    _lastResponseValid = true;
 }
 
 void

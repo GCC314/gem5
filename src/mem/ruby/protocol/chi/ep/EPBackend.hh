@@ -12,6 +12,7 @@
 #include "mem/ruby/protocol/chi/ep/BackstoreOrganization.hh"
 #include "mem/ruby/protocol/chi/ep/CoherenceMessage.hh"
 #include "mem/ruby/protocol/chi/ep/NodeAddressMap.hh"
+#include "mem/ruby/protocol/chi/ep/UBCCProtocolIF.hh"
 #include "params/EPBackend.hh"
 #include "sim/sim_object.hh"
 
@@ -285,15 +286,7 @@ struct RequesterLineSnapshot {
     int homeNode;   // Home node for this remote line (-1 if none)
 };
 
-// ---- F3: Grant Data Source ----
-// Formal data source for grant data population.
-// Replaces the debug-only GrantDataProvenance with a concrete
-// enumeration of authoritative data sources (§F3.1).
-enum class GrantDataSource {
-    HomeMemory,   // Data resides in DDR4 at the home node (clean/shared)
-    RecallBuffer, // Data captured from recall (dirty owner eviction)
-    NoData        // No data needed / zero-fill (uninitialized memory)
-};
+// GrantDataSource, UBCC_OuterReqType, UBCC_OuterGrantType now in UBCCProtocolIF.hh
 
 struct HomeMemoryService {
     memory::SimpleMemory *physMem;

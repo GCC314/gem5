@@ -24,21 +24,8 @@ class RubySystem;
 class UBIOModule;
 class EPBackend;
 
-// Forward declarations for M5 outer protocol types.
-// These mirror the enums in EPBackend.hh but are used internally.
-enum class UBCC_OuterReqType {
-    GlobalReadShared,
-    GlobalReadUnique,
-    GlobalWriteback,   // M7: dirty owner writeback
-    GlobalEvict,       // M7: clean sharer/owner eviction
-    GlobalInvalidate   // M8: invalidate sharers for exclusive upgrade
-};
-
-enum class UBCC_OuterGrantType {
-    GlobalGrantShared,
-    GlobalGrantExclusive,
-    GlobalGrantModified
-};
+// Enums UBCC_OuterReqType, UBCC_OuterGrantType, GrantDataSource, and
+// class UbioHostIf are now defined in UBCCProtocolIF.hh (included above).
 
 // ---- M6: Recall result codes ----
 enum class UBCC_RecallResult {
@@ -583,6 +570,7 @@ class UBCCController
     /** Local UBIOModule *for sending messages (e.g., UpgradeAckNotify). */
     UBIOModule *_router = nullptr;
     UbioHostIf *_host = nullptr;
+    EPBackend *_backend = nullptr;
 
     // Q3: Estimated UBCC-to-remote-UBCC interconnect latency (ticks).
     // Controls how long pendingOp=3 blocks before grant is released.

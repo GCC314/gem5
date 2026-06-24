@@ -13,7 +13,7 @@
 #include "sim/eventq.hh"
 
 namespace pseudo { class PseudoMemPort; class PseudoManager; }
-namespace framework { class Port; }
+namespace framework { class Port; struct MemMessage; }
 
 namespace gem5
 {
@@ -23,6 +23,11 @@ namespace ruby
 class EPBackend;
 class UBIOModule;
 class UBCCController;
+
+enum class TransportMode {
+    LegacyInline,   // _port == nullptr: transportSend/Recv + _lastResponse
+    PortAsync,      // _port != nullptr: Port + processSyncAndReceive + _pendingRequests
+};
 
 // Forward-declare EPBackend message types (defined in EPBackend.hh)
 struct OuterRecallMsg;
@@ -60,7 +65,7 @@ class UBAdapter : public SimObject
     pseudo::PseudoMemPort* pseudoPort() const { return _pseudoPort; }
 
     /** Optional external transport port (injected by launcher/module). */
-    void setPort(framework::Port *port) { _port = port; }
+    void setPort(framework::Port *port) { _port = port; if (port) _mode = TransportMode::PortAsync; }
     framework::Port* port() const { return _port; }
 
     /**
@@ -154,6 +159,12 @@ class UBAdapter : public SimObject
     /** Event-driven response processing. Replaces busy-poll transportRecv. */
     void wakeup();
     void checkResponseCallbacks();
+    void scheduleResponseCheck();
+    void handleResponse(framework::MemMessage *m);
+
+    /** Set transport mode — instance-level fixed after init. */
+    void setMode(TransportMode mode) { _mode = mode; }
+    TransportMode mode() const { return _mode; }
 
     // ---- Accessors ----
     const NodeAddressMap& addrMap() const { return _addrMap; }
@@ -205,6 +216,8 @@ class UBAdapter : public SimObject
     uint64_t _safeTick = 0;
     int _responseCheckCount = 0;
     bool _eventArmed = false;
+
+    TransportMode _mode = TransportMode::LegacyInline;
 
     friend class UBIOModule;
 };
