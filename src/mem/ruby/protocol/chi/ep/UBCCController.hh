@@ -10,8 +10,9 @@
 
 #include "base/types.hh"
 #include "mem/ruby/common/DataBlock.hh"
-#include "mem/ruby/protocol/chi/ep/EPBackend.hh"  // F3: GrantDataSource
+#include "mem/ruby/protocol/chi/ep/CoherenceMessage.hh"  // for CoherenceMessage types
 #include "mem/ruby/protocol/chi/ep/ResidentDir.hh"
+#include "mem/ruby/protocol/chi/ep/UBCCProtocolIF.hh"
 
 namespace gem5
 {
@@ -581,7 +582,7 @@ class UBCCController
 
     /** Local UBIOModule *for sending messages (e.g., UpgradeAckNotify). */
     UBIOModule *_router = nullptr;
-    EPBackend *_backend = nullptr;
+    UbioHostIf *_host = nullptr;
 
     // Q3: Estimated UBCC-to-remote-UBCC interconnect latency (ticks).
     // Controls how long pendingOp=3 blocks before grant is released.

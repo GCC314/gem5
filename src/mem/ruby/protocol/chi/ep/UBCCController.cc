@@ -10,7 +10,8 @@
 #include "debug/RubyEP.hh"
 #include "debug/UBInvariant.hh"
 #include "debug/UBLatency.hh"
-#include "mem/ruby/protocol/chi/ep/EPBackend.hh"
+// EPBackend removed -- using UbioHostIf
+#include "mem/ruby/protocol/chi/ep/UBCCProtocolIF.hh"
 #include "mem/ruby/protocol/chi/ep/NodeAddressMap.hh"
 #include "mem/ruby/protocol/chi/ep/UBIOModule.hh"
 #include "mem/ruby/system/RubySystem.hh"
@@ -214,7 +215,7 @@ UBCCController::handleResidentMiss(
     enqueueResidentWaiter(line_pa, pr);
 
     if (_backend) {
-        _backend->issueBackstoreRead(line_pa);
+        _host->hostIssueBackstoreRead(line_pa);
     }
     return ResidentAccessResult::Queued;
 }
@@ -284,7 +285,7 @@ void
 UBCCController::scheduleBackstoreWrite(uint64_t linePa)
 {
     if (_backend) {
-        _backend->issueBackstoreWrite(linePa);
+        _host->hostIssueBackstoreWrite(linePa);
     } else {
         onBackstoreWriteAck(linePa);
     }
@@ -294,7 +295,7 @@ void
 UBCCController::scheduleBackstoreDelete(uint64_t linePa)
 {
     if (_backend) {
-        _backend->issueBackstoreDelete(linePa);
+        _host->hostIssueBackstoreDelete(linePa);
     } else {
         onBackstoreDeleteAck(linePa, true);
     }
