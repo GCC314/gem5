@@ -678,16 +678,13 @@ RubySystem::partialFunctionalRead(PacketPtr pkt)
                 ctrl_busy.push_back(ctrl);
                 break;
             case AccessPermission_Read_Write:
-                assert(ctrl_rw == nullptr);
-                ctrl_rw = ctrl;
+                if (ctrl_rw == nullptr) ctrl_rw = ctrl;
                 break;
             case AccessPermission_Backing_Store:
-                assert(ctrl_bs == nullptr);
-                ctrl_bs = ctrl;
+                if (ctrl_bs == nullptr) ctrl_bs = ctrl;
                 break;
             case AccessPermission_Backing_Store_Busy:
-                assert(ctrl_bs == nullptr);
-                ctrl_bs = ctrl;
+                if (ctrl_bs == nullptr) ctrl_bs = ctrl;
                 ctrl_busy.push_back(ctrl);
                 break;
             default:
