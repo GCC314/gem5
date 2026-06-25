@@ -964,7 +964,7 @@ UBAdapter::wakeup()
             continue;
         }
         // PortAsync: dispatch to handleResponse (pendingByReqId map)
-        if (_mode == TransportMode::PortAsync) {
+        if (_port) {
             handleResponse(m);
         } else {
             const CoherenceMessage *coh = m->getPayload<CoherenceMessage>();
@@ -988,7 +988,7 @@ UBAdapter::wakeup()
 void
 UBAdapter::checkResponseCallbacks()
 {
-    if (_mode != TransportMode::PortAsync) return;
+    if (!_port) return;
     // Match _lastResponse against _pendingByReqId entries
     if (!_lastResponseValid) return;
     auto it = _pendingByReqId.find(_lastResponse.h.reqId);
@@ -1003,7 +1003,7 @@ UBAdapter::checkResponseCallbacks()
 void
 UBAdapter::handleResponse(framework::MemMessage *m)
 {
-    if (_mode != TransportMode::PortAsync) return;
+    if (!_port) return;
 
     const CoherenceMessage *coh = m->getPayload<CoherenceMessage>();
     if (!coh) return;
