@@ -52,6 +52,17 @@ UBIOModule::UBIOModule(const Params &p)
 
 UBIOModule::~UBIOModule()
 {
+    // Send TERMINATE to ubio process(es) via Port
+    if (_localAdapter && _localAdapter->port()) {
+        auto *port = _localAdapter->port();
+        auto *msg = port->sendAllocateBuffer(curTick());
+        if (msg) {
+            msg->hdr.type = static_cast<uint32_t>(framework::MemMessageType::TERMINATE);
+            msg->hdr.size = sizeof(framework::MemMessageHeader);
+            port->send(msg);
+        }
+    }
+
     _routers.erase({_nodeId, _socketId});
     for (auto &kv : _pairQueues) {
         delete kv.second;
