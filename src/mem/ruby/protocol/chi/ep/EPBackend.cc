@@ -1,4 +1,5 @@
 #include "mem/ruby/protocol/chi/ep/EPBackend.hh"
+#include "mem/ruby/protocol/chi/ep/UBCCController.hh"
 
 #include <cstdio>
 #include <cstring>
@@ -18,7 +19,6 @@
 #include "mem/ruby/protocol/chi/ep/BackstoreSchemaC.hh"
 #include "mem/ruby/protocol/chi/ep/EPRNFController.hh"
 #include "mem/ruby/protocol/chi/ep/MetaRNFController.hh"
-#include "mem/ruby/protocol/chi/ep/UBCCController.hh"
 #include "mem/ruby/protocol/chi/ep/UBAdapter.hh"
 #include "mem/ruby/protocol/CHI/CHIRequestType.hh"
 #include "mem/ruby/system/RubySystem.hh"
@@ -126,13 +126,6 @@ EPBackend::EPBackend(const Params &p)
     _epSnfs.resize(_numSockets, nullptr);  // v4-dual-socket: per-socket EP-SNF slots
 
     auto *ruby_system = p.ruby_system;
-    // v4-dual-socket: _ubcc retained for inspection/tests; main paths use message-passing.
-    _ubcc = new UBCCController(_nodeId, 0, ruby_system,
-                               p.ubcc_epoch_bits,
-                               p.ubcc_bf_bytes,
-                               p.ubcc_force_resident_entries);
-    _ubcc->setBackend(this);
-
     // v4: create backstore organization from config
     if (p.ubcc_backstore_org == "schema_c") {
         _org = new BackstoreSchemaC();
@@ -261,7 +254,6 @@ EPBackend::~EPBackend()
 {
     // M6: Deregister from cross-node routing registry
     _backendInstances.erase(_nodeId);
-    delete _ubcc;
 }
 
 /**
@@ -305,9 +297,6 @@ EPBackend::init()
         UBAdapter *adapter = getUBAdapter(s);
         if (adapter) {
             adapter->bindBackend(this);
-            if (_ubcc) {
-                adapter->bindUbccToRouter(_ubcc);
-            }
         }
     }
 
@@ -317,27 +306,11 @@ EPBackend::init()
                  "EPBackend node_id=%d: missing EP-SNF for socket %d", _nodeId, s);
     }
 
-    // ---- M4 Sentinel Registration Self-Test ----
-    // ---- M5 Sideband Self-Test ----
-    // ---- M6 UBCC Directory + EP_RNF Self-Test ----
-    // Runs during instantiation; results printed to stdout.
-    // Python test harness parses the output.
-    // Only one node (node 0) runs the self-tests to avoid duplicate output.
-    if (_nodeId == 0 && _ubcc) {
-        m4SelfTest_run(this);
-        m5SelfTest_run(this);
-        m6SelfTest_run(this);
-        m7SelfTest_run(this);
-        m8SelfTest_run(this);
-    }
 }
 
 void
 EPBackend::wakeup()
-{
-    if (_ubcc)
-        _ubcc->wakeup();
-}
+{}
 
 bool
 EPBackend::checkAddr(uint64_t pa) const
@@ -422,31 +395,25 @@ EPBackend::homeNodeCrossNode(uint64_t pa) const
 bool
 EPBackend::isDsmAddr(uint64_t pa) const
 {
-    if (!_ubcc)
-        return false;
-    return _ubcc->isDsmAddr(pa);
+    return _addrMap.isDsm(_nodeId, pa);
 }
 
 uint64_t
 EPBackend::getEpRnfSnoopCount() const
 {
-    if (!_ubcc)
-        return 0;
-    return _ubcc->getEpRnfSnoopCount();
+    return _epRnfSnoopCount;
 }
 
 void
 EPBackend::resetEpRnfSnoopCount()
 {
-    if (_ubcc)
-        _ubcc->resetEpRnfSnoopCount();
+    _epRnfSnoopCount = 0;
 }
 
 void
 EPBackend::incrementEpRnfSnoopCount()
 {
-    if (_ubcc)
-        _ubcc->incrementEpRnfSnoopCount();
+    _epRnfSnoopCount++;
 }
 
 // ---- M5: Remote Miss Request Dispatch ----
@@ -613,10 +580,10 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
             reqEnv.writeIntent, reqEnv.srcNode, reqEnv.epoch, reqEnv.reqId);
 
     // Convert outer request type to UBCC's internal enum
-    UBCC_OuterReqType ubccReq =
+    OuterReqType ubccReq =
         (reqType == OuterReqType::GlobalReadShared)
-            ? UBCC_OuterReqType::GlobalReadShared
-            : UBCC_OuterReqType::GlobalReadUnique;
+            ? OuterReqType::GlobalReadShared
+            : OuterReqType::GlobalReadUnique;
 
     // ---- M6: Mark outer txn pending before dispatching ----
     // Inform local EP_RNF that an outer transaction is in flight
@@ -635,7 +602,7 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
     GrantDataSource dataSource = GrantDataSource::HomeMemory;
     uint64_t authEpoch = 0;
 
-    UBCC_OuterGrantType ubccGrant;
+    OuterGrantType grantTypeVar;
     int pendingInvCount = -1;
     uint64_t pendingInvMask = 0;
     uint64_t committedEpoch = 0;
@@ -653,11 +620,11 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
     // Port async path: -2 means response pending, callers will retry
     if (grantInt == -2) return -2;
 
-    ubccGrant = static_cast<UBCC_OuterGrantType>(grantInt);
+    grantTypeVar = static_cast<OuterGrantType>(grantInt);
 
     printf("[TC5-CLEAR-TRACE] handleRemoteMiss node=%d localPA=0x%lx homePA=0x%lx "
-           "ubccGrant=%d reqId=%lu entryEpoch=%lu authEpoch=%lu recallNeeded=%d owner=%d\n",
-           _nodeId, line_pa, homePa, static_cast<int>(ubccGrant), reqIdVal,
+           "grantTypeVar=%d reqId=%lu entryEpoch=%lu authEpoch=%lu recallNeeded=%d owner=%d\n",
+           _nodeId, line_pa, homePa, static_cast<int>(grantTypeVar), reqIdVal,
            entry.epoch, authEpoch, recallNeeded, recallOwnerNode);
 
     // ---- M6: Handle recall path ----
@@ -769,7 +736,7 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
     // must be torn down here; otherwise EP-RNF keeps the line marked as
     // outerTxnPending forever and later retries / delayed snoop responses
     // can self-deadlock.
-    if (static_cast<int>(ubccGrant) < 0) {
+    if (static_cast<int>(grantTypeVar) < 0) {
         if (_epRnfCtrl) {
             _epRnfCtrl->setOuterTxnPending(line_pa, false);
             _epRnfCtrl->signalOuterTxnComplete(line_pa);
@@ -779,22 +746,22 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
 
     // Convert UBCC grant back to EPBackend's OuterGrantType
     OuterGrantType grant;
-    switch (ubccGrant) {
-        case UBCC_OuterGrantType::GlobalGrantShared:
+    switch (grantTypeVar) {
+        case OuterGrantType::GlobalGrantShared:
             grant = OuterGrantType::GlobalGrantShared;
             grantEnv.grantType = OuterGrantType::GlobalGrantShared;
             break;
-        case UBCC_OuterGrantType::GlobalGrantExclusive:
+        case OuterGrantType::GlobalGrantExclusive:
             grant = OuterGrantType::GlobalGrantExclusive;
             grantEnv.grantType = OuterGrantType::GlobalGrantExclusive;
             break;
-        case UBCC_OuterGrantType::GlobalGrantModified:
+        case OuterGrantType::GlobalGrantModified:
             grant = OuterGrantType::GlobalGrantModified;
             grantEnv.grantType = OuterGrantType::GlobalGrantModified;
             break;
         default:
             fatal("EPBackend node_id=%d: unknown UBCC grant %d\n",
-                  _nodeId, static_cast<int>(ubccGrant));
+                  _nodeId, static_cast<int>(grantTypeVar));
     }
 
     _lastGrantEnv = grantEnv;
@@ -1042,120 +1009,6 @@ EPBackend::setMetaRnfController(MetaRNFController *ctrl)
     _metaRnf = ctrl;
 }
 
-void
-EPBackend::issueBackstoreRead(uint64_t homePa)
-{
-    if (!_ubcc) return;
-
-    appendTmpLog("ep_backstore.log", "[BACKSTORE] read pa=0x%lx\n", homePa);
-
-    ResidentDir& dir = _ubcc->directory();
-
-    if (!dir.bloomMayContain(homePa)) {
-        UBCCController::BackstoreEntry empty{};
-        _ubcc->onBackstoreFillComplete(homePa, false, empty);
-        return;
-    }
-
-    if (!_metaRnf) {
-        panic("MetaRNF required for backstore I/O; no software fallback");
-    }
-
-    const uint64_t metaPa = metadataBackstorePa(homePa);
-    _metaRnf->issueRead(metaPa,
-        [this, homePa](bool ok, const MetaLine &line) {
-            UBCCController::BackstoreEntry e;
-            bool found = false;
-            if (ok) {
-                MetaStoreDecoded decoded;
-                found = decodeMetaLine(homePa, line, decoded);
-                if (found) {
-                    e.state = static_cast<UBCCMESIState>(decoded.state);
-                    e.sharersMask = decoded.sharersMask;
-                    e.epoch = decoded.epoch;
-                }
-            }
-            _ubcc->onBackstoreFillComplete(homePa, found, e);
-        });
-}
-
-void
-EPBackend::issueBackstoreWrite(uint64_t homePa)
-{
-    if (!_ubcc) return;
-
-    appendTmpLog("ep_backstore.log", "[BACKSTORE] write pa=0x%lx\n", homePa);
-
-    UBCCController::BackstoreEntry e;
-    if (!_ubcc->snapshotResidentForBackstore(homePa, e)) {
-        _ubcc->onBackstoreWriteAck(homePa);
-        return;
-    }
-
-    if (!_metaRnf) {
-        panic("MetaRNF required for backstore I/O; no software fallback");
-    }
-
-    const uint64_t metaPa = metadataBackstorePa(homePa);
-    MetaLine line = encodeMetaLine(homePa, static_cast<int>(e.state),
-                                    e.sharersMask, e.epoch);
-    _metaRnf->issueWrite(metaPa, line, [this, homePa](bool) {
-        _ubcc->directory().bloomInsert(homePa);
-        _ubcc->onBackstoreWriteAck(homePa);
-    });
-}
-
-void
-EPBackend::issueBackstoreDelete(uint64_t homePa)
-{
-    if (!_ubcc) return;
-
-    appendTmpLog("ep_backstore.log", "[BACKSTORE] delete pa=0x%lx\n", homePa);
-
-    if (!_metaRnf) {
-        panic("MetaRNF required for backstore I/O; no software fallback");
-    }
-
-    const uint64_t metaPa = metadataBackstorePa(homePa);
-    _metaRnf->issueDelete(metaPa, [this, homePa](bool existed) {
-        _ubcc->directory().bloomRemove(homePa);
-        _ubcc->onBackstoreDeleteAck(homePa, existed);
-    });
-}
-
-std::string
-EPBackend::inspectOffloadLineForTest(uint64_t homePa) const
-{
-    if (!_ubcc) {
-        return "{\"error\":\"no_ubcc\"}";
-    }
-    return _ubcc->inspectOffloadLineForTest(homePa);
-}
-
-bool
-EPBackend::debugSeedBackstoreForTest(
-    uint64_t homePa, int mesi, uint64_t sharersMask, uint64_t epoch)
-{
-    return _ubcc &&
-           _ubcc->debugSeedBackstoreForTest(homePa, mesi, sharersMask, epoch);
-}
-
-bool
-EPBackend::debugSeedResidentForTest(
-    uint64_t homePa, int mesi, uint64_t sharersMask, uint64_t epoch,
-    bool residentDirty)
-{
-    return _ubcc &&
-           _ubcc->debugSeedResidentForTest(homePa, mesi, sharersMask,
-                                           epoch, residentDirty);
-}
-
-bool
-EPBackend::debugForceResidentEvictForTest(uint64_t homePa)
-{
-    return _ubcc && _ubcc->debugForceResidentEvictForTest(homePa);
-}
-
 // ---- M5 Phase 2: Diagnose Expected Grant ----
 
 std::string
@@ -1357,7 +1210,6 @@ EPBackend::handleHomeWritebackComplete(uint64_t homePa)
 {
     printf("[EP-HOME-WB] node=%d pa=0x%lx\n", _nodeId, homePa);
     // v4-dual-socket: Send HomeWritebackNotify through adapter instead of
-    // calling _ubcc->notifyHomeWritebackComplete() directly.
     // For single-socket backward compat, homeSocket = 0.
     int homeSocket = _addrMap.homeSocket(_nodeId, homePa);
     if (homeSocket < 0) homeSocket = 0;
@@ -1395,26 +1247,30 @@ EPBackend::handleWriteback(uint64_t line_pa, bool keepAsClean)
     // Look up requester entry to get epoch
     // For home-local writebacks (called from EPSNF), fall back to UBCC
     // directory which holds the authoritative epoch and owner.
-    // v4-dual-socket TODO: replace direct _ubcc calls with QueryLineMetaReq/Resp
     // when _requesterLines miss and multiple sockets are active.
     uint64_t epochVal = 0;
     int requesterNode = _nodeId;
     auto it = _requesterLines.find(line_pa);
     if (it != _requesterLines.end()) {
         epochVal = it->second.epoch;
-    } else if (_ubcc) {
-        epochVal = _ubcc->getEpochForLine(line_pa);
+    } else {
+        // Query home UBCC via message for epoch + owner
+        uint64_t qEpoch = 0;
+        int qOwnerNode = -1;
+        bool qFound = false;
+        UBAdapter *wa = getUBAdapter(0);
+        if (wa) {
+            wa->sendQueryLineMetaReq(line_pa, homeNode, homeSocket,
+                                     qEpoch, qOwnerNode, qFound);
+        }
+        if (qFound) {
+            epochVal = qEpoch;
+            if (qOwnerNode >= 0) requesterNode = qOwnerNode;
+        }
         if (epochVal == 0) {
             _epochCounter++;
             epochVal = _epochCounter;
         }
-        int ownerNode = _ubcc->getOwnerForLine(line_pa);
-        if (ownerNode >= 0) {
-            requesterNode = ownerNode;
-        }
-    } else {
-        _epochCounter++;
-        epochVal = _epochCounter;
     }
 
     printf("[EP-HANDLE-WB] node=%d pa=0x%lx epoch=%lu requester=%d keepAsClean=%d\n",
@@ -1528,36 +1384,6 @@ EPBackend::handleEvict(uint64_t line_pa)
             _nodeId, line_pa, ok);
 
     return ok;
-}
-
-uint64_t
-EPBackend::getStaleRejectedCount() const
-{
-    if (!_ubcc)
-        return 0;
-    return _ubcc->getStaleEpochRejectedCount();
-}
-
-void
-EPBackend::resetStaleRejectedCount()
-{
-    if (_ubcc)
-        _ubcc->resetStaleEpochRejectedCount();
-}
-
-uint64_t
-EPBackend::getOwnerMismatchRejectedCount() const
-{
-    if (!_ubcc)
-        return 0;
-    return _ubcc->getOwnerMismatchRejectedCount();
-}
-
-void
-EPBackend::resetOwnerMismatchRejectedCount()
-{
-    if (_ubcc)
-        _ubcc->resetOwnerMismatchRejectedCount();
 }
 
 // ---- M8: Global Invalidation Management ----
@@ -1950,8 +1776,17 @@ EPBackend::sendHomeWritebackNotify(uint64_t homePa, int homeSocket)
 
     // Get current epoch from UBCC (for stale check at UBCC)
     uint64_t epochVal = 0;
-    if (_ubcc) {
-        epochVal = _ubcc->getEpochForLine(homePa);
+    {
+        uint64_t qEpoch = 0;
+        int qOwnerNode = -1;
+        bool qFound = false;
+        UBAdapter *na = getUBAdapter(homeSocket);
+        if (!na) na = getUBAdapter(0);
+        if (na) {
+            na->sendQueryLineMetaReq(homePa, homeNode, homeSocket,
+                                     qEpoch, qOwnerNode, qFound);
+            if (qFound) epochVal = qEpoch;
+        }
     }
 
     adapter->sendHomeWritebackNotify(homePa, epochVal, homeNode, homeSocket);

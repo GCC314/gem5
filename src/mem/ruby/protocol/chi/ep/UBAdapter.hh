@@ -21,7 +21,6 @@ namespace ruby
 {
 
 class EPBackend;
-class UBIOModule;
 class UBCCController;
 
 // Forward-declare EPBackend message types (defined in EPBackend.hh)
@@ -52,8 +51,6 @@ class UBAdapter : public SimObject
     /** Bind the EPBackend that owns this adapter. */
     void bindBackend(EPBackend *backend) { _backend = backend; }
 
-    /** Bind the local UBIOModule *for message dispatch. */
-    void setRouter(UBIOModule *router) { _router = router; }
 
     /** Set PseudoMemPort for async message transport (multi-process path). */
     void setPseudoPort(pseudo::PseudoMemPort *port) { _pseudoPort = port; }
@@ -64,11 +61,6 @@ class UBAdapter : public SimObject
     framework::Port* port() const { return _port; }
 
     /**
-     * Wire the local UBCC to the router.
-     * Called from EPBackend::init() after SimObject wiring is complete.
-     */
-    void bindUbccToRouter(UBCCController *ubcc);
-
     /**
      * Phase 2: Synchronous Read Request.
      *
@@ -163,13 +155,11 @@ class UBAdapter : public SimObject
     const NodeAddressMap& addrMap() const { return _addrMap; }
 
     /** The router for UBCC→Adapter messages. */
-    UBIOModule * router() const { return _router; }
 
   private:
     int _nodeId;
     int _socketId;
     EPBackend *_backend = nullptr;
-    UBIOModule *_router = nullptr;
     pseudo::PseudoMemPort *_pseudoPort = nullptr;
     framework::Port *_port = nullptr;
     NodeAddressMap _addrMap;
@@ -210,7 +200,6 @@ class UBAdapter : public SimObject
     int _responseCheckCount = 0;
     bool _eventArmed = false;
 
-    friend class UBIOModule;
 };
 
 } // namespace ruby

@@ -12,7 +12,6 @@
 #include "mem/ruby/protocol/chi/ep/BackstoreOrganization.hh"
 #include "mem/ruby/protocol/chi/ep/CoherenceMessage.hh"
 #include "mem/ruby/protocol/chi/ep/NodeAddressMap.hh"
-#include "mem/ruby/protocol/chi/ep/UBCCProtocolIF.hh"
 #include "params/EPBackend.hh"
 #include "sim/sim_object.hh"
 
@@ -22,7 +21,6 @@ namespace gem5
 namespace ruby
 {
 
-class UBCCController;
 class EPRNFController;
 class EPSNFController;
 class UBAdapter;
@@ -471,15 +469,11 @@ class EPBackend : public SimObject
     /**
      * Get stale-epoch-rejected count for test observation.
      */
-    uint64_t getStaleRejectedCount() const;
-    void resetStaleRejectedCount();
 
     /**
      * Get owner-mismatch-rejected count for test observation (P0-1).
      * Writeback from a node that is not the current owner is rejected.
      */
-    uint64_t getOwnerMismatchRejectedCount() const;
-    void resetOwnerMismatchRejectedCount();
 
     // M7: Envelope accessors for test inspection
     const OuterWritebackMsg& lastWritebackMsg() const { return _lastWritebackMsg; }
@@ -577,8 +571,6 @@ class EPBackend : public SimObject
     void resetEpRnfSnoopCount();
     void incrementEpRnfSnoopCount();
 
-    /** Access to UBCCController for Python inspection */
-    UBCCController* getUBCC() const { return _ubcc; }
 
     /** Bind the UBAdapter for message-path access to UBCC (legacy single-socket). */
     void setUBAdapter(UBAdapter *adapter) {
@@ -635,17 +627,10 @@ class EPBackend : public SimObject
     void setMetaRnfController(MetaRNFController *ctrl);
     void setBackstoreOrganization(BackstoreOrganization *org) { _org = org; }
     BackstoreOrganization* backstoreOrganization() const { return _org; }
-    void issueBackstoreRead(uint64_t homePa);
-    void issueBackstoreWrite(uint64_t homePa);
-    void issueBackstoreDelete(uint64_t homePa);
 
-    std::string inspectOffloadLineForTest(uint64_t homePa) const;
-    bool debugSeedBackstoreForTest(uint64_t homePa, int mesi,
-                                   uint64_t sharersMask, uint64_t epoch);
-    bool debugSeedResidentForTest(uint64_t homePa, int mesi,
-                                  uint64_t sharersMask, uint64_t epoch,
-                                  bool residentDirty);
-    bool debugForceResidentEvictForTest(uint64_t homePa);
+
+
+
 
     // ---- M6: EP_RNF delayed response hook ----
     /**
@@ -691,9 +676,7 @@ class EPBackend : public SimObject
 
     const int _nodeId;
     NodeAddressMap _addrMap;
-    // v4-dual-socket: _ubcc retained for backward compatibility (tests/inspection).
-    // Main protocol paths MUST use _ubAdapters[] → UBIOModule *→ UBCC message-passing.
-    UBCCController *_ubcc = nullptr;
+    uint64_t _epRnfSnoopCount = 0;
     MetaRNFController *_metaRnf = nullptr;
     BackstoreOrganization *_org = nullptr;
     std::vector<UBAdapter*> _ubAdapters;  // v4-dual-socket: per-socket adapters
