@@ -2,6 +2,7 @@
 #define __MEM_RUBY_PROTOCOL_CHI_EP_UBADAPTER_HH__
 
 #include <cstdint>
+#include <deque>
 #include <functional>
 #include <map>
 
@@ -171,6 +172,8 @@ class UBAdapter : public SimObject
     /** Poll injected framework::Port and dispatch to recvFromRouter(). */
     bool transportRecv(CoherenceMessageType expectedType, uint64_t expectedReqId);
 
+    void drainDeferredControls();
+
     /**
      * Per-transaction pending state.
      * Tracks in-flight requests waiting for responses.
@@ -200,6 +203,9 @@ class UBAdapter : public SimObject
     int _responseCheckCount = 0;
     bool _eventArmed = false;
 
+    // Deferred async control messages (InvalidateReq/RecallReq/UpgradeAckNotify)
+    std::deque<CoherenceMessage> _deferredControls;
+    bool _drainingDeferredControls = false;
 };
 
 } // namespace ruby

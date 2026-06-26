@@ -660,46 +660,14 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
         getUBAdapter(0)->sendRecallReqToOwner(recallOwnerNode, recallMsg, homeSocket);
     }
 
-    // ---- M8: Global Invalidation Routing ----
-    // Check if the home UBCC has pending invalidations from this
-    // request (e.g., G_S upgrade to unique with external sharers).
-    {
-        if (pendingInvCount > 0) {
-            // P0-1: Use home committed epoch (not requester's local epoch)
-            // so that processInvalidationAck's checkEpochForLine() matches.
-            uint64_t homeEpoch = committedEpoch;
-            DPRINTF(RubyEP,
-                    "EPBackend node_id=%d: M8 routing invalidations "
-                    "PA=0x%lx homePa=0x%lx invCount=%d invMask=0x%lx "
-                    "homeEpoch=%lu\n",
-                    _nodeId, line_pa, homePa,
-                    pendingInvCount, pendingInvMask, homeEpoch);
-
-            // For each sharer node in the pending invalidation mask,
-            // send an invalidation request through that node's EPBackend.
-            for (int s = 0; s < 64 && pendingInvMask != 0; s++) {
-                uint64_t sBit = (1ULL << s);
-                if (pendingInvMask & sBit) {
-                    pendingInvMask &= ~sBit; // Clear as we process
-
-                    OuterInvalidateMsg invMsg;
-                    invMsg.linePa = homePa;
-                    invMsg.sharerLocalPa = _addrMap.buildDsmPA(
-                        s, homeNode, offset);
-                    invMsg.sharerNode = s;
-                    invMsg.homeNode = homeNode;
-                    invMsg.epoch = homeEpoch;
-                    invMsg.reqId = reqIdVal;  // v4: outer transaction reqId
-
-                    _lastInvalidateMsg = invMsg;
-
-                    DPRINTF(RubyEP,
-                            "EPBackend node_id=%d: routing invalidation "
-                            "to node %d via UBAdapter\n", _nodeId, s);
-                    getUBAdapter(0)->sendInvalidateReqToSharer(s, invMsg, 0);
-                }
-            }
-        }
+    // ---- M8: Invalidation now owned by Home UBCC (direct fanout) ----
+    // Requester no longer routes invalidations; home UBCC sends them
+    // directly via its outbound sender interface (ubio_main injects).
+    if (pendingInvCount > 0) {
+        DPRINTF(RubyEP,
+                "EPBackend node_id=%d: home UBCC owns invalidation fanout "
+                "PA=0x%lx pendingInvCount=%d mask=0x%lx\n",
+                _nodeId, line_pa, pendingInvCount, pendingInvMask);
     }
 
     // ---- M5 Phase 2: Outer Grant Envelope ----

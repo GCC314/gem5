@@ -944,7 +944,7 @@ UBAdapter::wakeup()
     // 2. Drain all ready messages (using three-state recv)
     framework::ReceiveStatus st;
     framework::MemMessage *m = _port->recv(curTick(), &st);
-    while (m && st == framework::ReceiveStatus::kMessage) {
+    while (m && (st == framework::ReceiveStatus::kMessage || st == framework::ReceiveStatus::kSync)) {
         if (m->hdr.type == static_cast<uint32_t>(framework::MemMessageType::CONTROL_SYNC)) {
             m = _port->recv(curTick(), &st);
             continue;
@@ -963,15 +963,22 @@ UBAdapter::wakeup()
         m = _port->recv(curTick(), &st);
     }
 
-    // 3. Check for matched responses (for retry-based callers)
+    // 3. Drain deferred async control messages before checking responses
+    drainDeferredControls();
+
+    // 4. Check for matched responses (for retry-based callers)
     checkResponseCallbacks();
 
-    // 4. Schedule next wakeup using safeTs for conservative advancement
+    // 5. Schedule next wakeup using safeTs for conservative advancement
     if (++_responseCheckCount < 100000) {
         uint64_t safeT = _port->safeTs(curTick());
         if (safeT <= curTick()) safeT = curTick() + 1000;
         schedule(_responseCheckEvent, safeT);
         _eventArmed = true;
+    } else {
+        static int wstop = 0;
+        if (++wstop <= 1)
+            warn("UBAdapter node=%d: wakeup STOPPED after 100000 checks\n", _nodeId);
     }
 }
 
@@ -998,6 +1005,17 @@ UBAdapter::handleResponse(framework::MemMessage *m)
     const CoherenceMessage *coh = m->getPayload<CoherenceMessage>();
     if (!coh) return;
 
+    // Async control messages: enqueue FIFO, process later via drainDeferredControls
+    switch (coh->h.type) {
+      case CoherenceMessageType::InvalidateReq:
+      case CoherenceMessageType::RecallReq:
+      case CoherenceMessageType::UpgradeAckNotify:
+        _deferredControls.push_back(*coh);
+        return;
+      default:
+        break;
+    }
+
     // Dispatch via _pendingByReqId map
     auto it = _pendingByReqId.find(m->hdr.req_id);
     if (it != _pendingByReqId.end() && it->second.onResp) {
@@ -1018,6 +1036,19 @@ UBAdapter::scheduleResponseCheck()
         schedule(_responseCheckEvent, curTick() + 10);
         _eventArmed = true;
     }
+}
+
+void
+UBAdapter::drainDeferredControls()
+{
+    if (_drainingDeferredControls) return;
+    _drainingDeferredControls = true;
+    while (!_deferredControls.empty()) {
+        CoherenceMessage msg = _deferredControls.front();
+        _deferredControls.pop_front();
+        recvFromRouter(msg);
+    }
+    _drainingDeferredControls = false;
 }
 
 } // namespace ruby
