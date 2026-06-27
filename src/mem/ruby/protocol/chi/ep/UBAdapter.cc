@@ -10,6 +10,7 @@
 #include "framework/Port.hh"
 #include "mem/ruby/protocol/chi/ep/EPBackend.hh"
 #include "sim/cur_tick.hh"
+#include "sim/system.hh"
 
 namespace gem5
 {
@@ -49,6 +50,28 @@ UBAdapter::init()
             _port = new framework::Port(
                 "gem5_ubio", _nodeId, 0, ep, true, *ctx, 1000);
             std::printf("[STEP5] Port enabled node=%d ep=%s\n", _nodeId, ep.c_str());
+
+            // Barrier Port: connect to BarrierManager
+            _barrierCtx = new zmq::context_t(1);
+            std::string bep = "ipc:///tmp/barrier_m" + std::to_string(_nodeId) + "_p1";
+            _barrierPort = new framework::Port(
+                "barrier", _nodeId, 1, bep, false, *_barrierCtx, 1000);
+            std::printf("[STEP5-BARRIER] Port enabled node=%d ep=%s\n", _nodeId, bep.c_str());
+        }
+    }
+
+    // Register barrier callback with SyncWaitManager
+    if (_barrierPort) {
+        SimObject *_sysObj = getSimObjectResolver()->resolve("system");
+        if (_sysObj) {
+            System *_sys = dynamic_cast<System*>(_sysObj);
+            if (_sys) {
+                _sys->syncWait.setNodeId(_nodeId);
+                _sys->syncWait.setBarrierSendFn(
+                    [this](uint32_t mask, uint32_t src) {
+                        this->onBarrierReady(mask, src);
+                    });
+            }
         }
     }
 
@@ -968,6 +991,9 @@ UBAdapter::wakeup()
     // 3. Drain deferred async control messages before checking responses
     drainDeferredControls();
 
+    // 3b. Drain barrier port messages
+    drainBarrierMessages();
+
     // 4. Check for matched responses (for retry-based callers)
     checkResponseCallbacks();
 
@@ -1051,6 +1077,49 @@ UBAdapter::drainDeferredControls()
         recvFromRouter(msg);
     }
     _drainingDeferredControls = false;
+}
+
+void
+UBAdapter::onBarrierReady(uint32_t mask, uint32_t srcNode)
+{
+    if (!_barrierPort) return;
+    std::printf("[BARRIER-SEND] node=%d mask=0x%x\n", _nodeId, mask);
+    MemMessage *m = _barrierPort->sendAllocateBuffer(curTick());
+    if (m) {
+        m->hdr.type = static_cast<uint32_t>(framework::MemMessageType::BARRIER_REACHED);
+        m->hdr.req_id = mask;
+        m->hdr.src_module = _nodeId;
+        m->hdr.dst_module = 0;
+        m->hdr.size = sizeof(framework::MemMessageHeader);
+        _barrierPort->send(m);
+    }
+}
+
+void
+UBAdapter::handleBarrierRelease(uint32_t mask)
+{
+    std::printf("[BARRIER-RELEASE] node=%d mask=0x%x\n", _nodeId, mask);
+    SimObject *_sysObj = getSimObjectResolver()->resolve("system");
+    if (_sysObj) {
+        System *_sys = dynamic_cast<System*>(_sysObj);
+        if (_sys) {
+            _sys->syncWait.barrierRelease(mask);
+        }
+    }
+}
+
+void
+UBAdapter::drainBarrierMessages()
+{
+    if (!_barrierPort) return;
+    framework::ReceiveStatus st;
+    framework::MemMessage *m = _barrierPort->recv(curTick(), &st);
+    while (m && st == framework::ReceiveStatus::kMessage) {
+        if (m->hdr.type == static_cast<uint32_t>(framework::MemMessageType::BARRIER_RELEASE)) {
+            handleBarrierRelease(static_cast<uint32_t>(m->hdr.req_id));
+        }
+        m = _barrierPort->recv(curTick(), &st);
+    }
 }
 
 } // namespace ruby

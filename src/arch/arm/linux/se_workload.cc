@@ -147,12 +147,28 @@ setTLSFunc64(SyscallDesc *desc, ThreadContext *tc, uint32_t tlsPtr)
 
 template <typename ABI>
 static SyscallReturn
-syncWaitFunc(SyscallDesc *desc, ThreadContext *tc, uint64_t node_mask)
+syncWaitFunc(SyscallDesc *desc, ThreadContext *tc, uint64_t node_mask,
+             uint64_t active_threads)
 {
-    // High 32 bits non-zero: only 32-bit masks are supported.
-    if (node_mask >> 32) {
-        return -EINVAL;
-    }
+    auto *sys = dynamic_cast<System *>(tc->getSystemPtr());
+    if (!sys) return (int64_t)-1;
+    int ret = sys->syncWait.barrierArrive(tc,
+        static_cast<uint32_t>(node_mask),
+        static_cast<uint32_t>(active_threads));
+    return (ret < 0) ? (int64_t)ret : (int64_t)node_mask;
+}
+
+// Old single-arg compat
+template <typename ABI>
+static SyscallReturn
+syncWaitFuncOld(SyscallDesc *desc, ThreadContext *tc, uint64_t node_mask)
+{
+    auto *sys = dynamic_cast<System *>(tc->getSystemPtr());
+    if (!sys) return (int64_t)-1;
+    int ret = sys->syncWait.barrierArrive(tc,
+        static_cast<uint32_t>(node_mask), 2); // legacy: popcount default
+    return (ret < 0) ? (int64_t)ret : (int64_t)node_mask;
+}
 
     auto *sys = tc->getSystemPtr();
     int ret = sys->syncWait.barrierWait(tc, static_cast<uint32_t>(node_mask));

@@ -30,84 +30,56 @@
 #define __SIM_SYNC_WAIT_HH__
 
 #include <cstdint>
+#include <functional>
 #include <map>
 #include <set>
+#include <vector>
 
 namespace gem5
 {
 
 class ThreadContext;
 
-/**
- * SyncWaitManager provides a cross-node barrier primitive for SE-mode
- * multi-threaded simulations.
- *
- * Each barrier instance is identified by a node_mask. The number of
- * bits set in node_mask determines the expected number of threads that
- * must reach the barrier before all are released.
- *
- * Barrier instances are isolated by node_mask: threads using different
- * masks do not block each other.
- *
- * Barriers are reusable: after a round completes (all threads released),
- * the barrier state resets so the next round starts clean.
- *
- * Only threads that explicitly call Sync_Wait are counted; threads that
- * do not call the syscall are ignored.
- */
 class SyncWaitManager
 {
   public:
-    /** Maximum number of nodes in the current topology.
-     *  Only bits 0..(MAX_NODE_COUNT-1) are valid in node_mask. */
     static constexpr uint32_t MAX_NODE_COUNT = 3;
 
+    /** Callback: UBAdapter registers this to send BARRIER_REACHED via Port. */
+    using BarrierSendFn = std::function<void(uint32_t mask, uint32_t nodeId)>;
+
   private:
-    /** Per-barrier-instance state. */
     struct BarrierState
     {
-        /** Target count: popcount of node_mask. */
-        uint32_t target;
-        /** Set of ThreadContext pointers that have arrived this round. */
-        std::set<ThreadContext *> arrived;
-        /** True while a round is active (gathering or just released). */
-        bool gathering;
+        uint32_t activeThreads = 0;
+        std::set<ThreadContext *> waiting;
     };
 
-    /** Map from node_mask to barrier state. */
-    std::map<uint32_t, BarrierState> barriers;
-
-    /**
-     * Popcount helper: count number of set bits in a 32-bit integer.
-     */
-    static uint32_t popcount(uint32_t v);
+    std::map<uint32_t, BarrierState> _barriers;
+    BarrierSendFn _sendFn;
+    uint32_t _nodeId = 0;
 
   public:
     SyncWaitManager() = default;
     ~SyncWaitManager() = default;
 
+    void setNodeId(uint32_t nid) { _nodeId = nid; }
+    void setBarrierSendFn(BarrierSendFn fn) { _sendFn = std::move(fn); }
+
     /**
-     * Called when a thread invokes the Sync_Wait syscall.
-     *
-     * @param tc        The calling thread context.
-     * @param node_mask The barrier identifier; popcount(mask) gives the
-     *                  expected number of threads.
-     * @return 0 on success; negative errno (-EINVAL) on invalid node_mask.
-     *
-     * If not all expected threads have arrived, the calling thread is
-     * suspended. When the last expected thread arrives, all waiting
-     * threads are activated.
-     *
-     * Duplicate calls by the same thread within the same round are
-     * safely ignored.
-     * After a round completes and a new round begins, the barrier
-     * state is automatically reset.
-     *
-     * Returns -EINVAL if:
-     *   - node_mask == 0
-     *   - node_mask contains bits beyond MAX_NODE_COUNT-1
+     * Called when a thread invokes Sync_Wait(mask, activeThreads).
+     * activeThreads: total threads on THIS node that must arrive before
+     *               BARRIER_REACHED is sent to BarrierManager.
+     * If not all local threads arrived: suspend tc.
+     * If all local arrived: send BARRIER_REACHED and suspend tc.
      */
-    int barrierWait(ThreadContext *tc, uint32_t node_mask);
+    int barrierArrive(ThreadContext *tc, uint32_t mask, uint32_t activeThreads);
+
+    /**
+     * Called when BarrierManager sends BARRIER_RELEASE.
+     * Wakes all waiting threads for this mask.
+     */
+    void barrierRelease(uint32_t mask);
 };
 
 } // namespace gem5
