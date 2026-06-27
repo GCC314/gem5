@@ -47,7 +47,7 @@ UBAdapter::init()
             auto* ctx = new zmq::context_t(1);
             std::string ep = "ipc:///tmp/ubio_n" + std::to_string(_nodeId);
             _port = new framework::Port(
-                "gem5_ubio", _nodeId, 0, ep, true, *ctx, 100000);
+                "gem5_ubio", _nodeId, 0, ep, true, *ctx, 4000);
             std::printf("[STEP5] Port enabled node=%d ep=%s\n", _nodeId, ep.c_str());
         }
     }
@@ -707,6 +707,8 @@ UBAdapter::sendRecallReqToOwner(int targetNode,
         req.h.flags |= static_cast<uint32_t>(CFLAG_HAS_DATA);
 
     // Fire-and-forget: no response expected from the remote adapter
+    printf("[RECALL-TRACE-B] UBAdapter n=%d sendRecallReqToOwner PA=0x%lx target=%d epoch=%lu\n",
+           _nodeId, recallMsg.linePa, targetNode, recallMsg.epoch);
     (void)transportSend(req);
 }
 
