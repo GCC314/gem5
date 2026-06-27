@@ -47,7 +47,7 @@ UBAdapter::init()
             auto* ctx = new zmq::context_t(1);
             std::string ep = "ipc:///tmp/ubio_n" + std::to_string(_nodeId);
             _port = new framework::Port(
-                "gem5_ubio", _nodeId, 0, ep, true, *ctx, 4000);
+                "gem5_ubio", _nodeId, 0, ep, true, *ctx, 1000);
             std::printf("[STEP5] Port enabled node=%d ep=%s\n", _nodeId, ep.c_str());
         }
     }
