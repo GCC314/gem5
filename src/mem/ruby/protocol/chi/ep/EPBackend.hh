@@ -442,7 +442,7 @@ class EPBackend : public SimObject
      * @param keepAsClean True if owner wants to keep clean exclusive copy
      * @return            True if writeback was accepted by home
      */
-    bool handleWriteback(uint64_t line_pa, bool keepAsClean);
+    int handleWriteback(uint64_t line_pa, bool keepAsClean);
 
     /**
      * Called by EPSNFController when HN-F completes a WriteNoSnp write

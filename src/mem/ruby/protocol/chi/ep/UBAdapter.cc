@@ -45,10 +45,13 @@ UBAdapter::init()
         int enableNode = atoi(portEnv);
         if (enableNode < 0 || _nodeId == enableNode) {
             auto* ctx = new zmq::context_t(1);
-            std::string ep = "ipc:///tmp/ubio_n" + std::to_string(_nodeId);
+            std::string base = "/workspace/gem5/shared_ipc/ipc";
+            std::string rx = base + "_ubio_" + std::to_string(_nodeId) + "_to_gem5_" + std::to_string(_nodeId);
+            std::string tx = base + "_gem5_" + std::to_string(_nodeId) + "_to_ubio_" + std::to_string(_nodeId);
             _port = new framework::Port(
-                "gem5_ubio", _nodeId, 0, ep, true, *ctx, 100000);
-            std::printf("[STEP5] Port enabled node=%d ep=%s\n", _nodeId, ep.c_str());
+                "gem5_ubio", _nodeId, 0, "ipc://" + rx, "ipc://" + tx, *ctx, 1000);
+            std::printf("[Port gem5_ubio] n=%d rx=%s tx->%s\n",
+                        _nodeId, rx.c_str(), tx.c_str());
         }
     }
 
@@ -284,7 +287,7 @@ UBAdapter::sendReadReq(
 
 // ---- Phase 2+: Writeback Request ----
 
-bool
+int
 UBAdapter::sendWritebackReq(uint64_t homePa, int requesterNode,
                              uint64_t epochVal, bool keepAsClean,
                              int homeNode, int homeSocket)
@@ -300,6 +303,13 @@ UBAdapter::sendWritebackReq(uint64_t homePa, int requesterNode,
               _nodeId, _socketId);
     }
 
+    // Port async: check cached response first
+    if (_port && _lastResponseValid &&
+        _lastResponse.h.type == CoherenceMessageType::WritebackResp &&
+        _lastResponse.h.homeLinePa == homePa) {
+        return _lastResponse.b.writebackResp.success ? 1 : 0;
+    }
+
     CoherenceMessage req;
     req.h.type = CoherenceMessageType::WritebackReq;
     req.h.srcNode = _nodeId;
@@ -312,6 +322,7 @@ UBAdapter::sendWritebackReq(uint64_t homePa, int requesterNode,
     req.h.requesterNode = requesterNode;
     req.h.homeLinePa = homePa;
     req.h.epoch = epochVal;
+    req.h.reqId = 0;
     req.h.seqNum = _nextSeq++;
     req.h.enqueueTick = curTick();
     req.h.readyTick = curTick();
@@ -320,30 +331,36 @@ UBAdapter::sendWritebackReq(uint64_t homePa, int requesterNode,
 
     _lastResponseValid = false;
     if (!transportSend(req)) {
-        return false;
+        return -1;
+    }
+
+    // Port async path: schedule check, return pending
+    if (_port) {
+        scheduleResponseCheck();
+        return -2;
     }
 
     if (!transportRecv(CoherenceMessageType::WritebackResp, req.h.reqId)) {
         warn("UBAdapter node=%d: sendWritebackReq: no response PA=0x%lx\n",
              _nodeId, homePa);
-        return false;
+        return -1;
     }
 
     const CoherenceMessage &resp = _lastResponse;
     if (resp.h.type != CoherenceMessageType::WritebackResp) {
         warn("UBAdapter node=%d: sendWritebackReq: unexpected response type %s\n",
              _nodeId, coherenceMsgTypeName(resp.h.type));
-        return false;
+        return -1;
     }
 
-    return resp.b.writebackResp.success;
+    return resp.b.writebackResp.success ? 1 : 0;
 }
 
 // ---- Evict Request ----
 
-bool
+int
 UBAdapter::sendEvictReq(uint64_t homePa, int evictingNode, uint64_t epochVal,
-                         int homeNode, int homeSocket)
+                          int homeNode, int homeSocket)
 {
     DPRINTF(RubyEP,
             "UBAdapter node=%d socket=%d: sendEvictReq homePa=0x%lx "
@@ -354,6 +371,13 @@ UBAdapter::sendEvictReq(uint64_t homePa, int evictingNode, uint64_t epochVal,
     if (!_port) {
         fatal("UBAdapter node=%d socket=%d: sendEvictReq called with no transport bound\n",
               _nodeId, _socketId);
+    }
+
+    // Port async: check cached response first
+    if (_port && _lastResponseValid &&
+        _lastResponse.h.type == CoherenceMessageType::EvictResp &&
+        _lastResponse.h.homeLinePa == homePa) {
+        return _lastResponse.b.evictResp.success ? 1 : 0;
     }
 
     CoherenceMessage req;
@@ -368,34 +392,41 @@ UBAdapter::sendEvictReq(uint64_t homePa, int evictingNode, uint64_t epochVal,
     req.h.requesterNode = evictingNode;
     req.h.homeLinePa = homePa;
     req.h.epoch = epochVal;
+    req.h.reqId = 0;
     req.h.seqNum = _nextSeq++;
     req.h.enqueueTick = curTick();
     req.h.readyTick = curTick();
 
     _lastResponseValid = false;
     if (!transportSend(req)) {
-        return false;
+        return -1;
+    }
+
+    // Port async path: schedule check, return pending
+    if (_port) {
+        scheduleResponseCheck();
+        return -2;
     }
 
     if (!transportRecv(CoherenceMessageType::EvictResp, req.h.reqId)) {
         warn("UBAdapter node=%d: sendEvictReq: no response PA=0x%lx\n",
              _nodeId, homePa);
-        return false;
+        return -1;
     }
 
     const CoherenceMessage &resp = _lastResponse;
     if (resp.h.type != CoherenceMessageType::EvictResp) {
         warn("UBAdapter node=%d: sendEvictReq: unexpected response type %s\n",
              _nodeId, coherenceMsgTypeName(resp.h.type));
-        return false;
+        return -1;
     }
 
-    return resp.b.evictResp.success;
+    return resp.b.evictResp.success ? 1 : 0;
 }
 
 // ---- Upgrade Request ----
 
-bool
+int
 UBAdapter::sendUpgradeReq(uint64_t homePa, int requesterNode,
                             uint64_t epoch, uint64_t reqId,
                             int desiredPerm, int cause,
@@ -412,6 +443,19 @@ UBAdapter::sendUpgradeReq(uint64_t homePa, int requesterNode,
     if (!_port) {
         fatal("UBAdapter node=%d socket=%d: sendUpgradeReq called with no transport bound\n",
               _nodeId, _socketId);
+    }
+
+    // Port async: check cached response first
+    if (_port && _lastResponseValid &&
+        _lastResponse.h.type == CoherenceMessageType::UpgradeResp &&
+        _lastResponse.h.reqId == reqId) {
+        if (outUpgradeTargetMask)
+            *outUpgradeTargetMask = _lastResponse.b.upgradeResp.upgradeTargetMask;
+        if (outCommittedEpoch)
+            *outCommittedEpoch = _lastResponse.b.upgradeResp.committedEpoch;
+        bool accepted =
+            (_lastResponse.h.flags & static_cast<uint32_t>(CFLAG_ACCEPTED)) != 0;
+        return accepted ? 1 : 0;
     }
 
     CoherenceMessage req;
@@ -436,20 +480,26 @@ UBAdapter::sendUpgradeReq(uint64_t homePa, int requesterNode,
 
     _lastResponseValid = false;
     if (!transportSend(req)) {
-        return false;
+        return -1;
+    }
+
+    // Port async path: schedule check, return pending
+    if (_port) {
+        scheduleResponseCheck();
+        return -2;
     }
 
     if (!transportRecv(CoherenceMessageType::UpgradeResp, reqId)) {
         warn("UBAdapter node=%d: sendUpgradeReq: no response PA=0x%lx\n",
              _nodeId, homePa);
-        return false;
+        return -1;
     }
 
     const CoherenceMessage &resp = _lastResponse;
     if (resp.h.type != CoherenceMessageType::UpgradeResp) {
         warn("UBAdapter node=%d: sendUpgradeReq: unexpected response type %s\n",
              _nodeId, coherenceMsgTypeName(resp.h.type));
-        return false;
+        return -1;
     }
 
     bool accepted = (resp.h.flags & static_cast<uint32_t>(CFLAG_ACCEPTED)) != 0;
@@ -462,15 +512,15 @@ UBAdapter::sendUpgradeReq(uint64_t homePa, int requesterNode,
             "UBAdapter node=%d: sendUpgradeReq result accepted=%d targetMask=0x%lx\n",
             _nodeId, accepted, resp.b.upgradeResp.upgradeTargetMask);
 
-    return accepted;
+    return accepted ? 1 : 0;
 }
 
 // ---- Upgrade Done Request ----
 
-bool
+int
 UBAdapter::sendUpgradeDoneReq(uint64_t homePa, int requesterNode,
-                               uint64_t epoch, uint64_t reqId,
-                               int homeNode, int homeSocket)
+                                uint64_t epoch, uint64_t reqId,
+                                int homeNode, int homeSocket)
 {
     DPRINTF(RubyEP,
             "UBAdapter node=%d socket=%d: sendUpgradeDoneReq homePa=0x%lx "
@@ -481,6 +531,13 @@ UBAdapter::sendUpgradeDoneReq(uint64_t homePa, int requesterNode,
     if (!_port) {
         fatal("UBAdapter node=%d socket=%d: sendUpgradeDoneReq called with no transport bound\n",
               _nodeId, _socketId);
+    }
+
+    // Port async: check cached response first
+    if (_port && _lastResponseValid &&
+        _lastResponse.h.type == CoherenceMessageType::UpgradeDoneResp &&
+        _lastResponse.h.reqId == reqId) {
+        return _lastResponse.b.upgradeDoneResp.accepted ? 1 : 0;
     }
 
     CoherenceMessage req;
@@ -502,41 +559,47 @@ UBAdapter::sendUpgradeDoneReq(uint64_t homePa, int requesterNode,
 
     _lastResponseValid = false;
     if (!transportSend(req)) {
-        return false;
+        return -1;
+    }
+
+    // Port async path: schedule check, return pending
+    if (_port) {
+        scheduleResponseCheck();
+        return -2;
     }
 
     if (!transportRecv(CoherenceMessageType::UpgradeDoneResp, reqId)) {
         warn("UBAdapter node=%d: sendUpgradeDoneReq: no response PA=0x%lx\n",
              _nodeId, homePa);
-        return false;
+        return -1;
     }
 
     const CoherenceMessage &resp = _lastResponse;
     if (resp.h.type != CoherenceMessageType::UpgradeDoneResp) {
         warn("UBAdapter node=%d: sendUpgradeDoneReq: unexpected response type %s\n",
              _nodeId, coherenceMsgTypeName(resp.h.type));
-        return false;
+        return -1;
     }
 
-    return resp.b.upgradeDoneResp.accepted;
+    return resp.b.upgradeDoneResp.accepted ? 1 : 0;
 }
 
 // ---- Clear Request ----
 
-bool
+int
 UBAdapter::sendClearReq(uint64_t linePa, int srcNode,
                          uint64_t epoch, uint64_t reqId,
                          int homeNode, int homeSocket)
 {
-    DPRINTF(RubyEP,
-            "UBAdapter node=%d socket=%d: sendClearReq PA=0x%lx "
-            "srcNode=%d epoch=%lu reqId=%lu homeNode=%d homeSocket=%d\n",
-            _nodeId, _socketId, linePa, srcNode, epoch, reqId,
-            homeNode, homeSocket);
-
     if (!_port) {
         fatal("UBAdapter node=%d socket=%d: sendClearReq called with no transport bound\n",
               _nodeId, _socketId);
+    }
+
+    // Port async: check cached response first
+    if (_port && _lastResponseValid && _lastResponse.h.type == CoherenceMessageType::ClearResp
+        && _lastResponse.h.reqId == reqId) {
+        return _lastResponse.b.clearResp.accepted ? 1 : 0;
     }
 
     CoherenceMessage req;
@@ -555,28 +618,33 @@ UBAdapter::sendClearReq(uint64_t linePa, int srcNode,
     req.h.seqNum = _nextSeq++;
     req.h.enqueueTick = curTick();
     req.h.readyTick = curTick();
-
-    req.b.clearReq.reason = 0; // GrantHandshake
+    req.b.clearReq.reason = 0;
 
     _lastResponseValid = false;
     if (!transportSend(req)) {
-        return false;
+        return -1;
+    }
+
+    // Port async path: schedule check, return pending
+    if (_port) {
+        scheduleResponseCheck();
+        return -2;
     }
 
     if (!transportRecv(CoherenceMessageType::ClearResp, reqId)) {
         warn("UBAdapter node=%d: sendClearReq: no response PA=0x%lx\n",
              _nodeId, linePa);
-        return false;
+        return -1;
     }
 
     const CoherenceMessage &resp = _lastResponse;
     if (resp.h.type != CoherenceMessageType::ClearResp) {
         warn("UBAdapter node=%d: sendClearReq: unexpected response type %s\n",
              _nodeId, coherenceMsgTypeName(resp.h.type));
-        return false;
+        return -1;
     }
 
-    return resp.b.clearResp.accepted;
+    return resp.b.clearResp.accepted ? 1 : 0;
 }
 
 // ---- Recall Response (fire-and-forget → home UBCC) ----
@@ -766,6 +834,16 @@ UBAdapter::sendQueryLineMetaReq(uint64_t homePa, int homeNode, int homeSocket,
               _nodeId, _socketId);
     }
 
+    // Port async: check cached response first
+    if (_port && _lastResponseValid &&
+        _lastResponse.h.type == CoherenceMessageType::QueryLineMetaResp &&
+        _lastResponse.h.homeLinePa == homePa) {
+        outFound = _lastResponse.b.queryLineMetaResp.found;
+        outEpoch = _lastResponse.b.queryLineMetaResp.epoch;
+        outOwnerNode = _lastResponse.b.queryLineMetaResp.ownerNode;
+        return outFound ? 0 : -1;
+    }
+
     CoherenceMessage req;
     req.h.type = CoherenceMessageType::QueryLineMetaReq;
     req.h.srcNode = _nodeId;
@@ -776,6 +854,7 @@ UBAdapter::sendQueryLineMetaReq(uint64_t homePa, int homeNode, int homeSocket,
     req.h.homeSocket = homeSocket;
     req.h.ingressSocket = _socketId;
     req.h.homeLinePa = homePa;
+    req.h.reqId = 0;
     req.h.seqNum = _nextSeq++;
     req.h.enqueueTick = curTick();
     req.h.readyTick = curTick();
@@ -783,6 +862,12 @@ UBAdapter::sendQueryLineMetaReq(uint64_t homePa, int homeNode, int homeSocket,
     _lastResponseValid = false;
     if (!transportSend(req)) {
         return -1;
+    }
+
+    // Port async path: schedule check, return pending
+    if (_port) {
+        scheduleResponseCheck();
+        return -2;
     }
 
     if (!transportRecv(CoherenceMessageType::QueryLineMetaResp, req.h.reqId)) {
@@ -851,6 +936,11 @@ UBAdapter::recvFromRouter(const CoherenceMessage &msg)
 
     switch (msg.h.type) {
         case CoherenceMessageType::ReadResp:
+            std::fprintf(stderr,
+                         "[ADAPTER-GOT-RESP] node=%d type=ReadResp pa=0x%lx src=%d grant=%d epoch=%lu reqId=%lu\n",
+                         _nodeId, msg.h.homeLinePa, msg.h.srcNode,
+                         static_cast<int>(msg.b.readResp.grantType),
+                         msg.h.epoch, msg.h.reqId);
             printf("[ADAPTER-GOT-RESP] node=%d type=ReadResp pa=0x%lx src=%d "
                    "grant=%d epoch=%lu reqId=%lu\n",
                    _nodeId, msg.h.homeLinePa, msg.h.srcNode,
@@ -864,6 +954,12 @@ UBAdapter::recvFromRouter(const CoherenceMessage &msg)
         case CoherenceMessageType::UpgradeResp:
         case CoherenceMessageType::UpgradeDoneResp:
         case CoherenceMessageType::ClearResp:
+            std::fprintf(stderr,
+                         "[CLEAR-RESP] node=%d via=recvFromRouter pa=0x%lx src=%d accepted=%d epoch=%lu reqId=%lu\n",
+                         _nodeId, msg.h.homeLinePa, msg.h.srcNode,
+                         msg.b.clearResp.accepted ? 1 : 0,
+                         msg.h.epoch, msg.h.reqId);
+            [[fallthrough]];
         case CoherenceMessageType::QueryLineMetaResp:
             // Synchronous response — store for caller
             _lastResponse = msg;
@@ -1004,6 +1100,14 @@ UBAdapter::handleResponse(framework::MemMessage *m)
 
     const CoherenceMessage *coh = m->getPayload<CoherenceMessage>();
     if (!coh) return;
+
+    if (coh->h.type == CoherenceMessageType::ClearResp) {
+        std::fprintf(stderr,
+                     "[CLEAR-RESP] node=%d via=handleResponse pa=0x%lx src=%d accepted=%d epoch=%lu reqId=%lu\n",
+                     _nodeId, coh->h.homeLinePa, coh->h.srcNode,
+                     coh->b.clearResp.accepted ? 1 : 0,
+                     coh->h.epoch, coh->h.reqId);
+    }
 
     // Async control messages: enqueue FIFO, process later via drainDeferredControls
     switch (coh->h.type) {

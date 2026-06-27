@@ -83,27 +83,27 @@ class UBAdapter : public SimObject
         DataBlock *outGrantData, bool *outGrantDataValid);
 
     // ---- Phase 3: EPBackend→UBCC synchronous paths ----
-    bool sendWritebackReq(uint64_t homePa, int requesterNode,
-                          uint64_t epochVal, bool keepAsClean,
-                          int homeNode, int homeSocket);
+    int sendWritebackReq(uint64_t homePa, int requesterNode,
+                         uint64_t epochVal, bool keepAsClean,
+                         int homeNode, int homeSocket);
 
-    bool sendEvictReq(uint64_t homePa, int evictingNode,
-                      uint64_t epochVal, int homeNode, int homeSocket);
+    int sendEvictReq(uint64_t homePa, int evictingNode,
+                     uint64_t epochVal, int homeNode, int homeSocket);
 
-    bool sendUpgradeReq(uint64_t homePa, int requesterNode,
-                        uint64_t epoch, uint64_t reqId,
-                        int desiredPerm, int cause,
-                        uint64_t *outUpgradeTargetMask,
-                        uint64_t *outCommittedEpoch,
-                        int homeNode, int homeSocket);
+    int sendUpgradeReq(uint64_t homePa, int requesterNode,
+                       uint64_t epoch, uint64_t reqId,
+                       int desiredPerm, int cause,
+                       uint64_t *outUpgradeTargetMask,
+                       uint64_t *outCommittedEpoch,
+                       int homeNode, int homeSocket);
 
-    bool sendUpgradeDoneReq(uint64_t homePa, int requesterNode,
-                            uint64_t epoch, uint64_t reqId,
-                            int homeNode, int homeSocket);
+    int sendUpgradeDoneReq(uint64_t homePa, int requesterNode,
+                           uint64_t epoch, uint64_t reqId,
+                           int homeNode, int homeSocket);
 
-    bool sendClearReq(uint64_t linePa, int srcNode,
-                      uint64_t epoch, uint64_t reqId,
-                      int homeNode, int homeSocket);
+    int sendClearReq(uint64_t linePa, int srcNode,
+                     uint64_t epoch, uint64_t reqId,
+                     int homeNode, int homeSocket);
 
     // Cross-node EPBackend→EPBackend (fire-and-forget via router)
     void sendRecallReqToOwner(int targetNode,

@@ -74,6 +74,14 @@ class EPSNFController : public EPController
     };
     std::vector<DeferredGrantEntry> _deferredGrants;
     void processDeferredGrants();
+
+    // Pending writeback retry
+    struct PendingWriteback {
+        uint64_t linePa;
+        bool keepAsClean;
+    };
+    std::deque<PendingWriteback> _pendingWritebacks;
+    void processPendingWritebacks();
 };
 
 } // namespace ruby

@@ -71,6 +71,9 @@ EPSNFController::wakeup()
     // v4: Send deferred grants (§4.4.2, I10 timing invariant)
     processDeferredGrants();
 
+    // v4: Process pending writebacks
+    processPendingWritebacks();
+
     // Q3: Process retry queue — request grants that were previously BUSY
     if (!_retryQueue.empty()) {
         bool needWakeup = false;
@@ -490,7 +493,14 @@ EPSNFController::recvDataMsg(const CHIDataMsg *msg)
             // Notify UBCC that home data has been written to DRAM,
             // releasing directory ownership.
             if (_backend && _backend->isDsmAddr(writePa)) {
-                _backend->handleWriteback(writePa, false);
+                int wbRet = _backend->handleWriteback(writePa, false);
+                if (wbRet == -2) {
+                    std::fprintf(stderr,
+                                 "[EPSNF-WB-PENDING] node=%d pa=0x%lx\n",
+                                 _nodeId, writePa);
+                    // Queue for retry in wakeup
+                    _pendingWritebacks.push_back({writePa, false});
+                }
             }
 
             DPRINTF(RubyCHIGeneric,
@@ -521,6 +531,23 @@ EPSNFController::recvDataMsg(const CHIDataMsg *msg)
     }
 
     return true;
+}
+
+void
+EPSNFController::processPendingWritebacks()
+{
+    if (_pendingWritebacks.empty()) return;
+    for (auto it = _pendingWritebacks.begin(); it != _pendingWritebacks.end(); ) {
+        int wbRet = _backend->handleWriteback(it->linePa, it->keepAsClean);
+        if (wbRet != -2) {
+            // Writeback completed (or error) — remove from queue
+            it = _pendingWritebacks.erase(it);
+        } else {
+            ++it;
+        }
+    }
+    if (!_pendingWritebacks.empty())
+        scheduleEvent(Cycles(5000));
 }
 
 } // namespace ruby

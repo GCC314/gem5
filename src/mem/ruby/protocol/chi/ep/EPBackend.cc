@@ -1230,8 +1230,14 @@ EPBackend::handleWriteback(uint64_t line_pa, bool keepAsClean)
         bool qFound = false;
         UBAdapter *wa = getUBAdapter(0);
         if (wa) {
-            wa->sendQueryLineMetaReq(line_pa, homeNode, homeSocket,
-                                     qEpoch, qOwnerNode, qFound);
+            int qRet = wa->sendQueryLineMetaReq(line_pa, homeNode, homeSocket,
+                                                qEpoch, qOwnerNode, qFound);
+            if (qRet == -2) {
+                std::fprintf(stderr,
+                             "[EP-QLM-PENDING] node=%d pa=0x%lx home=%d socket=%d\n",
+                             _nodeId, line_pa, homeNode, homeSocket);
+                return -2;  // pending — caller must retry
+            }
         }
         if (qFound) {
             epochVal = qEpoch;
@@ -1258,14 +1264,21 @@ EPBackend::handleWriteback(uint64_t line_pa, bool keepAsClean)
               "PA=0x%lx homeNode=%d\n",
               _nodeId, line_pa, homeNode);
     }
-    bool ok = getUBAdapter(0)->sendWritebackReq(
+    int wbRet = getUBAdapter(0)->sendWritebackReq(
         homePa, requesterNode, epochVal, keepAsClean, homeNode, homeSocket);
+    bool wbPending = (wbRet == -2);
+    bool ok = (wbRet > 0);
+    if (wbPending) {
+        std::fprintf(stderr,
+                     "[EP-WB-PENDING] node=%d pa=0x%lx home=%d epoch=%lu\n",
+                     _nodeId, homePa, homeNode, epochVal);
+    }
 
     // Build ack envelope
     _lastAckMsg.linePa = homePa;
     _lastAckMsg.homeNode = homeNode;
     _lastAckMsg.epoch = epochVal;
-    _lastAckMsg.success = ok;
+    _lastAckMsg.success = ok || wbPending;
 
     // Update requester bookkeeping based on result
     if (ok) {
@@ -1286,7 +1299,7 @@ EPBackend::handleWriteback(uint64_t line_pa, bool keepAsClean)
             "ok=%d keepAsClean=%d\n",
             _nodeId, line_pa, ok, keepAsClean);
 
-    return ok;
+    return ok || wbPending;
 }
 
 bool
@@ -1333,13 +1346,21 @@ EPBackend::handleEvict(uint64_t line_pa)
               "PA=0x%lx homeNode=%d\n",
               _nodeId, line_pa, homeNode);
     }
-    bool ok = getUBAdapter(0)->sendEvictReq(homePa, _nodeId, epochVal, homeNode, 0 /* homeSocket */);
+    int evRet = getUBAdapter(0)->sendEvictReq(homePa, _nodeId, epochVal,
+                                              homeNode, 0 /* homeSocket */);
+    bool evPending = (evRet == -2);
+    bool ok = (evRet > 0);
+    if (evPending) {
+        std::fprintf(stderr,
+                     "[EP-EVICT-PENDING] node=%d pa=0x%lx home=%d epoch=%lu\n",
+                     _nodeId, homePa, homeNode, epochVal);
+    }
 
     // Build ack envelope
     _lastAckMsg.linePa = homePa;
     _lastAckMsg.homeNode = homeNode;
     _lastAckMsg.epoch = epochVal;
-    _lastAckMsg.success = ok;
+    _lastAckMsg.success = ok || evPending;
 
     if (ok) {
         _evictCount++;
@@ -1353,7 +1374,7 @@ EPBackend::handleEvict(uint64_t line_pa)
             "EPBackend node_id=%d: handleEvict PA=0x%lx complete ok=%d\n",
             _nodeId, line_pa, ok);
 
-    return ok;
+    return ok || evPending;
 }
 
 // ---- M8: Global Invalidation Management ----
@@ -1496,10 +1517,17 @@ EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
 
     uint64_t upgradeTargetMask = 0;
     uint64_t committedEpoch = 0;
-    bool accepted = getUBAdapter(0)->sendUpgradeReq(
+    int upgradeRet = getUBAdapter(0)->sendUpgradeReq(
         homePa, _nodeId, epochVal, reqIdVal,
         desiredPerm, static_cast<int>(ubccCause),
         &upgradeTargetMask, &committedEpoch, homeNode, 0 /* homeSocket */);
+    if (upgradeRet == -2) {
+        std::fprintf(stderr,
+                     "[EP-UPGRADE-PENDING] node=%d pa=0x%lx home=%d epoch=%lu reqId=%lu\n",
+                     _nodeId, homePa, homeNode, epochVal, reqIdVal);
+        return false;
+    }
+    bool accepted = (upgradeRet > 0);
 
     if (accepted) {
         // Store returned values (reservedEpoch, echoed reqId)
@@ -1606,8 +1634,15 @@ EPBackend::sendUpgradeDone(uint64_t line_pa, int homeNode,
     doneMsg.reqId = reqId;
     _lastUpgradeDone = doneMsg;
 
-    bool accepted = getUBAdapter(0)->sendUpgradeDoneReq(
+    int doneRet = getUBAdapter(0)->sendUpgradeDoneReq(
         homePa, _nodeId, epoch, reqId, homeNode, 0 /* homeSocket */);
+    bool donePending = (doneRet == -2);
+    bool accepted = (doneRet > 0);
+    if (donePending) {
+        std::fprintf(stderr,
+                     "[EP-UPGDONE-PENDING] node=%d pa=0x%lx home=%d epoch=%lu reqId=%lu\n",
+                     _nodeId, homePa, homeNode, epoch, reqId);
+    }
 
     OuterUpgradeDoneAck doneAck;
     doneAck.linePa = homePa;
@@ -1615,10 +1650,10 @@ EPBackend::sendUpgradeDone(uint64_t line_pa, int homeNode,
     doneAck.dstNode = _nodeId;
     doneAck.epoch = epoch;
     doneAck.reqId = reqId;
-    doneAck.accepted = accepted;
+    doneAck.accepted = accepted || donePending;
     _lastUpgradeDoneAck = doneAck;
 
-    return accepted;
+    return accepted || donePending;
 }
 
 // ---- v4: Clear / ClearAck (§3.5) ----
@@ -1627,6 +1662,9 @@ bool
 EPBackend::sendClear(uint64_t line_pa, int homeNode,
                       uint64_t epoch, uint64_t reqId)
 {
+    std::fprintf(stderr,
+                 "[CLEAR-SEND] node=%d pa=0x%lx homeNode=%d epoch=%lu reqId=%lu\n",
+                 _nodeId, line_pa, homeNode, epoch, reqId);
     DPRINTF(RubyEP,
             "EPBackend node_id=%d: sendClear "
             "PA=0x%lx homeNode=%d epoch=%lu reqId=%lu\n",
@@ -1662,8 +1700,9 @@ EPBackend::sendClear(uint64_t line_pa, int homeNode,
               "PA=0x%lx homeNode=%d\n",
               _nodeId, line_pa, homeNode);
     }
-    bool accepted = getUBAdapter(0)->sendClearReq(
+    int clearRet = getUBAdapter(0)->sendClearReq(
         line_pa, _nodeId, clearEpoch, reqId, homeNode, 0 /* homeSocket */);
+    bool accepted = (clearRet > 0);  // -2=pending, -1=error, 0=rejected, 1=accepted
 
     printf("[TC5-CLEAR-TRACE] sendClearResult node=%d linePA=0x%lx homeNode=%d "
            "clearEpoch=%lu reqId=%lu accepted=%d\n",
@@ -1753,8 +1792,13 @@ EPBackend::sendHomeWritebackNotify(uint64_t homePa, int homeSocket)
         UBAdapter *na = getUBAdapter(homeSocket);
         if (!na) na = getUBAdapter(0);
         if (na) {
-            na->sendQueryLineMetaReq(homePa, homeNode, homeSocket,
-                                     qEpoch, qOwnerNode, qFound);
+            int qRet = na->sendQueryLineMetaReq(homePa, homeNode, homeSocket,
+                                                qEpoch, qOwnerNode, qFound);
+            if (qRet == -2) {
+                std::fprintf(stderr,
+                             "[EP-HWB-QLM-PENDING] node=%d pa=0x%lx home=%d socket=%d\n",
+                             _nodeId, homePa, homeNode, homeSocket);
+            }
             if (qFound) epochVal = qEpoch;
         }
     }
