@@ -20,43 +20,24 @@ SyncWaitManager::barrierArrive(ThreadContext *tc, uint32_t mask,
 
     auto &bs = _barriers[mask];
 
-    // First thread sets the expected count
     if (bs.activeThreads == 0)
-        bs.activeThreads = activeThreads;
+        bs.activeThreads = __builtin_popcount(mask) * activeThreads;
 
-    // Duplicate arrival: ignore
     if (bs.waiting.find(tc) != bs.waiting.end())
         return 0;
 
     bs.waiting.insert(tc);
 
-    if (bs.waiting.size() < bs.activeThreads) {
-        tc->suspend();
+    if (bs.waiting.size() >= bs.activeThreads) {
+        for (ThreadContext *t : bs.waiting)
+            t->activate();
+        bs.waiting.clear();
+        bs.activeThreads = 0;
         return 0;
     }
 
-    // All local threads arrived — send BARRIER_REACHED to BarrierManager
-    if (_sendFn) {
-        _sendFn(mask, _nodeId);
-    }
-
-    // Suspend the last thread too (wait for BARRIER_RELEASE from BarrierManager)
     tc->suspend();
     return 0;
-}
-
-void
-SyncWaitManager::barrierRelease(uint32_t mask)
-{
-    auto it = _barriers.find(mask);
-    if (it == _barriers.end())
-        return;
-
-    for (ThreadContext *t : it->second.waiting)
-        t->activate();
-
-    it->second.waiting.clear();
-    it->second.activeThreads = 0;
 }
 
 } // namespace gem5

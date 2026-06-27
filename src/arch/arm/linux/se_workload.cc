@@ -170,11 +170,6 @@ syncWaitFuncOld(SyscallDesc *desc, ThreadContext *tc, uint64_t node_mask)
     return (ret < 0) ? (int64_t)ret : (int64_t)node_mask;
 }
 
-    auto *sys = tc->getSystemPtr();
-    int ret = sys->syncWait.barrierWait(tc, static_cast<uint32_t>(node_mask));
-    return ret;
-}
-
 class SyscallTable32 : public SyscallDescTable<EmuLinux::SyscallABI32>
 {
   public:

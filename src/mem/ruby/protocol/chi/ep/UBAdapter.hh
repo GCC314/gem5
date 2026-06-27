@@ -206,13 +206,6 @@ class UBAdapter : public SimObject
     // Deferred async control messages (InvalidateReq/RecallReq/UpgradeAckNotify)
     std::deque<CoherenceMessage> _deferredControls;
     bool _drainingDeferredControls = false;
-
-    // ---- Barrier Manager ----
-    framework::Port *_barrierPort = nullptr;
-    zmq::context_t *_barrierCtx = nullptr;
-    void onBarrierReady(uint32_t mask, uint32_t srcNode);
-    void handleBarrierRelease(uint32_t mask);
-    void drainBarrierMessages();
 };
 
 } // namespace ruby
