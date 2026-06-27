@@ -149,7 +149,7 @@ UBAdapter::sendReadReq(
     int homeNode, int ingressSocket, int homeSocket,
     Tick *outGrantVisibleTick, Tick *outSentinelVisibleTick,
     bool *outRecallNeeded, int *outRecallOwnerNode,
-    int *outDataSource, uint64_t *outAuthEpoch,
+    GrantDataSource *outDataSource, uint64_t *outAuthEpoch,
     int *outPendingInvCount, uint64_t *outPendingInvMask,
     uint64_t *outCommittedEpoch,
     DataBlock *outGrantData, bool *outGrantDataValid)
@@ -201,7 +201,7 @@ UBAdapter::sendReadReq(
         if (outSentinelVisibleTick) *outSentinelVisibleTick = _lastResponse.b.readResp.sentinelVisibleTick;
         if (outRecallNeeded) *outRecallNeeded = _lastResponse.b.readResp.recallNeeded;
         if (outRecallOwnerNode) *outRecallOwnerNode = _lastResponse.b.readResp.recallOwnerNode;
-        if (outDataSource) *outDataSource = _lastResponse.b.readResp.dataSource;
+        if (outDataSource) *outDataSource = static_cast<GrantDataSource>(_lastResponse.b.readResp.dataSource);
         if (outAuthEpoch) *outAuthEpoch = _lastResponse.b.readResp.authEpoch;
         if (outPendingInvCount) *outPendingInvCount = _lastResponse.b.readResp.pendingInvCount;
         if (outPendingInvMask) *outPendingInvMask = _lastResponse.b.readResp.pendingInvMask;
@@ -254,7 +254,7 @@ UBAdapter::sendReadReq(
     if (outRecallOwnerNode)
         *outRecallOwnerNode = resp.b.readResp.recallOwnerNode;
     if (outDataSource)
-        *outDataSource = resp.b.readResp.dataSource;
+        *outDataSource = static_cast<GrantDataSource>(resp.b.readResp.dataSource);
     if (outAuthEpoch)
         *outAuthEpoch = resp.b.readResp.authEpoch;
     if (outPendingInvCount)

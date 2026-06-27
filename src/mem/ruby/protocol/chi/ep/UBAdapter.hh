@@ -77,7 +77,7 @@ class UBAdapter : public SimObject
         int homeNode, int ingressSocket, int homeSocket,
         Tick *outGrantVisibleTick, Tick *outSentinelVisibleTick,
         bool *outRecallNeeded, int *outRecallOwnerNode,
-        int *outDataSource, uint64_t *outAuthEpoch,
+        GrantDataSource *outDataSource, uint64_t *outAuthEpoch,
         int *outPendingInvCount, uint64_t *outPendingInvMask,
         uint64_t *outCommittedEpoch,
         DataBlock *outGrantData, bool *outGrantDataValid);

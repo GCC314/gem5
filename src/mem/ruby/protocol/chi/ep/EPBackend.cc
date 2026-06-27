@@ -613,7 +613,7 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
         entry.epoch, reqIdVal, homeNode, ingressSocket, homeSocket,
         &grantVisibleTick, &sentinelVisibleTick,
         &recallNeeded, &recallOwnerNode,
-        reinterpret_cast<int*>(&dataSource), &authEpoch,
+        &dataSource, &authEpoch,
         &pendingInvCount, &pendingInvMask, &committedEpoch,
         &routedGrantData, &routedGrantDataValid);
 
@@ -626,6 +626,8 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
            "grantTypeVar=%d reqId=%lu entryEpoch=%lu authEpoch=%lu recallNeeded=%d owner=%d\n",
            _nodeId, line_pa, homePa, static_cast<int>(grantTypeVar), reqIdVal,
            entry.epoch, authEpoch, recallNeeded, recallOwnerNode);
+    printf("[RECALL-OUTPUT] EPBackend n=%d PA=0x%lx recallNeeded=%d recallOwnerNode=%d\n",
+           _nodeId, line_pa, recallNeeded, recallOwnerNode);
 
     // ---- M6: Handle recall path ----
     // If the home UBCC signals that a recall is needed, we must
