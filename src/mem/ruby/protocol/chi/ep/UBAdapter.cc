@@ -1046,10 +1046,18 @@ UBAdapter::wakeup()
             continue;
         }
         if (m->hdr.type != static_cast<uint32_t>(framework::MemMessageType::COH_MSG)) {
+            static int noncoh = 0;
+            if (++noncoh <= 5)
+                std::fprintf(stderr, "[WAKEUP-NONCOH] node=%d type=%u sz=%u\n",
+                             _nodeId, m->hdr.type, m->hdr.size);
             m = _port->recv(curTick(), &st);
             continue;
         }
         // PortAsync: dispatch to handleResponse (pendingByReqId map)
+        static int cohcnt = 0;
+        if (++cohcnt <= 5)
+            std::fprintf(stderr, "[WAKEUP-COH] node=%d type=%u sz=%u req_id=%lu\n",
+                         _nodeId, m->hdr.type, m->hdr.size, m->hdr.req_id);
         if (_port) {
             handleResponse(m);
         } else {
@@ -1094,6 +1102,11 @@ UBAdapter::handleResponse(framework::MemMessage *m)
     if (!_port) return;
 
     const CoherenceMessage *coh = m->getPayload<CoherenceMessage>();
+    std::fprintf(stderr, "[HR-ENTRY] node=%d msg_type=%u msg_sz=%u payload=%s coh_type=%d reqId=%lu\n",
+                 _nodeId, m->hdr.type, m->hdr.size,
+                 coh ? "OK" : "NULL",
+                 coh ? static_cast<int>(coh->h.type) : -1,
+                 coh ? coh->h.reqId : 0UL);
     if (!coh) return;
 
     if (coh->h.type == CoherenceMessageType::ClearResp) {
