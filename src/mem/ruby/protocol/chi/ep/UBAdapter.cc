@@ -3,6 +3,7 @@
 
 #include <cstdio>
 #include <limits>
+#include <thread>
 
 #include "base/logging.hh"
 #include "debug/RubyEP.hh"
@@ -1051,22 +1052,73 @@ UBAdapter::wakeup()
     // 4. Check for matched responses (for retry-based callers)
     checkResponseCallbacks();
 
-    // 5. Schedule next wakeup using safeTs.  When the peer is behind,
-    //    keep polling at curTick() without advancing — do NOT bypass
-    //    safeTs with a +syncInterval fallback.
+    // 5. Schedule next wakeup using safeTs (conservative PDES bound).
+    //    safeT = min(peer's latest timestamp, ownLastSync + syncInterval).
+    //
+    //    - safeT > curTick  : the peer is ahead; advance our clock to safeT.
+    //    - safeT <= curTick : the peer has NOT advanced past us yet. We must
+    //      NOT advance simulated time (that races gem5 ahead of the natives and
+    //      breaks the protocol). Earlier we re-armed the event at the SAME tick
+    //      and let it re-fire — but that hot-spins the gem5 event queue at
+    //      millions of wakeups/sec, and each wakeup hammers ZMQ recv on the
+    //      peer's socket. That saturated the IPC path and made the peer's own
+    //      loop ~100x slower (the idle node's ubio peer crawled while the active
+    //      nodes' peers flew), throttling the whole simulation to ~1 leapfrog
+    //      step per 10 ms (the ZMQ send timeout).
+    //
+    //      Instead we busy-wait in WALL-CLOCK time, yielding the CPU between
+    //      polls, exactly like the reference waitForUbsimAdvance() in
+    //      docs/all.cpp. We never advance simulated time, so there is no drift;
+    //      we stop hammering, so the peer advances quickly; and we still drain
+    //      responses so the protocol keeps flowing. The syncInterval lookahead
+    //      window guarantees the peer can always advance >= linkLatency, so this
+    //      wait terminates promptly.
     ++_responseCheckCount;
-    uint64_t safeT = _port->safeTs(curTick());
-    uint64_t nextT = safeT > curTick() ? safeT : curTick();
+    const uint64_t curT = curTick();
+    uint64_t safeT = _port->safeTs(curT);
+    bool stalled = !(safeT > curT);
+
+    if (stalled) {
+        uint64_t waitIters = 0;
+        // Safety net only: in normal operation the peer lifts safeT within a
+        // few microseconds. If something is genuinely wedged, fall back to a
+        // same-tick re-arm so the event queue can run other nodes' events.
+        const uint64_t kWaitCap = 2000000ULL;
+        while (safeT <= curT && waitIters < kWaitCap) {
+            std::this_thread::yield();
+            // Drain whatever the peer has sent so receiveTimestamp() can rise
+            // and any in-flight coherence responses keep flowing.
+            framework::ReceiveStatus wst;
+            framework::MemMessage *wm = _port->recv(curT, &wst);
+            while (wm && (wst == framework::ReceiveStatus::kMessage ||
+                          wst == framework::ReceiveStatus::kSync)) {
+                if (wm->hdr.type ==
+                    static_cast<uint32_t>(framework::MemMessageType::COH_MSG))
+                    handleResponse(wm);
+                wm = _port->recv(curT, &wst);
+            }
+            safeT = _port->safeTs(curT);
+            ++waitIters;
+        }
+        drainDeferredControls();
+        checkResponseCallbacks();
+        stalled = !(safeT > curT);
+    }
+
+    uint64_t nextT = stalled ? curT : safeT;
     if (_responseCheckEvent.scheduled())
         reschedule(_responseCheckEvent, nextT);
     else
         schedule(_responseCheckEvent, nextT);
     _eventArmed = true;
 
-    if (_responseCheckCount % 100 == 0) {
+    if (_responseCheckCount % 2000 == 0) {
         uint64_t rxt = _port->receiveTimestamp();
-        std::fprintf(stderr, "[CLK-SYNC] node=%d curT=%lu rxt=%lu safeT=%lu\n",
-                     _nodeId, curTick(), rxt, safeT);
+        std::fprintf(stderr,
+                     "[CLK-SYNC] node=%d curT=%lu rxt=%lu safeT=%lu %s cnt=%lu\n",
+                     _nodeId, curT, rxt, safeT,
+                     stalled ? "WAIT" : "advance",
+                     (unsigned long)_responseCheckCount);
     }
 }
 
