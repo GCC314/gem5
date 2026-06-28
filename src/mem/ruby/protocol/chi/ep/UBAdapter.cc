@@ -1066,16 +1066,11 @@ UBAdapter::wakeup()
     checkResponseCallbacks();
 
     // 5. Schedule next wakeup using safeTs for conservative advancement
-    if (++_responseCheckCount < 100000) {
-        uint64_t safeT = _port->safeTs(curTick());
-        if (safeT <= curTick()) safeT = curTick() + 1000;
-        schedule(_responseCheckEvent, safeT);
-        _eventArmed = true;
-    } else {
-        static int wstop = 0;
-        if (++wstop <= 1)
-            warn("UBAdapter node=%d: wakeup STOPPED after 100000 checks\n", _nodeId);
-    }
+    ++_responseCheckCount;
+    uint64_t safeT = _port->safeTs(curTick());
+    if (safeT <= curTick()) safeT = curTick() + 1000;
+    schedule(_responseCheckEvent, safeT);
+    _eventArmed = true;
 }
 
 void

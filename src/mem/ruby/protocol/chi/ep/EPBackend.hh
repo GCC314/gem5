@@ -379,7 +379,7 @@ class EPBackend : public SimObject
      * @param reqId     Transaction reqId
      * @return          True if Clear accepted (ClearAck.accepted==true)
      */
-    bool sendClear(uint64_t line_pa, int homeNode,
+    int sendClear(uint64_t line_pa, int homeNode,
                    uint64_t epoch, uint64_t reqId);
     /**
      * Handle an incoming recall request from a home UBCC.

@@ -768,7 +768,8 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
     // v4: Populate grant data using formal F3 data source
     populateGrantData(homePa, dataSource);
 
-    sendClear(homePa, homeNode, grantEnv.epoch, grantEnv.reqId);
+    int clearRet = sendClear(homePa, homeNode, grantEnv.epoch, grantEnv.reqId);
+    if (clearRet == -2) return -2;
 
     // ---- M6: Clear outer txn pending and signal completion (after Clear) ----
     if (_epRnfCtrl) {
@@ -1186,7 +1187,7 @@ EPBackend::handleHomeWritebackComplete(uint64_t homePa)
     sendHomeWritebackNotify(homePa, homeSocket);
 }
 
-bool
+int
 EPBackend::handleWriteback(uint64_t line_pa, bool keepAsClean)
 {
     DPRINTF(RubyEP,
@@ -1658,7 +1659,7 @@ EPBackend::sendUpgradeDone(uint64_t line_pa, int homeNode,
 
 // ---- v4: Clear / ClearAck (§3.5) ----
 
-bool
+    int
 EPBackend::sendClear(uint64_t line_pa, int homeNode,
                       uint64_t epoch, uint64_t reqId)
 {
@@ -1717,7 +1718,7 @@ EPBackend::sendClear(uint64_t line_pa, int homeNode,
     ack.accepted = accepted;
     _lastClearAckMsg = ack;
 
-    return accepted;
+    return (clearRet == -2) ? -2 : (accepted ? 1 : 0);
 }
 
 // ---- upgrade_invalidate_fix: upgrade ack callback ----
