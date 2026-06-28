@@ -535,6 +535,33 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
     // If found, reuse epoch/reqId so that Clear matches GRANT_HANDSHAKE.
     auto existing = _requesterLines.find(line_pa);
 
+    // ---- Async grant/clear: pending-Clear fast path ----
+    // If we already obtained the outer grant for this line and are only waiting
+    // for the ClearResp to confirm it, do NOT retry the whole miss. Re-issuing a
+    // fresh ReadReq here would (a) allocate a brand-new reqId (handleGrant has
+    // already moved the line out of R_WAIT_GRANT, so isRetry would be false) and
+    // (b) make the already-cached ClearResp{original reqId} unmatchable — an
+    // infinite retry loop that ends in a Sequencer deadlock. Instead re-drive
+    // sendClear() with the ORIGINAL reqId/epoch saved in the pending grant txn,
+    // and complete the transaction once the ClearResp is accepted.
+    {
+        auto pgt = _pendingGrantTxns.find(homePa);
+        if (pgt != _pendingGrantTxns.end() && pgt->second.valid) {
+            int clearRet = sendClear(homePa, pgt->second.homeNode,
+                                     pgt->second.baseEpoch, pgt->second.reqId);
+            if (clearRet == -2)
+                return -2;   // ClearResp not here yet; keep waiting (same reqId)
+            // ClearResp accepted: sendClear() has consumed the txn. Finish up.
+            OuterGrantType g = pgt->second.grantType;
+            _pendingGrantTxns.erase(pgt);
+            if (_epRnfCtrl) {
+                _epRnfCtrl->setOuterTxnPending(line_pa, false);
+                _epRnfCtrl->signalOuterTxnComplete(line_pa);
+            }
+            return static_cast<int>(g);
+        }
+    }
+
     // Same-node duplicate ReadShared coalescing (remote homes only).
     // another local CPU may miss on the same remote line after a sibling CPU
     // already obtained R_S/R_E/R_M.  Issuing a brand-new outer request here
@@ -1706,8 +1733,11 @@ EPBackend::sendClear(uint64_t line_pa, int homeNode,
         (txnIt != _pendingGrantTxns.end() && txnIt->second.valid);
     if (txnIt != _pendingGrantTxns.end() && txnIt->second.valid) {
         clearEpoch = txnIt->second.baseEpoch;
-        // Invalidate after use (single-consumer)
-        txnIt->second.valid = false;
+        // Do NOT invalidate here. The grant/clear handshake is asynchronous:
+        // the first sendClear typically returns -2 (ClearResp not yet here) and
+        // the line must be retried. Consuming the txn on first use let the line
+        // leave R_WAIT_GRANT, get a new reqId on retry, and never match the
+        // cached ClearResp. We invalidate below only once the clear is accepted.
     }
 
     printf("[TC5-CLEAR-TRACE] sendClear node=%d linePA=0x%lx homeNode=%d "
@@ -1732,6 +1762,12 @@ EPBackend::sendClear(uint64_t line_pa, int homeNode,
     int clearRet = getUBAdapter(0)->sendClearReq(
         line_pa, _nodeId, clearEpoch, reqId, homeNode, 0 /* homeSocket */);
     bool accepted = (clearRet > 0);  // -2=pending, -1=error, 0=rejected, 1=accepted
+
+    // Consume the pending grant txn only once the clear is actually accepted,
+    // so retries while it is still pending (clearRet==-2) keep matching reqId.
+    if (accepted && txnIt != _pendingGrantTxns.end() && txnIt->second.valid) {
+        txnIt->second.valid = false;
+    }
 
     printf("[TC5-CLEAR-TRACE] sendClearResult node=%d linePA=0x%lx homeNode=%d "
            "clearEpoch=%lu reqId=%lu accepted=%d\n",
