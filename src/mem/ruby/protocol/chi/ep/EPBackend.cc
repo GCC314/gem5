@@ -20,6 +20,7 @@
 #include "mem/ruby/protocol/chi/ep/EPRNFController.hh"
 #include "mem/ruby/protocol/chi/ep/MetaRNFController.hh"
 #include "mem/ruby/protocol/chi/ep/UBAdapter.hh"
+#include "mem/ruby/protocol/chi/ep/EPSNFController.hh"
 #include "mem/ruby/protocol/CHI/CHIRequestType.hh"
 #include "mem/ruby/system/RubySystem.hh"
 #include "params/EPBackend.hh"
@@ -162,6 +163,15 @@ EPBackend::registerEpSnf(int socketId, EPSNFController *ctrl)
     _epSnfs[socketId] = ctrl;
     if (_numSockets < (int)_epSnfs.size())
         _numSockets = _epSnfs.size();
+
+    if (socketId == 0 && !_ubAdapters.empty() && _ubAdapters[0]) {
+        std::fprintf(stderr, "[WIRE] node=%d wiring adapter->snf callback\n", _nodeId);
+        _ubAdapters[0]->setOnResponseWired([this]{
+            std::fprintf(stderr, "[RSP-FIRE] node=%d scheduling EPSNF wakeup\n", _nodeId);
+            if (!_epSnfs.empty() && _epSnfs[0])
+                _epSnfs[0]->scheduleEvent(Cycles(1));
+        });
+    }
 }
 
 EPSNFController*
@@ -300,6 +310,18 @@ EPBackend::init()
         }
     }
 
+    // Wire UBAdapter -> EPSNF response wakeup
+    for (int s = 0; s < _numSockets; s++) {
+        UBAdapter *adapter = getUBAdapter(s);
+        EPSNFController *snf = getEpSnf(s);
+        if (adapter && snf) {
+            adapter->setOnResponseWired([snf]{
+                std::fprintf(stderr, "[RSP-FIRE] scheduling EPSNF wakeup\n");
+                snf->scheduleEvent(Cycles(1));
+            });
+        }
+    }
+
     // v4-dual-socket: EP-SNF completeness check (§3.6 change 3)
     for (int s = 0; s < _numSockets; ++s) {
         fatal_if(_epSnfs[s] == nullptr,
@@ -310,7 +332,13 @@ EPBackend::init()
 
 void
 EPBackend::wakeup()
-{}
+{
+    for (int s = 0; s < _numSockets; ++s) {
+        UBAdapter *adapter = getUBAdapter(s);
+        if (adapter && adapter->port())
+            adapter->wakeup();
+    }
+}
 
 bool
 EPBackend::checkAddr(uint64_t pa) const

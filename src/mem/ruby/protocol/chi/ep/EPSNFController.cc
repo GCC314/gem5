@@ -74,6 +74,11 @@ EPSNFController::wakeup()
     // v4: Process pending writebacks
     processPendingWritebacks();
 
+    // Poll backend first so newly-arrived responses are available
+    // for retry queue evaluation below
+    if (_backend)
+        _backend->wakeup();
+
     // Q3: Process retry queue — request grants that were previously BUSY
     if (!_retryQueue.empty()) {
         bool needWakeup = false;
@@ -123,11 +128,8 @@ EPSNFController::wakeup()
             }
         }
         if (needWakeup)
-            scheduleEvent(Cycles(20000));
+            scheduleEvent(Cycles(100));
     }
-
-    if (_backend)
-        _backend->wakeup();
 }
 
 void
@@ -223,7 +225,7 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
         entry.fwdReq = msg->m_fwdRequestor;
         entry.dataToFwdReq = msg->m_dataToFwdRequestor;
         _retryQueue.push_back(entry);
-        scheduleEvent(Cycles(20000));
+        scheduleEvent(Cycles(100));
         return true;
     }
 
@@ -279,7 +281,7 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
             entry.fwdReq = msg->m_fwdRequestor;
             entry.dataToFwdReq = msg->m_dataToFwdRequestor;
             _retryQueue.push_back(entry);
-            scheduleEvent(Cycles(20000));
+            scheduleEvent(Cycles(100));
             return true;
         }
         // NoData: zero-fill is the correct behavior
@@ -336,7 +338,7 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
 
     // Schedule deferred sends
     if (!_deferredCompData.empty()) {
-        scheduleEvent(Cycles(20000));
+        scheduleEvent(Cycles(100));
     }
 
     return true;
@@ -547,7 +549,7 @@ EPSNFController::processPendingWritebacks()
         }
     }
     if (!_pendingWritebacks.empty())
-        scheduleEvent(Cycles(20000));
+        scheduleEvent(Cycles(100));
 }
 
 } // namespace ruby

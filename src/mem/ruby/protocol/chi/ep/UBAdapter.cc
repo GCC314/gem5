@@ -49,9 +49,10 @@ UBAdapter::init()
             std::string rx = base + "_ubio_" + std::to_string(_nodeId) + "_to_gem5_" + std::to_string(_nodeId);
             std::string tx = base + "_gem5_" + std::to_string(_nodeId) + "_to_ubio_" + std::to_string(_nodeId);
             _port = new framework::Port(
-                "gem5_ubio", _nodeId, 0, "ipc://" + rx, "ipc://" + tx, *ctx, 1000);
+                "gem5_ubio", _nodeId, 0, "ipc://" + rx, "ipc://" + tx, *ctx, 1000, 1000, 1000);
             std::printf("[Port gem5_ubio] n=%d rx=%s tx->%s\n",
                         _nodeId, rx.c_str(), tx.c_str());
+            std::printf("STEP5 Port enabled node=%d\n", _nodeId);
         }
     }
 
@@ -62,6 +63,7 @@ UBAdapter::transportSend(const CoherenceMessage &msg)
 {
     if (_port) {
         framework::MemMessage *buf = _port->sendAllocateBuffer(curTick());
+        uint64_t sendTick = curTick(); // capture before send
         if (!buf) {
             warn("UBAdapter node=%d socket=%d: transportSend no tx buffer (reqId=%lu type=%s)",
                  _nodeId, _socketId, msg.h.reqId, coherenceMsgTypeName(msg.h.type));
@@ -81,6 +83,11 @@ UBAdapter::transportSend(const CoherenceMessage &msg)
                  _nodeId, _socketId, msg.h.reqId);
             return false;
         }
+
+        static int _tscount = 0;
+        if (msg.h.type == CoherenceMessageType::ReadReq && ++_tscount <= 3)
+            std::fprintf(stderr, "[GEM5-SEND] node=%d type=ReadReq reqId=%lu gem5_tick=%lu buf_ts=%lu\n",
+                         _nodeId, msg.h.reqId, curTick(), buf->hdr.timestamp);
         return true;
     }
 
@@ -215,8 +222,12 @@ UBAdapter::sendReadReq(
                 *outGrantDataValid = (resp.b.readResp.grantType == static_cast<int>(UBCC_OuterGrantType::GlobalGrantModified));
                 if (*outGrantDataValid) memcpy(outGrantData->getDataMod(0), resp.b.readResp.grantData, 64);
             }
+            _inflightReadReqs.erase(reqId);
             _readyResponses.erase(rit);
             return static_cast<int>(resp.b.readResp.grantType);
+        }
+        if (_inflightReadReqs.count(reqId)) {
+            return -2;
         }
     }
 
@@ -226,6 +237,7 @@ UBAdapter::sendReadReq(
     }
 
     if (_port) {
+        _inflightReadReqs.insert(reqId);
         scheduleResponseCheck();
         return -2;
     }
@@ -1079,12 +1091,21 @@ UBAdapter::wakeup()
     // 4. Check for matched responses (for retry-based callers)
     checkResponseCallbacks();
 
-    // 5. Schedule next wakeup using safeTs for conservative advancement
+    // 5. Schedule next wakeup using safeTs
     ++_responseCheckCount;
     uint64_t safeT = _port->safeTs(curTick());
-    if (safeT <= curTick()) safeT = curTick() + 1000;
-    schedule(_responseCheckEvent, safeT);
+    if (safeT <= curTick()) safeT = curTick() + 10;
+    if (_responseCheckEvent.scheduled())
+        reschedule(_responseCheckEvent, safeT);
+    else
+        schedule(_responseCheckEvent, safeT);
     _eventArmed = true;
+
+    if (_responseCheckCount % 100 == 0 && _responseCheckCount <= 1000) {
+        uint64_t rxt = _port->receiveTimestamp();
+        std::fprintf(stderr, "[CLK-SYNC] node=%d curT=%lu rxt=%lu safeT=%lu\n",
+                     _nodeId, curTick(), rxt, safeT);
+    }
 }
 
 void
@@ -1092,6 +1113,7 @@ UBAdapter::checkResponseCallbacks()
 {
     if (!_port || _readyResponses.empty()) return;
 
+    bool delivered = false;
     for (auto rit = _readyResponses.begin(); rit != _readyResponses.end(); ) {
         const PendingKey &rkey = rit->first;
         auto pit = _pendingByReqId.find(rkey);
@@ -1099,9 +1121,13 @@ UBAdapter::checkResponseCallbacks()
             pit->second.onResp(rit->second);
             _pendingByReqId.erase(pit);
             rit = _readyResponses.erase(rit);
+            delivered = true;
         } else {
             ++rit;
         }
+    }
+    if (delivered && _onResponseWired) {
+        std::fprintf(stderr, "[RSP-WIRED] node=%d firing wakeup\n", _nodeId);
     }
 }
 
@@ -1139,15 +1165,9 @@ UBAdapter::handleResponse(framework::MemMessage *m)
 
     // Dispatch via _pendingByReqId — now keyed by (respType, reqId)
     PendingKey key{coh->h.type, coh->h.reqId};
-    // Check if there's a direct pending match (fast path)
     auto it = _pendingByReqId.find(key);
-    if (it != _pendingByReqId.end() && it->second.onResp) {
-        it->second.onResp(*coh);
-        _pendingByReqId.erase(it);
-        return;
-    }
 
-    // Store in ready-response cache for checkResponseCallbacks to match
+    // Store in ready-response cache for retry-based sendReadReq
     _readyResponses[key] = *coh;
     if (coh->h.type == CoherenceMessageType::ReadResp) {
         static int rc = 0;
@@ -1155,6 +1175,13 @@ UBAdapter::handleResponse(framework::MemMessage *m)
             warn("UBAdapter node=%d: stored ReadResp reqId=%lu grant=%d\n",
                  _nodeId, coh->h.reqId,
                  static_cast<int>(coh->b.readResp.grantType));
+    }
+
+    // If there's a direct callback, also invoke it
+    if (it != _pendingByReqId.end() && it->second.onResp) {
+        _inflightReadReqs.erase(coh->h.reqId);
+        it->second.onResp(*coh);
+        _pendingByReqId.erase(it);
     }
 }
 

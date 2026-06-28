@@ -5,6 +5,7 @@
 #include <deque>
 #include <functional>
 #include <map>
+#include <set>
 
 #include "mem/ruby/common/DataBlock.hh"
 #include "mem/ruby/protocol/chi/ep/CoherenceMessage.hh"
@@ -60,6 +61,8 @@ class UBAdapter : public SimObject
     /** Optional external transport port (injected by launcher/module). */
     void setPort(framework::Port *port) { _port = port; }
     framework::Port* port() const { return _port; }
+
+    void setOnResponseWired(std::function<void()> cb) { _onResponseWired = std::move(cb); }
 
     /**
     /**
@@ -202,6 +205,8 @@ class UBAdapter : public SimObject
               homeNode(-1), epoch(0) {}
     };
 
+    std::set<uint64_t> _inflightReadReqs;
+
     std::map<PendingKey, PendingTxn> _pendingByReqId;
     std::map<PendingKey, CoherenceMessage> _readyResponses;
 
@@ -217,6 +222,9 @@ class UBAdapter : public SimObject
     uint64_t _safeTick = 0;
     int _responseCheckCount = 0;
     bool _eventArmed = false;
+
+    std::function<void()> _onResponseWired;
+    friend class EPSNFController;
 
     // Deferred async control messages (InvalidateReq/RecallReq/UpgradeAckNotify)
     std::deque<CoherenceMessage> _deferredControls;
