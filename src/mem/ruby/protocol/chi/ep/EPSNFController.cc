@@ -128,7 +128,7 @@ EPSNFController::wakeup()
             }
         }
         if (needWakeup)
-            scheduleEvent(Cycles(100));
+            scheduleEvent(Cycles(1600000));
     }
 }
 
@@ -225,7 +225,7 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
         entry.fwdReq = msg->m_fwdRequestor;
         entry.dataToFwdReq = msg->m_dataToFwdRequestor;
         _retryQueue.push_back(entry);
-        scheduleEvent(Cycles(100));
+        scheduleEvent(Cycles(1600000));
         return true;
     }
 
@@ -281,7 +281,7 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
             entry.fwdReq = msg->m_fwdRequestor;
             entry.dataToFwdReq = msg->m_dataToFwdRequestor;
             _retryQueue.push_back(entry);
-            scheduleEvent(Cycles(100));
+            scheduleEvent(Cycles(1600000));
             return true;
         }
         // NoData: zero-fill is the correct behavior
@@ -338,7 +338,7 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
 
     // Schedule deferred sends
     if (!_deferredCompData.empty()) {
-        scheduleEvent(Cycles(100));
+        scheduleEvent(Cycles(1600000));
     }
 
     return true;
@@ -549,7 +549,7 @@ EPSNFController::processPendingWritebacks()
         }
     }
     if (!_pendingWritebacks.empty())
-        scheduleEvent(Cycles(100));
+        scheduleEvent(Cycles(1600000));
 }
 
 } // namespace ruby

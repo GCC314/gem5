@@ -49,13 +49,27 @@ UBAdapter::init()
             std::string rx = base + "_ubio_" + std::to_string(_nodeId) + "_to_gem5_" + std::to_string(_nodeId);
             std::string tx = base + "_gem5_" + std::to_string(_nodeId) + "_to_ubio_" + std::to_string(_nodeId);
             _port = new framework::Port(
-                "gem5_ubio", _nodeId, 0, "ipc://" + rx, "ipc://" + tx, *ctx, 1000, 1000, 1000);
+                "gem5_ubio", _nodeId, 0, "ipc://" + rx, "ipc://" + tx, *ctx);
             std::printf("[Port gem5_ubio] n=%d rx=%s tx->%s\n",
                         _nodeId, rx.c_str(), tx.c_str());
             std::printf("STEP5 Port enabled node=%d\n", _nodeId);
         }
     }
 
+}
+
+void
+UBAdapter::startup()
+{
+    SimObject::startup();
+
+    if (_port && !_eventArmed) {
+        schedule(_responseCheckEvent, curTick());
+        _eventArmed = true;
+        std::fprintf(stderr,
+                     "[UBADAPTER-STARTUP] node=%d socket=%d schedule sync wakeup @%lu\n",
+                     _nodeId, _socketId, curTick());
+    }
 }
 
 bool
@@ -236,91 +250,30 @@ UBAdapter::sendReadReq(
         return -1;
     }
 
+    // Port async path: schedule check, return pending
     if (_port) {
-        _inflightReadReqs.insert(reqId);
         scheduleResponseCheck();
         return -2;
     }
 
     if (!transportRecv(CoherenceMessageType::ReadResp, reqId)) {
-        printf("[ADAPTER-NO-RESP] node=%d pa=0x%lx epoch=%lu reqId=%lu home=%d\n",
-               _nodeId, homePa, epoch, reqId, homeNode);
-        warn("UBAdapter node=%d: sendReadReq: no response received "
-             "PA=0x%lx\n", _nodeId, homePa);
+        warn("UBAdapter node=%d: sendReadReq: no response received PA=0x%lx\n",
+             _nodeId, homePa);
         return -1;
     }
-
-    const CoherenceMessage &resp = _lastResponse;
-    if (resp.h.type != CoherenceMessageType::ReadResp) {
-        warn("UBAdapter node=%d: sendReadReq: unexpected response type %s "
-             "PA=0x%lx\n", _nodeId, coherenceMsgTypeName(resp.h.type), homePa);
-        return -1;
-    }
-
-    int grant = static_cast<int>(resp.b.readResp.grantType);
-    printf("[ADAPTER-GRANT-OK] node=%d pa=0x%lx grant=%d\n",
-           _nodeId, homePa, grant);
-
-    if (outGrantVisibleTick)
-        *outGrantVisibleTick = resp.b.readResp.grantVisibleTick;
-    if (outSentinelVisibleTick)
-        *outSentinelVisibleTick = resp.b.readResp.sentinelVisibleTick;
-    if (outRecallNeeded)
-        *outRecallNeeded = resp.b.readResp.recallNeeded;
-    if (outRecallOwnerNode)
-        *outRecallOwnerNode = resp.b.readResp.recallOwnerNode;
-    if (outDataSource)
-        *outDataSource = static_cast<GrantDataSource>(resp.b.readResp.dataSource);
-    if (outAuthEpoch)
-        *outAuthEpoch = resp.b.readResp.authEpoch;
-    if (outPendingInvCount)
-        *outPendingInvCount = resp.b.readResp.pendingInvCount;
-    if (outPendingInvMask)
-        *outPendingInvMask = resp.b.readResp.pendingInvMask;
-    if (outCommittedEpoch)
-        *outCommittedEpoch = resp.b.readResp.committedEpoch;
-    if (outGrantDataValid) {
-        *outGrantDataValid =
-            (resp.h.flags & static_cast<uint32_t>(CFLAG_HAS_DATA)) != 0;
-    }
-    if (outGrantData &&
-        (resp.h.flags & static_cast<uint32_t>(CFLAG_HAS_DATA)) != 0) {
-        outGrantData->setData(resp.b.readResp.grantData, 0, 64);
-    }
-
-    DPRINTF(RubyEP,
-            "UBAdapter node=%d: sendReadReq result grant=%d "
-            "recallNeeded=%d recallOwner=%d dataSource=%d authEpoch=%lu\n",
-            _nodeId, grant,
-            resp.b.readResp.recallNeeded, resp.b.readResp.recallOwnerNode,
-            resp.b.readResp.dataSource, resp.b.readResp.authEpoch);
-
-    return grant;
+    return static_cast<int>(_lastResponse.b.readResp.grantType);
 }
 
-// ---- Phase 2+: Writeback Request ----
+// ---- Writeback Request ----
 
 int
 UBAdapter::sendWritebackReq(uint64_t homePa, int requesterNode,
                              uint64_t epochVal, bool keepAsClean,
                              int homeNode, int homeSocket)
 {
-    DPRINTF(RubyEP,
-            "UBAdapter node=%d socket=%d: sendWritebackReq homePa=0x%lx "
-            "reqNode=%d epoch=%lu keepAsClean=%d homeNode=%d homeSocket=%d\n",
-            _nodeId, _socketId, homePa, requesterNode, epochVal, keepAsClean,
-            homeNode, homeSocket);
-
     if (!_port) {
         fatal("UBAdapter node=%d socket=%d: sendWritebackReq called with no transport bound\n",
               _nodeId, _socketId);
-    }
-
-    // Port async: check cached response first
-    if (_port && _lastResponseValid &&
-        _lastResponse.h.type == CoherenceMessageType::WritebackResp &&
-        _lastResponse.h.homeLinePa == homePa) {
-        return _lastResponse.b.writebackResp.success ? 1 : 0;
     }
 
     CoherenceMessage req;
@@ -614,10 +567,14 @@ UBAdapter::sendClearReq(uint64_t linePa, int srcNode,
         PendingKey rkey{CoherenceMessageType::ClearResp, reqId};
         auto rit = _readyResponses.find(rkey);
         if (rit != _readyResponses.end()) {
+            std::fprintf(stderr, "[CLR-CACHE-HIT] node=%d reqId=%lu accepted=%d\n",
+                         _nodeId, reqId, rit->second.b.clearResp.accepted ? 1 : 0);
             bool a = rit->second.b.clearResp.accepted;
             _readyResponses.erase(rit);
             return a ? 1 : 0;
         }
+        std::fprintf(stderr, "[CLR-CACHE-MISS] node=%d reqId=%lu sending new ClearReq\n",
+                     _nodeId, reqId);
     }
 
     CoherenceMessage req;
@@ -642,6 +599,9 @@ UBAdapter::sendClearReq(uint64_t linePa, int srcNode,
     if (!transportSend(req)) {
         return -1;
     }
+
+    std::fprintf(stderr, "[CLR-TX] n=%d reqId=%lu curT=%lu\n",
+                 _nodeId, reqId, curTick());
 
     // Port async path: schedule check, return pending
     if (_port) {
@@ -1091,17 +1051,19 @@ UBAdapter::wakeup()
     // 4. Check for matched responses (for retry-based callers)
     checkResponseCallbacks();
 
-    // 5. Schedule next wakeup using safeTs
+    // 5. Schedule next wakeup using safeTs.  When the peer is behind,
+    //    keep polling at curTick() without advancing — do NOT bypass
+    //    safeTs with a +syncInterval fallback.
     ++_responseCheckCount;
     uint64_t safeT = _port->safeTs(curTick());
-    if (safeT <= curTick()) safeT = curTick() + 10;
+    uint64_t nextT = safeT > curTick() ? safeT : curTick();
     if (_responseCheckEvent.scheduled())
-        reschedule(_responseCheckEvent, safeT);
+        reschedule(_responseCheckEvent, nextT);
     else
-        schedule(_responseCheckEvent, safeT);
+        schedule(_responseCheckEvent, nextT);
     _eventArmed = true;
 
-    if (_responseCheckCount % 100 == 0 && _responseCheckCount <= 1000) {
+    if (_responseCheckCount % 100 == 0) {
         uint64_t rxt = _port->receiveTimestamp();
         std::fprintf(stderr, "[CLK-SYNC] node=%d curT=%lu rxt=%lu safeT=%lu\n",
                      _nodeId, curTick(), rxt, safeT);

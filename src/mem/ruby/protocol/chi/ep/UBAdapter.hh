@@ -42,10 +42,11 @@ class UBAdapter : public SimObject
 {
   public:
     PARAMS(UBAdapter);
-    UBAdapter(const Params &p);
-    ~UBAdapter();
+     UBAdapter(const Params &p);
+     ~UBAdapter();
 
-    void init() override;
+     void init() override;
+     void startup() override;
 
     int nodeId() const { return _nodeId; }
     int socketId() const { return _socketId; }
