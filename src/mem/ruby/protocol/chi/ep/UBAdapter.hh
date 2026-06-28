@@ -178,24 +178,39 @@ class UBAdapter : public SimObject
      * Per-transaction pending state.
      * Tracks in-flight requests waiting for responses.
      */
+    struct PendingKey {
+        CoherenceMessageType respType;
+        uint64_t reqId;
+        bool operator<(const PendingKey &o) const {
+            return std::tie(respType, reqId) < std::tie(o.respType, o.reqId);
+        }
+    };
+
     struct PendingTxn {
         CoherenceMessageType reqType;
+        CoherenceMessageType respType;
+        uint64_t reqId;
         uint64_t homeLinePa;
-        uint64_t localLinePa;
         int homeNode;
+        uint64_t epoch;
         std::function<void(const CoherenceMessage&)> onResp;
 
         PendingTxn()
             : reqType(CoherenceMessageType::ReadReq),
-              homeLinePa(0), localLinePa(0),
-              homeNode(-1) {}
+              respType(CoherenceMessageType::ReadResp),
+              reqId(0), homeLinePa(0),
+              homeNode(-1), epoch(0) {}
     };
 
-    std::map<uint64_t, PendingTxn> _pendingByReqId;
+    std::map<PendingKey, PendingTxn> _pendingByReqId;
+    std::map<PendingKey, CoherenceMessage> _readyResponses;
 
-    /** Last response received from router (for synchronous callers). */
+    /** Last response (for sync transportRecv fallback and recvFromRouter). */
     CoherenceMessage _lastResponse;
     bool _lastResponseValid = false;
+
+    uint64_t _nextLocalReqId = 1;
+    uint64_t allocLocalReqId();
 
     /** Event for periodic Port response polling. */
     EventFunctionWrapper _responseCheckEvent;

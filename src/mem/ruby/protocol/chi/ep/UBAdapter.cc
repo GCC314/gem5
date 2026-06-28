@@ -196,27 +196,28 @@ UBAdapter::sendReadReq(
             "UBAdapter node=%d socket=%d: sending ReadReq %s\n",
             _nodeId, _socketId, ubMsgToString(req).c_str());
 
-    // Port async path: if response already cached, return it directly
-    if (_port && _lastResponseValid && _lastResponse.h.type == CoherenceMessageType::ReadResp
-        && _lastResponse.h.reqId == reqId) {
-        // Fill output pointers from cached response
-        if (outGrantVisibleTick) *outGrantVisibleTick = _lastResponse.b.readResp.grantVisibleTick;
-        if (outSentinelVisibleTick) *outSentinelVisibleTick = _lastResponse.b.readResp.sentinelVisibleTick;
-        if (outRecallNeeded) *outRecallNeeded = _lastResponse.b.readResp.recallNeeded;
-        if (outRecallOwnerNode) *outRecallOwnerNode = _lastResponse.b.readResp.recallOwnerNode;
-        if (outDataSource) *outDataSource = static_cast<GrantDataSource>(_lastResponse.b.readResp.dataSource);
-        if (outAuthEpoch) *outAuthEpoch = _lastResponse.b.readResp.authEpoch;
-        if (outPendingInvCount) *outPendingInvCount = _lastResponse.b.readResp.pendingInvCount;
-        if (outPendingInvMask) *outPendingInvMask = _lastResponse.b.readResp.pendingInvMask;
-        if (outCommittedEpoch) *outCommittedEpoch = _lastResponse.b.readResp.committedEpoch;
-        if (outGrantData && outGrantDataValid) {
-            *outGrantDataValid = (_lastResponse.b.readResp.grantType
-                                  == static_cast<int>(UBCC_OuterGrantType::GlobalGrantModified));
-            if (*outGrantDataValid)
-                memcpy(outGrantData->getDataMod(0),
-                       _lastResponse.b.readResp.grantData, 64);
+    // Port async path: check ready-response cache keyed by (ReadResp, reqId)
+    if (_port) {
+        PendingKey rkey{CoherenceMessageType::ReadResp, reqId};
+        auto rit = _readyResponses.find(rkey);
+        if (rit != _readyResponses.end()) {
+            const CoherenceMessage &resp = rit->second;
+            if (outGrantVisibleTick) *outGrantVisibleTick = resp.b.readResp.grantVisibleTick;
+            if (outSentinelVisibleTick) *outSentinelVisibleTick = resp.b.readResp.sentinelVisibleTick;
+            if (outRecallNeeded) *outRecallNeeded = resp.b.readResp.recallNeeded;
+            if (outRecallOwnerNode) *outRecallOwnerNode = resp.b.readResp.recallOwnerNode;
+            if (outDataSource) *outDataSource = static_cast<GrantDataSource>(resp.b.readResp.dataSource);
+            if (outAuthEpoch) *outAuthEpoch = resp.b.readResp.authEpoch;
+            if (outPendingInvCount) *outPendingInvCount = resp.b.readResp.pendingInvCount;
+            if (outPendingInvMask) *outPendingInvMask = resp.b.readResp.pendingInvMask;
+            if (outCommittedEpoch) *outCommittedEpoch = resp.b.readResp.committedEpoch;
+            if (outGrantData && outGrantDataValid) {
+                *outGrantDataValid = (resp.b.readResp.grantType == static_cast<int>(UBCC_OuterGrantType::GlobalGrantModified));
+                if (*outGrantDataValid) memcpy(outGrantData->getDataMod(0), resp.b.readResp.grantData, 64);
+            }
+            _readyResponses.erase(rit);
+            return static_cast<int>(resp.b.readResp.grantType);
         }
-        return static_cast<int>(_lastResponse.b.readResp.grantType);
     }
 
     _lastResponseValid = false;
@@ -596,10 +597,15 @@ UBAdapter::sendClearReq(uint64_t linePa, int srcNode,
               _nodeId, _socketId);
     }
 
-    // Port async: check cached response first
-    if (_port && _lastResponseValid && _lastResponse.h.type == CoherenceMessageType::ClearResp
-        && _lastResponse.h.reqId == reqId) {
-        return _lastResponse.b.clearResp.accepted ? 1 : 0;
+    // Port async: check ready-response cache keyed by (ClearResp, reqId)
+    if (_port) {
+        PendingKey rkey{CoherenceMessageType::ClearResp, reqId};
+        auto rit = _readyResponses.find(rkey);
+        if (rit != _readyResponses.end()) {
+            bool a = rit->second.b.clearResp.accepted;
+            _readyResponses.erase(rit);
+            return a ? 1 : 0;
+        }
     }
 
     CoherenceMessage req;
@@ -1084,16 +1090,19 @@ UBAdapter::wakeup()
 void
 UBAdapter::checkResponseCallbacks()
 {
-    if (!_port) return;
-    // Match _lastResponse against _pendingByReqId entries
-    if (!_lastResponseValid) return;
-    auto it = _pendingByReqId.find(_lastResponse.h.reqId);
-    if (it == _pendingByReqId.end()) return;
-    if (it->second.onResp) {
-        it->second.onResp(_lastResponse);
+    if (!_port || _readyResponses.empty()) return;
+
+    for (auto rit = _readyResponses.begin(); rit != _readyResponses.end(); ) {
+        const PendingKey &rkey = rit->first;
+        auto pit = _pendingByReqId.find(rkey);
+        if (pit != _pendingByReqId.end() && pit->second.onResp) {
+            pit->second.onResp(rit->second);
+            _pendingByReqId.erase(pit);
+            rit = _readyResponses.erase(rit);
+        } else {
+            ++rit;
+        }
     }
-    _pendingByReqId.erase(it);
-    _lastResponseValid = false;
 }
 
 void
@@ -1128,17 +1137,25 @@ UBAdapter::handleResponse(framework::MemMessage *m)
         break;
     }
 
-    // Dispatch via _pendingByReqId map
-    auto it = _pendingByReqId.find(m->hdr.req_id);
+    // Dispatch via _pendingByReqId — now keyed by (respType, reqId)
+    PendingKey key{coh->h.type, coh->h.reqId};
+    // Check if there's a direct pending match (fast path)
+    auto it = _pendingByReqId.find(key);
     if (it != _pendingByReqId.end() && it->second.onResp) {
         it->second.onResp(*coh);
         _pendingByReqId.erase(it);
         return;
     }
 
-    // Fallback: store as lastResponse for retry-based callers
-    _lastResponse = *coh;
-    _lastResponseValid = true;
+    // Store in ready-response cache for checkResponseCallbacks to match
+    _readyResponses[key] = *coh;
+    if (coh->h.type == CoherenceMessageType::ReadResp) {
+        static int rc = 0;
+        if (++rc <= 3)
+            warn("UBAdapter node=%d: stored ReadResp reqId=%lu grant=%d\n",
+                 _nodeId, coh->h.reqId,
+                 static_cast<int>(coh->b.readResp.grantType));
+    }
 }
 
 void
@@ -1148,6 +1165,14 @@ UBAdapter::scheduleResponseCheck()
         schedule(_responseCheckEvent, curTick() + 10);
         _eventArmed = true;
     }
+}
+
+uint64_t
+UBAdapter::allocLocalReqId()
+{
+    uint64_t id = _nextLocalReqId++;
+    if (id == 0) id = _nextLocalReqId++;
+    return id;
 }
 
 void
