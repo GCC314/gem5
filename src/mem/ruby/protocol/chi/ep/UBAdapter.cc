@@ -234,7 +234,17 @@ UBAdapter::sendReadReq(
             if (outPendingInvMask) *outPendingInvMask = resp.b.readResp.pendingInvMask;
             if (outCommittedEpoch) *outCommittedEpoch = resp.b.readResp.committedEpoch;
             if (outGrantData && outGrantDataValid) {
-                *outGrantDataValid = (resp.b.readResp.grantType == static_cast<int>(UBCC_OuterGrantType::GlobalGrantModified));
+                // Grant data is valid for Modified grants (dirty fill) AND
+                // whenever the home sourced the data from a recall buffer (the
+                // previous owner's dirty line). A remote ReadShared whose home
+                // just recalled the owner must still receive that recalled dirty
+                // data — gating only on GlobalGrantModified dropped it, so the
+                // requester read zeros. (See dataSource==RecallBuffer.)
+                *outGrantDataValid =
+                    (resp.b.readResp.grantType ==
+                         static_cast<int>(UBCC_OuterGrantType::GlobalGrantModified)) ||
+                    (resp.b.readResp.dataSource ==
+                         static_cast<int>(GrantDataSource::RecallBuffer));
                 if (*outGrantDataValid) memcpy(outGrantData->getDataMod(0), resp.b.readResp.grantData, 64);
             }
             _inflightReadReqs.erase(reqId);
