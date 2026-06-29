@@ -99,7 +99,8 @@ class UBAdapter : public SimObject
                        int desiredPerm, int cause,
                        uint64_t *outUpgradeTargetMask,
                        uint64_t *outCommittedEpoch,
-                       int homeNode, int homeSocket);
+                       int homeNode, int homeSocket,
+                       bool checkOnly = false);
 
     int sendUpgradeDoneReq(uint64_t homePa, int requesterNode,
                            uint64_t epoch, uint64_t reqId,

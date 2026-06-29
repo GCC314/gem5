@@ -1544,10 +1544,23 @@ EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
     uint64_t offset = _addrMap.dsmOffset(line_pa);
     uint64_t homePa = _addrMap.buildDsmPA(homeNode, homeNode, offset);
 
-    // Allocate new epoch and reqId
-    _epochCounter++;
-    uint64_t epochVal = _epochCounter;
-    uint64_t reqIdVal = makeRequesterReqId(_nodeId, _epochCounter);
+    // Reuse reqId/epoch if an async upgrade is already pending for this line
+    // (sendUpgradeReq returned -2 last time). Allocating a fresh reqId on every
+    // snoop retry made the home reject the duplicate (existing outstanding) and
+    // loop forever (TC3/8/10/11).
+    auto put = _pendingUpgradeTxns.find(line_pa);
+    const bool hadPending = (put != _pendingUpgradeTxns.end() && put->second.valid);
+
+    uint64_t epochVal;
+    uint64_t reqIdVal;
+    if (hadPending) {
+        epochVal = put->second.epoch;
+        reqIdVal = put->second.reqId;
+    } else {
+        _epochCounter++;
+        epochVal = _epochCounter;
+        reqIdVal = makeRequesterReqId(_nodeId, _epochCounter);
+    }
 
     if (!getUBAdapter(0)) {
         fatal("EPBackend node_id=%d: UBAdapter required for upgrade "
@@ -1576,13 +1589,27 @@ EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
     int upgradeRet = getUBAdapter(0)->sendUpgradeReq(
         homePa, _nodeId, epochVal, reqIdVal,
         desiredPerm, static_cast<int>(ubccCause),
-        &upgradeTargetMask, &committedEpoch, homeNode, 0 /* homeSocket */);
+        &upgradeTargetMask, &committedEpoch, homeNode, 0 /* homeSocket */,
+        hadPending /*checkOnly: don't re-send an in-flight upgrade*/);
     if (upgradeRet == -2) {
         std::fprintf(stderr,
                      "[EP-UPGRADE-PENDING] node=%d pa=0x%lx home=%d epoch=%lu reqId=%lu\n",
                      _nodeId, homePa, homeNode, epochVal, reqIdVal);
+        // Save the pending reqId/epoch so the next snoop retry reuses them and
+        // hits the cached UpgradeResp, rather than allocating a new reqId that
+        // the home rejects (existing outstanding).
+        PendingUpgradeTxn txn;
+        txn.valid = true;
+        txn.linePa = line_pa;
+        txn.homeNode = homeNode;
+        txn.epoch = epochVal;
+        txn.reqId = reqIdVal;
+        _pendingUpgradeTxns[line_pa] = txn;
         return false;
     }
+    // UpgradeResp arrived: clear any pending txn for this line.
+    if (put != _pendingUpgradeTxns.end() && put->second.valid)
+        put->second.valid = false;
     bool accepted = (upgradeRet > 0);
 
     if (accepted) {

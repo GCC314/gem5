@@ -773,6 +773,22 @@ class EPBackend : public SimObject
     };
     std::map<uint64_t, PendingGrantTxn> _pendingGrantTxns;
 
+    // ---- Async upgrade pending txn (mirrors PendingGrantTxn for clear) ----
+    // When sendUpgradeReq returns -2 (UpgradeResp not yet arrived), we save the
+    // reqId/epoch so a snoop retry reuses the SAME reqId and hits the cached
+    // UpgradeResp, instead of allocating a fresh reqId that the home rejects
+    // (existing outstanding) — the death loop that hung TC3/8/10/11.
+    struct PendingUpgradeTxn {
+        bool valid;
+        uint64_t linePa;
+        int homeNode;
+        uint64_t epoch;
+        uint64_t reqId;
+        PendingUpgradeTxn() : valid(false), linePa(0), homeNode(-1),
+                              epoch(0), reqId(0) {}
+    };
+    std::map<uint64_t, PendingUpgradeTxn> _pendingUpgradeTxns;
+
     // ---- M6: Cross-Node EPBackend Routing Registry ----
     static std::map<int, EPBackend*> _backendInstances;
 };

@@ -409,7 +409,8 @@ UBAdapter::sendUpgradeReq(uint64_t homePa, int requesterNode,
                             int desiredPerm, int cause,
                             uint64_t *outUpgradeTargetMask,
                             uint64_t *outCommittedEpoch,
-                            int homeNode, int homeSocket)
+                            int homeNode, int homeSocket,
+                            bool checkOnly)
 {
     DPRINTF(RubyEP,
             "UBAdapter node=%d socket=%d: sendUpgradeReq homePa=0x%lx "
@@ -422,17 +423,31 @@ UBAdapter::sendUpgradeReq(uint64_t homePa, int requesterNode,
               _nodeId, _socketId);
     }
 
-    // Port async: check cached response first
-    if (_port && _lastResponseValid &&
-        _lastResponse.h.type == CoherenceMessageType::UpgradeResp &&
-        _lastResponse.h.reqId == reqId) {
-        if (outUpgradeTargetMask)
-            *outUpgradeTargetMask = _lastResponse.b.upgradeResp.upgradeTargetMask;
-        if (outCommittedEpoch)
-            *outCommittedEpoch = _lastResponse.b.upgradeResp.committedEpoch;
-        bool accepted =
-            (_lastResponse.h.flags & static_cast<uint32_t>(CFLAG_ACCEPTED)) != 0;
-        return accepted ? 1 : 0;
+    // Port async: check ready-response cache keyed by (UpgradeResp, reqId).
+    // Using the map cache (not the single-slot _lastResponse) so that a retry
+    // with the SAME reqId hits the cached UpgradeResp once it arrives, instead
+    // of sending a duplicate UpgradeReq that the home rejects (existing
+    // outstanding) — the death loop that hung TC3/8/10/11.
+    if (_port) {
+        PendingKey rkey{CoherenceMessageType::UpgradeResp, reqId};
+        auto rit = _readyResponses.find(rkey);
+        if (rit != _readyResponses.end()) {
+            const CoherenceMessage &resp = rit->second;
+            if (outUpgradeTargetMask)
+                *outUpgradeTargetMask = resp.b.upgradeResp.upgradeTargetMask;
+            if (outCommittedEpoch)
+                *outCommittedEpoch = resp.b.upgradeResp.committedEpoch;
+            bool accepted =
+                (resp.h.flags & static_cast<uint32_t>(CFLAG_ACCEPTED)) != 0;
+            _readyResponses.erase(rit);
+            return accepted ? 1 : 0;
+        }
+        // checkOnly: a previous UpgradeReq for this reqId is already in flight
+        // (async pending). Do NOT re-send — a duplicate would make the home emit
+        // a rejected UpgradeResp that could overwrite the accepted one in the
+        // cache. Just report still-pending.
+        if (checkOnly)
+            return -2;
     }
 
     CoherenceMessage req;
