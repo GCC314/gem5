@@ -23,7 +23,6 @@ namespace ruby
 {
 
 class EPBackend;
-class UBCCController;
 
 // Forward-declare EPBackend message types (defined in EPBackend.hh)
 struct OuterRecallMsg;

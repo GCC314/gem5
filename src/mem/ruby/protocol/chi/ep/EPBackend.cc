@@ -1,5 +1,4 @@
 #include "mem/ruby/protocol/chi/ep/EPBackend.hh"
-#include "mem/ruby/protocol/chi/ep/UBCCController.hh"
 
 #include <cstdio>
 #include <cstring>

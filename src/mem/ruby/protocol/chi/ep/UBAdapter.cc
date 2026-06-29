@@ -1,5 +1,4 @@
 #include "mem/ruby/protocol/chi/ep/UBAdapter.hh"
-#include "mem/ruby/protocol/chi/ep/UBCCController.hh"
 
 #include <cstdio>
 #include <limits>
