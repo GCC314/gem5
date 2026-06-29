@@ -45,15 +45,16 @@ UBAdapter::init()
     if (portEnv) {
         int enableNode = atoi(portEnv);
         if (enableNode < 0 || _nodeId == enableNode) {
-            auto* ctx = new zmq::context_t(1);
-            std::string base = "/workspace/gem5/shared_ipc/ipc";
-            std::string rx = base + "_ubio_" + std::to_string(_nodeId) + "_to_gem5_" + std::to_string(_nodeId);
-            std::string tx = base + "_gem5_" + std::to_string(_nodeId) + "_to_ubio_" + std::to_string(_nodeId);
-            _port = new framework::Port(
-                "gem5_ubio", _nodeId, 0, "ipc://" + rx, "ipc://" + tx, *ctx);
-            std::printf("[Port gem5_ubio] n=%d rx=%s tx->%s\n",
-                        _nodeId, rx.c_str(), tx.c_str());
-            std::printf("STEP5 Port enabled node=%d\n", _nodeId);
+            framework::PortParams pp = framework::PortEnvLoader::gem5UbioPort(_nodeId);
+            _port = new framework::Port();
+            if (!_port->init(pp)) {
+                std::fprintf(stderr, "[UBAdapter] node=%d Port init failed\n", _nodeId);
+                delete _port; _port = nullptr;
+            } else {
+                std::printf("[Port gem5_ubio] n=%d rx=%s tx->%s\n",
+                            _nodeId, pp.localRxEndpoint.c_str(), pp.peerRxEndpoint.c_str());
+                std::printf("STEP5 Port enabled node=%d\n", _nodeId);
+            }
         }
     }
 
@@ -77,23 +78,24 @@ bool
 UBAdapter::transportSend(const CoherenceMessage &msg)
 {
     if (_port) {
-        framework::MemMessage *buf = _port->sendAllocateBuffer(curTick());
-        uint64_t sendTick = curTick(); // capture before send
-        if (!buf) {
+        framework::TxHandle *h = _port->allocateSendBuffer(curTick());
+        if (!h) {
             warn("UBAdapter node=%d socket=%d: transportSend no tx buffer (reqId=%lu type=%s)",
                  _nodeId, _socketId, msg.h.reqId, coherenceMsgTypeName(msg.h.type));
             return false;
         }
+        framework::MemMessage *buf = h->buffer();
 
         buf->hdr.type = static_cast<uint32_t>(framework::MemMessageType::COH_MSG);
         buf->hdr.req_id = msg.h.reqId;
         if (!buf->setPayload(msg)) {
             warn("UBAdapter node=%d socket=%d: transportSend payload encode failed (reqId=%lu)",
                  _nodeId, _socketId, msg.h.reqId);
+            h->cancel();
             return false;
         }
 
-        if (!_port->send(buf)) {
+        if (!h->send()) {
             warn("UBAdapter node=%d socket=%d: transportSend port send failed (reqId=%lu)",
                  _nodeId, _socketId, msg.h.reqId);
             return false;
