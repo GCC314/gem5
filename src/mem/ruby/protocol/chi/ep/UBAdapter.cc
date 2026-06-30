@@ -47,15 +47,31 @@ UBAdapter::init()
     if (portEnv) {
         int enableNode = atoi(portEnv);
         if (enableNode < 0 || _nodeId == enableNode) {
-            framework::PortParams pp = framework::PortEnvLoader::gem5UbioPort(_nodeId);
+            // Socket-plane model: each (node, socket) UBAdapter binds to its own
+            // ubio process, identified by the global module id gid=node*K+socket.
+            // Previously all sockets of a node used gem5UbioPort(node), so only
+            // socket 0 bound (duplicate endpoint) and socket-1 traffic deadlocked.
+            int numSockets = 1;
+            if (const char* e = getenv("UBCC_NUM_SOCKETS")) {
+                int v = atoi(e); if (v >= 1 && v <= 8) numSockets = v;
+            }
+            int gid = _nodeId * numSockets + _socketId;
+            framework::PortParams pp = framework::PortEnvLoader::gem5UbioPort(gid);
             _port = new framework::Port();
             if (!_port->init(pp)) {
-                std::fprintf(stderr, "[UBAdapter] node=%d Port init failed\n", _nodeId);
+                std::fprintf(stderr, "[UBAdapter] node=%d socket=%d Port init failed\n",
+                             _nodeId, _socketId);
                 delete _port; _port = nullptr;
             } else {
-                std::printf("[Port gem5_ubio] n=%d rx=%s tx->%s\n",
-                            _nodeId, pp.localRxEndpoint.c_str(), pp.peerRxEndpoint.c_str());
-                std::printf("STEP5 Port enabled node=%d\n", _nodeId);
+                std::printf("[Port gem5_ubio] n=%d s=%d gid=%d rx=%s tx->%s\n",
+                            _nodeId, _socketId, gid,
+                            pp.localRxEndpoint.c_str(), pp.peerRxEndpoint.c_str());
+                std::printf("STEP5 Port enabled node=%d socket=%d gid=%d\n",
+                            _nodeId, _socketId, gid);
+                // Flush: this C++ stdio buffer is separate from Python's stdout;
+                // the launcher greps the log for STEP5 to detect Port binding, so
+                // it must reach the file immediately (not wait for buffer fill).
+                std::fflush(stdout);
                 // Multi-process split: when this gem5 node's simulation ends
                 // (process exit), notify ubio with a best-effort TERMINATE so
                 // the distributed clock treats this node as "done" (+inf) rather
@@ -77,9 +93,13 @@ UBAdapter::init()
                 // calls our callback to send BARRIER_REACHED to ubio (which
                 // forwards to the barrier_manager / other ubios). We receive
                 // BARRIER_RELEASE in wakeup() and call releaseBarrier().
+                // Barriers are per-NODE and flow through the socket-0 plane only.
+                // Register the SyncWaitManager callback on socket 0's UBAdapter so
+                // BARRIER_REACHED egresses via ubio(node,0); socket-1 UBAdapters do
+                // not participate (would double-count / split the node's arrival).
                 const char* localNodeEnv = getenv("UBCC_LOCAL_NODE");
                 int localNode = localNodeEnv ? atoi(localNodeEnv) : -1;
-                if (localNode >= 0 && !System::systemList.empty()) {
+                if (_socketId == 0 && localNode >= 0 && !System::systemList.empty()) {
                     System *sys = System::systemList[0];
                     sys->syncWait.setLocalNodeId(localNode);
                     sys->syncWait.setBarrierSendFn(
@@ -87,7 +107,7 @@ UBAdapter::init()
                             sendBarrierReached(mask, nodeId);
                         });
                     std::fprintf(stderr,
-                        "[UBADAPTER-BARRIER] node=%d registered IPC barrier "
+                        "[UBADAPTER-BARRIER] node=%d socket=0 registered IPC barrier "
                         "callback (localNode=%d)\n", _nodeId, localNode);
                 }
             }

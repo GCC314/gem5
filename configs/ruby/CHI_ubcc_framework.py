@@ -272,6 +272,10 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
         nd['meta_rnfs'] = []
         for socket_id in range(num_sockets):
             ub_adapter = UBAdapter(node_id=node_id, socket_id=socket_id)
+            # Parent each adapter explicitly in the SimObject tree so its init()
+            # runs (binds ubio(node, socket) Port). A VectorParam reference alone
+            # leaves it an orphan; explicit setattr is the unambiguous parent.
+            setattr(ruby_system, f"ub_adapter_node{node_id}_s{socket_id}", ub_adapter)
             nd['ub_adapters'].append(ub_adapter)
 
         # Backward-compat aliases for first socket
@@ -282,6 +286,10 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
         ep_backend = EPBackend(node_id=node_id, ruby_system=ruby_system,
                                 meta_rnf=NULL,
                                 ub_adapter=nd['ub_adapter'],
+                                # Socket-plane: pass ALL per-socket UBAdapters so
+                                # each becomes a tree child (init() runs, binds its
+                                # own ubio Port) and is registered for getUBAdapter.
+                                ub_adapters=nd['ub_adapters'],
                                 num_sockets=num_sockets,
                                 ubcc_epoch_bits=ubcc_epoch_bits,
                                 ubcc_bf_bytes=ubcc_bf_bytes,

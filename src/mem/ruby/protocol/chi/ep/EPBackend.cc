@@ -138,6 +138,14 @@ EPBackend::EPBackend(const Params &p)
     if (legacyAdapter) {
         registerAdapter(0, legacyAdapter);
     }
+    // Socket-plane: register per-socket UBAdapters (index == socket_id). Passing
+    // them as a VectorParam also makes each a child SimObject, so its init()
+    // runs and binds its own ubio Port (ubio(node, socket)). Without this, only
+    // socket 0's adapter was tree-attached and socket-1 traffic had no transport.
+    for (int s = 0; s < (int)p.ub_adapters.size(); ++s) {
+        if (p.ub_adapters[s])
+            registerAdapter(s, p.ub_adapters[s]);
+    }
 
     // M6: Register this EPBackend in the static cross-node routing registry
     _backendInstances[_nodeId] = this;
@@ -502,30 +510,23 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
     int homeSocket = _addrMap.homeSocket(_nodeId, line_pa);
     if (homeSocket < 0) homeSocket = 0;
 
-    // Determine adapter to use based on ingressSocket
+    // Socket-plane model: the request egresses via its ingress socket's own
+    // UBAdapter, which binds to ubio(node, ingressSocket). Each socket has its
+    // own Port, so cross-socket DSM reads reach the correct plane's ubio.
     int adapterIdx = (ingressSocket >= 0 && ingressSocket < _numSockets)
                          ? ingressSocket : 0;
     UBAdapter *adapter = getUBAdapter(adapterIdx);
-    // Multi-process split: only socket 0's UBAdapter binds the per-node ubio
-    // Port; the other sockets' adapters are portless. A cross-socket DSM read
-    // routed through a portless adapter never reaches ubio and the requesting
-    // Sequencer deadlocks (dual-socket TC32/35). Fall back to the port-bearing
-    // adapter — there is a single ubio connection per node, so all sockets must
-    // egress through it. The home/ingress socket is still carried in the message
-    // header, so home-side routing is unaffected.
-    if (adapter && !adapter->port()) {
-        UBAdapter *primary = getUBAdapter(0);
-        if (primary && primary->port())
-            adapter = primary;
-    }
     if (!adapter) {
         fatal("EPBackend node_id=%d: no UBAdapter for socket %d\n",
               _nodeId, adapterIdx);
     }
 
-    // Translate PA from requester's view to home node's view.
+    // Translate PA from requester's view to the home (node, socket) view.
+    // The homeSocket MUST be encoded into the home PA so it lands in the home
+    // plane's DSM segment; otherwise the message's dstSocket (=homeSocket) and
+    // its homeLinePa disagree and it is routed to the wrong plane's ubio.
     uint64_t offset = _addrMap.dsmOffset(line_pa);
-    uint64_t homePa = _addrMap.buildDsmPA(homeNode, homeNode, offset);
+    uint64_t homePa = _addrMap.buildDsmPA(homeNode, homeNode, offset, homeSocket);
 
     DPRINTF(RubyCHIGeneric,
             "EPBackend node_id=%d: translating PA 0x%lx -> home PA 0x%lx "
