@@ -1236,11 +1236,16 @@ EPBackend::sendRecallResponse(const OuterRecallResponse &response)
               "PA=0x%lx homeNode=%d\n",
               _nodeId, response.linePa, response.homeNode);
     }
+    // RecallResp returns to the home directory plane; derive its socket from the
+    // home line PA so it routes to ubio(homeNode, homeSocket) and matches the
+    // outstanding RECALL there (hardcoding 0 stranded cross-socket recalls).
+    int rrHomeSocket = _addrMap.homeSocket(response.homeNode, response.linePa);
+    if (rrHomeSocket < 0) rrHomeSocket = 0;
     bool ok = getUBAdapter(0)->sendRecallResp(
         response.linePa, response.ownerNode, response.dataReturned,
         response.epoch, response.reqId,
         response.hasDataPayload ? &response.dataPayload : nullptr,
-        response.homeNode, 0 /* homeSocket */);
+        response.homeNode, rrHomeSocket);
 
     if (!ok) {
         warn("EPBackend node_id=%d: home UBCC rejected recall response "
@@ -1285,11 +1290,10 @@ EPBackend::handleWriteback(uint64_t line_pa, bool keepAsClean)
 
     // Translate PA to home node's view
     uint64_t offset = _addrMap.dsmOffset(line_pa);
-    uint64_t homePa = _addrMap.buildDsmPA(homeNode, homeNode, offset);
-
     // v4-dual-socket: derive homeSocket from PA (always 0 for single-socket)
     int homeSocket = _addrMap.homeSocket(_nodeId, line_pa);
     if (homeSocket < 0) homeSocket = 0;
+    uint64_t homePa = _addrMap.buildDsmPA(homeNode, homeNode, offset, homeSocket);
 
     // Look up requester entry to get epoch
     // For home-local writebacks (called from EPSNF), fall back to UBCC
@@ -1400,7 +1404,9 @@ EPBackend::handleEvict(uint64_t line_pa)
 
     // Translate PA to home node's view
     uint64_t offset = _addrMap.dsmOffset(line_pa);
-    uint64_t homePa = _addrMap.buildDsmPA(homeNode, homeNode, offset);
+    int homeSocket = _addrMap.homeSocket(_nodeId, line_pa);
+    if (homeSocket < 0) homeSocket = 0;
+    uint64_t homePa = _addrMap.buildDsmPA(homeNode, homeNode, offset, homeSocket);
 
     // Look up requester entry to get epoch
     uint64_t epochVal = 0;
@@ -1424,7 +1430,7 @@ EPBackend::handleEvict(uint64_t line_pa)
               _nodeId, line_pa, homeNode);
     }
     int evRet = getUBAdapter(0)->sendEvictReq(homePa, _nodeId, epochVal,
-                                              homeNode, 0 /* homeSocket */);
+                                              homeNode, homeSocket);
     bool evPending = (evRet == -2);
     bool ok = (evRet > 0);
     if (evPending) {
@@ -1537,9 +1543,11 @@ EPBackend::sendInvalidationAck(const OuterInvalidationAck &ack)
               "PA=0x%lx homeNode=%d\n",
               _nodeId, ack.linePa, ack.homeNode);
     }
+    int ackHomeSocket = _addrMap.homeSocket(ack.homeNode, ack.linePa);
+    if (ackHomeSocket < 0) ackHomeSocket = 0;
     bool ok = getUBAdapter(0)->sendInvalidateAck(
         ack.linePa, ack.ackNode, ack.epoch, ack.reqId,
-        ack.homeNode, 0 /* homeSocket */);
+        ack.homeNode, ackHomeSocket);
 
     if (!ok) {
         warn("EPBackend node_id=%d: home UBCC rejected invalidation ack "
@@ -1563,7 +1571,9 @@ EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
 
     // Translate local PA to home PA
     uint64_t offset = _addrMap.dsmOffset(line_pa);
-    uint64_t homePa = _addrMap.buildDsmPA(homeNode, homeNode, offset);
+    int homeSocket = _addrMap.homeSocket(_nodeId, line_pa);
+    if (homeSocket < 0) homeSocket = 0;
+    uint64_t homePa = _addrMap.buildDsmPA(homeNode, homeNode, offset, homeSocket);
 
     // Reuse reqId/epoch if an async upgrade is already pending for this line
     // (sendUpgradeReq returned -2 last time). Allocating a fresh reqId on every
@@ -1604,7 +1614,7 @@ EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
     int upgradeRet = getUBAdapter(0)->sendUpgradeReq(
         homePa, _nodeId, epochVal, reqIdVal,
         desiredPerm, static_cast<int>(cause),
-        &upgradeTargetMask, &committedEpoch, homeNode, 0 /* homeSocket */,
+        &upgradeTargetMask, &committedEpoch, homeNode, homeSocket,
         hadPending /*checkOnly: don't re-send an in-flight upgrade*/);
     if (upgradeRet == -2) {
         std::fprintf(stderr,
@@ -1663,7 +1673,7 @@ EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
                     DPRINTF(RubyEP,
                             "EPBackend node_id=%d: upgrade fanout "
                             "invalidation to node %d via UBAdapter\n", _nodeId, s);
-                    getUBAdapter(0)->sendInvalidateReqToSharer(s, invMsg, 0 /* homeSocket */);
+                    getUBAdapter(0)->sendInvalidateReqToSharer(s, invMsg, homeSocket);
                 }
             }
 
@@ -1716,7 +1726,9 @@ EPBackend::sendUpgradeDone(uint64_t line_pa, int homeNode,
             _nodeId, line_pa, homeNode, epoch, reqId);
 
     uint64_t offset = _addrMap.dsmOffset(line_pa);
-    uint64_t homePa = _addrMap.buildDsmPA(homeNode, homeNode, offset);
+    int homeSocket = _addrMap.homeSocket(_nodeId, line_pa);
+    if (homeSocket < 0) homeSocket = 0;
+    uint64_t homePa = _addrMap.buildDsmPA(homeNode, homeNode, offset, homeSocket);
 
     if (!getUBAdapter(0)) {
         fatal("EPBackend node_id=%d: UBAdapter required for upgrade done "
@@ -1733,7 +1745,7 @@ EPBackend::sendUpgradeDone(uint64_t line_pa, int homeNode,
     _lastUpgradeDone = doneMsg;
 
     int doneRet = getUBAdapter(0)->sendUpgradeDoneReq(
-        homePa, _nodeId, epoch, reqId, homeNode, 0 /* homeSocket */);
+        homePa, _nodeId, epoch, reqId, homeNode, homeSocket);
     bool donePending = (doneRet == -2);
     bool accepted = (doneRet > 0);
     if (donePending) {
@@ -1801,8 +1813,14 @@ EPBackend::sendClear(uint64_t line_pa, int homeNode,
               "PA=0x%lx homeNode=%d\n",
               _nodeId, line_pa, homeNode);
     }
+    // line_pa here is the home PA (socket-encoded); derive its home socket so
+    // the ClearReq routes to the home plane's ubio (matching the original
+    // grant). Hardcoding 0 sent cross-socket clears to the wrong plane, so the
+    // grant handshake never completed and the requester deadlocked.
+    int clearHomeSocket = _addrMap.homeSocket(homeNode, line_pa);
+    if (clearHomeSocket < 0) clearHomeSocket = 0;
     int clearRet = getUBAdapter(0)->sendClearReq(
-        line_pa, _nodeId, clearEpoch, reqId, homeNode, 0 /* homeSocket */);
+        line_pa, _nodeId, clearEpoch, reqId, homeNode, clearHomeSocket);
     bool accepted = (clearRet > 0);  // -2=pending, -1=error, 0=rejected, 1=accepted
 
     // Consume the pending grant txn only once the clear is actually accepted,
