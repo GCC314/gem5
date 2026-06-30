@@ -506,6 +506,18 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
     int adapterIdx = (ingressSocket >= 0 && ingressSocket < _numSockets)
                          ? ingressSocket : 0;
     UBAdapter *adapter = getUBAdapter(adapterIdx);
+    // Multi-process split: only socket 0's UBAdapter binds the per-node ubio
+    // Port; the other sockets' adapters are portless. A cross-socket DSM read
+    // routed through a portless adapter never reaches ubio and the requesting
+    // Sequencer deadlocks (dual-socket TC32/35). Fall back to the port-bearing
+    // adapter — there is a single ubio connection per node, so all sockets must
+    // egress through it. The home/ingress socket is still carried in the message
+    // header, so home-side routing is unaffected.
+    if (adapter && !adapter->port()) {
+        UBAdapter *primary = getUBAdapter(0);
+        if (primary && primary->port())
+            adapter = primary;
+    }
     if (!adapter) {
         fatal("EPBackend node_id=%d: no UBAdapter for socket %d\n",
               _nodeId, adapterIdx);
