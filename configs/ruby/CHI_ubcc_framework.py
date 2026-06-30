@@ -52,7 +52,7 @@ def _make_hnf(ruby_system, addr_ranges, llcache_type, node_id):
 # the page table to the CHI Ruby physical address space.
 
 def setup_dsm_va_mapping(processes, num_nodes=DEFAULT_N, seg_size=DEFAULT_SEG_SIZE,
-                         num_sockets=1):
+                         num_sockets=1, req_node_ids=None):
     """Install VA→PA mappings for DSM regions on all processes.
 
     Each process gets VA range [DSM_VA_BASE + k*SEG, DSM_VA_BASE + (k+1)*SEG)
@@ -74,13 +74,18 @@ def setup_dsm_va_mapping(processes, num_nodes=DEFAULT_N, seg_size=DEFAULT_SEG_SI
     total_dsm_segs = num_nodes * num_sockets
     dsm_va_base = (0xFFFFFFFFFFFF + 1) - (total_dsm_segs + 1) * seg_size
 
-    # Compute CPUs per node for node_id assignment.
+    # Compute CPUs per node for node_id assignment (legacy all-node mode).
     _cpus_per_node = len(processes) // num_nodes if num_nodes > 0 else 1
 
     for _proc_idx, proc in enumerate(processes):
         if proc is None:
             continue
-        _req_node_id = _proc_idx // _cpus_per_node
+        # Split mode passes explicit req_node_ids (the local node for each
+        # process); legacy mode derives it from global CPU index.
+        if req_node_ids is not None:
+            _req_node_id = req_node_ids[_proc_idx]
+        else:
+            _req_node_id = _proc_idx // _cpus_per_node
         _req_node_base = _req_node_id << addr_map.node_shift
 
         seg_idx = 0
@@ -161,7 +166,11 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
     # In older gem5 versions this was inherited; v25.1 requires explicit set.
     ruby_system.clk_domain = system.clk_domain
 
-    num_nodes = DEFAULT_N
+    num_nodes = int(os.environ.get("UBCC_NUM_NODES", str(DEFAULT_N)))
+    # Multi-process split: UBCC_LOCAL_NODE selects the single node this gem5
+    # process owns. -1 (default) builds ALL nodes in one process (legacy
+    # single-process mode, used for regression parity).
+    local_node = int(os.environ.get("UBCC_LOCAL_NODE", "-1"))
     seg_size = DEFAULT_SEG_SIZE
     num_sockets = int(os.environ.get("UBCC_NUM_SOCKETS", "1"))
     ubcc_epoch_bits = int(os.environ.get("UBCC_EPOCH_BITS", "64"))
@@ -175,7 +184,17 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
     ubcc_meta_write_ticks = int(os.environ.get("UBCC_META_WRITE_TICKS", "7500"))
     ubcc_meta_delete_ticks = int(os.environ.get("UBCC_META_DELETE_TICKS", "7500"))
     cache_line = system.cache_line_size.value
-    print(f"[UBCC-CONFIG] epoch_bits={ubcc_epoch_bits} num_sockets={num_sockets}")
+    # node_list: which nodes this process builds. In split mode, exactly one.
+    if local_node < 0:
+        node_list = list(range(num_nodes))
+    else:
+        assert 0 <= local_node < num_nodes, \
+            f"UBCC_LOCAL_NODE={local_node} out of range [0,{num_nodes})"
+        node_list = [local_node]
+    cpus_per_node = DEFAULT_D * DEFAULT_L
+    print(f"[UBCC-CONFIG] epoch_bits={ubcc_epoch_bits} num_sockets={num_sockets} "
+          f"num_nodes={num_nodes} local_node={local_node} "
+          f"build_nodes={node_list}")
     addr_map = NodeAddressMap(num_nodes, seg_size, num_sockets)
     params = chi_defs.NoC_Params
 
@@ -190,13 +209,20 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
     all_cntrls = []
     mem_backstores = []
 
-    per_node = {nid: {} for nid in range(num_nodes)}
+    per_node = {nid: {} for nid in node_list}
 
-    total_cpus = num_nodes * DEFAULT_D * DEFAULT_L
-    assert len(cpus) == total_cpus, \
-        f"Need {total_cpus} CPUs, got {len(cpus)}"
+    expected_cpus = len(node_list) * cpus_per_node
+    assert len(cpus) == expected_cpus, \
+        f"Need {expected_cpus} CPUs ({len(node_list)} nodes x {cpus_per_node}), got {len(cpus)}"
 
-    for node_id in range(num_nodes):
+    # Map a global node_id to its slice within the passed-in cpus list.
+    # In split mode cpus holds only the local node's CPUs (slice index 0).
+    def _node_cpu_slice(nid):
+        local_idx = node_list.index(nid)
+        base = local_idx * cpus_per_node
+        return cpus[base:base + cpus_per_node]
+
+    for node_id in node_list:
         nd = per_node[node_id]
         cfg = NodeConfig(node_id, num_nodes, seg_size, num_sockets)
 
@@ -372,10 +398,10 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
             hnf_cntrl.epRnfMachineVersion = nd['ep_rnf_cntrl'].version
 
         nd['clusters'] = []
+        node_cpus = _node_cpu_slice(node_id)
         for cluster_i in range(DEFAULT_D):
-            node_cpu_base = node_id * DEFAULT_D * DEFAULT_L
-            cluster_base = node_cpu_base + cluster_i * DEFAULT_L
-            cluster_cpus = cpus[cluster_base:cluster_base + DEFAULT_L]
+            cluster_base = cluster_i * DEFAULT_L
+            cluster_cpus = node_cpus[cluster_base:cluster_base + DEFAULT_L]
 
             # v4-dual-socket: explicit socket_id from cluster index
             # TODO: derive from CPU object socket metadata when available
@@ -395,7 +421,7 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
 
         # Q3: Extend deadlock threshold to accommodate UBCC retry delays
         for seq in cpu_sequencers:
-            seq.deadlock_threshold = 20000000
+            seq.deadlock_threshold = 200000000
 
         # Q2 Fix B: Set L1/L2 addr_ranges to include DSM PA ranges so
         # functionalRead() in populateGrantData() can find cached data
@@ -416,14 +442,14 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
                     + dsm_ranges
                 )
 
-    for node_id in range(num_nodes):
+    for node_id in node_list:
         nd = per_node[node_id]
         # v4-dual-socket: cluster downstream to ALL local HN-Fs (§3.2 change 8)
         hnf_c_list = [nd['hnf_cntrls'][sid] for sid in range(num_sockets)]
         for cluster in nd['clusters']:
             cluster.setDownstream(hnf_c_list)
 
-    for node_id in range(num_nodes):
+    for node_id in node_list:
         nd = per_node[node_id]
         # v4-dual-socket: each HN-F only connects to its socket's EP-SNF (§3.2 change 9)
         for sid in range(num_sockets):
@@ -463,6 +489,15 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
     # Collect all Process objects across all CPUs and map DSM VA regions
     # to the corresponding home node's DSM PA base for each node.
     processes = [proc for cpu in cpus for proc in cpu.workload]
-    setup_dsm_va_mapping(processes, num_nodes, seg_size, num_sockets)
+    # Each CPU belongs to node_list[cpu_index // cpus_per_node]; build a
+    # per-process node-id list so DSM VA mapping uses the correct requesting
+    # node base even in split mode (where only the local node's CPUs exist).
+    req_node_ids = []
+    for _cpu_idx, cpu in enumerate(cpus):
+        _nid = node_list[_cpu_idx // cpus_per_node]
+        for _proc in cpu.workload:
+            req_node_ids.append(_nid)
+    setup_dsm_va_mapping(processes, num_nodes, seg_size, num_sockets,
+                         req_node_ids=req_node_ids)
 
     return (cpu_sequencers, [], topology)

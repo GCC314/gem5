@@ -101,7 +101,7 @@ EPBackend* EPBackend::getBackendInstance(int node_id)
 EPBackend::EPBackend(const Params &p)
   : SimObject(p),
     _nodeId(p.node_id),
-    _addrMap(3, 1, 128ULL * 1024 * 1024),
+    _addrMap(epNumNodesFromEnv(), p.num_sockets, 128ULL * 1024 * 1024),
     _metaRnf(p.meta_rnf),
     _numSockets(p.num_sockets),
     _ruby_system(p.ruby_system),
@@ -1195,7 +1195,16 @@ EPBackend::sendRecallResponse(const OuterRecallResponse &response)
     _lastRecallResponse = response;
     _recallResponseSentCount++;
 
-    // R2: Require both dataReturned AND hasDataPayload before installing to home memory
+    // R2: Require both dataReturned AND hasDataPayload before installing to home memory.
+    //
+    // NOTE (multi-process split): getBackendInstance(homeNode) only finds the
+    // home node's EPBackend when home and owner run in the SAME process. In a
+    // split (one gem5 process per node) build, a remote home returns nullptr
+    // here, physMem becomes null, and HomeMemoryService::write() no-ops
+    // (returns false). That is intentional: the authoritative delivery of
+    // recall data to the home is the IPC sendRecallResp() below, which the
+    // home node's UBCC/UBAdapter applies. This in-process write is only a
+    // same-process fast path / redundant shortcut.
     if (response.dataReturned && response.hasDataPayload) {
         EPBackend *homeBackend = EPBackend::getBackendInstance(response.homeNode);
         RubySystem *homeRuby = homeBackend ? homeBackend->getRubySystem() : nullptr;
@@ -1567,12 +1576,6 @@ EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
               _nodeId, line_pa, homeNode);
     }
 
-    // Convert EPBackend UpgradeCause to UBCC UpgradeCause
-    UBCC_UpgradeCause ubccCause =
-        (cause == UpgradeCause::LocalCleanUnique)
-            ? UBCC_UpgradeCause::LocalCleanUnique
-            : UBCC_UpgradeCause::LocalStoreUpgrade;
-
     // Send OuterUpgradeReq to home UBCC via message passing
     OuterUpgradeReq upgradeReq;
     upgradeReq.linePa = homePa;
@@ -1587,7 +1590,7 @@ EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
     uint64_t committedEpoch = 0;
     int upgradeRet = getUBAdapter(0)->sendUpgradeReq(
         homePa, _nodeId, epochVal, reqIdVal,
-        desiredPerm, static_cast<int>(ubccCause),
+        desiredPerm, static_cast<int>(cause),
         &upgradeTargetMask, &committedEpoch, homeNode, 0 /* homeSocket */,
         hadPending /*checkOnly: don't re-send an in-flight upgrade*/);
     if (upgradeRet == -2) {

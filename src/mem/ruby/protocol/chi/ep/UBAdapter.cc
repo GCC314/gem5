@@ -9,7 +9,10 @@
 #include "framework/MemMessage.hh"
 #include "framework/Port.hh"
 #include "mem/ruby/protocol/chi/ep/EPBackend.hh"
+#include "sim/core.hh"
 #include "sim/cur_tick.hh"
+#include "sim/sync_wait.hh"
+#include "sim/system.hh"
 
 namespace gem5
 {
@@ -21,7 +24,7 @@ UBAdapter::UBAdapter(const Params &p)
       _nodeId(p.node_id),
       _socketId(p.socket_id),
 
-      _addrMap(3, 1, 128ULL * 1024 * 1024),
+      _addrMap(epNumNodesFromEnv(), epNumSocketsFromEnv(), 128ULL * 1024 * 1024),
       _responseCheckEvent([this]{ wakeup(); }, name() + ".responseCheck")
 {
     fatal_if(sizeof(CoherenceMessage) > framework::kMaxPayloadSize,
@@ -53,10 +56,68 @@ UBAdapter::init()
                 std::printf("[Port gem5_ubio] n=%d rx=%s tx->%s\n",
                             _nodeId, pp.localRxEndpoint.c_str(), pp.peerRxEndpoint.c_str());
                 std::printf("STEP5 Port enabled node=%d\n", _nodeId);
+                // Multi-process split: when this gem5 node's simulation ends
+                // (process exit), notify ubio with a best-effort TERMINATE so
+                // the distributed clock treats this node as "done" (+inf) rather
+                // than a frozen peer. Otherwise a node that finishes early (e.g.
+                // an idle node) would cap min(safeTs) forever and freeze the
+                // still-running nodes. See Port::safeTs PEER_LOST handling.
+                framework::Port *portToClose = _port;
+                int nodeForLog = _nodeId;
+                registerExitCallback([portToClose, nodeForLog]() {
+                    std::fprintf(stderr,
+                        "[UBADAPTER-EXIT] node=%d sending TERMINATE to ubio\n",
+                        nodeForLog);
+                    portToClose->terminate();
+                });
+
+                // Multi-process split: register cross-node barrier callback
+                // with the System's SyncWaitManager. When the workload calls
+                // sync_wait with a mask spanning other nodes, the SyncWaitManager
+                // calls our callback to send BARRIER_REACHED to ubio (which
+                // forwards to the barrier_manager / other ubios). We receive
+                // BARRIER_RELEASE in wakeup() and call releaseBarrier().
+                const char* localNodeEnv = getenv("UBCC_LOCAL_NODE");
+                int localNode = localNodeEnv ? atoi(localNodeEnv) : -1;
+                if (localNode >= 0 && !System::systemList.empty()) {
+                    System *sys = System::systemList[0];
+                    sys->syncWait.setLocalNodeId(localNode);
+                    sys->syncWait.setBarrierSendFn(
+                        [this](uint32_t mask, uint32_t nodeId) {
+                            sendBarrierReached(mask, nodeId);
+                        });
+                    std::fprintf(stderr,
+                        "[UBADAPTER-BARRIER] node=%d registered IPC barrier "
+                        "callback (localNode=%d)\n", _nodeId, localNode);
+                }
             }
         }
     }
 
+}
+
+void
+UBAdapter::sendBarrierReached(uint32_t mask, uint32_t nodeId)
+{
+    if (!_port) return;
+    framework::TxHandle *h = _port->allocateSendBuffer(curTick());
+    if (!h) {
+        std::fprintf(stderr,
+            "[UBADAPTER-BARRIER] node=%d sendBarrierReached FAILED (no tx buf) "
+            "mask=0x%x\n", _nodeId, mask);
+        return;
+    }
+    framework::MemMessage *buf = h->buffer();
+    buf->hdr.type = static_cast<uint32_t>(framework::MemMessageType::BARRIER_REACHED);
+    buf->hdr.size = sizeof(framework::MemMessageHeader);
+    buf->hdr.req_id = mask;
+    buf->hdr.src_module = nodeId;
+    buf->hdr.dst_module = 0;
+    buf->hdr.dst_port = 0;
+    bool ok = h->send();
+    std::fprintf(stderr,
+        "[UBADAPTER-BARRIER-SEND] node=%d mask=0x%x ok=%d\n",
+        _nodeId, mask, ok);
 }
 
 void
@@ -242,8 +303,8 @@ UBAdapter::sendReadReq(
                 // data — gating only on GlobalGrantModified dropped it, so the
                 // requester read zeros. (See dataSource==RecallBuffer.)
                 *outGrantDataValid =
-                    (resp.b.readResp.grantType ==
-                         static_cast<int>(UBCC_OuterGrantType::GlobalGrantModified)) ||
+                     (resp.b.readResp.grantType ==
+                         static_cast<int>(OuterGrantType::GlobalGrantModified)) ||
                     (resp.b.readResp.dataSource ==
                          static_cast<int>(GrantDataSource::RecallBuffer));
                 if (*outGrantDataValid) memcpy(outGrantData->getDataMod(0), resp.b.readResp.grantData, 64);
@@ -1050,6 +1111,22 @@ UBAdapter::wakeup()
             m = _port->recv(curTick(), &st);
             continue;
         }
+        // Multi-process split: handle BARRIER_RELEASE from ubio/barrier_manager.
+        if (m->hdr.type == static_cast<uint32_t>(framework::MemMessageType::BARRIER_RELEASE)) {
+            uint32_t mask = static_cast<uint32_t>(m->hdr.req_id);
+            std::fprintf(stderr,
+                "[UBADAPTER-BARRIER-RELEASE] node=%d mask=0x%x\n", _nodeId, mask);
+            if (!System::systemList.empty()) {
+                System::systemList[0]->syncWait.releaseBarrier(mask);
+            }
+            m = _port->recv(curTick(), &st);
+            continue;
+        }
+        // BARRIER_REACHED is handled by ubio/barrier_manager, not gem5; skip.
+        if (m->hdr.type == static_cast<uint32_t>(framework::MemMessageType::BARRIER_REACHED)) {
+            m = _port->recv(curTick(), &st);
+            continue;
+        }
         if (m->hdr.type != static_cast<uint32_t>(framework::MemMessageType::COH_MSG)) {
             static int noncoh = 0;
             if (++noncoh <= 5)
@@ -1121,6 +1198,12 @@ UBAdapter::wakeup()
                 if (wm->hdr.type ==
                     static_cast<uint32_t>(framework::MemMessageType::COH_MSG))
                     handleResponse(wm);
+                else if (wm->hdr.type ==
+                    static_cast<uint32_t>(framework::MemMessageType::BARRIER_RELEASE)) {
+                    uint32_t mask = static_cast<uint32_t>(wm->hdr.req_id);
+                    if (!System::systemList.empty())
+                        System::systemList[0]->syncWait.releaseBarrier(mask);
+                }
                 wm = _port->recv(curT, &wst);
             }
             safeT = _port->safeTs(curT);
@@ -1132,6 +1215,16 @@ UBAdapter::wakeup()
     }
 
     uint64_t nextT = stalled ? curT : safeT;
+    // If stalled but there is a pending message (timestamp > curT), advance
+    // to the pending timestamp so the message can be delivered next wakeup.
+    // This is critical for BARRIER_RELEASE from ubio: without it the release
+    // stays in Port recv's _pending queue forever and the barrier never fires.
+    if (stalled) {
+        uint64_t pendingT = _port->receiveTimestamp();
+        if (pendingT > curT && pendingT < nextT &&
+            pendingT != ~static_cast<uint64_t>(0))
+            nextT = pendingT;
+    }
     if (_responseCheckEvent.scheduled())
         reschedule(_responseCheckEvent, nextT);
     else

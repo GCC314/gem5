@@ -284,7 +284,9 @@ struct RequesterLineSnapshot {
     int homeNode;   // Home node for this remote line (-1 if none)
 };
 
-// GrantDataSource, UBCC_OuterReqType, UBCC_OuterGrantType now in UBCCProtocolIF.hh
+// GrantDataSource is defined in modules/ubiomodule/CoherenceMessage.hh
+// (included via ep/CoherenceMessage.hh forward shim).
+// OuterReqType, OuterGrantType, UpgradeCause are defined locally below.
 
 struct HomeMemoryService {
     memory::SimpleMemory *physMem;

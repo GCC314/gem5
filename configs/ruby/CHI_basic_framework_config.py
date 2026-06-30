@@ -34,7 +34,8 @@ class NodeAddressMap:
     """
     def __init__(self, num_nodes=DEFAULT_N, seg_size=DEFAULT_SEG_SIZE,
                  num_sockets=1):
-        assert num_nodes == 3
+        assert 1 <= num_nodes <= 16, \
+            f"num_nodes must be in [1,16], got {num_nodes}"
         self.num_nodes = num_nodes
         self.seg_size = seg_size
         self.node_shift = NODE_ADDR_SHIFT

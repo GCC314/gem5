@@ -2,6 +2,7 @@
 #define __MEM_RUBY_PROTOCOL_CHI_EP_NODEADDRESSMAP_HH__
 
 #include <cstdint>
+#include <cstdlib>
 
 namespace gem5
 {
@@ -9,11 +10,37 @@ namespace gem5
 namespace ruby
 {
 
+// Multi-process split: the total node count is a global system property that
+// must be identical across every gem5 process, the ubio processes, and the
+// address map. It is provided via the UBCC_NUM_NODES environment variable
+// (set by the launcher / test harness). Defaults to 3 for legacy runs.
+inline int
+epNumNodesFromEnv()
+{
+    const char *e = std::getenv("UBCC_NUM_NODES");
+    if (e) {
+        int n = std::atoi(e);
+        if (n >= 1 && n <= 16) return n;
+    }
+    return 3;
+}
+
+inline int
+epNumSocketsFromEnv()
+{
+    const char *e = std::getenv("UBCC_NUM_SOCKETS");
+    if (e) {
+        int s = std::atoi(e);
+        if (s >= 1 && s <= 8) return s;
+    }
+    return 1;
+}
+
 class NodeAddressMap
 {
   public:
     static constexpr int NODE_ADDR_SHIFT = 40;
-    static constexpr int MAX_NODES = 3;
+    static constexpr int MAX_NODES = 16;
     static constexpr int DEFAULT_NUM_SOCKETS = 1;
 
     NodeAddressMap(int num_nodes, int num_sockets = DEFAULT_NUM_SOCKETS,

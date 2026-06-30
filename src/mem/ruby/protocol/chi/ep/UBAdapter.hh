@@ -173,6 +173,9 @@ class UBAdapter : public SimObject
     /** Send via injected framework::Port when available, else via router. */
     bool transportSend(const CoherenceMessage &msg);
 
+    /** Multi-process split: send BARRIER_REACHED to ubio via Port. */
+    void sendBarrierReached(uint32_t mask, uint32_t nodeId);
+
     /** Poll injected framework::Port and dispatch to recvFromRouter(). */
     bool transportRecv(CoherenceMessageType expectedType, uint64_t expectedReqId);
 
