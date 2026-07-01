@@ -712,7 +712,7 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
         OuterRecallMsg recallMsg;
         recallMsg.linePa = homePa;
         recallMsg.ownerLocalPa = _addrMap.buildDsmPA(
-            recallOwnerNode, homeNode, offset);
+            recallOwnerNode, homeNode, offset, homeSocket);
         recallMsg.ownerNode = recallOwnerNode;
         recallMsg.homeNode = homeNode;
         recallMsg.epoch = committedEpoch;
@@ -1495,6 +1495,59 @@ EPBackend::handleInvalidationRequest(const OuterInvalidateMsg &invMsg)
         }
     }
 
+    // If a SnpCleanInvalid-upgrade is currently held for this line, do NOT
+    // issue startCleanUnique to the local HN-F — it already has a pending
+    // SnpCleanInvalid TBE for this address and a second CleanUnique would
+    // collide (assert/RetryAck, TC16/25/53 double-upgrade race).
+    if (_epRnfCtrl) {
+        // If the held upgrade was rejected by the home, abandon this upgrade
+        // attempt but KEEP the snoop held (do NOT send SnpResp_I yet — that
+        // would let the HN-F grant local exclusive to L2 without global
+        // authorization from home, creating a split-brain window where node1
+        // reads/writes locally while home thinks owner=node0).
+        //
+        // Instead:
+        //   1. Ack the InvalidateReq directly (bypass startCleanUnique — no
+        //      second CleanUnique to the HN-F). This lets the other requester's
+        //      upgrade collect its acks and complete.
+        //   2. Mark the held upgrade for retry. Once the other upgrade drains
+        //      at the home, processUpgradeRetries re-issues a fresh
+        //      OuterUpgradeReq. When that succeeds (home accepts), the normal
+        //      receiveUpgradeAck path sends SnpResp_I — at which point L2 gets
+        //      local exclusive WITH global authorization. No split-brain.
+        if (_epRnfCtrl->isHeldUpgradeRejected(lookupPa)) {
+            DPRINTF(RubyEP,
+                    "EPBackend node_id=%d: InvalidateReq PA=0x%lx — held "
+                    "upgrade rejected, direct ack (no SnpResp_I), will retry\n",
+                    _nodeId, lookupPa);
+            printf("[INVAL-DIAG] node=%d direct ack (rejected upgrade, retry) "
+                   "PA=0x%lx\n", _nodeId, invMsg.linePa);
+            // Direct InvalidateAck — let the other requester's upgrade complete.
+            // Do NOT send SnpResp_I: HN-F's CleanUnique #1 stays pending,
+            // so L2 does NOT get local exclusive yet.
+            OuterInvalidationAck ack;
+            ack.linePa = invMsg.linePa;
+            ack.ackNode = _nodeId;
+            ack.homeNode = invMsg.homeNode;
+            ack.epoch = invMsg.epoch;
+            ack.reqId = invMsg.reqId;
+            sendInvalidationAck(ack);
+            // Schedule a retry: re-issue the upgrade once the home is free.
+            _epRnfCtrl->scheduleUpgradeRetryAfterRejection(lookupPa);
+            return true;
+        }
+        // Held upgrade still pending (not rejected) — defer the InvalidateReq
+        // until the held snoop is resolved.
+        if (_epRnfCtrl->hasHeldUpgrade(lookupPa)) {
+            DPRINTF(RubyEP,
+                    "EPBackend node_id=%d: deferring InvalidateReq PA=0x%lx — "
+                    "held snoop in progress\n",
+                    _nodeId, lookupPa);
+            _deferredInvalidationReqs[lookupPa] = invMsg;
+            return true;
+        }
+    }
+
     // ---- v4 (§4.2.4): FIXED — use EP-RNF.startCleanUnique, wait for
     // callback before sending invalidation ack.  Previous code directly
     // ack'd, bypassing HN-F and losing grant/invalidation serialization.
@@ -1562,8 +1615,10 @@ EPBackend::sendInvalidationAck(const OuterInvalidationAck &ack)
 bool
 EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
                                     int desiredPerm, UpgradeCause cause,
-                                    uint64_t &outEpoch, uint64_t &outReqId)
+                                    uint64_t &outEpoch, uint64_t &outReqId,
+                                    bool *outRejected)
 {
+    if (outRejected) *outRejected = false;
     DPRINTF(RubyEP,
             "EPBackend node_id=%d: notifyLocalWriteUpgrade "
             "PA=0x%lx homeNode=%d desiredPerm=%d\n",
@@ -1637,6 +1692,16 @@ EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
         put->second.valid = false;
     bool accepted = (upgradeRet > 0);
 
+    // upgradeRet == 0 means the home explicitly rejected this upgrade (an
+    // upgrade for this line is already outstanding for another requester).
+    // The caller must NOT keep holding the snoop in that case — it has to fall
+    // back to a plain SnpResp_I, give up its copy, and retry the upgrade later.
+    // (Two requesters upgrading the same line otherwise deadlock: each holds
+    // its SnpResp_I waiting for its own upgrade, so neither can be invalidated
+    // for the other's upgrade. TC16/25/53 double-upgrade race.)
+    if (!accepted && outRejected)
+        *outRejected = true;
+
     if (accepted) {
         // Store returned values (reservedEpoch, echoed reqId)
         outEpoch = epochVal;
@@ -1662,7 +1727,7 @@ EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
                     OuterInvalidateMsg invMsg;
                     invMsg.linePa = homePa;
                     invMsg.sharerLocalPa = _addrMap.buildDsmPA(
-                        s, homeNode, offset);
+                        s, homeNode, offset, homeSocket);
                     invMsg.sharerNode = s;
                     invMsg.homeNode = homeNode;
                     invMsg.epoch = homeEpoch;
@@ -1862,7 +1927,10 @@ EPBackend::notifyUpgradeAckReady(uint64_t linePa)
         int homeNode = _lastUpgradeAck.homeNode;
         if (homeNode >= 0) {
             uint64_t offset = _addrMap.dsmOffset(linePa);
-            callbackPa = _addrMap.buildDsmPA(_nodeId, homeNode, offset);
+            int homeSocket = _addrMap.homeSocket(homeNode, linePa);
+            if (homeSocket < 0) homeSocket = 0;
+            callbackPa = _addrMap.buildDsmPA(_nodeId, homeNode, offset,
+                                             homeSocket);
             _lastUpgradeAck.accepted = true;
         }
         DPRINTF(RubyEP,
@@ -1874,6 +1942,75 @@ EPBackend::notifyUpgradeAckReady(uint64_t linePa)
         warn("EPBackend node_id=%d: notifyUpgradeAckReady PA=0x%lx "
              "but no EPRNFController registered\n",
              _nodeId, linePa);
+    }
+}
+
+void
+EPBackend::clearPendingUpgradeTxn(uint64_t linePa)
+{
+    auto it = _pendingUpgradeTxns.find(linePa);
+    if (it != _pendingUpgradeTxns.end())
+        it->second.valid = false;
+}
+
+void
+EPBackend::clearCachedUpgradeResp(uint64_t linePa)
+{
+    // Clear any rejected UpgradeResp from the UBAdapter's ready-response cache
+    // so the next upgrade attempt sends a fresh UpgradeReq instead of hitting
+    // the stale rejected response.
+    if (getUBAdapter(0))
+        getUBAdapter(0)->clearReadyResponsesForLine(linePa);
+}
+
+void
+EPBackend::flushDeferredInvalidation(uint64_t linePa)
+{
+    // Called after a held snoop has been resolved (SnpResp_I sent, local copy
+    // invalidated). Process any InvalidateReq that was deferred because it
+    // arrived while the snoop was held. Since the SnpResp_I already
+    // invalidated the local copy, we can ack directly without startCleanUnique.
+    auto it = _deferredInvalidationReqs.find(linePa);
+    if (it == _deferredInvalidationReqs.end())
+        return;
+    OuterInvalidateMsg invMsg = it->second;
+    _deferredInvalidationReqs.erase(it);
+
+    DPRINTF(RubyEP,
+            "EPBackend node_id=%d: flushing deferred InvalidateReq "
+            "PA=0x%lx home=%d — direct ack (copy already invalidated)\n",
+            _nodeId, invMsg.linePa, invMsg.homeNode);
+
+    OuterInvalidationAck ack;
+    ack.linePa = invMsg.linePa;
+    ack.ackNode = _nodeId;
+    ack.homeNode = invMsg.homeNode;
+    ack.epoch = invMsg.epoch;
+    ack.reqId = invMsg.reqId;
+    sendInvalidationAck(ack);
+}
+
+void
+EPBackend::onUpgradeRespArrived(uint64_t reqId)
+{
+    // Event-driven completion of a held SnpCleanInvalid-upgrade. Called when an
+    // OuterUpgradeResp arrives on the async Port path (UBAdapter). Without this,
+    // a no-other-sharers upgrade (which sends NO UpgradeAckNotify) would have to
+    // wait for the snoop to be re-issued to pull the cached UpgradeResp — i.e.
+    // the busy-wait livelock (TC16/25/53). Instead we proactively drive the
+    // held upgrade to completion as soon as its response is available.
+    if (!_epRnfCtrl)
+        return;
+
+    for (auto &kv : _pendingUpgradeTxns) {
+        if (kv.second.valid && kv.second.reqId == reqId) {
+            DPRINTF(RubyEP,
+                    "EPBackend node_id=%d: onUpgradeRespArrived reqId=%lu "
+                    "localPA=0x%lx — completing held upgrade\n",
+                    _nodeId, reqId, kv.first);
+            _epRnfCtrl->completeHeldUpgrade(kv.first);
+            return;
+        }
     }
 }
 

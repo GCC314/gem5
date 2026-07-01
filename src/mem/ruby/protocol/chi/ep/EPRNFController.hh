@@ -234,6 +234,56 @@ class EPRNFController : public EPController
      *  Triggers the deferred SnpResp_I to HN-F. */
     void receiveUpgradeAck(uint64_t linePa);
 
+    /** Drive a held SnpCleanInvalid-upgrade to completion. Idempotent: a
+     *  no-op if no held upgrade exists for this line or it already completed.
+     *  Called inline at first arrival and event-wise from
+     *  EPBackend::onUpgradeRespArrived() when the OuterUpgradeResp arrives. */
+    void completeHeldUpgrade(uint64_t linePa);
+
+    /** Check whether a SnpCleanInvalid-upgrade is currently held (pending
+     *  or not-yet-resolved) for this line. Used by EPBackend to decide whether
+     *  to defer an incoming InvalidateReq until the held snoop is resolved. */
+    bool hasHeldUpgrade(uint64_t linePa) const {
+        auto it = _upgradePending.find(linePa);
+        return it != _upgradePending.end() && it->second.valid &&
+               !it->second.ackReceived;
+    }
+
+    /** Check whether a held upgrade for this line was rejected by the home.
+     *  Used by EPBackend to handle an incoming InvalidateReq by ack'ing
+     *  directly (no startCleanUnique) — the upgrade is being abandoned. */
+    bool isHeldUpgradeRejected(uint64_t linePa) const {
+        auto it = _upgradePending.find(linePa);
+        return it != _upgradePending.end() && it->second.valid &&
+               it->second.rejected;
+    }
+
+    /** Clear a held (rejected) upgrade for this line — called after the
+     *  deferred InvalidateReq has been ack'd directly. */
+    void clearHeldUpgrade(uint64_t linePa) {
+        auto it = _upgradePending.find(linePa);
+        if (it != _upgradePending.end())
+            _upgradePending.erase(it);
+    }
+
+    /** Mark a rejected held upgrade for retry after its InvalidateAck has been
+     *  sent (so the other requester's upgrade can drain). Resets the rejected
+     *  flag and clears the old pending txn so the retry issues a fresh
+     *  OuterUpgradeReq with a new reqId. Schedules a delayed wakeup. */
+    void scheduleUpgradeRetryAfterRejection(uint64_t linePa);
+
+    /** Get the HN-F destination recorded for a held snoop (to send SnpResp_I
+     *  when the upgrade is abandoned). */
+    MachineID getHeldUpgradeHnfDest(uint64_t linePa) const {
+        auto it = _upgradePending.find(linePa);
+        if (it != _upgradePending.end())
+            return it->second.hnfDest;
+        return MachineID();
+    }
+
+    /** Send a SnpResp_I to the given HN-F destination for this line. */
+    void sendSnpRespI(uint64_t linePa, MachineID hnfDest);
+
     // ---- Q2 (deprecated): removed — RN-F should not send snoops ----
     // Snoops are HN-F's responsibility per CHI spec.  Recall/invalidation
     // must go through proper CHI Request path: EP-RNF → HN-F → HN-F handles snooping.
@@ -436,11 +486,25 @@ class EPRNFController : public EPController
         uint64_t reqId;
         MachineID hnfDest;      // HN-F that sent SnpCleanInvalid
         bool ackReceived;       // true when OuterUpgradeAck(true) arrived
+        bool rejected;          // true when home rejected: give up upgrade, but
+                                // keep snoop held until the line is invalidated
+                                // via a deferred InvalidateReq (direct ack, no
+                                // startCleanUnique to avoid HN-F TBE collision)
+        bool needsRetry;        // true when rejected + InvalidateAck sent:
+                                // re-issue a fresh upgrade once the home drains
 
         UpgradePending() : valid(false), linePa(0), homeNode(-1), epoch(0),
-                           reqId(0), ackReceived(false) {}
+                           reqId(0), ackReceived(false), rejected(false),
+                           needsRetry(false) {}
     };
     std::map<uint64_t, UpgradePending> _upgradePending;
+
+    // Lines whose upgrade was rejected by the home (another upgrade
+    // outstanding) and need a delayed retry. The snoop stays held; the retry
+    // re-issues a fresh OuterUpgradeReq once the other upgrade drains.
+    std::set<uint64_t> _upgradeRetryLines;
+    void scheduleUpgradeRetry(uint64_t linePa);
+    void processUpgradeRetries();
 
     /** Count of Cache-type controllers (for reference). */
     int _numCacheControllers;

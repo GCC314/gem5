@@ -1336,6 +1336,16 @@ UBAdapter::handleResponse(framework::MemMessage *m)
         it->second.onResp(*coh);
         _pendingByReqId.erase(it);
     }
+
+    // Event-driven completion of a held SnpCleanInvalid-upgrade: an
+    // OuterUpgradeResp is now cached in _readyResponses, so a checkOnly retry
+    // will succeed. Proactively drive the held upgrade instead of relying on
+    // the snoop being re-issued to pull it (busy-wait livelock; TC16/25/53).
+    // No-other-sharers upgrades send no UpgradeAckNotify, so this is the only
+    // event that can complete them.
+    if (coh->h.type == CoherenceMessageType::UpgradeResp && _backend) {
+        _backend->onUpgradeRespArrived(coh->h.reqId);
+    }
 }
 
 void
@@ -1353,6 +1363,19 @@ UBAdapter::allocLocalReqId()
     uint64_t id = _nextLocalReqId++;
     if (id == 0) id = _nextLocalReqId++;
     return id;
+}
+
+void
+UBAdapter::clearReadyResponsesForLine(uint64_t linePa)
+{
+    for (auto it = _readyResponses.begin(); it != _readyResponses.end(); ) {
+        if (it->second.h.homeLinePa == linePa ||
+            it->second.h.localLinePa == linePa) {
+            it = _readyResponses.erase(it);
+        } else {
+            ++it;
+        }
+    }
 }
 
 void

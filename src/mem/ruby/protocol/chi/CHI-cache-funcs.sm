@@ -689,6 +689,13 @@ void prepareRequest(TBE tbe, CHIRequestType type, CHIRequestMsg & out_msg) {
   // Default UBCC sideband: Shared, no write intent
   out_msg.ubcc_needed_perm := 0;
   out_msg.ubcc_write_intent := false;
+
+  // v4: propagate epProxyOp so the snoop recipient (EP-RNF) can distinguish
+  // a self-initiated upgrade snoop (NoProxyOp, from CPU store) from a passive
+  // invalidation snoop (InvalidateOnly, from handleInvalidationRequest's
+  // startCleanUnique). Without this, EP-RNF cannot tell the two apart and
+  // wrongly issues an OuterUpgradeReq for passive invalidations (TC25).
+  out_msg.ep_proxy_op := tbe.epProxyOp;
 }
 
 // UBCC sideband: populate permission intent based on HN upper request

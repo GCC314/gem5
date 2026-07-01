@@ -353,11 +353,20 @@ class EPBackend : public SimObject
      * @param cause     Upgrade cause
      * @param outEpoch  Output: reserved epoch from UpgradeAck
      * @param outReqId  Output: reqId for this upgrade
+     * @param outRejected Output (optional): set true when the home explicitly
+     *                  REJECTED the upgrade (e.g. another upgrade is already
+     *                  outstanding for this line). Distinguishes a hard reject
+     *                  (return false, *outRejected=true) from an async-pending
+     *                  not-yet-answered upgrade (return false,
+     *                  *outRejected=false). A rejected upgrade must NOT keep
+     *                  holding the snoop — the snoop has to fall back to a
+     *                  plain SnpResp_I so the line can be invalidated.
      * @return          True if UpgradeAck(true) received
      */
     bool notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
                                   int desiredPerm, UpgradeCause cause,
-                                  uint64_t &outEpoch, uint64_t &outReqId);
+                                  uint64_t &outEpoch, uint64_t &outReqId,
+                                  bool *outRejected = nullptr);
 
     /**
      * Send OuterUpgradeDone after local upgrade completes.
@@ -532,6 +541,34 @@ class EPBackend : public SimObject
      * Triggers the deferred receiveUpgradeAck() on EPRNFController.
      */
     void notifyUpgradeAckReady(uint64_t linePa);
+
+    /**
+     * Event-driven completion of a held SnpCleanInvalid-upgrade. Called when
+     * an OuterUpgradeResp arrives on the async Port path. Drives the matching
+     * held upgrade (by reqId) to completion, replacing the prior busy-wait
+     * where a re-issued snoop had to pull the cached UpgradeResp.
+     */
+    void onUpgradeRespArrived(uint64_t reqId);
+
+    /** Invalidate any in-flight pending-upgrade bookkeeping for a line so a
+     *  later store re-issues a fresh upgrade. Used by the upgrade-reject
+     *  fallback path in EPRNFController. */
+    void clearPendingUpgradeTxn(uint64_t linePa);
+
+    /** Clear any rejected UpgradeResp cached in the UBAdapter for this line,
+     *  so a retry sends a fresh UpgradeReq. */
+    void clearCachedUpgradeResp(uint64_t linePa);
+
+    /** Process a deferred InvalidateReq after the held snoop that blocked it
+     *  has been resolved (SnpResp_I sent). Acks directly since the local copy
+     *  is already invalidated. */
+    void flushDeferredInvalidation(uint64_t linePa);
+
+    /** Check whether a deferred InvalidateReq exists for this line. */
+    bool hasDeferredInvalidation(uint64_t linePa) const {
+        return _deferredInvalidationReqs.find(linePa) !=
+               _deferredInvalidationReqs.end();
+    }
 
     /**
      * Diagnose the expected grant for a given sideband combination
@@ -790,6 +827,13 @@ class EPBackend : public SimObject
                               epoch(0), reqId(0) {}
     };
     std::map<uint64_t, PendingUpgradeTxn> _pendingUpgradeTxns;
+
+    // InvalidateReqs that arrived while a SnpCleanInvalid-upgrade was held.
+    // They are deferred until the held snoop is resolved (SnpResp_I sent),
+    // because their startCleanUnique would collide with the HN-F's pending
+    // SnpCleanInvalid TBE. Once SnpResp_I has invalidated the local copy,
+    // the deferred InvalidateReq can be ack'd directly (no CleanUnique needed).
+    std::map<uint64_t, OuterInvalidateMsg> _deferredInvalidationReqs;
 
     // ---- M6: Cross-Node EPBackend Routing Registry ----
     static std::map<int, EPBackend*> _backendInstances;

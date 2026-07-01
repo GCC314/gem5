@@ -142,6 +142,10 @@ class UBAdapter : public SimObject
     void sendHomeWritebackNotify(uint64_t homePa, uint64_t epoch,
                                   int homeNode, int homeSocket);
 
+    /** Clear cached ready-responses for a given line PA (e.g. a rejected
+     *  UpgradeResp) so a retry sends a fresh request. */
+    void clearReadyResponsesForLine(uint64_t linePa);
+
     /**
      * Receive a message from the local UBIOModule *.
      * Routes to the appropriate handler based on message type.

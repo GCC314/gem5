@@ -309,6 +309,9 @@ EPRNFController::wakeup()
 
     if (_backend)
         _backend->wakeup();
+
+    // Process delayed upgrade retries (rejected upgrades waiting for home to drain).
+    processUpgradeRetries();
 }
 
 void
@@ -691,43 +694,33 @@ EPRNFController::handleSnpCleanInvalid(const CHIRequestMsg *msg)
         printf("[UPGRADE-DIAG] node=%d first SnpCleanInvalid PA=0x%lx home=%d\n",
                _nodeId, msg->m_addr, homeNode);
 
-        bool accepted = backend->notifyLocalWriteUpgrade(
-            msg->m_addr, homeNode, 1,
-            UpgradeCause::LocalCleanUnique,
-            epoch, reqId);
-
-        if (!accepted) {
-            DPRINTF(RubyCHIGeneric,
-                    "EP_RNF node_id=%d: OuterUpgradeReq not accepted for "
-                    "PA=0x%lx — deferring SnpResp_I for retry\n",
-                    _nodeId, msg->m_addr);
-            printf("[UPGRADE-DIAG] node=%d OuterUpgradeReq rejected PA=0x%lx\n",
-                   _nodeId, msg->m_addr);
-            return false;
-        }
-
+        // CHI §4.3.3 / §5.5: a snoop whose upgrade is not yet complete must be
+        // *held* (accepted, response deferred), NOT NACKed. Establish the
+        // _upgradePending record BEFORE issuing the OuterUpgradeReq so that:
+        //   (1) any redelivery of this snoop hits the held-path above
+        //       (line 667-679: return true, response stays deferred) instead of
+        //       being treated as a brand-new first-arrival — which previously
+        //       caused HN-F to re-issue the snoop every tick (busy-wait
+        //       livelock, TC16/25/53), each retry allocating a fresh reqId.
+        //   (2) the later notifyUpgradeAckReady() -> receiveUpgradeAck()
+        //       callback finds its context instead of losing it.
         UpgradePending pending;
         pending.valid = true;
         pending.linePa = msg->m_addr;
         pending.homeNode = homeNode;
-        pending.epoch = epoch;
-        pending.reqId = reqId;
+        pending.epoch = 0;
+        pending.reqId = 0;
         pending.hnfDest = msg->m_requestor;
         _upgradePending[msg->m_addr] = pending;
 
-        // upgrade_invalidate_fix D2: only call receiveUpgradeAck() immediately
-        // if the ack is ready (targetMask==0, lastUpgradeAck().accepted==true).
-        // If targetMask!=0, the ack will be triggered later via
-        // EPBackend::notifyUpgradeAckReady() when all invalidation acks arrive.
-        if (backend->lastUpgradeAck().accepted) {
-            // Fast path: no other sharers, immediate Ack(true)
-            receiveUpgradeAck(msg->m_addr);
-        } else {
-            // Deferred: wait for all invalidation acks to arrive
-            printf("[UPGRADE-DIAG] node=%d upgrade deferred ack PA=0x%lx "
-                   "— waiting for invalidation acks\n",
-                   _nodeId, msg->m_addr);
-        }
+        // Try to complete the upgrade now. If the OuterUpgradeResp has not yet
+        // arrived (async pending), completeHeldUpgrade() leaves the record valid
+        // and we hold the snoop (return true, SnpResp_I deferred). The held
+        // upgrade is later driven to completion event-wise by
+        // completeHeldUpgrade() when UpgradeResp arrives (EPBackend
+        // ::onUpgradeRespArrived) or by notifyUpgradeAckReady() when all
+        // invalidation acks arrive — NOT by re-issuing the snoop every tick.
+        completeHeldUpgrade(msg->m_addr);
         return true;
     }
 
@@ -1347,6 +1340,190 @@ EPRNFController::processRetryQueue()
 // ---- v4: Upgrade Path (§5.5) ----
 
 void
+EPRNFController::sendSnpRespI(uint64_t linePa, MachineID hnfDest)
+{
+    NetDest dest(m_ruby_system);
+    dest.add(hnfDest);
+    auto rsp = std::make_shared<CHIResponseMsg>(
+        curTick(), cacheLineSize, m_ruby_system,
+        linePa, CHIResponseType_SnpResp_I,
+        m_machineID, dest,
+        false, false, 0, 0, MessageSizeType_Control);
+    sendResponseMsg(rsp);
+}
+
+void
+EPRNFController::scheduleUpgradeRetry(uint64_t linePa)
+{
+    _upgradeRetryLines.insert(linePa);
+    scheduleEvent(Cycles(100000));
+}
+
+void
+EPRNFController::scheduleUpgradeRetryAfterRejection(uint64_t linePa)
+{
+    // The rejected upgrade's InvalidateAck has been sent. Reset the rejected
+    // state so completeHeldUpgrade will issue a FRESH OuterUpgradeReq (new
+    // reqId/epoch) instead of hitting the stale rejected UpgradeResp.
+    auto upIt = _upgradePending.find(linePa);
+    if (upIt != _upgradePending.end() && upIt->second.valid) {
+        upIt->second.rejected = false;
+        upIt->second.needsRetry = true;
+        // Clear pending txn in EPBackend so notifyLocalWriteUpgrade allocates
+        // a fresh reqId instead of reusing the rejected one (checkOnly).
+        EPBackend *backend = EPBackend::getBackendInstance(_nodeId);
+        if (backend) {
+            backend->clearPendingUpgradeTxn(linePa);
+            backend->clearCachedUpgradeResp(linePa);
+        }
+    }
+    // Schedule the retry. The interval must be long enough for the other
+    // upgrade to fully drain at the home (InvalidateAck → commit →
+    // UpgradeAckNotify → UpgradeDone). ~1M cycles (500µs @2GHz) is generous.
+    _upgradeRetryLines.insert(linePa);
+    scheduleEvent(Cycles(1000000));
+}
+
+void
+EPRNFController::processUpgradeRetries()
+{
+    if (_upgradeRetryLines.empty())
+        return;
+    printf("[RETRY-DIAG] node=%d processUpgradeRetries lines=%zu\n",
+           _nodeId, _upgradeRetryLines.size());
+    auto lines = _upgradeRetryLines;
+    _upgradeRetryLines.clear();
+    for (uint64_t linePa : lines) {
+        auto upIt = _upgradePending.find(linePa);
+        if (upIt == _upgradePending.end() || !upIt->second.valid) {
+            continue;
+        }
+        if (upIt->second.ackReceived) {
+            continue;
+        }
+        // For needsRetry: clear the flag so completeHeldUpgrade proceeds
+        // normally (issues a fresh OuterUpgradeReq, not checkOnly).
+        upIt->second.needsRetry = false;
+        DPRINTF(RubyCHIGeneric,
+                "EP_RNF node_id=%d: retrying held upgrade PA=0x%lx\n",
+                _nodeId, linePa);
+        printf("[UPGRADE-DIAG] node=%d retry upgrade PA=0x%lx\n",
+               _nodeId, linePa);
+        completeHeldUpgrade(linePa);
+    }
+}
+
+void
+EPRNFController::completeHeldUpgrade(uint64_t linePa)
+{
+    // Drive a held SnpCleanInvalid-upgrade to completion. Called:
+    //   (a) inline from handleSnpCleanInvalid first-arrival, and
+    //   (b) event-wise from EPBackend::onUpgradeRespArrived() when the
+    //       OuterUpgradeResp finally arrives (async Port path).
+    // This replaces the previous busy-wait where each redelivered snoop
+    // re-issued a fresh OuterUpgradeReq (livelock; TC16/25/53).
+    auto upIt = _upgradePending.find(linePa);
+    if (upIt == _upgradePending.end() || !upIt->second.valid) {
+        // No held upgrade for this line (already completed or never started).
+        return;
+    }
+    if (upIt->second.ackReceived) {
+        // Already completed; nothing to do.
+        return;
+    }
+
+    EPBackend *backend = EPBackend::getBackendInstance(_nodeId);
+    if (!backend) {
+        warn("EP_RNF node_id=%d: completeHeldUpgrade PA=0x%lx but no backend\n",
+             _nodeId, linePa);
+        return;
+    }
+
+    int homeNode = upIt->second.homeNode;
+    uint64_t epoch = 0;
+    uint64_t reqId = 0;
+    bool rejected = false;
+
+    // Re-check the upgrade. With checkOnly semantics (an in-flight upgrade is
+    // already pending in EPBackend::_pendingUpgradeTxns), this returns true once
+    // the cached OuterUpgradeResp is available, false while still pending or
+    // rejected. `rejected` distinguishes a hard reject from async-pending.
+    bool accepted = backend->notifyLocalWriteUpgrade(
+        linePa, homeNode, 1,
+        UpgradeCause::LocalCleanUnique,
+        epoch, reqId, &rejected);
+
+    if (!accepted && rejected) {
+        // CHI: the home rejected this upgrade because another requester already
+        // has an upgrade outstanding for this line. Give up this attempt but
+        // KEEP the snoop held (do NOT send SnpResp_I — that would let the HN-F
+        // grant local exclusive to L2 without global authorization, creating a
+        // split-brain window). Mark rejected so the subsequent InvalidateReq
+        // (from the other requester's upgrade fanout) is ack'd directly without
+        // a second CleanUnique to the HN-F. Then schedule a retry: once the
+        // other upgrade drains at the home, re-issue a fresh OuterUpgradeReq.
+        // Only when THAT succeeds do we send SnpResp_I (with global auth).
+        DPRINTF(RubyCHIGeneric,
+                "EP_RNF node_id=%d: upgrade REJECTED for PA=0x%lx — giving up, "
+                "holding snoop as rejected (inval will ack directly)\n",
+                _nodeId, linePa);
+        printf("[UPGRADE-DIAG] node=%d upgrade REJECTED PA=0x%lx "
+               "— hold as rejected\n",
+               _nodeId, linePa);
+
+        backend->clearPendingUpgradeTxn(linePa);
+        backend->clearCachedUpgradeResp(linePa);
+        upIt->second.rejected = true;
+
+        // If an InvalidateReq already arrived and was deferred, ack it now and
+        // schedule the retry. If not yet arrived, the retry will be scheduled
+        // when handleInvalidationRequest sees isHeldUpgradeRejected.
+        if (backend->hasDeferredInvalidation(linePa)) {
+            backend->flushDeferredInvalidation(linePa);
+            scheduleUpgradeRetryAfterRejection(linePa);
+        } else if (upIt->second.needsRetry || upIt->second.rejected) {
+            // This is a retry that got rejected again (the other upgrade hasn't
+            // drained yet). No InvalidateReq to ack — just schedule another
+            // retry with a longer backoff.
+            backend->clearPendingUpgradeTxn(linePa);
+            backend->clearCachedUpgradeResp(linePa);
+            upIt->second.rejected = true;
+            _upgradeRetryLines.insert(linePa);
+            scheduleEvent(Cycles(2000000));
+        }
+        return;
+    }
+
+    if (!accepted) {
+        // Still pending — keep holding the snoop. Will be retried when the
+        // UpgradeResp arrives (onUpgradeRespArrived) or acks complete.
+        DPRINTF(RubyCHIGeneric,
+                "EP_RNF node_id=%d: completeHeldUpgrade PA=0x%lx still pending "
+                "— holding snoop\n",
+                _nodeId, linePa);
+        return;
+    }
+
+    // Accepted: record the real epoch/reqId for the deferred SnpResp_I /
+    // UpgradeDone path.
+    upIt->second.epoch = epoch;
+    upIt->second.reqId = reqId;
+
+    // upgrade_invalidate_fix D2: only call receiveUpgradeAck() immediately if
+    // the ack is ready (targetMask==0). Otherwise it is triggered later via
+    // EPBackend::notifyUpgradeAckReady() when all invalidation acks arrive.
+    if (backend->lastUpgradeAck().accepted) {
+        // Fast path: no other sharers, immediate Ack(true)
+        receiveUpgradeAck(linePa);
+    } else {
+        // Deferred: wait for all invalidation acks to arrive
+        printf("[UPGRADE-DIAG] node=%d upgrade deferred ack PA=0x%lx "
+               "— waiting for invalidation acks\n",
+               _nodeId, linePa);
+    }
+}
+
+void
 EPRNFController::receiveUpgradeAck(uint64_t linePa)
 {
     // Called by EPBackend when OuterUpgradeAck(true) is received.
@@ -1363,6 +1540,17 @@ EPRNFController::receiveUpgradeAck(uint64_t linePa)
              _nodeId, linePa);
         return;
     }
+
+    if (upIt->second.ackReceived) {
+        // Already processed (e.g. both fast-path and notifyUpgradeAckReady
+        // fired). Avoid sending a duplicate SnpResp_I / UpgradeDone.
+        DPRINTF(RubyCHIGeneric,
+                "EP_RNF node_id=%d: receiveUpgradeAck PA=0x%lx already "
+                "processed — skipping duplicate\n",
+                _nodeId, linePa);
+        return;
+    }
+    upIt->second.ackReceived = true;
 
     DPRINTF(RubyCHIGeneric,
             "EP_RNF node_id=%d: OuterUpgradeAck received for PA=0x%lx "
@@ -1406,6 +1594,12 @@ EPRNFController::receiveUpgradeAck(uint64_t linePa)
 
     // Clear upgrade pending state
     _upgradePending.erase(upIt);
+
+    // Process any InvalidateReq deferred while the snoop was held. In the
+    // accepted path the upgrade has completed and SnpResp_I was already sent
+    // above, so the local copy state is consistent.
+    if (backend)
+        backend->flushDeferredInvalidation(linePa);
 }
 
 } // namespace ruby

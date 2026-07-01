@@ -255,7 +255,7 @@ action(Initiate_Request, desc="") {
   State initial := getState(tbe, cache_entry, address);
   bool was_retried := false;
   peek(reqRdyPort, CHIRequestMsg) {
-    DPRINTF(RubySlicc, "[HNF-REQ-ARRIVE] addr=%#x type=%d\n", address, in_msg.type);
+    DPRINTF(RubyGenerated, "[HNF-REQ-ARRIVE] addr=%#x type=%d\n", address, in_msg.type);
     set_tbe(allocateRequestTBE(address, in_msg));
     // only a msg that was already retried doesn't allow a retry
     was_retried := in_msg.allowRetry == false;
@@ -265,7 +265,7 @@ action(Initiate_Request, desc="") {
 
   // F6-diag: log CleanUnique start
   if (tbe.reqType == CHIRequestType:CleanUnique) {
-    DPRINTF(RubySlicc, "[HNF-CU-START] addr=%#x epProxy=%d sharers=%d owner=%d dataValid=%d dataUnique=%d\n",
+    DPRINTF(RubyGenerated, "[HNF-CU-START] addr=%#x epProxy=%d sharers=%d owner=%d dataValid=%d dataUnique=%d\n",
       address, tbe.epProxyOp, tbe.dir_sharers.count(), tbe.dir_ownerExists,
       tbe.dataValid, tbe.dataUnique);
   }
@@ -402,11 +402,11 @@ action(Initiate_Replacement, desc="") {
   if (unify_repl_TBEs) {
     peek(replTriggerInPort, ReplacementMsg) {
       set_tbe(allocateReplacementTBEOnSlot(address, in_msg.slot));
-      DPRINTF(RubySlicc, "Allocated replacement TBE on slot %d\n", tbe.storSlot);
+      DPRINTF(RubyGenerated, "Allocated replacement TBE on slot %d\n", tbe.storSlot);
     }
   } else {
     set_tbe(allocateReplacementTBE(address));
-    DPRINTF(RubySlicc, "Allocated replacement TBE on new slot %d\n", tbe.storSlot);
+    DPRINTF(RubyGenerated, "Allocated replacement TBE on new slot %d\n", tbe.storSlot);
   }
   copyCacheAndDir(cache_entry, getDirEntry(address), tbe, initial);
 
@@ -433,7 +433,7 @@ action(StallRequest, desc="") {
 
   // F6-diag: log CleanUnique stall
   if (tbe.reqType == CHIRequestType:CleanUnique) {
-    DPRINTF(RubySlicc, "[HNF-CU-STALLED] addr=%#x activeReq=%d pendReq=%d expReq=%d expSnp=%d\n",
+    DPRINTF(RubyGenerated, "[HNF-CU-STALLED] addr=%#x activeReq=%d pendReq=%d expReq=%d expSnp=%d\n",
       address, tbe.reqType, tbe.pendReqType,
       tbe.expected_req_resp.expected(), tbe.expected_snp_resp.expected());
   }
@@ -841,7 +841,7 @@ action(Finish_CleanUnique, desc="") {
   assert(tbe.actions.empty());
 
   // F6-diag: log stale path decision
-  DPRINTF(RubySlicc, "[HNF-CU-FINISH] addr=%#x epProxy=%d inSharers=%d count=%d\n",
+  DPRINTF(RubyGenerated, "[HNF-CU-FINISH] addr=%#x epProxy=%d inSharers=%d count=%d\n",
           address, tbe.epProxyOp, tbe.dir_sharers.isElement(tbe.requestor),
           tbe.dir_sharers.count());
 
@@ -1950,7 +1950,7 @@ action(Send_SnpCleanInvalid_NoReq, desc="") {
     out_msg.ns := tbe.ns;
     setExpectedForInvSnoop(tbe, false);
     tbe.expected_snp_resp.setExpectedCount(out_msg.Destination.count());
-    DPRINTF(RubySlicc, "[HNF-CU-SNPCLN] addr=%#x targets=%d\n",
+    DPRINTF(RubyGenerated, "[HNF-CU-SNPCLN] addr=%#x targets=%d\n",
             address, out_msg.Destination.count());
   }
 }
@@ -2296,8 +2296,8 @@ action(Receive_ReqDataResp, desc="") {
       tbe.oldDataBlk.copyPartial(in_msg.dataBlk, in_msg.bitMask);
       assert(tbe.dataBlkValid.isOverlap(in_msg.bitMask) == false);
       tbe.dataBlkValid.orMask(in_msg.bitMask);
-      DPRINTF(RubySlicc, "Received %s\n", tbe.oldDataBlk);
-      DPRINTF(RubySlicc, "dataBlkValid = %s\n", tbe.dataBlkValid);
+      DPRINTF(RubyGenerated, "Received %s\n", tbe.oldDataBlk);
+      DPRINTF(RubyGenerated, "dataBlkValid = %s\n", tbe.dataBlkValid);
     } else if ((tbe.dataBlkValid.isFull() == false) ||
         (in_msg.type == CHIDataType:CompData_UD_PD) ||
         (in_msg.type == CHIDataType:CompData_SD_PD) ||
@@ -2359,7 +2359,7 @@ action(Receive_SnpDataResp, desc="") {
     if (tbe.expected_snp_resp.receiveData(in_msg.type) == false) {
       error("Received unexpected message");
     }
-    DPRINTF(RubySlicc, "[HNF-CU-SNPDATARESP] addr=%#x type=%d remain=%d\n",
+    DPRINTF(RubyGenerated, "[HNF-CU-SNPDATARESP] addr=%#x type=%d remain=%d\n",
             address, in_msg.type, tbe.expected_snp_resp.expected());
     // Copy data to tbe only if we didn't have valid data or the received
     // data is dirty
@@ -2631,14 +2631,14 @@ action(UpdateDataState_FromADataResp, desc="") {
   if (is_HN && (tbe.expected_req_resp.hasReceivedData()) &&
       ((tbe.reqType == CHIRequestType:AtomicReturn) ||
        (tbe.reqType == CHIRequestType:AtomicNoReturn))) {
-    DPRINTF(RubySlicc, "Atomic before %s\n", tbe.dataBlk);
+    DPRINTF(RubyGenerated, "Atomic before %s\n", tbe.dataBlk);
 
     tbe.oldDataBlk := tbe.dataBlk;
     tbe.dataBlk.atomicPartial(tbe.dataBlk, tbe.atomic_op);
     tbe.dataBlk.clearAtomicLogEntries();
     tbe.dataDirty := true;
 
-    DPRINTF(RubySlicc, "Atomic after %s\n", tbe.dataBlk);
+    DPRINTF(RubyGenerated, "Atomic after %s\n", tbe.dataBlk);
   } else if ((tbe.expected_req_resp.hasReceivedData()) &&
              ((tbe.reqType == CHIRequestType:AtomicReturn) ||
              (tbe.reqType == CHIRequestType:AtomicNoReturn))){
@@ -2812,7 +2812,7 @@ action(Receive_ReqResp, desc="") {
     if (tbe.expected_req_resp.receiveResp(in_msg.type) == false) {
       error("Received unexpected message");
     }
-    DPRINTF(RubySlicc, "[STALE-MISMATCH] addr=%#x type=%d stale=%d tbe_stale=%d\n",
+    DPRINTF(RubyGenerated, "[STALE-MISMATCH] addr=%#x type=%d stale=%d tbe_stale=%d\n",
             address, in_msg.type, in_msg.stale, tbe.is_stale);
   }
 }
@@ -2846,9 +2846,9 @@ action(Receive_SnpResp, desc="") {
     if (tbe.expected_snp_resp.receiveResp(in_msg.type) == false) {
       error("Received unexpected message");
     }
-    DPRINTF(RubySlicc, "[STALE-MISMATCH] addr=%#x type=%d stale=%d tbe_stale=%d\n",
+    DPRINTF(RubyGenerated, "[STALE-MISMATCH] addr=%#x type=%d stale=%d tbe_stale=%d\n",
             address, in_msg.type, in_msg.stale, tbe.is_stale);
-    DPRINTF(RubySlicc, "[HNF-CU-SNPRESP] addr=%#x type=%d remain=%d\n",
+    DPRINTF(RubyGenerated, "[HNF-CU-SNPRESP] addr=%#x type=%d remain=%d\n",
             address, in_msg.type, tbe.expected_snp_resp.expected());
   }
 }
@@ -3350,7 +3350,7 @@ action(Send_CompI, desc="") {
 
 action(Send_CompUC, desc="") {
   assert(is_valid(tbe));
-  DPRINTF(RubySlicc, "[HNF-CU-COMPUC] addr=%#x stale=0\n", address);
+  DPRINTF(RubyGenerated, "[HNF-CU-COMPUC] addr=%#x stale=0\n", address);
   enqueue(rspOutPort, CHIResponseMsg, response_latency) {
     out_msg.addr := address;
     out_msg.type := CHIResponseType:Comp_UC;
@@ -3363,7 +3363,7 @@ action(Send_CompUC, desc="") {
 
 action(Send_CompUC_Stale, desc="") {
   assert(is_valid(tbe));
-  DPRINTF(RubySlicc, "[HNF-CU-COMPUC] addr=%#x stale=1\n", address);
+  DPRINTF(RubyGenerated, "[HNF-CU-COMPUC] addr=%#x stale=1\n", address);
   enqueue(rspOutPort, CHIResponseMsg, response_latency) {
     out_msg.addr := address;
     out_msg.type := CHIResponseType:Comp_UC;
@@ -3391,7 +3391,7 @@ action(Send_CompUD_PD, desc="") {
 
 action(Send_CompAck, desc="") {
   assert(is_valid(tbe));
-  DPRINTF(RubySlicc, "COMPACK: %s addr=%#x txnId=%d reqType=%s\n",
+  DPRINTF(RubyGenerated, "COMPACK: %s addr=%#x txnId=%d reqType=%s\n",
           machineID, address, tbe.txnId, tbe.reqType);
   enqueue(rspOutPort, CHIResponseMsg, response_latency) {
     out_msg.addr := address;
@@ -3616,7 +3616,7 @@ action(Finalize_UpdateCacheFromTBE, desc="") {
     assert(tbe.dataValid);
     assert(is_valid(cache_entry));
     cache_entry.DataBlk := tbe.dataBlk;
-    DPRINTF(RubySlicc, "Cached data %s pfb %s\n", tbe.dataBlk, cache_entry.HWPrefetched);
+    DPRINTF(RubyGenerated, "Cached data %s pfb %s\n", tbe.dataBlk, cache_entry.HWPrefetched);
   } else {
     // make sure only deallocate the cache entry if data is invalid
     assert(tbe.dataValid == false);
@@ -3698,18 +3698,18 @@ action(CheckCacheFill, desc="") {
     // The `is_valid(victim_entry)` condition here is to avoid an unused
     // variable error when compiling to gem5.fast.
     if (is_invalid(victim_tbe) && is_valid(victim_entry)) {
-      DPRINTF(RubySlicc, "Eviction for %#x victim: %#x state=%s\n",
+      DPRINTF(RubyGenerated, "Eviction for %#x victim: %#x state=%s\n",
                           address, victim_addr, victim_entry.state);
       enqueue(replTriggerOutPort, ReplacementMsg, 0) {
         out_msg.addr := victim_addr;
         out_msg.from_addr := address;
         if (unify_repl_TBEs) {
           out_msg.slot := tbe.storSlot;
-          DPRINTF(RubySlicc, "Reusing slot %d\n", out_msg.slot);
+          DPRINTF(RubyGenerated, "Reusing slot %d\n", out_msg.slot);
         }
       }
     } else {
-      DPRINTF(RubySlicc, "Eviction for %#x victim: %#x state=%s\n",
+      DPRINTF(RubyGenerated, "Eviction for %#x victim: %#x state=%s\n",
                           address, victim_addr, victim_tbe.state);
       // just wait until the transaction finishes to try again
       victim_tbe.wakeup_pending_tgr := true;
@@ -3733,7 +3733,7 @@ action(CheckCacheFill, desc="") {
 action(Finalize_DeallocateRequest, desc="") {
   assert(is_valid(tbe));
   assert(tbe.actions.empty());
-  DPRINTF(RubySlicc, "[NF-FINAL-DEALLOC] addr=%#x reqType=%d isReqTBE=%d\n",
+  DPRINTF(RubyGenerated, "[NF-FINAL-DEALLOC] addr=%#x reqType=%d isReqTBE=%d\n",
     tbe.addr, tbe.reqType, tbe.is_req_tbe);
   wakeupPendingReqs(tbe);
   wakeupPendingSnps(tbe);
@@ -3844,7 +3844,7 @@ action(Callback_LoadHit, desc="") {
   assert(tbe.reqType == CHIRequestType:Load);
   if (tbe.is_local_pf == false) {
     assert(tbe.dataValid);
-    DPRINTF(RubySlicc, "Read data %s\n", tbe.dataBlk);
+    DPRINTF(RubyGenerated, "Read data %s\n", tbe.dataBlk);
     sequencer.readCallback(tbe.addr, tbe.dataBlk, false);
   }
 }
@@ -3855,9 +3855,9 @@ action(Callback_StoreHit, desc="") {
          (tbe.reqType == CHIRequestType:Store));
   if (tbe.is_local_pf == false) {
     assert(tbe.dataValid);
-    DPRINTF(RubySlicc, "Write before %s\n", tbe.dataBlk);
+    DPRINTF(RubyGenerated, "Write before %s\n", tbe.dataBlk);
     sequencer.writeCallback(tbe.addr, tbe.dataBlk, false);
-    DPRINTF(RubySlicc, "Write after %s\n", tbe.dataBlk);
+    DPRINTF(RubyGenerated, "Write after %s\n", tbe.dataBlk);
     tbe.dataDirty := true;
   }
 }
@@ -3867,7 +3867,7 @@ action(Callback_AtomicHit, desc="") {
   assert(tbe.dataValid);
   assert((tbe.reqType == CHIRequestType:AtomicLoad) ||
          (tbe.reqType == CHIRequestType:AtomicStore));
-  DPRINTF(RubySlicc, "Atomic before %s\n", tbe.dataBlk);
+  DPRINTF(RubyGenerated, "Atomic before %s\n", tbe.dataBlk);
 
   DataBlock oldDataBlk;
   oldDataBlk := tbe.dataBlk;
@@ -3875,7 +3875,7 @@ action(Callback_AtomicHit, desc="") {
   tbe.dataBlk.clearAtomicLogEntries();
 
   sequencer.atomicCallback(tbe.addr, oldDataBlk, false);
-  DPRINTF(RubySlicc, "Atomic after %s\n", tbe.dataBlk);
+  DPRINTF(RubyGenerated, "Atomic after %s\n", tbe.dataBlk);
   tbe.dataDirty := true;
 }
 
@@ -3903,14 +3903,14 @@ action(Callback_Miss, desc="") {
     pfProxy.completePrefetch(tbe.addr);
 
   } else if (tbe.dataValid && (tbe.reqType == CHIRequestType:Load)) {
-    DPRINTF(RubySlicc, "Read data %s\n", tbe.dataBlk);
+    DPRINTF(RubyGenerated, "Read data %s\n", tbe.dataBlk);
     sequencer.readCallback(tbe.addr, tbe.dataBlk, true);
 
   } else if (tbe.dataValid && ((tbe.reqType == CHIRequestType:Store) ||
                                (tbe.reqType == CHIRequestType:StoreLine))) {
-    DPRINTF(RubySlicc, "Write before %s\n", tbe.dataBlk);
+    DPRINTF(RubyGenerated, "Write before %s\n", tbe.dataBlk);
     sequencer.writeCallback(tbe.addr, tbe.dataBlk, true);
-    DPRINTF(RubySlicc, "Write after %s\n", tbe.dataBlk);
+    DPRINTF(RubyGenerated, "Write after %s\n", tbe.dataBlk);
     tbe.dataDirty := true;
 
     // sets a use time out for store misses to prevent LL/SC livelocks
@@ -3934,7 +3934,7 @@ action(Callback_Miss, desc="") {
     assert(tbe.dataValid);
     assert((tbe.reqType == CHIRequestType:AtomicLoad) ||
            (tbe.reqType == CHIRequestType:AtomicStore));
-    DPRINTF(RubySlicc, "Atomic before %s\n", tbe.dataBlk);
+    DPRINTF(RubyGenerated, "Atomic before %s\n", tbe.dataBlk);
 
     DataBlock oldDataBlk;
     oldDataBlk := tbe.dataBlk;
@@ -3942,10 +3942,10 @@ action(Callback_Miss, desc="") {
     tbe.dataBlk.clearAtomicLogEntries();
 
     sequencer.atomicCallback(tbe.addr, oldDataBlk, false);
-    DPRINTF(RubySlicc, "Atomic after %s\n", tbe.dataBlk);
+    DPRINTF(RubyGenerated, "Atomic after %s\n", tbe.dataBlk);
     tbe.dataDirty := true;
   } else if (tbe.dataValid && tbe.dataAMOValid && (tbe.reqType == CHIRequestType:AtomicLoad)) {
-    DPRINTF(RubySlicc, "Atomic before %s\n", tbe.oldDataBlk);
+    DPRINTF(RubyGenerated, "Atomic before %s\n", tbe.oldDataBlk);
     sequencer.atomicCallback(tbe.addr, tbe.oldDataBlk, false);
   }
 }
@@ -3974,7 +3974,7 @@ action(Callback_AtomicNoReturn, desc="") {
 
   if(tbe.reqType == CHIRequestType:AtomicStore){
     sequencer.atomicCallback(tbe.addr, tbe.dataBlk);
-    DPRINTF(RubySlicc, "AtomicNoReturn %s\n", tbe.dataBlk);
+    DPRINTF(RubyGenerated, "AtomicNoReturn %s\n", tbe.dataBlk);
   }
 }
 
@@ -3985,7 +3985,7 @@ action(Callback_WriteUnique, desc="") {
          (tbe.reqType == CHIRequestType:Store));
   assert(tbe.dataValid == false);
   sequencer.writeUniqueCallback(tbe.addr, tbe.dataBlk);
-  DPRINTF(RubySlicc, "WriteUnique data %s\n", tbe.dataBlk);
+  DPRINTF(RubyGenerated, "WriteUnique data %s\n", tbe.dataBlk);
   // set mask; note data is never considered valid
   assert(tbe.dataBlkValid.isEmpty());
   tbe.dataBlkValid.setMask(addressOffset(tbe.accAddr, tbe.addr), tbe.accSize);
@@ -4064,7 +4064,7 @@ action(Profile_Eviction, desc="") {
     scLockIncLatency();
   }
   if (send_evictions) {
-    DPRINTF(RubySlicc, "Sending invalidation for %#x to the sequencer\n", address);
+    DPRINTF(RubyGenerated, "Sending invalidation for %#x to the sequencer\n", address);
     sequencer.evictionCallback(address);
   }
   if (use_prefetcher && is_valid(cache_entry)) {
