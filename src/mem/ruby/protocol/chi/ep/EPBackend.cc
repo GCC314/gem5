@@ -1495,36 +1495,44 @@ EPBackend::handleInvalidationRequest(const OuterInvalidateMsg &invMsg)
         }
     }
 
-    // If a SnpCleanInvalid-upgrade is currently held for this line, do NOT
-    // issue startCleanUnique to the local HN-F — it already has a pending
-    // SnpCleanInvalid TBE for this address and a second CleanUnique would
-    // collide (assert/RetryAck, TC16/25/53 double-upgrade race).
+// If a SnpCleanInvalid-upgrade is currently held for this line, do NOT
+    // issue startCleanUnique to the local HN-F.
     if (_epRnfCtrl) {
-        // If the held upgrade was rejected by the home, abandon this upgrade
-        // attempt but KEEP the snoop held (do NOT send SnpResp_I yet — that
-        // would let the HN-F grant local exclusive to L2 without global
-        // authorization from home, creating a split-brain window where node1
-        // reads/writes locally while home thinks owner=node0).
-        //
-        // Instead:
-        //   1. Ack the InvalidateReq directly (bypass startCleanUnique — no
-        //      second CleanUnique to the HN-F). This lets the other requester's
-        //      upgrade collect its acks and complete.
-        //   2. Mark the held upgrade for retry. Once the other upgrade drains
-        //      at the home, processUpgradeRetries re-issues a fresh
-        //      OuterUpgradeReq. When that succeeds (home accepts), the normal
-        //      receiveUpgradeAck path sends SnpResp_I — at which point L2 gets
-        //      local exclusive WITH global authorization. No split-brain.
+        // If the held upgrade was rejected by the home, abandon this upgrade.
+        // Send SnpResp_I to the local HN-F so its CleanUnique #1 completes as
+        // stale (CompUCRespStale) — L2 learns it did NOT get exclusive, so the
+        // store will retry with a fresh ReadUnique/CleanUnique. This is safe
+        // (no split-brain): L2 knows it doesn't own the line. Also send
+        // InvalidateAck directly (bypass startCleanUnique — no second
+        // CleanUnique to the HN-F). After the store retries, a new upgrade
+        // request will be issued when the line is re-fetched.
         if (_epRnfCtrl->isHeldUpgradeRejected(lookupPa)) {
+            // TC16 dual-upgrade race LOSER path (abandon-and-downgrade).
+            //
+            // Our global OuterUpgradeReq was rejected by home because another
+            // node won the race and took ownership. The winner's write made our
+            // shared (SC) copy STALE, so an upgrade (S->M) is no longer valid —
+            // we must recall the winner's fresh data (I->M) instead. But the L2
+            // requestor already issued a local CleanUnique that is parked at the
+            // local HN-F (BUSY_BLKD) waiting for our held SnpResp_I.
+            //
+            // We therefore release the held snoop with SnpResp_I marked STALE.
+            // The local HN-F, seeing stale on a CleanUnique's terminating snoop
+            // response, removes the requestor from dir_sharers and completes the
+            // CleanUnique as Comp_UC(stale=1). The L2 detects stale and re-issues
+            // a fresh ReadUnique, which recalls the winner's data from home. No
+            // split-brain: the L2 never enters UC on the stale completion.
+            //
+            // We also ack the winner directly so its invalidation fanout drains
+            // (bypassing startCleanUnique — there is no second CleanUnique).
             DPRINTF(RubyEP,
                     "EPBackend node_id=%d: InvalidateReq PA=0x%lx — held "
-                    "upgrade rejected, direct ack (no SnpResp_I), will retry\n",
+                    "upgrade rejected; abandon via stale SnpResp_I + ack winner\n",
                     _nodeId, lookupPa);
-            printf("[INVAL-DIAG] node=%d direct ack (rejected upgrade, retry) "
-                   "PA=0x%lx\n", _nodeId, invMsg.linePa);
-            // Direct InvalidateAck — let the other requester's upgrade complete.
-            // Do NOT send SnpResp_I: HN-F's CleanUnique #1 stays pending,
-            // so L2 does NOT get local exclusive yet.
+            MachineID hnfDest = _epRnfCtrl->getHeldUpgradeHnfDest(lookupPa);
+            uint64_t hnfRaw = ((uint64_t)hnfDest.type << 24) | hnfDest.num;
+            _epRnfCtrl->clearHeldUpgrade(lookupPa);
+            sendSnpRespIForRejected(lookupPa, hnfRaw);  // stale=true
             OuterInvalidationAck ack;
             ack.linePa = invMsg.linePa;
             ack.ackNode = _nodeId;
@@ -1532,8 +1540,6 @@ EPBackend::handleInvalidationRequest(const OuterInvalidateMsg &invMsg)
             ack.epoch = invMsg.epoch;
             ack.reqId = invMsg.reqId;
             sendInvalidationAck(ack);
-            // Schedule a retry: re-issue the upgrade once the home is free.
-            _epRnfCtrl->scheduleUpgradeRetryAfterRejection(lookupPa);
             return true;
         }
         // Held upgrade still pending (not rejected) — defer the InvalidateReq
@@ -1616,9 +1622,10 @@ bool
 EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
                                     int desiredPerm, UpgradeCause cause,
                                     uint64_t &outEpoch, uint64_t &outReqId,
-                                    bool *outRejected)
+                                    bool *outRejected, bool *outNotSharer)
 {
     if (outRejected) *outRejected = false;
+    if (outNotSharer) *outNotSharer = false;
     DPRINTF(RubyEP,
             "EPBackend node_id=%d: notifyLocalWriteUpgrade "
             "PA=0x%lx homeNode=%d desiredPerm=%d\n",
@@ -1701,6 +1708,11 @@ EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
     // for the other's upgrade. TC16/25/53 double-upgrade race.)
     if (!accepted && outRejected)
         *outRejected = true;
+    // upgradeRet == -3: PERMANENT reject (requester no longer a committed
+    // sharer — lost a dual-upgrade race). Caller must abandon + ReadUnique.
+    // upgradeRet == 0: TEMPORARY reject (existing outstanding) — retry later.
+    if ((upgradeRet == -3) && outNotSharer)
+        *outNotSharer = true;
 
     if (accepted) {
         // Store returned values (reservedEpoch, echoed reqId)
@@ -1954,6 +1966,19 @@ EPBackend::clearPendingUpgradeTxn(uint64_t linePa)
 }
 
 void
+EPBackend::sendSnpRespIForRejected(uint64_t linePa, uint64_t hnfDestRaw)
+{
+    if (_epRnfCtrl) {
+        MachineID hnfDest;
+        hnfDest.type = (MachineType)(hnfDestRaw >> 24);
+        hnfDest.num = (NodeID)(hnfDestRaw & 0xFFFFFF);
+        // staleMark=true: abandon path — tells local HN-F this CleanUnique must
+        // complete as stale (Comp_UC stale=1), so the L2 downgrades to ReadUnique.
+        _epRnfCtrl->sendSnpRespI(linePa, hnfDest, true);
+    }
+}
+
+void
 EPBackend::clearCachedUpgradeResp(uint64_t linePa)
 {
     // Clear any rejected UpgradeResp from the UBAdapter's ready-response cache
@@ -1975,6 +2000,31 @@ EPBackend::flushDeferredInvalidation(uint64_t linePa)
         return;
     OuterInvalidateMsg invMsg = it->second;
     _deferredInvalidationReqs.erase(it);
+
+    // TC16 dual-upgrade race LOSER: if the held upgrade for this line was
+    // REJECTED by home, the deferred InvalidateReq must drive the stale-abandon
+    // path (release the held snoop with SnpResp_I(stale=1) so the local HN-F
+    // completes the CleanUnique as stale and the L2 downgrades to ReadUnique),
+    // NOT a bare ack. A bare ack would leave the held CleanUnique parked at the
+    // HN-F forever (Sequencer deadlock).
+    if (_epRnfCtrl && _epRnfCtrl->isHeldUpgradeRejected(linePa)) {
+        DPRINTF(RubyEP,
+                "EPBackend node_id=%d: flushing deferred InvalidateReq PA=0x%lx "
+                "— held upgrade rejected, abandon via stale SnpResp_I + ack\n",
+                _nodeId, invMsg.linePa);
+        MachineID hnfDest = _epRnfCtrl->getHeldUpgradeHnfDest(linePa);
+        uint64_t hnfRaw = ((uint64_t)hnfDest.type << 24) | hnfDest.num;
+        _epRnfCtrl->clearHeldUpgrade(linePa);
+        sendSnpRespIForRejected(linePa, hnfRaw);  // stale=true
+        OuterInvalidationAck ackR;
+        ackR.linePa = invMsg.linePa;
+        ackR.ackNode = _nodeId;
+        ackR.homeNode = invMsg.homeNode;
+        ackR.epoch = invMsg.epoch;
+        ackR.reqId = invMsg.reqId;
+        sendInvalidationAck(ackR);
+        return;
+    }
 
     DPRINTF(RubyEP,
             "EPBackend node_id=%d: flushing deferred InvalidateReq "

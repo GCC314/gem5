@@ -8,6 +8,8 @@
 #include <vector>
 
 #include "mem/simple_mem.hh"
+
+namespace gem5 { namespace ruby { class EPRNFController; } }
 #include "mem/ruby/common/DataBlock.hh"
 #include "mem/ruby/protocol/chi/ep/BackstoreOrganization.hh"
 #include "mem/ruby/protocol/chi/ep/CoherenceMessage.hh"
@@ -363,10 +365,16 @@ class EPBackend : public SimObject
      *                  plain SnpResp_I so the line can be invalidated.
      * @return          True if UpgradeAck(true) received
      */
+    // outRejected: set true on any reject. outNotSharer: set true only for a
+    // PERMANENT reject (requester lost a dual-upgrade race and is no longer a
+    // committed sharer) — the caller must abandon + ReadUnique rather than
+    // retry the upgrade. A temporary reject (outNotSharer stays false) should
+    // be retried once the home drains.
     bool notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
                                   int desiredPerm, UpgradeCause cause,
                                   uint64_t &outEpoch, uint64_t &outReqId,
-                                  bool *outRejected = nullptr);
+                                  bool *outRejected = nullptr,
+                                  bool *outNotSharer = nullptr);
 
     /**
      * Send OuterUpgradeDone after local upgrade completes.
@@ -569,6 +577,11 @@ class EPBackend : public SimObject
         return _deferredInvalidationReqs.find(linePa) !=
                _deferredInvalidationReqs.end();
     }
+
+    /** Send SnpResp_I for a rejected upgrade's held snoop (stale completion
+     *  of the local HN-F's CleanUnique). The L2 will get CompUCRespStale and
+     *  retry the store with a fresh ReadUnique. */
+    void sendSnpRespIForRejected(uint64_t linePa, uint64_t hnfDestRaw);
 
     /**
      * Diagnose the expected grant for a given sideband combination

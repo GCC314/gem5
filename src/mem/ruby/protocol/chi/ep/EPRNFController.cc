@@ -1340,15 +1340,16 @@ EPRNFController::processRetryQueue()
 // ---- v4: Upgrade Path (§5.5) ----
 
 void
-EPRNFController::sendSnpRespI(uint64_t linePa, MachineID hnfDest)
+EPRNFController::sendSnpRespI(uint64_t linePa, MachineID hnfDest, bool staleMark)
 {
     NetDest dest(m_ruby_system);
     dest.add(hnfDest);
+    // The 5th ctor arg is CHIResponseMsg.stale. Only the abandon path sets it.
     auto rsp = std::make_shared<CHIResponseMsg>(
         curTick(), cacheLineSize, m_ruby_system,
         linePa, CHIResponseType_SnpResp_I,
         m_machineID, dest,
-        false, false, 0, 0, MessageSizeType_Control);
+        staleMark, false, 0, 0, MessageSizeType_Control);
     sendResponseMsg(rsp);
 }
 
@@ -1443,53 +1444,85 @@ EPRNFController::completeHeldUpgrade(uint64_t linePa)
     uint64_t epoch = 0;
     uint64_t reqId = 0;
     bool rejected = false;
+    bool notSharer = false;
 
     // Re-check the upgrade. With checkOnly semantics (an in-flight upgrade is
     // already pending in EPBackend::_pendingUpgradeTxns), this returns true once
     // the cached OuterUpgradeResp is available, false while still pending or
-    // rejected. `rejected` distinguishes a hard reject from async-pending.
+    // rejected. `rejected` distinguishes a hard reject from async-pending;
+    // `notSharer` distinguishes a PERMANENT reject (we lost a dual-upgrade race
+    // and were invalidated) from a TEMPORARY reject (another op is outstanding).
     bool accepted = backend->notifyLocalWriteUpgrade(
         linePa, homeNode, 1,
         UpgradeCause::LocalCleanUnique,
-        epoch, reqId, &rejected);
+        epoch, reqId, &rejected, &notSharer);
 
-    if (!accepted && rejected) {
-        // CHI: the home rejected this upgrade because another requester already
-        // has an upgrade outstanding for this line. Give up this attempt but
-        // KEEP the snoop held (do NOT send SnpResp_I — that would let the HN-F
-        // grant local exclusive to L2 without global authorization, creating a
-        // split-brain window). Mark rejected so the subsequent InvalidateReq
-        // (from the other requester's upgrade fanout) is ack'd directly without
-        // a second CleanUnique to the HN-F. Then schedule a retry: once the
-        // other upgrade drains at the home, re-issue a fresh OuterUpgradeReq.
-        // Only when THAT succeeds do we send SnpResp_I (with global auth).
+    // Decide between RETRY and ABANDON on a reject.
+    //
+    // ABANDON is required when continuing to hold+retry would deadlock. That
+    // happens in two cases:
+    //   (a) notSharer: the home permanently rejected us — we lost a dual-upgrade
+    //       race and were removed from the sharersMask (retry is rejected
+    //       forever). [TC16 steady state]
+    //   (b) A winner's InvalidateReq for this line is already pending/deferred
+    //       against our held snoop. That means another node's upgrade is waiting
+    //       for OUR invalidation ack, while we are waiting for our own upgrade to
+    //       be granted — a circular wait. The home cannot drain the winner until
+    //       we let go, so our upgrade will be rejected (existing outstanding)
+    //       forever. We must abandon to break the cycle. [TC16 race]
+    // Otherwise (temporary reject, no winner waiting on us) RETRY: the home has
+    // some unrelated op outstanding that will drain, after which the retried
+    // upgrade succeeds and the held snoop completes normally. [TC53 storm]
+    bool mustAbandon = notSharer || backend->hasDeferredInvalidation(linePa);
+
+    if (!accepted && rejected && !mustAbandon) {
         DPRINTF(RubyCHIGeneric,
-                "EP_RNF node_id=%d: upgrade REJECTED for PA=0x%lx — giving up, "
-                "holding snoop as rejected (inval will ack directly)\n",
+                "EP_RNF node_id=%d: upgrade TEMP-REJECT PA=0x%lx — hold snoop, "
+                "schedule retry (no winner waiting, still a sharer)\n",
                 _nodeId, linePa);
-        printf("[UPGRADE-DIAG] node=%d upgrade REJECTED PA=0x%lx "
-               "— hold as rejected\n",
-               _nodeId, linePa);
+        scheduleUpgradeRetryAfterRejection(linePa);
+        return;
+    }
+
+    if (!accepted && rejected && mustAbandon) {
+        // ABANDON — dual-upgrade race LOSER (TC16): retrying would deadlock
+        // (circular wait) or be rejected forever (not a sharer). Our SC copy is
+        // stale, so an upgrade (S->M) is invalid — the L2 must recall the
+        // winner's data via a fresh ReadUnique (I->M). We do NOT send a plain
+        // SnpResp_I (that would let the HN-F grant local exclusive without global
+        // auth — split brain). Instead we release the held snoop with
+        // SnpResp_I(stale=1) so the HN-F completes the CleanUnique as stale and
+        // the L2 downgrades to ReadUnique.
+        DPRINTF(RubyCHIGeneric,
+                "EP_RNF node_id=%d: upgrade ABANDON for PA=0x%lx (notSharer=%d "
+                "deferredInval=%d) — stale SnpResp_I drives L2 ReadUnique\n",
+                _nodeId, linePa, notSharer,
+                backend->hasDeferredInvalidation(linePa));
 
         backend->clearPendingUpgradeTxn(linePa);
         backend->clearCachedUpgradeResp(linePa);
         upIt->second.rejected = true;
 
-        // If an InvalidateReq already arrived and was deferred, ack it now and
-        // schedule the retry. If not yet arrived, the retry will be scheduled
-        // when handleInvalidationRequest sees isHeldUpgradeRejected.
+        // Drive the stale-SnpResp_I abandon. There are two orderings:
+        //  (1) InvalidateReq arrives AFTER the reject (TC16): it was deferred
+        //      while the snoop was held; re-drive it now so handleInvalidation
+        //      Request's rejected branch performs the abandon.
+        //  (2) InvalidateReq arrived BEFORE our local CleanUnique/reject (TC53
+        //      contention storm): the winner's fanout already ran (invalidating
+        //      our copy via startCleanUnique) and no further InvalidateReq will
+        //      come. Nothing would ever drive the abandon, so the held snoop —
+        //      and thus the L2's re-issued CleanUnique — would deadlock. In that
+        //      case we abandon PROACTIVELY here: release the held snoop with a
+        //      stale SnpResp_I so the local HN-F completes the CleanUnique as
+        //      stale and the L2 downgrades to ReadUnique.
         if (backend->hasDeferredInvalidation(linePa)) {
             backend->flushDeferredInvalidation(linePa);
-            scheduleUpgradeRetryAfterRejection(linePa);
-        } else if (upIt->second.needsRetry || upIt->second.rejected) {
-            // This is a retry that got rejected again (the other upgrade hasn't
-            // drained yet). No InvalidateReq to ack — just schedule another
-            // retry with a longer backoff.
-            backend->clearPendingUpgradeTxn(linePa);
-            backend->clearCachedUpgradeResp(linePa);
-            upIt->second.rejected = true;
-            _upgradeRetryLines.insert(linePa);
-            scheduleEvent(Cycles(2000000));
+        } else {
+            // No pending/deferred InvalidateReq — proactively abandon.
+            MachineID hnfDest = upIt->second.hnfDest;
+            uint64_t hnfRaw = ((uint64_t)hnfDest.type << 24) | hnfDest.num;
+            clearHeldUpgrade(linePa);
+            backend->sendSnpRespIForRejected(linePa, hnfRaw);
         }
         return;
     }

@@ -281,8 +281,16 @@ class EPRNFController : public EPController
         return MachineID();
     }
 
-    /** Send a SnpResp_I to the given HN-F destination for this line. */
-    void sendSnpRespI(uint64_t linePa, MachineID hnfDest);
+    /** Send a SnpResp_I to the given HN-F destination for this line.
+     *  @param staleMark If true, set the response's `stale` flag. Used only for
+     *  the EP-RNF upgrade-abandon path (TC16 dual-upgrade race loser): tells the
+     *  local HN-F that this held CleanUnique must complete as STALE (the global
+     *  upgrade was rejected by home). The HN-F then removes the requestor from
+     *  dir_sharers and sends Comp_UC(stale=1); the L2 requestor detects stale
+     *  and re-issues a fresh ReadUnique (I->M) to recall the winner's data.
+     *  Default false preserves all existing (non-abandon) SnpResp_I callers
+     *  byte-for-byte. */
+    void sendSnpRespI(uint64_t linePa, MachineID hnfDest, bool staleMark = false);
 
     // ---- Q2 (deprecated): removed — RN-F should not send snoops ----
     // Snoops are HN-F's responsibility per CHI spec.  Recall/invalidation

@@ -521,8 +521,12 @@ UBAdapter::sendUpgradeReq(uint64_t homePa, int requesterNode,
                 *outCommittedEpoch = resp.b.upgradeResp.committedEpoch;
             bool accepted =
                 (resp.h.flags & static_cast<uint32_t>(CFLAG_ACCEPTED)) != 0;
+            bool permanent =
+                (resp.h.flags & static_cast<uint32_t>(CFLAG_BUSY)) != 0;
             _readyResponses.erase(rit);
-            return accepted ? 1 : 0;
+            // 1=accepted, -3=permanent reject (not sharer → abandon),
+            // 0=temporary reject (retry).
+            return accepted ? 1 : (permanent ? -3 : 0);
         }
         // checkOnly: a previous UpgradeReq for this reqId is already in flight
         // (async pending). Do NOT re-send — a duplicate would make the home emit
@@ -577,16 +581,18 @@ UBAdapter::sendUpgradeReq(uint64_t homePa, int requesterNode,
     }
 
     bool accepted = (resp.h.flags & static_cast<uint32_t>(CFLAG_ACCEPTED)) != 0;
+    bool permanent = (resp.h.flags & static_cast<uint32_t>(CFLAG_BUSY)) != 0;
     if (outUpgradeTargetMask)
         *outUpgradeTargetMask = resp.b.upgradeResp.upgradeTargetMask;
     if (outCommittedEpoch)
         *outCommittedEpoch = resp.b.upgradeResp.committedEpoch;
 
     DPRINTF(RubyEP,
-            "UBAdapter node=%d: sendUpgradeReq result accepted=%d targetMask=0x%lx\n",
-            _nodeId, accepted, resp.b.upgradeResp.upgradeTargetMask);
+            "UBAdapter node=%d: sendUpgradeReq result accepted=%d permanent=%d targetMask=0x%lx\n",
+            _nodeId, accepted, permanent, resp.b.upgradeResp.upgradeTargetMask);
 
-    return accepted ? 1 : 0;
+    // 1=accepted, -3=permanent reject (not sharer → abandon), 0=temporary (retry).
+    return accepted ? 1 : (permanent ? -3 : 0);
 }
 
 // ---- Upgrade Done Request ----
