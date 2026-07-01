@@ -2753,6 +2753,25 @@ action(UpdateDirState_FromSnpResp, desc="") {
       if (tbe.dir_ownerExists && (tbe.dir_owner == in_msg.responder)){
         tbe.dir_ownerExists := false;
       }
+      // EP-RNF upgrade-abandon (TC16 dual-upgrade race loser). The EP-RNF, whose
+      // global upgrade was rejected by home, releases its held snoop with
+      // SnpResp_I marked stale. This is the terminating snoop response of the
+      // requestor's local CleanUnique. Force that CleanUnique to complete as
+      // STALE: drop the requestor from dir_sharers and invalidate our copy so
+      // Finish_CleanUnique takes its native stale branch (Comp_UC stale=1) and
+      // the L2 requestor re-issues a fresh ReadUnique to recall the winner's
+      // data (I->M). Strictly gated on (stale && reqType==CleanUnique) so all
+      // ordinary SnpResp_I paths are byte-for-byte unchanged.
+      if (in_msg.stale && (tbe.reqType == CHIRequestType:CleanUnique)) {
+        DPRINTF(RubyGenerated,
+                "[HNF-CU-ABANDON] addr=%#x — stale SnpResp_I, forcing stale CleanUnique\n",
+                address);
+        if (tbe.dir_sharers.isElement(tbe.requestor)) {
+          tbe.dir_sharers.remove(tbe.requestor);
+        }
+        tbe.dataValid := false;
+        tbe.is_stale := true;
+      }
 
     } else if (in_msg.type == CHIResponseType:SnpResp_SC) {
       // expected from a sharer that already has it in shared state
@@ -2814,6 +2833,18 @@ action(Receive_ReqResp, desc="") {
     }
     DPRINTF(RubyGenerated, "[STALE-MISMATCH] addr=%#x type=%d stale=%d tbe_stale=%d\n",
             address, in_msg.type, in_msg.stale, tbe.is_stale);
+    // EP-RNF upgrade-abandon (TC16 dual-upgrade race loser): a CleanUnique that
+    // completes with Comp_UC marked stale means our shared copy was invalidated
+    // by the race winner and is no longer valid. Record that so the follow-up
+    // CheckUpgrade_FromCU downgrades to a fresh ReadUnique (I->M) to recall the
+    // winner's data. We must also drop dataValid *before* UpdateDataState_
+    // FromCUResp recomputes dataUnique, otherwise the requestor would wrongly
+    // treat the stale completion as a successful upgrade (silent split-brain).
+    // Strictly gated on (Comp_UC && stale) so ordinary responses are unchanged.
+    if ((in_msg.type == CHIResponseType:Comp_UC) && in_msg.stale) {
+      tbe.is_stale := true;
+      tbe.dataValid := false;
+    }
   }
 }
 
@@ -3554,7 +3585,34 @@ action(CheckUpgrade_FromStoreOrRU, desc="") {
 
 action(CheckUpgrade_FromCU, desc="") {
   assert(is_HN == false);
-  if (tbe.dataUnique == false) {
+  // EP-RNF upgrade-abandon (TC16 dual-upgrade race loser): the CleanUnique
+  // completed STALE (Comp_UC stale=1, recorded by Receive_ReqResp which also
+  // cleared dataValid). Our shared copy was invalidated by the race winner, so
+  // an upgrade is invalid — mirror CheckUpgrade_FromStoreOrRU and re-issue a
+  // fresh ReadUnique (I->M) to recall the winner's data. Gated directly on
+  // tbe.is_stale (independent of the dataUnique recomputation, which can be
+  // skewed by an L1 that still appears as a downstream sharer). All non-stale
+  // CleanUnique completions keep their existing behavior byte-for-byte.
+  if (tbe.is_stale) {
+    // Mirrors CheckUpgrade_FromStoreOrRU's stale branch (no dir assert there):
+    // cancel any pending owner/dir update and re-fetch via ReadUnique.
+    // Reset dataUnique/dataValid so the subsequent ReadUnique data response
+    // (CompData_UC) satisfies UpdateDataState_FromReqDataResp's precondition
+    // assert(dataUnique==false). UpdateDataState_FromCUResp may have set
+    // dataUnique=true off a stale downstream sharer (e.g. our own L1); the
+    // stale abandon means we hold no valid unique copy and must re-fetch.
+    tbe.dataUnique := false;
+    tbe.dataValid := false;
+    // The abandoned upgrade holds no valid/unique copy; the upcoming ReadUnique
+    // re-fetches a fresh unique line, so there is no dirty upstream to preserve.
+    tbe.dataMaybeDirtyUpstream := false;
+    tbe.requestorToBeExclusiveOwner := false;
+    // Keep updateDirOnCompAck unchanged here. Finish_CleanUnique will decide
+    // owner intent for the post-downgrade flow and needs the normal CompAck
+    // directory update path to remain enabled.
+    tbe.actions.pushFront(Event:SendReadUnique);
+    tbe.is_stale := false;
+  } else if (tbe.dataUnique == false) {
     // actually failed, so just cancel the directory update
     assert(tbe.dir_sharers.isElement(tbe.requestor) == false);
     tbe.requestorToBeExclusiveOwner := false;
