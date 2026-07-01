@@ -15,8 +15,6 @@
 #include "mem/packet.hh"
 #include "mem/request.hh"
 #include "mem/simple_mem.hh"
-#include "mem/ruby/protocol/chi/ep/BackstoreSchemaA.hh"
-#include "mem/ruby/protocol/chi/ep/BackstoreSchemaC.hh"
 #include "mem/ruby/protocol/chi/ep/EPRNFController.hh"
 #include "mem/ruby/protocol/chi/ep/MetaRNFController.hh"
 #include "mem/ruby/protocol/chi/ep/UBAdapter.hh"
@@ -127,12 +125,6 @@ EPBackend::EPBackend(const Params &p)
     _epSnfs.resize(_numSockets, nullptr);  // v4-dual-socket: per-socket EP-SNF slots
 
     auto *ruby_system = p.ruby_system;
-    // v4: create backstore organization from config
-    if (p.ubcc_backstore_org == "schema_c") {
-        _org = new BackstoreSchemaC();
-    } else {
-        _org = new BackstoreSchemaA();
-    }
 
     // v4-dual-socket: Register legacy single adapter into slot 0 if provided.
     UBAdapter *legacyAdapter = p.ub_adapter;

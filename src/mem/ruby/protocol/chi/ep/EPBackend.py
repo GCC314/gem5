@@ -22,11 +22,5 @@ class EPBackend(SimObject):
     ubcc_force_resident_entries = Param.UInt32(
         0, "force resident entries for tests (0=auto)"
     )
-    ubcc_backstore_page_bytes = Param.UInt32(
-        64, "backstore metadata page size in bytes (64 or 256)"
-    )
-    ubcc_backstore_org = Param.String(
-        "schema_a", "backstore organization (schema_a or schema_c)"
-    )
     metadata_private_base = Param.Addr(0, "metadata private DRAM base")
     metadata_private_size = Param.MemorySize("16MB", "metadata private DRAM size")

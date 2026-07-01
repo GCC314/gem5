@@ -177,8 +177,6 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
     ubcc_bf_bytes = int(os.environ.get("UBCC_BF_BYTES", "65536"))
     ubcc_force_resident_entries = int(
         os.environ.get("UBCC_FORCE_RESIDENT_ENTRIES", "0"))
-    ubcc_backstore_page_bytes = int(os.environ.get("UBCC_BACKSTORE_PAGE_BYTES", "64"))
-    ubcc_backstore_org = os.environ.get("UBCC_BACKSTORE_ORG", "schema_a")
     ubcc_meta_max_flights = int(os.environ.get("UBCC_META_MAX_FLIGHTS", "8"))
     ubcc_meta_read_ticks = int(os.environ.get("UBCC_META_READ_TICKS", "8000"))
     ubcc_meta_write_ticks = int(os.environ.get("UBCC_META_WRITE_TICKS", "7500"))
@@ -295,9 +293,6 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
                                 ubcc_bf_bytes=ubcc_bf_bytes,
                                 ubcc_force_resident_entries=
                                      ubcc_force_resident_entries,
-                                ubcc_backstore_page_bytes=
-                                     ubcc_backstore_page_bytes,
-                                ubcc_backstore_org=ubcc_backstore_org,
                                 metadata_private_base=cfg.metadata_private_base,
                                 metadata_private_size=f"{metadata_private_size}B")
 

@@ -11,7 +11,7 @@
 
 namespace gem5 { namespace ruby { class EPRNFController; } }
 #include "mem/ruby/common/DataBlock.hh"
-#include "mem/ruby/protocol/chi/ep/BackstoreOrganization.hh"
+#include "mem/ruby/protocol/chi/ep/BackstoreTypes.hh"
 #include "mem/ruby/protocol/chi/ep/CoherenceMessage.hh"
 #include "mem/ruby/protocol/chi/ep/NodeAddressMap.hh"
 #include "params/EPBackend.hh"
@@ -677,8 +677,6 @@ class EPBackend : public SimObject
     void clearSidebandSnapshot();
 
     void setMetaRnfController(MetaRNFController *ctrl);
-    void setBackstoreOrganization(BackstoreOrganization *org) { _org = org; }
-    BackstoreOrganization* backstoreOrganization() const { return _org; }
 
 
 
@@ -730,7 +728,6 @@ class EPBackend : public SimObject
     NodeAddressMap _addrMap;
     uint64_t _epRnfSnoopCount = 0;
     MetaRNFController *_metaRnf = nullptr;
-    BackstoreOrganization *_org = nullptr;
     std::vector<UBAdapter*> _ubAdapters;  // v4-dual-socket: per-socket adapters
     std::vector<EPSNFController*> _epSnfs; // v4-dual-socket: per-socket EP-SNF
     int _numSockets = 1;                   // v4-dual-socket
