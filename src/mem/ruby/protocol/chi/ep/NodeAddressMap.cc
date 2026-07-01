@@ -1,1 +1,1 @@
-#include "../../../../../../../modules/ubiomodule/NodeAddressMap.cc"
+#include "protocol/NodeAddressMap.cc"

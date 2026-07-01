@@ -1,4 +1,5 @@
 #include "mem/ruby/protocol/chi/ep/UBAdapter.hh"
+#include "mem/ruby/protocol/chi/ep/EpConfig.hh"
 
 #include <cstdio>
 #include <limits>

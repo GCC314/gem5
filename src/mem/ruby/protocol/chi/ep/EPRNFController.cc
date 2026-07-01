@@ -1,4 +1,5 @@
 #include "mem/ruby/protocol/chi/ep/EPRNFController.hh"
+#include "mem/ruby/protocol/chi/ep/EpConfig.hh"
 
 #include <cassert>
 

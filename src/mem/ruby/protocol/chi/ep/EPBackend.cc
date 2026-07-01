@@ -1,4 +1,5 @@
 #include "mem/ruby/protocol/chi/ep/EPBackend.hh"
+#include "mem/ruby/protocol/chi/ep/EpConfig.hh"
 
 #include <cstdio>
 #include <cstring>

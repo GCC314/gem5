@@ -1,4 +1,4 @@
-#ifndef FORWARD_COHERENCEMESSAGE_HH
-#define FORWARD_COHERENCEMESSAGE_HH
-#include "../../../../../../../modules/ubiomodule/CoherenceMessage.hh"
+#ifndef COHERENCEMESSAGE_HH_FWD
+#define COHERENCEMESSAGE_HH_FWD
+#include "protocol/CoherenceMessage.hh"
 #endif
