@@ -127,11 +127,17 @@ UBAdapter::sendBarrierReached(uint32_t mask, uint32_t nodeId)
         return;
     }
     framework::MemMessage *buf = h->buffer();
-    buf->hdr.type = static_cast<uint32_t>(framework::MemMessageType::BARRIER_REACHED);
-    buf->hdr.size = sizeof(framework::MemMessageHeader);
+    // Barrier is carried as a PAYLOAD CoherenceMessage (BarrierReached); the
+    // transport layer no longer has a dedicated BARRIER_REACHED type.
+    buf->hdr.type = static_cast<uint32_t>(framework::MemMessageType::PAYLOAD);
     buf->hdr.req_id = mask;
     buf->hdr.sourceId = nodeId;
     buf->hdr.targetId = 0;
+    CoherenceMessage bmsg;
+    bmsg.h.type = CoherenceMessageType::BarrierReached;
+    bmsg.h.srcNode = static_cast<uint16_t>(nodeId);
+    bmsg.b.barrier.mask = mask;
+    buf->setPayload(bmsg);
     bool ok = h->send();
     std::fprintf(stderr,
         "[UBADAPTER-BARRIER-SEND] node=%d mask=0x%x ok=%d\n",
@@ -1127,27 +1133,12 @@ UBAdapter::wakeup()
     // 1. Emit sync (heartbeat) to let peer advance its boundary
     _port->emitSync(curTick());
 
-    // 2. Drain all ready messages (using three-state recv)
+    // 2. Drain all ready messages. CONTROL_SYNC now arrives as an ordinary
+    //    kMessage and is skipped by hdr.type below (2.1.2 alignment).
     framework::ReceiveStatus st;
     framework::MemMessage *m = _port->recv(curTick(), &st);
-    while (m && (st == framework::ReceiveStatus::kMessage || st == framework::ReceiveStatus::kSync)) {
+    while (m && st == framework::ReceiveStatus::kMessage) {
         if (m->hdr.type == static_cast<uint32_t>(framework::MemMessageType::CONTROL_SYNC)) {
-            m = _port->recv(curTick(), &st);
-            continue;
-        }
-        // Multi-process split: handle BARRIER_RELEASE from ubio/barrier_manager.
-        if (m->hdr.type == static_cast<uint32_t>(framework::MemMessageType::BARRIER_RELEASE)) {
-            uint32_t mask = static_cast<uint32_t>(m->hdr.req_id);
-            std::fprintf(stderr,
-                "[UBADAPTER-BARRIER-RELEASE] node=%d mask=0x%x\n", _nodeId, mask);
-            if (!System::systemList.empty()) {
-                System::systemList[0]->syncWait.releaseBarrier(mask);
-            }
-            m = _port->recv(curTick(), &st);
-            continue;
-        }
-        // BARRIER_REACHED is handled by ubio/barrier_manager, not gem5; skip.
-        if (m->hdr.type == static_cast<uint32_t>(framework::MemMessageType::BARRIER_REACHED)) {
             m = _port->recv(curTick(), &st);
             continue;
         }
@@ -1158,6 +1149,24 @@ UBAdapter::wakeup()
                              _nodeId, m->hdr.type, m->hdr.size);
             m = _port->recv(curTick(), &st);
             continue;
+        }
+        // Barrier control now travels as a PAYLOAD CoherenceMessage. Peek its
+        // coherence type: BarrierRelease releases the local sync_wait mask;
+        // BarrierReached is handled by ubio/barrier_manager, not gem5, so skip.
+        if (const CoherenceMessage *bc = m->getPayload<CoherenceMessage>()) {
+            if (bc->h.type == CoherenceMessageType::BarrierRelease) {
+                uint32_t mask = bc->b.barrier.mask;
+                std::fprintf(stderr,
+                    "[UBADAPTER-BARRIER-RELEASE] node=%d mask=0x%x\n", _nodeId, mask);
+                if (!System::systemList.empty())
+                    System::systemList[0]->syncWait.releaseBarrier(mask);
+                m = _port->recv(curTick(), &st);
+                continue;
+            }
+            if (bc->h.type == CoherenceMessageType::BarrierReached) {
+                m = _port->recv(curTick(), &st);
+                continue;
+            }
         }
         // PortAsync: dispatch to handleResponse (pendingByReqId map)
         static int cohcnt = 0;
@@ -1217,16 +1226,19 @@ UBAdapter::wakeup()
             // and any in-flight coherence responses keep flowing.
             framework::ReceiveStatus wst;
             framework::MemMessage *wm = _port->recv(curT, &wst);
-            while (wm && (wst == framework::ReceiveStatus::kMessage ||
-                          wst == framework::ReceiveStatus::kSync)) {
+            // CONTROL_SYNC arrives as kMessage and is ignored (no branch below).
+            while (wm && wst == framework::ReceiveStatus::kMessage) {
                 if (wm->hdr.type ==
-                    static_cast<uint32_t>(framework::MemMessageType::PAYLOAD))
-                    handleResponse(wm);
-                else if (wm->hdr.type ==
-                    static_cast<uint32_t>(framework::MemMessageType::BARRIER_RELEASE)) {
-                    uint32_t mask = static_cast<uint32_t>(wm->hdr.req_id);
-                    if (!System::systemList.empty())
-                        System::systemList[0]->syncWait.releaseBarrier(mask);
+                    static_cast<uint32_t>(framework::MemMessageType::PAYLOAD)) {
+                    // Peek for barrier control (now a PAYLOAD CoherenceMessage).
+                    const CoherenceMessage *bc = wm->getPayload<CoherenceMessage>();
+                    if (bc && bc->h.type == CoherenceMessageType::BarrierRelease) {
+                        if (!System::systemList.empty())
+                            System::systemList[0]->syncWait.releaseBarrier(
+                                bc->b.barrier.mask);
+                    } else {
+                        handleResponse(wm);
+                    }
                 }
                 wm = _port->recv(curT, &wst);
             }
