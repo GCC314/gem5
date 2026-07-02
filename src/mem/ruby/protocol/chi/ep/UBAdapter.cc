@@ -1142,6 +1142,10 @@ UBAdapter::wakeup()
     framework::ReceiveStatus st;
     framework::MemMessage *m = _port->recv(curTick(), &st);
     while (m && st == framework::ReceiveStatus::kMessage) {
+        if (m->hdr.type == static_cast<uint32_t>(framework::MemMessageType::TERMINATE)) {
+            m = _port->recv(curTick(), &st);
+            continue;
+        }
         if (m->hdr.type == static_cast<uint32_t>(framework::MemMessageType::CONTROL_SYNC)) {
             m = _port->recv(curTick(), &st);
             continue;
@@ -1232,6 +1236,11 @@ UBAdapter::wakeup()
             framework::MemMessage *wm = _port->recv(curT, &wst);
             // CONTROL_SYNC arrives as kMessage and is ignored (no branch below).
             while (wm && wst == framework::ReceiveStatus::kMessage) {
+                if (wm->hdr.type ==
+                    static_cast<uint32_t>(framework::MemMessageType::TERMINATE)) {
+                    wm = _port->recv(curT, &wst);
+                    continue;
+                }
                 if (wm->hdr.type ==
                     static_cast<uint32_t>(framework::MemMessageType::PAYLOAD)) {
                     // Peek for barrier control (now a PAYLOAD CoherenceMessage).
