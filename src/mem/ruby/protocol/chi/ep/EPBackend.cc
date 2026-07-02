@@ -105,7 +105,6 @@ EPBackend::EPBackend(const Params &p)
     _ruby_system(p.ruby_system),
     _metadataPrivateBase(p.metadata_private_base),
     _metadataPrivateSize(p.metadata_private_size),
-    _pageAllocCursor(p.metadata_private_base + (p.metadata_private_size / 2)),
     _lastGrantDataBlock(64),  // cache line size = 64 bytes
     _lastGrantDataValid(false),
     _lastSideband{false, 0, 0, false, -1, -1, -1},
@@ -179,84 +178,6 @@ EPBackend::getEpSnf(int socketId) const
     if (socketId >= 0 && socketId < (int)_epSnfs.size())
         return _epSnfs[socketId];
     return nullptr;
-}
-
-uint64_t
-EPBackend::metadataBackstorePa(uint64_t homePa) const
-{
-    if (_metadataPrivateSize < 64) {
-        return _metadataPrivateBase;
-    }
-    const uint64_t slot_count = _metadataPrivateSize / 64;
-    const uint64_t line_idx = (homePa >> 6) % slot_count;
-    return _metadataPrivateBase + line_idx * 64;
-}
-
-uint64_t
-EPBackend::allocatePagePa()
-{
-    const uint64_t end = _metadataPrivateBase + _metadataPrivateSize;
-    if (_pageAllocCursor + BackstorePageSize > end)
-        return 0;
-
-    uint64_t pa = _pageAllocCursor;
-    _pageAllocCursor += BackstorePageSize;
-    return pa;
-}
-
-EPBackend::MetaLine
-EPBackend::encodeMetaLine(uint64_t homePa, int state,
-                          uint64_t sharersMask, uint64_t epoch)
-{
-    MetaLine line{};
-    line[0] = 1; // valid
-    memcpy(line.data() + 8, &homePa, sizeof(homePa));
-    int64_t s = state;
-    memcpy(line.data() + 16, &s, sizeof(s));
-    memcpy(line.data() + 24, &sharersMask, sizeof(sharersMask));
-    memcpy(line.data() + 32, &epoch, sizeof(epoch));
-    return line;
-}
-
-bool
-EPBackend::decodeMetaLine(uint64_t expectedHomePa, const MetaLine &line,
-                          MetaStoreDecoded &entry)
-{
-    if (line[0] == 0) {
-        return false;
-    }
-
-    uint64_t key = 0;
-    memcpy(&key, line.data() + 8, sizeof(key));
-    if (key != expectedHomePa) {
-        return false;
-    }
-
-    int64_t st = 0;
-    memcpy(&st, line.data() + 16, sizeof(st));
-    memcpy(&entry.sharersMask, line.data() + 24, sizeof(entry.sharersMask));
-    memcpy(&entry.epoch, line.data() + 32, sizeof(entry.epoch));
-    entry.state = static_cast<int>(st);
-
-    if (entry.state < static_cast<int>(UBCCMESIState::G_I) ||
-        entry.state > static_cast<int>(UBCCMESIState::G_M)) {
-        return false;
-    }
-    if (entry.state == static_cast<int>(UBCCMESIState::G_I) &&
-        entry.sharersMask != 0) {
-        return false;
-    }
-    if (entry.state == static_cast<int>(UBCCMESIState::G_S) &&
-        entry.sharersMask == 0) {
-        return false;
-    }
-    if (entry.state == static_cast<int>(UBCCMESIState::G_E) ||
-        entry.state == static_cast<int>(UBCCMESIState::G_M)) {
-        if (__builtin_popcountll(entry.sharersMask) != 1) {
-            return false;
-        }
-    }
-    return true;
 }
 
 EPBackend::~EPBackend()

@@ -11,7 +11,6 @@
 
 namespace gem5 { namespace ruby { class EPRNFController; } }
 #include "mem/ruby/common/DataBlock.hh"
-#include "mem/ruby/protocol/chi/ep/BackstoreTypes.hh"
 #include "mem/ruby/protocol/chi/ep/CoherenceMessage.hh"
 #include "mem/ruby/protocol/chi/ep/NodeAddressMap.hh"
 #include "params/EPBackend.hh"
@@ -709,21 +708,6 @@ class EPBackend : public SimObject
     static EPBackend* getBackendInstance(int node_id);
 
   private:
-    using MetaLine = std::array<uint8_t, 64>;
-    struct MetaStoreDecoded {
-        int state;
-        uint64_t sharersMask;
-        uint64_t epoch;
-    };
-    uint64_t metadataBackstorePa(uint64_t homePa) const;
-    static MetaLine encodeMetaLine(uint64_t homePa, int state,
-                                   uint64_t sharersMask, uint64_t epoch);
-    static bool decodeMetaLine(uint64_t expectedHomePa, const MetaLine &line,
-                                MetaStoreDecoded &entry);
-
-    /** Allocate a new page PA in the metadata private range. Returns 0 if full. */
-    uint64_t allocatePagePa();
-
     const int _nodeId;
     NodeAddressMap _addrMap;
     uint64_t _epRnfSnoopCount = 0;
@@ -735,7 +719,6 @@ class EPBackend : public SimObject
     RubySystem *_ruby_system = nullptr;
     uint64_t _metadataPrivateBase = 0;
     uint64_t _metadataPrivateSize = 0;
-    uint64_t _pageAllocCursor = 0;         // next free metadata page PA
 
     // ---- Q1: Grant Data Buffer ----
     // Cache-line-sized buffer populated after each grant decision.
