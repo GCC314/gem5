@@ -119,14 +119,13 @@ void
 UBAdapter::sendBarrierReached(uint32_t mask, uint32_t nodeId)
 {
     if (!_port) return;
-    framework::TxHandle *h = _port->allocateSendBuffer(curTick());
-    if (!h) {
+    framework::MemMessage *buf = _port->allocateSendBuffer(curTick());
+    if (!buf) {
         std::fprintf(stderr,
             "[UBADAPTER-BARRIER] node=%d sendBarrierReached FAILED (no tx buf) "
             "mask=0x%x\n", _nodeId, mask);
         return;
     }
-    framework::MemMessage *buf = h->buffer();
     // Barrier is carried as a PAYLOAD CoherenceMessage (BarrierReached); the
     // transport layer no longer has a dedicated BARRIER_REACHED type.
     buf->hdr.type = static_cast<uint32_t>(framework::MemMessageType::PAYLOAD);
@@ -137,8 +136,14 @@ UBAdapter::sendBarrierReached(uint32_t mask, uint32_t nodeId)
     bmsg.h.type = CoherenceMessageType::BarrierReached;
     bmsg.h.srcNode = static_cast<uint16_t>(nodeId);
     bmsg.b.barrier.mask = mask;
-    buf->setPayload(bmsg);
-    bool ok = h->send();
+    if (!buf->setPayload(bmsg)) {
+        delete buf;
+        std::fprintf(stderr,
+            "[UBADAPTER-BARRIER] node=%d sendBarrierReached setPayload failed "
+            "mask=0x%x\n", _nodeId, mask);
+        return;
+    }
+    bool ok = _port->send(buf);
     std::fprintf(stderr,
         "[UBADAPTER-BARRIER-SEND] node=%d mask=0x%x ok=%d\n",
         _nodeId, mask, ok);
@@ -162,24 +167,23 @@ bool
 UBAdapter::transportSend(const CoherenceMessage &msg)
 {
     if (_port) {
-        framework::TxHandle *h = _port->allocateSendBuffer(curTick());
-        if (!h) {
+        framework::MemMessage *buf = _port->allocateSendBuffer(curTick());
+        if (!buf) {
             warn("UBAdapter node=%d socket=%d: transportSend no tx buffer (reqId=%lu type=%s)",
                  _nodeId, _socketId, msg.h.reqId, coherenceMsgTypeName(msg.h.type));
             return false;
         }
-        framework::MemMessage *buf = h->buffer();
 
         buf->hdr.type = static_cast<uint32_t>(framework::MemMessageType::PAYLOAD);
         buf->hdr.req_id = msg.h.reqId;
         if (!buf->setPayload(msg)) {
             warn("UBAdapter node=%d socket=%d: transportSend payload encode failed (reqId=%lu)",
                  _nodeId, _socketId, msg.h.reqId);
-            h->cancel();
+            delete buf;
             return false;
         }
 
-        if (!h->send()) {
+        if (!_port->send(buf)) {
             warn("UBAdapter node=%d socket=%d: transportSend port send failed (reqId=%lu)",
                  _nodeId, _socketId, msg.h.reqId);
             return false;

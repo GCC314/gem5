@@ -3,6 +3,7 @@
 Import('*')
 
 import os
+import SCons.Errors
 
 if env['CONF']['PROTOCOL'] != 'CHI':
     Return()
