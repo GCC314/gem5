@@ -132,9 +132,8 @@ UBAdapter::sendBarrierReached(uint32_t mask, uint32_t nodeId)
     buf->hdr.type = static_cast<uint32_t>(framework::MemMessageType::BARRIER_REACHED);
     buf->hdr.size = sizeof(framework::MemMessageHeader);
     buf->hdr.req_id = mask;
-    buf->hdr.src_module = nodeId;
-    buf->hdr.dst_module = 0;
-    buf->hdr.dst_port = 0;
+    buf->hdr.sourceId = nodeId;
+    buf->hdr.targetId = 0;
     bool ok = h->send();
     std::fprintf(stderr,
         "[UBADAPTER-BARRIER-SEND] node=%d mask=0x%x ok=%d\n",
@@ -167,7 +166,7 @@ UBAdapter::transportSend(const CoherenceMessage &msg)
         }
         framework::MemMessage *buf = h->buffer();
 
-        buf->hdr.type = static_cast<uint32_t>(framework::MemMessageType::COH_MSG);
+        buf->hdr.type = static_cast<uint32_t>(framework::MemMessageType::PAYLOAD);
         buf->hdr.req_id = msg.h.reqId;
         if (!buf->setPayload(msg)) {
             warn("UBAdapter node=%d socket=%d: transportSend payload encode failed (reqId=%lu)",
@@ -223,7 +222,7 @@ UBAdapter::transportRecv(CoherenceMessageType expectedType, uint64_t expectedReq
         if (msgType == framework::MemMessageType::CONTROL_SYNC) {
             continue;
         }
-        if (msgType != framework::MemMessageType::COH_MSG) {
+        if (msgType != framework::MemMessageType::PAYLOAD) {
             warn("UBAdapter node=%d socket=%d: transportRecv unexpected MemMessage type=%u",
                  _nodeId, _socketId, m->hdr.type);
             continue;
@@ -1154,7 +1153,7 @@ UBAdapter::wakeup()
             m = _port->recv(curTick(), &st);
             continue;
         }
-        if (m->hdr.type != static_cast<uint32_t>(framework::MemMessageType::COH_MSG)) {
+        if (m->hdr.type != static_cast<uint32_t>(framework::MemMessageType::PAYLOAD)) {
             static int noncoh = 0;
             if (++noncoh <= 5)
                 std::fprintf(stderr, "[WAKEUP-NONCOH] node=%d type=%u sz=%u\n",
@@ -1223,7 +1222,7 @@ UBAdapter::wakeup()
             while (wm && (wst == framework::ReceiveStatus::kMessage ||
                           wst == framework::ReceiveStatus::kSync)) {
                 if (wm->hdr.type ==
-                    static_cast<uint32_t>(framework::MemMessageType::COH_MSG))
+                    static_cast<uint32_t>(framework::MemMessageType::PAYLOAD))
                     handleResponse(wm);
                 else if (wm->hdr.type ==
                     static_cast<uint32_t>(framework::MemMessageType::BARRIER_RELEASE)) {
