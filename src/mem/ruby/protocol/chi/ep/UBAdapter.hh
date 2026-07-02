@@ -168,6 +168,9 @@ class UBAdapter : public SimObject
   private:
     int _nodeId;
     int _socketId;
+    int _numNodes;
+    int _numSockets;
+    int _localNode;
     EPBackend *_backend = nullptr;
     pseudo::PseudoMemPort *_pseudoPort = nullptr;
     framework::Port *_port = nullptr;

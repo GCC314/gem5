@@ -1,5 +1,4 @@
 #include "mem/ruby/protocol/chi/ep/EPRNFController.hh"
-#include "mem/ruby/protocol/chi/ep/EpConfig.hh"
 
 #include <cassert>
 
@@ -219,7 +218,7 @@ EPRNFController::EPRNFController(const Params &p)
   : EPController(p), _backend(p.ep_backend),
     _numCacheControllers(0),
     _numSockets(p.downstream_destinations.size()),
-    _addrMap(epNumNodesFromEnv(), _numSockets, 128ULL * 1024 * 1024),
+    _addrMap(p.num_nodes, _numSockets, 128ULL * 1024 * 1024),
     _chiRequestInFlight(false),
     _pendingHnResponseCount(0),
     _delayedResolvedCount(0)

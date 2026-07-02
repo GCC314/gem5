@@ -14,6 +14,7 @@ class EPController(RubyController):
     abstract = True
 
     node_id = Param.Int(0, "Node ID for this endpoint")
+    num_nodes = Param.Int(3, "Total number of nodes in the system")
 
     data_channel_size = Param.Int("")
     reqOut = Param.MessageBuffer("")

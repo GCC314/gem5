@@ -16,6 +16,7 @@ class EPBackend(SimObject):
                                             "becomes a child so each adapter's init() runs and "
                                             "binds its own ubio Port")
     num_sockets = Param.Int(1, "Number of sockets per node")
+    num_nodes = Param.Int(3, "Total number of nodes in the system")
     ubcc_epoch_bits = Param.UInt32(64, "UBCC committed epoch width in bits")
     meta_rnf = Param.MetaRNFController(NULL, "metadata async service stub")
     ubcc_bf_bytes = Param.UInt32(64 * 1024, "resident dir counting bloom bytes")

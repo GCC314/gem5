@@ -1,5 +1,4 @@
 #include "mem/ruby/protocol/chi/ep/EPBackend.hh"
-#include "mem/ruby/protocol/chi/ep/EpConfig.hh"
 
 #include <cstdio>
 #include <cstring>
@@ -100,7 +99,7 @@ EPBackend* EPBackend::getBackendInstance(int node_id)
 EPBackend::EPBackend(const Params &p)
   : SimObject(p),
     _nodeId(p.node_id),
-    _addrMap(epNumNodesFromEnv(), p.num_sockets, 128ULL * 1024 * 1024),
+    _addrMap(p.num_nodes, p.num_sockets, 128ULL * 1024 * 1024),
     _metaRnf(p.meta_rnf),
     _numSockets(p.num_sockets),
     _ruby_system(p.ruby_system),

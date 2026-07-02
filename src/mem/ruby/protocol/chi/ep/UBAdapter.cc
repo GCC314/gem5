@@ -1,5 +1,4 @@
 #include "mem/ruby/protocol/chi/ep/UBAdapter.hh"
-#include "mem/ruby/protocol/chi/ep/EpConfig.hh"
 
 #include <cstdio>
 #include <limits>
@@ -24,8 +23,10 @@ UBAdapter::UBAdapter(const Params &p)
     : SimObject(p),
       _nodeId(p.node_id),
       _socketId(p.socket_id),
-
-      _addrMap(epNumNodesFromEnv(), epNumSocketsFromEnv(), 128ULL * 1024 * 1024),
+      _numNodes(p.num_nodes),
+      _numSockets(p.num_sockets),
+      _localNode(p.local_node),
+      _addrMap(p.num_nodes, p.num_sockets, 128ULL * 1024 * 1024),
       _responseCheckEvent([this]{ wakeup(); }, name() + ".responseCheck")
 {
     fatal_if(sizeof(CoherenceMessage) > framework::kMaxPayloadSize,
@@ -43,19 +44,17 @@ UBAdapter::init()
 {
     SimObject::init();
 
-    // Create Port directly (guarantees all nodes get one regardless of init order)
-    const char* portEnv = getenv("UBIO_PORT_ENABLE");
-    if (portEnv) {
-        int enableNode = atoi(portEnv);
+    // Create Port directly (guarantees all nodes get one regardless of init order).
+    // _localNode selects which node this process owns (-1 = all nodes bind, legacy
+    // single-process mode). Port binds when this node is enabled.
+    {
+        int enableNode = _localNode;
         if (enableNode < 0 || _nodeId == enableNode) {
             // Socket-plane model: each (node, socket) UBAdapter binds to its own
             // ubio process, identified by the global module id gid=node*K+socket.
             // Previously all sockets of a node used gem5UbioPort(node), so only
             // socket 0 bound (duplicate endpoint) and socket-1 traffic deadlocked.
-            int numSockets = 1;
-            if (const char* e = getenv("UBCC_NUM_SOCKETS")) {
-                int v = atoi(e); if (v >= 1 && v <= 8) numSockets = v;
-            }
+            int numSockets = _numSockets;
             int gid = _nodeId * numSockets + _socketId;
             framework::PortParams pp = framework::PortEnvLoader::gem5UbioPort(gid);
             _port = new framework::Port();
@@ -98,8 +97,7 @@ UBAdapter::init()
                 // Register the SyncWaitManager callback on socket 0's UBAdapter so
                 // BARRIER_REACHED egresses via ubio(node,0); socket-1 UBAdapters do
                 // not participate (would double-count / split the node's arrival).
-                const char* localNodeEnv = getenv("UBCC_LOCAL_NODE");
-                int localNode = localNodeEnv ? atoi(localNodeEnv) : -1;
+                int localNode = _localNode;
                 if (_socketId == 0 && localNode >= 0 && !System::systemList.empty()) {
                     System *sys = System::systemList[0];
                     sys->syncWait.setLocalNodeId(localNode);

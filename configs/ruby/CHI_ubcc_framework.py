@@ -7,7 +7,6 @@ Q1: DSM VA Mapping helper — call setup_dsm_va_mapping() from test scripts
     after Process creation to map DSM_VA_BASE + k*SEG to PA for each node.
 """
 import math
-import os
 
 import m5
 from m5.objects import *
@@ -166,21 +165,26 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
     # In older gem5 versions this was inherited; v25.1 requires explicit set.
     ruby_system.clk_domain = system.clk_domain
 
-    num_nodes = int(os.environ.get("UBCC_NUM_NODES", str(DEFAULT_N)))
-    # Multi-process split: UBCC_LOCAL_NODE selects the single node this gem5
+    # UBCC config is plumbed through the `options` object (set by the test
+    # harness before create_system runs), not environment variables. `_opt`
+    # reads an attribute from options with a fallback default.
+    def _opt(name, default):
+        return getattr(options, name, default)
+
+    num_nodes = int(_opt("ubcc_num_nodes", DEFAULT_N))
+    # Multi-process split: ubcc_local_node selects the single node this gem5
     # process owns. -1 (default) builds ALL nodes in one process (legacy
     # single-process mode, used for regression parity).
-    local_node = int(os.environ.get("UBCC_LOCAL_NODE", "-1"))
+    local_node = int(_opt("ubcc_local_node", -1))
     seg_size = DEFAULT_SEG_SIZE
-    num_sockets = int(os.environ.get("UBCC_NUM_SOCKETS", "1"))
-    ubcc_epoch_bits = int(os.environ.get("UBCC_EPOCH_BITS", "64"))
-    ubcc_bf_bytes = int(os.environ.get("UBCC_BF_BYTES", "65536"))
-    ubcc_force_resident_entries = int(
-        os.environ.get("UBCC_FORCE_RESIDENT_ENTRIES", "0"))
-    ubcc_meta_max_flights = int(os.environ.get("UBCC_META_MAX_FLIGHTS", "8"))
-    ubcc_meta_read_ticks = int(os.environ.get("UBCC_META_READ_TICKS", "8000"))
-    ubcc_meta_write_ticks = int(os.environ.get("UBCC_META_WRITE_TICKS", "7500"))
-    ubcc_meta_delete_ticks = int(os.environ.get("UBCC_META_DELETE_TICKS", "7500"))
+    num_sockets = int(_opt("ubcc_num_sockets", 1))
+    ubcc_epoch_bits = int(_opt("ubcc_epoch_bits", 64))
+    ubcc_bf_bytes = int(_opt("ubcc_bf_bytes", 65536))
+    ubcc_force_resident_entries = int(_opt("ubcc_force_resident_entries", 0))
+    ubcc_meta_max_flights = int(_opt("ubcc_meta_max_flights", 8))
+    ubcc_meta_read_ticks = int(_opt("ubcc_meta_read_ticks", 8000))
+    ubcc_meta_write_ticks = int(_opt("ubcc_meta_write_ticks", 7500))
+    ubcc_meta_delete_ticks = int(_opt("ubcc_meta_delete_ticks", 7500))
     cache_line = system.cache_line_size.value
     # node_list: which nodes this process builds. In split mode, exactly one.
     if local_node < 0:
@@ -269,7 +273,9 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
         nd['ub_adapters'] = []
         nd['meta_rnfs'] = []
         for socket_id in range(num_sockets):
-            ub_adapter = UBAdapter(node_id=node_id, socket_id=socket_id)
+            ub_adapter = UBAdapter(node_id=node_id, socket_id=socket_id,
+                                   num_nodes=num_nodes, num_sockets=num_sockets,
+                                   local_node=local_node)
             # Parent each adapter explicitly in the SimObject tree so its init()
             # runs (binds ubio(node, socket) Port). A VectorParam reference alone
             # leaves it an orphan; explicit setattr is the unambiguous parent.
@@ -289,6 +295,7 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
                                 # own ubio Port) and is registered for getUBAdapter.
                                 ub_adapters=nd['ub_adapters'],
                                 num_sockets=num_sockets,
+                                num_nodes=num_nodes,
                                 ubcc_epoch_bits=ubcc_epoch_bits,
                                 ubcc_bf_bytes=ubcc_bf_bytes,
                                 ubcc_force_resident_entries=
@@ -381,7 +388,7 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
         # v4-dual-socket: EP-RNF binds ALL local HN-Fs (§3.2 change 5)
         nd['ep_rnf_cntrl'] = EPRNFController(
             version=chi_defs.Versions.getVersion(chi_defs.CHI_Cache_Controller),
-            ruby_system=ruby_system, node_id=node_id,
+            ruby_system=ruby_system, node_id=node_id, num_nodes=num_nodes,
             data_channel_size=params.data_width,
             ep_backend=ep_backend,
             addr_ranges=[NodeConfig.dsm_range_for(
