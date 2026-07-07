@@ -748,7 +748,17 @@ class CHI_SNF_Base(CHI_Node):
             addr_ranges=(addr_ranges if addr_ranges else []),
         )
 
-        self._cntrl.to_memory_controller_latency = 100
+        # HN-F/SN-F <-> MemCtrl hop latency (cycles @2GHz, 1cy=0.5ns). Chosen
+        # from the core->local-DRAM budget of ~100ns (latency_design.md §4):
+        #   L1+L2+L3 miss chain (round trip) ~= 24ns
+        #   DDR4_2400 device (tRCD 13.75 + tCL 13.75 + queueing) ~= 30ns
+        #   remaining ~46ns split over the two SN-F hops (req + resp)
+        #   -> ~23ns each way -> ~46cy; using 20cy (10ns) each way leaves
+        #      headroom for NoC/queueing and lands the round trip near 100ns.
+        # NOTE: this is a budget-derived estimate; exact core->DRAM calibration
+        # needs gem5-internal TRACE-PERF (Ruby sequencer issue/callback), which
+        # is future work. 100cy (50ns/hop) was overshooting the 100ns target.
+        self._cntrl.to_memory_controller_latency = 20
 
         self._cntrl.requestToMemory.buffer_size = (
             int(self._cntrl.to_memory_controller_latency) + 1
