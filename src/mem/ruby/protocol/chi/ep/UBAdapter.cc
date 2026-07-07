@@ -192,7 +192,10 @@ UBAdapter::transportSend(const CoherenceMessage &msg)
         static int _tscount = 0;
         if (msg.h.type == CoherenceMessageType::ReadReq && ++_tscount <= 3)
             std::fprintf(stderr, "[GEM5-SEND] node=%d type=ReadReq reqId=%lu gem5_tick=%lu buf_ts=%lu\n",
-                         _nodeId, msg.h.reqId, curTick(), buf->hdr.timestamp);
+                          _nodeId, msg.h.reqId, curTick(), buf->hdr.timestamp);
+        std::fprintf(stderr, "[TRACE-PERF] %lu|%d|gem5|%lu|0x%lx|SEND|%s|dst=%d\n",
+                     curTick(), _nodeId, msg.h.reqId, msg.h.homeLinePa,
+                     coherenceMsgTypeName(msg.h.type), msg.h.dstNode);
         return true;
     }
 
@@ -1175,6 +1178,9 @@ UBAdapter::wakeup()
                 m = _port->recv(curTick(), &st);
                 continue;
             }
+            std::fprintf(stderr, "[TRACE-PERF] %lu|%d|gem5|%lu|0x%lx|RECV|%s|src=%d\n",
+                         curTick(), _nodeId, bc->h.reqId, bc->h.homeLinePa,
+                         coherenceMsgTypeName(bc->h.type), bc->h.srcNode);
         }
         // PortAsync: dispatch to handleResponse (pendingByReqId map)
         static int cohcnt = 0;
