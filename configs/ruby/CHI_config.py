@@ -748,9 +748,8 @@ class CHI_SNF_Base(CHI_Node):
             addr_ranges=(addr_ranges if addr_ranges else []),
         )
 
-        # The Memory_Controller implementation deallocates the TBE for
-        # write requests when they are queue up to memory. The size of this
-        # buffer must be limited to prevent unlimited outstanding writes.
+        self._cntrl.to_memory_controller_latency = 100
+
         self._cntrl.requestToMemory.buffer_size = (
             int(self._cntrl.to_memory_controller_latency) + 1
         )
