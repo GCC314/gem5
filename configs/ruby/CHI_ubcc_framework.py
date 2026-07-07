@@ -201,8 +201,8 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
     params = chi_defs.NoC_Params
 
     class HNFCache(RubyCache):
-        dataAccessLatency = 30
-        tagAccessLatency = 6
+        dataAccessLatency = 10
+        tagAccessLatency = 4
         size = getattr(options, "l3_size", "256kB")
         assoc = getattr(options, "l3_assoc", 16)
 
