@@ -85,7 +85,7 @@ EPSNFController::wakeup()
         for (auto it = _retryQueue.begin(); it != _retryQueue.end(); ) {
             int homeNode = -1;
             int grantResult = _backend->handleRemoteMiss(
-                it->linePa, it->neededPerm, it->writeIntent, homeNode);
+                it->linePa, it->neededPerm, it->writeIntent, _socketId, homeNode);
             if (grantResult >= 0) {
                 // Grant succeeded — send CompData (same as normal flow)
                 NetDest hnDest(m_ruby_system);
@@ -210,7 +210,7 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
     // Map sideband to outer request and dispatch
     int homeNode = -1;
     int grantResult = _backend->handleRemoteMiss(
-        msg->m_addr, neededPerm, writeIntent, homeNode);
+        msg->m_addr, neededPerm, writeIntent, _socketId, homeNode);
 
     // Q3: If grant blocked, queue for retry instead of sending stale data
     if (grantResult < 0) {
