@@ -44,14 +44,16 @@ SyncWaitManager::barrierArrive(ThreadContext *tc, uint32_t mask,
     if (bs.waiting.find(tc) != bs.waiting.end())
         return 0;
 
-    // Determine if cross-node: any registered socket's barrierBit is NOT
-    // in the mask => cross-node barrier.
+    // Determine if cross-node: mask has bits that are NOT from any
+    // registered socket (i.e., bits from other nodes' sockets).
     bool crossNode = false;
+    uint32_t localBits = 0;
     for (int s = 0; s < _numSockets; s++) {
-        if (!_sockActive[s]) continue;
-        uint32_t localBit = 1u << _sockets[s].barrierBit;
-        if ((mask & ~localBit) != 0) { crossNode = true; break; }
+        if (_sockActive[s])
+            localBits |= (1u << _sockets[s].barrierBit);
     }
+    if (localBits > 0)
+        crossNode = (mask & ~localBits) != 0;
     bs.crossNode = crossNode;
 
     bs.waiting.insert(tc);
