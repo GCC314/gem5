@@ -1,6 +1,7 @@
 #include "mem/ruby/protocol/chi/ep/EPRNFController.hh"
 
 #include <cassert>
+#include <cstdlib>
 
 #include "base/logging.hh"
 #include "debug/RubyCHIGeneric.hh"
@@ -18,6 +19,24 @@ namespace ruby
 {
 
 using namespace CHI;
+
+static uint64_t eprn_compack_retry() {
+    static uint64_t v = 0;
+    if (v == 0) {
+        const char *e = std::getenv("EPRN_COMPACK_RETRY_CYCLES");
+        v = e ? std::strtoull(e, nullptr, 10) : 100000;
+    }
+    return v;
+}
+
+static uint64_t eprn_wakeup_retry() {
+    static uint64_t v = 0;
+    if (v == 0) {
+        const char *e = std::getenv("EPRN_WAKEUP_RETRY_CYCLES");
+        v = e ? std::strtoull(e, nullptr, 10) : 1000000;
+    }
+    return v;
+}
 
 EPController::EPController(const Params &p)
   : AbstractController(p),
@@ -1357,7 +1376,7 @@ void
 EPRNFController::scheduleUpgradeRetry(uint64_t linePa)
 {
     _upgradeRetryLines.insert(linePa);
-    scheduleEvent(Cycles(100000));
+    scheduleEvent(Cycles(eprn_compack_retry()));
 }
 
 void
@@ -1382,7 +1401,7 @@ EPRNFController::scheduleUpgradeRetryAfterRejection(uint64_t linePa)
     // upgrade to fully drain at the home (InvalidateAck → commit →
     // UpgradeAckNotify → UpgradeDone). ~1M cycles (500µs @2GHz) is generous.
     _upgradeRetryLines.insert(linePa);
-    scheduleEvent(Cycles(1000000));
+    scheduleEvent(Cycles(eprn_wakeup_retry()));
 }
 
 void

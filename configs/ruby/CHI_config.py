@@ -46,9 +46,38 @@ node to router binding. See configs/example/noc_config/2x4.py for an example.
 """
 
 import math
+import json
+import os
 
 import m5
 from m5.objects import *
+
+# ── External parameter loading (chi_params.json) ──────────────────────
+# Reads latency/capacity overrides from a JSON file. If the file is absent
+# or a key is missing, falls back to the Python defaults below.
+# This allows post-compilation tuning: just edit the JSON and re-run gem5.
+def _load_chi_params():
+    _json_path = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                              "chi_params.json")
+    if os.path.exists(_json_path):
+        with open(_json_path) as f:
+            return json.load(f)
+    return {}
+
+_chi = _load_chi_params()
+
+def _cache_param(cls_name, param, default):
+    """Read from chi_params.json, falling back to the class default."""
+    return _chi.get("cache", {}).get(cls_name + "_" + param, default)
+
+def _noc_param(param, default):
+    return _chi.get("noc", {}).get(param, default)
+
+def _snf_param(param, default):
+    return _chi.get("snf", {}).get(param, default)
+
+def _ctrl_param(param, default):
+    return _chi.get("controller", {}).get(param, default)
 
 
 # Declare caches and controller types used by the protocol
@@ -60,18 +89,18 @@ from m5.objects import *
 # dataAccessLatency may be set to 0 if one wants to consider parallel
 # data and tag lookups
 class L1ICache(RubyCache):
-    dataAccessLatency = 1
-    tagAccessLatency = 1
+    dataAccessLatency = _chi.get("cache", {}).get("l1i_data", 1)
+    tagAccessLatency = _chi.get("cache", {}).get("l1i_tag", 1)
 
 
 class L1DCache(RubyCache):
-    dataAccessLatency = 2
-    tagAccessLatency = 1
+    dataAccessLatency = _chi.get("cache", {}).get("l1d_data", 2)
+    tagAccessLatency = _chi.get("cache", {}).get("l1d_tag", 1)
 
 
 class L2Cache(RubyCache):
-    dataAccessLatency = 6
-    tagAccessLatency = 2
+    dataAccessLatency = _chi.get("cache", {}).get("l2_data", 6)
+    tagAccessLatency = _chi.get("cache", {}).get("l2_tag", 2)
 
 
 class Versions:
@@ -101,15 +130,14 @@ class Versions:
 
 class NoC_Params:
     """
-    Default parameters for the interconnect. The value of data_width is
-    also used to set the data_channel_size for all CHI controllers.
-    (see configs/ruby/CHI.py)
+    Default parameters for the interconnect. Values are loaded from
+    chi_params.json (or use the defaults below if the file is absent).
     """
 
-    router_link_latency = 1
-    node_link_latency = 1
-    router_latency = 1
-    router_buffer_size = 4
+    router_link_latency = _noc_param("router_link_latency", 1)
+    node_link_latency   = _noc_param("node_link_latency", 1)
+    router_latency      = _noc_param("router_latency", 1)
+    router_buffer_size  = 4
     cntrl_msg_size = 8
     data_width = 32
     cross_links = []
@@ -758,8 +786,7 @@ class CHI_SNF_Base(CHI_Node):
         # NOTE: this is a budget-derived estimate; exact core->DRAM calibration
         # needs gem5-internal TRACE-PERF (Ruby sequencer issue/callback), which
         # is future work. 100cy (50ns/hop) was overshooting the 100ns target.
-        self._cntrl.to_memory_controller_latency = 20
-
+        self._cntrl.to_memory_controller_latency = _snf_param("to_memory_controller_latency", 20)
         self._cntrl.requestToMemory.buffer_size = (
             int(self._cntrl.to_memory_controller_latency) + 1
         )

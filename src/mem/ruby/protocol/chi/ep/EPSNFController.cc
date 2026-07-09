@@ -10,6 +10,7 @@
 #include "mem/packet.hh"
 #include "mem/request.hh"
 #include "params/EPSNFController.hh"
+#include <cstdlib>
 
 namespace gem5
 {
@@ -18,6 +19,17 @@ namespace ruby
 {
 
 using namespace CHI;
+
+// Retry cycle count after BUSY grant — configurable via env var.
+// Default 1,600,000 cycles = 800 µs @ 2 GHz.
+static uint64_t epsnf_retry_cycles() {
+    static uint64_t v = 0;
+    if (v == 0) {
+        const char *e = std::getenv("EP_RETRY_CYCLES");
+        v = e ? std::strtoull(e, nullptr, 10) : 1600000;
+    }
+    return v;
+}
 
 EPSNFController::EPSNFController(const Params &p)
   : EPController(p), _backend(p.ep_backend),
@@ -128,7 +140,7 @@ EPSNFController::wakeup()
             }
         }
         if (needWakeup)
-            scheduleEvent(Cycles(1600000));
+            scheduleEvent(Cycles(epsnf_retry_cycles()));
     }
 }
 
@@ -225,7 +237,7 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
         entry.fwdReq = msg->m_fwdRequestor;
         entry.dataToFwdReq = msg->m_dataToFwdRequestor;
         _retryQueue.push_back(entry);
-        scheduleEvent(Cycles(1600000));
+        scheduleEvent(Cycles(epsnf_retry_cycles()));
         return true;
     }
 
@@ -281,7 +293,7 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
             entry.fwdReq = msg->m_fwdRequestor;
             entry.dataToFwdReq = msg->m_dataToFwdRequestor;
             _retryQueue.push_back(entry);
-            scheduleEvent(Cycles(1600000));
+            scheduleEvent(Cycles(epsnf_retry_cycles()));
             return true;
         }
         // NoData: zero-fill is the correct behavior
@@ -338,7 +350,7 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
 
     // Schedule deferred sends
     if (!_deferredCompData.empty()) {
-        scheduleEvent(Cycles(1600000));
+        scheduleEvent(Cycles(epsnf_retry_cycles()));
     }
 
     return true;
@@ -549,7 +561,7 @@ EPSNFController::processPendingWritebacks()
         }
     }
     if (!_pendingWritebacks.empty())
-        scheduleEvent(Cycles(1600000));
+        scheduleEvent(Cycles(epsnf_retry_cycles()));
 }
 
 } // namespace ruby

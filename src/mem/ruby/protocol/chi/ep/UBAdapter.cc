@@ -1,6 +1,7 @@
 #include "mem/ruby/protocol/chi/ep/UBAdapter.hh"
 
 #include <cstdio>
+#include <cstdlib>
 #include <limits>
 #include <thread>
 
@@ -18,6 +19,15 @@ namespace gem5
 {
 namespace ruby
 {
+
+static uint64_t ub_wait_cap() {
+    static uint64_t v = 0;
+    if (v == 0) {
+        const char *e = std::getenv("UB_WAIT_CAP");
+        v = e ? std::strtoull(e, nullptr, 10) : 2000000;
+    }
+    return v;
+}
 
 UBAdapter::UBAdapter(const Params &p)
     : SimObject(p),
@@ -1234,7 +1244,7 @@ UBAdapter::wakeup()
         // Safety net only: in normal operation the peer lifts safeT within a
         // few microseconds. If something is genuinely wedged, fall back to a
         // same-tick re-arm so the event queue can run other nodes' events.
-        const uint64_t kWaitCap = 2000000ULL;
+        const uint64_t kWaitCap = ub_wait_cap();
         while (safeT <= curT && waitIters < kWaitCap) {
             std::this_thread::yield();
             // Drain whatever the peer has sent so receiveTimestamp() can rise

@@ -1,0 +1,34 @@
+{
+  "_comment": "CHI latency/capacity parameters — loaded by CHI_config.py at startup.",
+  "_comment2": "Change values here and restart gem5; no recompilation needed for cache/NoC params.",
+  "_comment3": "C++ retry params (EP_RETRY_CYCLES etc.) are env vars; not in this JSON.",
+  "cache": {
+    "l1i_data": 1,
+    "l1i_tag": 1,
+    "l1d_data": 2,
+    "l1d_tag": 1,
+    "l2_data": 6,
+    "l2_tag": 2,
+    "l3_data": 10,
+    "l3_tag": 4
+  },
+  "noc": {
+    "router_latency": 1,
+    "router_link_latency": 1,
+    "node_link_latency": 1,
+    "cross_link_latency": 0,
+    "cross_socket_latency": 20
+  },
+  "snf": {
+    "to_memory_controller_latency": 20,
+    "response_latency": 2,
+    "data_latency": 1
+  },
+  "controller": {
+    "hnf_tbes": 4096,
+    "hnf_repl_tbes": 4096,
+    "hnf_snoop_tbes": 4096,
+    "hnf_dvm_tbes": 4096,
+    "snf_transitions_per_cycle": 1024
+  }
+}
