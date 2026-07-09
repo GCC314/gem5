@@ -162,12 +162,14 @@ EPBackend::registerEpSnf(int socketId, EPSNFController *ctrl)
     if (_numSockets < (int)_epSnfs.size())
         _numSockets = _epSnfs.size();
 
-    if (socketId == 0 && !_ubAdapters.empty() && _ubAdapters[0]) {
-        std::fprintf(stderr, "[WIRE] node=%d wiring adapter->snf callback\n", _nodeId);
-        _ubAdapters[0]->setOnResponseWired([this]{
-            std::fprintf(stderr, "[RSP-FIRE] node=%d scheduling EPSNF wakeup\n", _nodeId);
-            if (!_epSnfs.empty() && _epSnfs[0])
-                _epSnfs[0]->scheduleEvent(Cycles(1));
+    if (_ubAdapters.size() > (size_t)socketId && _ubAdapters[socketId]) {
+        std::fprintf(stderr, "[WIRE] node=%d wiring adapter[%d]->snf callback\n",
+                     _nodeId, socketId);
+        _ubAdapters[socketId]->setOnResponseWired([this, socketId]{
+            std::fprintf(stderr, "[RSP-FIRE] node=%d socket=%d scheduling EPSNF wakeup\n",
+                         _nodeId, socketId);
+            if (socketId < (int)_epSnfs.size() && _epSnfs[socketId])
+                _epSnfs[socketId]->scheduleEvent(Cycles(1));
         });
     }
 }
