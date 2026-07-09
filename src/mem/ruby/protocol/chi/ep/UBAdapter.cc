@@ -1369,12 +1369,18 @@ UBAdapter::handleResponse(framework::MemMessage *m)
 
     // Store in ready-response cache for retry-based sendReadReq
     _readyResponses[key] = *coh;
-    if (coh->h.type == CoherenceMessageType::ReadResp) {
-        static int rc = 0;
-        if (++rc <= 3)
-            warn("UBAdapter node=%d: stored ReadResp reqId=%lu grant=%d\n",
-                 _nodeId, coh->h.reqId,
-                 static_cast<int>(coh->b.readResp.grantType));
+
+    // Immediate response notification: fire the wired callback so the
+    // EPSNFController wakes up NOW and processes this response via retry,
+    // instead of waiting for the next EP_RETRY_CYCLES interval.
+    if (_onResponseWired && (coh->h.type == CoherenceMessageType::ReadResp ||
+                              coh->h.type == CoherenceMessageType::ClearResp ||
+                              coh->h.type == CoherenceMessageType::UpgradeResp ||
+                              coh->h.type == CoherenceMessageType::WritebackResp ||
+                              coh->h.type == CoherenceMessageType::EvictResp)) {
+        std::fprintf(stderr, "[RSP-WIRED] node=%d socket=%d firing immediate wakeup for type=%d reqId=%lu\n",
+                     _nodeId, _socketId, static_cast<int>(coh->h.type), coh->h.reqId);
+        _onResponseWired();
     }
 
     // If there's a direct callback, also invoke it
