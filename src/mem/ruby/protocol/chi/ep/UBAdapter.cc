@@ -103,20 +103,22 @@ UBAdapter::init()
                 // calls our callback to send BARRIER_REACHED to ubio (which
                 // forwards to the barrier_manager / other ubios). We receive
                 // BARRIER_RELEASE in wakeup() and call releaseBarrier().
-                // Barriers are per-NODE (each node's socket-0 UBAdapter sends
-                // BarrierReached). BarrierRelease is forwarded to ALL sockets by
-                // ubio, so all socket planes unblock (per-socket barrier fix).
+                // Per-socket barrier: each socket independently registers
+                // with SyncWaitManager. When the local barrier completes, all
+                // sockets fire BarrierReached with their own barrierBit
+                // (node*numSockets + socket).
                 int localNode = _localNode;
-                if (_socketId == 0 && localNode >= 0 && !System::systemList.empty()) {
+                if (localNode >= 0 && !System::systemList.empty()) {
+                    int barrierBit = _nodeId * _numSockets + _socketId;
                     System *sys = System::systemList[0];
-                    sys->syncWait.setLocalNodeId(localNode);
-                    sys->syncWait.setBarrierSendFn(
-                        [this](uint32_t mask, uint32_t nodeId) {
-                            sendBarrierReached(mask, nodeId);
+                    sys->syncWait.registerSocket(_socketId, barrierBit);
+                    sys->syncWait.registerSocketFn(_socketId,
+                        [this](uint32_t mask, uint32_t srcBit) {
+                            sendBarrierReached(mask, srcBit);
                         });
                     std::fprintf(stderr,
-                        "[UBADAPTER-BARRIER] node=%d socket=0 registered IPC barrier "
-                        "callback (localNode=%d)\n", _nodeId, localNode);
+                        "[UBADAPTER-BARRIER] node=%d socket=%d registered IPC barrier "
+                        "callback (barrierBit=%d)\n", _nodeId, _socketId, barrierBit);
                 }
             }
         }

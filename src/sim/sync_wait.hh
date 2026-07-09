@@ -5,6 +5,7 @@
 #include <functional>
 #include <map>
 #include <set>
+#include <vector>
 
 namespace gem5
 {
@@ -15,36 +16,47 @@ class SyncWaitManager
 {
   public:
     static constexpr uint32_t MAX_NODE_COUNT = 16;
-    using BarrierSendFn = std::function<void(uint32_t mask, uint32_t nodeId)>;
+    static constexpr uint32_t MAX_SOCKETS = 2;
+    using BarrierSendFn = std::function<void(uint32_t mask, uint32_t srcBit)>;
 
   private:
     struct BarrierState
     {
         uint32_t activeThreads = 0;
         std::set<ThreadContext *> waiting;
-        bool crossNode = false;       // mask includes non-local nodes
-        bool remoteReleased = false;  // BARRIER_RELEASE received from IPC
+        bool crossNode = false;
+        bool remoteReleased = false;
+    };
+
+    struct SocketReg {
+        int barrierBit;
+        BarrierSendFn sendFn;
     };
 
     std::map<uint32_t, BarrierState> _barriers;
 
-    // Multi-process split: when set, barriers whose mask includes nodes other
-    // than _localNodeId are routed through the IPC barrier_manager via _sendFn.
-    // _localNodeId < 0 => legacy single-process mode (all in-process).
-    int _localNodeId = -1;
-    BarrierSendFn _sendFn;  // sends BARRIER_REACHED to ubio via Port
+    // Per-socket barrier registration: each socket independently sends
+    // BarrierReached with its own barrierBit when the local barrier completes.
+    // Indexed by socket id (0..MAX_SOCKETS-1). Empty slots (no registration)
+    // are skipped when firing.
+    SocketReg _sockets[MAX_SOCKETS] = {};
+    bool _sockActive[MAX_SOCKETS] = {};
+    int _numSockets = 0;
 
   public:
     SyncWaitManager() = default;
     ~SyncWaitManager() = default;
 
-    void setLocalNodeId(int nid) { _localNodeId = nid; }
-    void setBarrierSendFn(BarrierSendFn fn) { _sendFn = std::move(fn); }
+    // Legacy single-slot API — registers socket 0 (backward compat).
+    void setLocalNodeId(int nid) { registerSocket(0, nid); }
+    void setBarrierSendFn(BarrierSendFn fn) { registerSocketFn(0, std::move(fn)); }
+
+    // Per-socket registration: each socket gets its own barrierBit.
+    void registerSocket(int socket, int barrierBit);
+    void registerSocketFn(int socket, BarrierSendFn fn);
 
     int barrierArrive(ThreadContext *tc, uint32_t mask, uint32_t activeThreads);
 
-    // Called by UBAdapter when a BARRIER_RELEASE message is received from ubio.
-    // Releases all local threads waiting on the given mask.
     void releaseBarrier(uint32_t mask);
 };
 
