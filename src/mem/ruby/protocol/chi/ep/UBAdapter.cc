@@ -1363,6 +1363,20 @@ UBAdapter::handleResponse(framework::MemMessage *m)
         break;
     }
 
+    // RecallResp is consumed by the home UBCC first; if ubio mirrors it back
+    // to local gem5, use it only as an event-driven wakeup so the requester's
+    // EP-SNF retry queue replays immediately after RECALL.DONE instead of
+    // idling for the 20k-cycle fallback backoff.
+    if (coh->h.type == CoherenceMessageType::RecallResp) {
+        if (_onResponseWired) {
+            std::fprintf(stderr,
+                         "[RSP-WIRED] node=%d socket=%d firing recall-done wakeup reqId=%lu\n",
+                         _nodeId, _socketId, coh->h.reqId);
+            _onResponseWired();
+        }
+        return;
+    }
+
     // Dispatch via _pendingByReqId — now keyed by (respType, reqId)
     PendingKey key{coh->h.type, coh->h.reqId};
     auto it = _pendingByReqId.find(key);
