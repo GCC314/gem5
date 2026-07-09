@@ -59,18 +59,14 @@ SyncWaitManager::barrierArrive(ThreadContext *tc, uint32_t mask,
     bs.waiting.insert(tc);
 
     if (bs.crossNode && _numSockets > 0) {
-        // Per-socket split mode: send ONE BarrierReached per process.
-        // The srcBit is the node-level ID (socket 0's barrierBit, which
-        // equals old-style nodeId in 1s mode). All local sockets fire
-        // together, but only the first registered socket's bit is used
-        // as the BarrierReached srcNode (backward compat with per-node
-        // workload masks like 0b111). BarrierRelease is forwarded to
-        // ALL local sockets via ubio's per-socket forwarding.
+        // Per-socket split mode: fire ALL registered sockets' BarrierReached
+        // callbacks, each with its own barrierBit. Workloads using per-node
+        // masks (e.g. 0b111) in dual-socket mode need their masks enlarged
+        // to account for per-socket senders (see per-TC audit in tests/).
         for (int s = 0; s < _numSockets; s++) {
             if (_sockActive[s] && _sockets[s].sendFn) {
                 _sockets[s].sendFn(mask,
                     static_cast<uint32_t>(_sockets[s].barrierBit));
-                break;  // fire only first socket's BarrierReached
             }
         }
         if (!bs.remoteReleased) {
