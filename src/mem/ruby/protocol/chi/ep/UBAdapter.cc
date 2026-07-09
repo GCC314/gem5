@@ -103,21 +103,22 @@ UBAdapter::init()
                 // calls our callback to send BARRIER_REACHED to ubio (which
                 // forwards to the barrier_manager / other ubios). We receive
                 // BARRIER_RELEASE in wakeup() and call releaseBarrier().
-                // Barriers are per-NODE and flow through the socket-0 plane only.
-                // Register the SyncWaitManager callback on socket 0's UBAdapter so
-                // BARRIER_REACHED egresses via ubio(node,0); socket-1 UBAdapters do
-                // not participate (would double-count / split the node's arrival).
+                // Per-(node,socket) barrier bit = node*numSockets + socket.
+                // In 1s mode this degenerates to node-level (bit=node) for
+                // backward compatibility.
                 int localNode = _localNode;
-                if (_socketId == 0 && localNode >= 0 && !System::systemList.empty()) {
+                if (localNode >= 0 && !System::systemList.empty()) {
                     System *sys = System::systemList[0];
-                    sys->syncWait.setLocalNodeId(localNode);
+                    // Use per-(node,socket) identity for barrier bit
+                    int barrierBit = _nodeId * _numSockets + _socketId;
+                    sys->syncWait.setLocalNodeId(localNode * _numSockets + _socketId);
                     sys->syncWait.setBarrierSendFn(
-                        [this](uint32_t mask, uint32_t nodeId) {
-                            sendBarrierReached(mask, nodeId);
+                        [this](uint32_t mask, uint32_t srcBit) {
+                            sendBarrierReached(mask, srcBit);
                         });
                     std::fprintf(stderr,
-                        "[UBADAPTER-BARRIER] node=%d socket=0 registered IPC barrier "
-                        "callback (localNode=%d)\n", _nodeId, localNode);
+                        "[UBADAPTER-BARRIER] node=%d socket=%d registered IPC barrier "
+                        "callback (barrierBit=%d)\n", _nodeId, _socketId, barrierBit);
                 }
             }
         }
