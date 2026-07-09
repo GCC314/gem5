@@ -26,7 +26,7 @@ static uint64_t epsnf_retry_cycles() {
     static uint64_t v = 0;
     if (v == 0) {
         const char *e = std::getenv("EP_RETRY_CYCLES");
-        v = e ? std::strtoull(e, nullptr, 10) : 1600000;
+        v = e ? std::strtoull(e, nullptr, 10) : 10000;  // default 5µs @2GHz
     }
     return v;
 }
