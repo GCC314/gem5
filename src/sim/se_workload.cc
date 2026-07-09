@@ -59,10 +59,11 @@ SEWorkload::setSystem(System *sys)
     // for timing only whose ranges are not in the conf table yet.
     if (memories.empty()) {
         warn("No conf-reported memories. Creating per-node fallback "
-             "MemPools (index=0,1,2 → [0,1,2]TiB + 256MiB).");
+             "MemPools (index=0..%d → 0..%dTiB + 256MiB).", max_nodes-1, max_nodes-1);
         constexpr uint64_t NODE_STRIDE = 1ULL << 40; // 1 TiB
         constexpr uint64_t POOL_SIZE = 256 * 1024 * 1024; // 256 MiB
-        for (int i = 0; i < 3; i++) {
+        constexpr int max_nodes = 16;  // NodeConfig supports up to 16
+        for (int i = 0; i < max_nodes; i++) {
             memories.push_back(AddrRange(
                 i * NODE_STRIDE,
                 i * NODE_STRIDE + POOL_SIZE));
