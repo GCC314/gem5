@@ -103,22 +103,20 @@ UBAdapter::init()
                 // calls our callback to send BARRIER_REACHED to ubio (which
                 // forwards to the barrier_manager / other ubios). We receive
                 // BARRIER_RELEASE in wakeup() and call releaseBarrier().
-                // Per-(node,socket) barrier bit = node*numSockets + socket.
-                // In 1s mode this degenerates to node-level (bit=node) for
-                // backward compatibility.
+                // Barriers are per-NODE (each node's socket-0 UBAdapter sends
+                // BarrierReached). BarrierRelease is forwarded to ALL sockets by
+                // ubio, so all socket planes unblock (per-socket barrier fix).
                 int localNode = _localNode;
-                if (localNode >= 0 && !System::systemList.empty()) {
+                if (_socketId == 0 && localNode >= 0 && !System::systemList.empty()) {
                     System *sys = System::systemList[0];
-                    // Use per-(node,socket) identity for barrier bit
-                    int barrierBit = _nodeId * _numSockets + _socketId;
-                    sys->syncWait.setLocalNodeId(localNode * _numSockets + _socketId);
+                    sys->syncWait.setLocalNodeId(localNode);
                     sys->syncWait.setBarrierSendFn(
-                        [this](uint32_t mask, uint32_t srcBit) {
-                            sendBarrierReached(mask, srcBit);
+                        [this](uint32_t mask, uint32_t nodeId) {
+                            sendBarrierReached(mask, nodeId);
                         });
                     std::fprintf(stderr,
-                        "[UBADAPTER-BARRIER] node=%d socket=%d registered IPC barrier "
-                        "callback (barrierBit=%d)\n", _nodeId, _socketId, barrierBit);
+                        "[UBADAPTER-BARRIER] node=%d socket=0 registered IPC barrier "
+                        "callback (localNode=%d)\n", _nodeId, localNode);
                 }
             }
         }
