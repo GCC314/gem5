@@ -58,11 +58,11 @@ SEWorkload::setSystem(System *sys)
     // Multi-node Ruby configurations (UBCC) have DDR4 controllers
     // for timing only whose ranges are not in the conf table yet.
     if (memories.empty()) {
+        constexpr int max_nodes = 16;  // NodeConfig supports up to 16
         warn("No conf-reported memories. Creating per-node fallback "
              "MemPools (index=0..%d → 0..%dTiB + 256MiB).", max_nodes-1, max_nodes-1);
         constexpr uint64_t NODE_STRIDE = 1ULL << 40; // 1 TiB
         constexpr uint64_t POOL_SIZE = 256 * 1024 * 1024; // 256 MiB
-        constexpr int max_nodes = 16;  // NodeConfig supports up to 16
         for (int i = 0; i < max_nodes; i++) {
             memories.push_back(AddrRange(
                 i * NODE_STRIDE,
