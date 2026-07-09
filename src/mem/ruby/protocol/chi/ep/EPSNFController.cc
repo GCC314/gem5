@@ -348,9 +348,16 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
         _deferredCompData.push_back(dat);
     }
 
-    // Schedule deferred sends
+    // Schedule deferred sends.
+    // NOTE: This is the *normal success* path — the grant already succeeded
+    // and the data is ready; we only defer by 1 tick to avoid the same-tick
+    // TBE race at the HN-F (see comment above / docs/tbe-race-condition.svg).
+    // Do NOT use epsnf_retry_cycles() here: that value is a *back-off* interval
+    // meant only for genuine BUSY / not-ready retries (a large back-off avoids
+    // a request storm while the request is still traversing the remote node).
+    // Using it here needlessly delayed every CompData by ~10µs.
     if (!_deferredCompData.empty()) {
-        scheduleEvent(Cycles(epsnf_retry_cycles()));
+        scheduleEvent(Cycles(1));
     }
 
     return true;
