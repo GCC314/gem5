@@ -31,6 +31,19 @@ static uint64_t epsnf_retry_cycles() {
     return v;
 }
 
+// Δ_noc: cross-socket NoC extra latency (cycles).  In dual-socket topologies
+// the SN-F may sit on a different socket from the requester HN-F, adding NoC
+// hops inside gem5.  This configurable delay (default 0 = single-socket)
+// models that extra cross-socket routing latency.  See latency_tuning_constraints.md §6.1.
+static uint64_t epsnf_delta_noc_cycles() {
+    static int64_t v = -1;
+    if (v < 0) {
+        const char *e = std::getenv("EP_DELTA_NOC_CYCLES");
+        v = e ? (int64_t)std::strtoull(e, nullptr, 10) : 0;
+    }
+    return (uint64_t)v;
+}
+
 EPSNFController::EPSNFController(const Params &p)
   : EPController(p), _backend(p.ep_backend),
     _socketId(p.socket_id)
@@ -357,7 +370,8 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
     // a request storm while the request is still traversing the remote node).
     // Using it here needlessly delayed every CompData by ~10µs.
     if (!_deferredCompData.empty()) {
-        scheduleEvent(Cycles(1));
+        // 1-tick TBE-race defer + optional cross-socket NoC Δ (default 0).
+        scheduleEvent(Cycles(1 + epsnf_delta_noc_cycles()));
     }
 
     return true;
