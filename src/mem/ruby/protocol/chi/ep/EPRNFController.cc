@@ -701,6 +701,31 @@ EPRNFController::handleSnpCleanInvalid(const CHIRequestMsg *msg)
         return true;
     }
 
+    // ---- Self-snoop guard: if we have a pending CHI transaction for this PA,
+    //     the SnpCleanInvalid is from our own RECALL-induced ReadUnique/ReadShared.
+    //     Just respond SnpResp_I immediately; the RECALL handles ownership transfer.
+    if (isDsmLine) {
+        auto chiIt = _pendingChiTxns.find(msg->m_addr);
+        if (chiIt != _pendingChiTxns.end()) {
+            printf("[SELF-SNOOP] node=%d SnpCleanInvalid PA=0x%lx "
+                   "pendingChiTxn op=%d — immediate SnpResp_I\n",
+                   _nodeId, msg->m_addr,
+                   static_cast<int>(chiIt->second.op));
+            return sendSnpRespI(msg);
+        }
+    }
+
+    // ---- RECALL snoop guard: if EPBackend has an active recall for this PA,
+    //     the SnpCleanInvalid is RECALL-induced (TC98 §6.1) — the UBCC RECALL
+    //     handles ownership transfer, so no OuterUpgradeReq is needed.
+    if (isDsmLine && backend && backend->hasActiveRecall(msg->m_addr)) {
+        printf("[RECALL-SNOOP] node=%d SnpCleanInvalid PA=0x%lx "
+               "during active recall — immediate SnpResp_I\n",
+               _nodeId, msg->m_addr);
+        backend->clearActiveRecall(msg->m_addr);
+        return sendSnpRespI(msg);
+    }
+
     if (isDsmLine) {
         int homeNode = backend->homeNodeCrossNode(msg->m_addr);
         uint64_t epoch = 0;

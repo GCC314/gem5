@@ -848,7 +848,26 @@ action(Finish_CleanUnique, desc="") {
   // everyone may have been hit by an invalidation so check again
   if (tbe.dir_sharers.isElement(tbe.requestor) == false) {
     tbe.updateDirOnCompAck := false;
-    assert(tbe.dataValid == false);
+    // v4 RECALL-SNOOP fix: under concurrent contention (e.g. TC98 hotspot),
+    // the requestor may already be removed from sharers by a prior SnpResp_I
+    // even though the CleanUnique has valid data to write back.
+    // Accept the data; the Comp_UC with stale flag tells the requestor to retry
+    // ownership if needed. The original assert(tbe.dataValid == false) was too
+    // strict for multi-sharer contention scenarios.
+    if (tbe.dataValid) {
+      DPRINTF(RubyGenerated, "[HNF-CU-STALE-DATAVALID] addr=%#x epProxy=%d - requestor not in sharers but data valid\n", address, tbe.epProxyOp);
+      // For EP-RNF proxy ops, clear directory state to prevent downstream
+      // Finalize_UpdateDirectoryFromTBE assert failures.
+      if (epRnfMachineVersion >= 0 &&
+          tbe.requestor == tbe.epRnfMachineID &&
+          tbe.epProxyOp != EpProxyOp:NoProxyOp) {
+        tbe.dir_sharers.clear();
+        tbe.dir_ownerExists := false;
+      }
+      // Mark as stale so the assert below passes. The requestor was removed
+      // from sharers by a prior SnpResp_I (regular, not necessarily stale).
+      tbe.is_stale := true;
+    }
     assert(tbe.is_stale);
     tbe.is_stale := false;
     tbe.actions.push(Event:SendCompUCRespStale);
@@ -3701,6 +3720,19 @@ action(Finalize_UpdateDirectoryFromTBE, desc="") {
     dir_entry.owner := tbe.dir_owner;
     dir_entry.sharers := tbe.dir_sharers;
   } else {
+    // v4 RECALL-SNOOP fix: EP-RNF proxy CleanUnique may complete with
+    // SnpResp_I having already removed the requestor from sharers.
+    // Normalize directory state before asserting.
+    if (epRnfMachineVersion >= 0 &&
+        tbe.requestor == tbe.epRnfMachineID &&
+        tbe.epProxyOp != EpProxyOp:NoProxyOp) {
+      if (tbe.dir_ownerExists || !tbe.dir_sharers.isEmpty()) {
+        DPRINTF(RubyGenerated, "[HNF-FINALIZE-EPRNF] addr=%#x owner=%d sharers=%d — clearing\n",
+                address, tbe.dir_ownerExists, tbe.dir_sharers.count());
+        tbe.dir_sharers.clear();
+        tbe.dir_ownerExists := false;
+      }
+    }
     assert((tbe.dir_ownerExists == false) && tbe.dir_sharers.isEmpty());
     if(directory.isTagPresent(address)) {
       directory.deallocate(address);

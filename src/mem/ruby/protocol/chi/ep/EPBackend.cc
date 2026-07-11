@@ -1011,6 +1011,18 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
     _lastRecallMsg = recallMsg;
     _recallReceivedCount++;
 
+    // Track active recall for self-snoop detection in EPRNFController.
+    // Store both local PA (matches SnpCleanInvalid msg->m_addr) and home PA.
+    {
+        uint64_t localPA = (recallMsg.ownerLocalPa != 0)
+                              ? recallMsg.ownerLocalPa
+                              : recallMsg.linePa;
+        _activeRecallPAs[localPA] = true;
+        _activeRecallPAs[recallMsg.linePa] = true;
+        printf("[RECALL-DIAG] node=%d active-recall-set linePA=0x%lx localPA=0x%lx\n",
+               _nodeId, recallMsg.linePa, localPA);
+    }
+
     // ---- M7: Update requester-side bookkeeping ----
     // Recall result split:
     //   - Read recall → old owner downgrades to shared (R_S)
@@ -1123,6 +1135,12 @@ EPBackend::sendRecallResponse(const OuterRecallResponse &response)
     _lastRecallResponse = response;
     _recallResponseSentCount++;
 
+    // NOTE: active recall tracking is NOT cleared here.
+    // The SnpCleanInvalid from the RECALL arrives AFTER sendRecallResponse
+    // (HN-F invalidates the old copy after granting to the new owner).
+    // The entry is cleared when the SnpCleanInvalid is handled in
+    // EPRNFController::handleSnpCleanInvalid via clearActiveRecall().
+
     // R2: Require both dataReturned AND hasDataPayload before installing to home memory.
     //
     // NOTE (multi-process split): getBackendInstance(homeNode) only finds the
@@ -1168,6 +1186,20 @@ EPBackend::sendRecallResponse(const OuterRecallResponse &response)
     }
 
     return ok;
+}
+
+bool
+EPBackend::hasActiveRecall(uint64_t pa) const
+{
+    return _activeRecallPAs.find(pa) != _activeRecallPAs.end();
+}
+
+void
+EPBackend::clearActiveRecall(uint64_t pa)
+{
+    _activeRecallPAs.erase(pa);
+    printf("[RECALL-DIAG] node=%d active-recall-clear PA=0x%lx\n",
+           _nodeId, pa);
 }
 
 // ---- M7: Writeback / Evict ----

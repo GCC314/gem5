@@ -426,6 +426,24 @@ class EPBackend : public SimObject
     void resetRecallReceivedCount() { _recallReceivedCount = 0; }
 
     /**
+     * Check if there is an active recall (between handleRecallRequest and
+     * sendRecallResponse) for a given physical address.
+     *
+     * Used by EPRNFController to distinguish RECALL-induced SnpCleanInvalid
+     * from genuine local upgrade SnpCleanInvalid (§§4.3.3, 5.5).
+     *
+     * @param pa  Physical address (local node view)
+     * @return    True if a recall is active for this PA
+     */
+    bool hasActiveRecall(uint64_t pa) const;
+
+    /**
+     * Clear active recall tracking for a PA after the associated
+     * SnpCleanInvalid has been handled (RECALL-SNOOP path).
+     */
+    void clearActiveRecall(uint64_t pa);
+
+    /**
      * F2: Set recall capture data from EPRNFController before callback fires.
      * Called by EPRNFController::finishChiTxn() to transfer data from
      * PendingChiTxn.recallDataBlk to EPBackend.
@@ -765,6 +783,12 @@ class EPBackend : public SimObject
     // ---- M6: Recall counters ----
     uint64_t _recallReceivedCount;
     uint64_t _recallResponseSentCount;
+
+    // Active recall PAs (local view).
+    // Inserted on handleRecallRequest, erased on sendRecallResponse.
+    // Used by EPRNFController::handleSnpCleanInvalid to detect RECALL-induced
+    // snoops and avoid spurious OuterUpgradeReq.
+    std::map<uint64_t, bool> _activeRecallPAs;
 
     // ---- M7: Writeback / Evict counters and envelopes ----
     uint64_t _writebackCount;
