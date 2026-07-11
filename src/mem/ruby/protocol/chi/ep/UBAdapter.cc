@@ -769,7 +769,8 @@ UBAdapter::sendRecallResp(uint64_t linePa, int ownerNode,
                            bool dataReturned, uint64_t epoch,
                            uint64_t reqId,
                            const DataBlock *dataBlk,
-                           int homeNode, int homeSocket)
+                           int homeNode, int homeSocket,
+                           bool dataForwarded)
 {
     DPRINTF(RubyEP,
             "UBAdapter node=%d socket=%d: sendRecallResp PA=0x%lx "
@@ -849,6 +850,15 @@ UBAdapter::sendInvalidateAck(uint64_t linePa, int ackNode,
     return transportSend(req);
 }
 
+// ---- C4: Direct data forward from owner to requester (bypasses home) ----
+
+bool
+UBAdapter::sendDirectData(const CoherenceMessage &msg)
+{
+    if (!_port) return false;
+    return transportSend(msg);
+}
+
 // ---- Cross-node Recall Request (EPBackend → EPBackend via router) ----
 
 void
@@ -874,7 +884,7 @@ UBAdapter::sendRecallReqToOwner(int targetNode,
     req.h.homeNode = recallMsg.homeNode;
     req.h.homeSocket = homeSocket;
     req.h.ingressSocket = homeSocket;
-    req.h.requesterNode = _nodeId;
+    req.h.requesterNode = recallMsg.requesterNode >= 0 ? recallMsg.requesterNode : _nodeId;  // C4: pass-through requester
     req.h.targetNode = targetNode;
     req.h.homeLinePa = recallMsg.linePa;
     req.h.localLinePa = recallMsg.ownerLocalPa;
@@ -1106,6 +1116,10 @@ UBAdapter::recvFromRouter(const CoherenceMessage &msg)
                 (msg.h.flags & static_cast<uint32_t>(CFLAG_IS_READ_RECALL)) != 0;
             recallMsg.dataNeeded =
                 (msg.h.flags & static_cast<uint32_t>(CFLAG_HAS_DATA)) != 0;
+
+            // C4: Extract direct-forward target from requesterNode header field
+            recallMsg.requesterNode = msg.h.requesterNode;
+            recallMsg.requesterSocket = 0;  // simplified for v1
 
             if (_backend) {
                 _backend->handleRecallRequest(recallMsg);

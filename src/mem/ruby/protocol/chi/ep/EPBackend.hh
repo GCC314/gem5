@@ -117,9 +117,12 @@ struct OuterRecallMsg {
     uint64_t reqId;          // v4: transaction ID
     bool isReadRequest;      // True if recall triggered by read (downgrade to shared)
     bool dataNeeded;         // True if dirty data must be returned
+    int requesterNode;       // C4: direct-forward target node (data goes here)
+    int requesterSocket;     // C4: direct-forward target socket
 
     OuterRecallMsg() : linePa(0), ownerLocalPa(0), ownerNode(-1), homeNode(-1),
-                       epoch(0), reqId(0), isReadRequest(false), dataNeeded(false) {}
+                       epoch(0), reqId(0), isReadRequest(false), dataNeeded(false),
+                       requesterNode(-1), requesterSocket(-1) {}
 };
 
 // Recall response sent from owner node's EPBackend back to home UBCC.
@@ -133,10 +136,13 @@ struct OuterRecallResponse {
     bool ackReceived;        // True if recall completed
     DataBlock dataPayload;   // F2: actual 64-byte cache line data from owner
     bool hasDataPayload;     // F2: true if dataPayload is valid
+    bool dataForwarded;      // C4: true if data was sent directly to requester
+    int  dataForwardedTo;    // C4: requester node that received direct data
 
     OuterRecallResponse() : linePa(0), ownerNode(-1), homeNode(-1),
                             epoch(0), reqId(0), dataReturned(false), ackReceived(false),
-                            dataPayload(64), hasDataPayload(false) {}
+                            dataPayload(64), hasDataPayload(false),
+                            dataForwarded(false), dataForwardedTo(-1) {}
 };
 
 // ---- M5 Phase 2: Outer Message Envelope ----

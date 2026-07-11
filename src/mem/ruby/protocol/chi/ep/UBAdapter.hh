@@ -122,10 +122,14 @@ class UBAdapter : public SimObject
                         bool dataReturned, uint64_t epoch,
                         uint64_t reqId,
                         const DataBlock *dataBlk,
-                        int homeNode, int homeSocket);
+                        int homeNode, int homeSocket,
+                        bool dataForwarded = false);
     bool sendInvalidateAck(uint64_t linePa, int ackNode,
                             uint64_t epoch, uint64_t reqId,
                             int homeNode, int homeSocket);
+
+    // C4: Direct data forward from owner to requester (bypasses home)
+    bool sendDirectData(const CoherenceMessage &msg);
 
     // ---- v4-dual-socket: new message types ----
     /**

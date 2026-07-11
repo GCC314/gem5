@@ -1085,6 +1085,40 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
                     resp.dataPayload = _recallCaptureDataBlock;
                     resp.hasDataPayload = true;
                 }
+                // C4: Direct-forward data to requester (requester ≠ owner ≠ home)
+                {
+                    bool canForward = (capturedMsg.requesterNode >= 0 &&
+                                       capturedMsg.requesterNode != capturedMsg.ownerNode &&
+                                       capturedMsg.requesterNode != capturedMsg.homeNode);
+                    if (canForward && resp.dataReturned && capturedMsg.requesterNode >= 0) {
+                        if (getUBAdapter(0)) {
+                            CoherenceMessage directData;
+                            directData.h.type = CoherenceMessageType::ReadResp;
+                            directData.h.srcNode = _nodeId;
+                            directData.h.srcSocket = 0;
+                            directData.h.dstNode = capturedMsg.requesterNode;
+                            directData.h.dstSocket = capturedMsg.requesterSocket;
+                            directData.h.homeNode = capturedMsg.homeNode;
+                            directData.h.homeSocket = 0;
+                            directData.h.homeLinePa = capturedMsg.linePa;
+                            directData.h.epoch = capturedMsg.epoch;
+                            // C4: reqId=0 so this ReadResp is NOT consumed
+                            // by the requester's synchronous sendReadReq poll.
+                            // The push-grant from home carries the full metadata.
+                            directData.h.reqId = 0;
+                            directData.h.flags = static_cast<uint32_t>(CFLAG_DATA_FORWARDED)
+                                               | static_cast<uint32_t>(CFLAG_HAS_DATA)
+                                               | static_cast<uint32_t>(CFLAG_DATA_RETURNED);
+                            memcpy(directData.b.readResp.grantData,
+                                   resp.dataPayload.getData(0, 64), 64);
+                            getUBAdapter(0)->sendDirectData(directData);
+                            resp.dataForwarded = true;
+                            resp.dataForwardedTo = capturedMsg.requesterNode;
+                            printf("[C4-FORWARD] RS node=%d forward data to requester=%d PA=0x%lx\n",
+                                   _nodeId, capturedMsg.requesterNode, capturedMsg.linePa);
+                        }
+                    }
+                }
                 sendRecallResponse(resp);
             });
     } else {
@@ -1110,6 +1144,39 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
                 if (resp.dataReturned) {
                     resp.dataPayload = _recallCaptureDataBlock;
                     resp.hasDataPayload = true;
+                }
+                // C4: Direct-forward data to requester (requester ≠ owner ≠ home)
+                {
+                    bool canForward = (capturedMsg.requesterNode >= 0 &&
+                                       capturedMsg.requesterNode != capturedMsg.ownerNode &&
+                                       capturedMsg.requesterNode != capturedMsg.homeNode);
+                    if (canForward && resp.dataReturned && capturedMsg.requesterNode >= 0) {
+                        if (getUBAdapter(0)) {
+                            CoherenceMessage directData;
+                            directData.h.type = CoherenceMessageType::ReadResp;
+                            directData.h.srcNode = _nodeId;
+                            directData.h.srcSocket = 0;
+                            directData.h.dstNode = capturedMsg.requesterNode;
+                            directData.h.dstSocket = capturedMsg.requesterSocket;
+                            directData.h.homeNode = capturedMsg.homeNode;
+                            directData.h.homeSocket = 0;
+                            directData.h.homeLinePa = capturedMsg.linePa;
+                            directData.h.epoch = capturedMsg.epoch;
+                            // C4: reqId=0 so this ReadResp is NOT consumed
+                            // by the requester's synchronous sendReadReq poll.
+                            directData.h.reqId = 0;
+                            directData.h.flags = static_cast<uint32_t>(CFLAG_DATA_FORWARDED)
+                                               | static_cast<uint32_t>(CFLAG_HAS_DATA)
+                                               | static_cast<uint32_t>(CFLAG_DATA_RETURNED);
+                            memcpy(directData.b.readResp.grantData,
+                                   resp.dataPayload.getData(0, 64), 64);
+                            getUBAdapter(0)->sendDirectData(directData);
+                            resp.dataForwarded = true;
+                            resp.dataForwardedTo = capturedMsg.requesterNode;
+                            printf("[C4-FORWARD] RU node=%d forward data to requester=%d PA=0x%lx\n",
+                                   _nodeId, capturedMsg.requesterNode, capturedMsg.linePa);
+                        }
+                    }
                 }
                 sendRecallResponse(resp);
             });
@@ -1151,6 +1218,8 @@ EPBackend::sendRecallResponse(const OuterRecallResponse &response)
     // recall data to the home is the IPC sendRecallResp() below, which the
     // home node's UBCC/UBAdapter applies. This in-process write is only a
     // same-process fast path / redundant shortcut.
+    // C4: Direct-forward sends extra copy to requester; home still needs the
+    // data via RecallResp for its _lineDataCache / grant construction.
     if (response.dataReturned && response.hasDataPayload) {
         EPBackend *homeBackend = EPBackend::getBackendInstance(response.homeNode);
         RubySystem *homeRuby = homeBackend ? homeBackend->getRubySystem() : nullptr;
