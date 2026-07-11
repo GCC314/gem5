@@ -117,9 +117,12 @@ struct OuterRecallMsg {
     uint64_t reqId;          // v4: transaction ID
     bool isReadRequest;      // True if recall triggered by read (downgrade to shared)
     bool dataNeeded;         // True if dirty data must be returned
+    int requesterNode;       // C4: direct-forward target node (data goes here)
+    int requesterSocket;     // C4: direct-forward target socket
 
     OuterRecallMsg() : linePa(0), ownerLocalPa(0), ownerNode(-1), homeNode(-1),
-                       epoch(0), reqId(0), isReadRequest(false), dataNeeded(false) {}
+                       epoch(0), reqId(0), isReadRequest(false), dataNeeded(false),
+                       requesterNode(-1), requesterSocket(-1) {}
 };
 
 // Recall response sent from owner node's EPBackend back to home UBCC.
@@ -133,10 +136,13 @@ struct OuterRecallResponse {
     bool ackReceived;        // True if recall completed
     DataBlock dataPayload;   // F2: actual 64-byte cache line data from owner
     bool hasDataPayload;     // F2: true if dataPayload is valid
+    bool dataForwarded;      // C4: true if data was sent directly to requester
+    int  dataForwardedTo;    // C4: requester node that received direct data
 
     OuterRecallResponse() : linePa(0), ownerNode(-1), homeNode(-1),
                             epoch(0), reqId(0), dataReturned(false), ackReceived(false),
-                            dataPayload(64), hasDataPayload(false) {}
+                            dataPayload(64), hasDataPayload(false),
+                            dataForwarded(false), dataForwardedTo(-1) {}
 };
 
 // ---- M5 Phase 2: Outer Message Envelope ----
@@ -424,6 +430,24 @@ class EPBackend : public SimObject
      */
     uint64_t getRecallReceivedCount() const { return _recallReceivedCount; }
     void resetRecallReceivedCount() { _recallReceivedCount = 0; }
+
+    /**
+     * Check if there is an active recall (between handleRecallRequest and
+     * sendRecallResponse) for a given physical address.
+     *
+     * Used by EPRNFController to distinguish RECALL-induced SnpCleanInvalid
+     * from genuine local upgrade SnpCleanInvalid (§§4.3.3, 5.5).
+     *
+     * @param pa  Physical address (local node view)
+     * @return    True if a recall is active for this PA
+     */
+    bool hasActiveRecall(uint64_t pa) const;
+
+    /**
+     * Clear active recall tracking for a PA after the associated
+     * SnpCleanInvalid has been handled (RECALL-SNOOP path).
+     */
+    void clearActiveRecall(uint64_t pa);
 
     /**
      * F2: Set recall capture data from EPRNFController before callback fires.
@@ -765,6 +789,12 @@ class EPBackend : public SimObject
     // ---- M6: Recall counters ----
     uint64_t _recallReceivedCount;
     uint64_t _recallResponseSentCount;
+
+    // Active recall PAs (local view).
+    // Inserted on handleRecallRequest, erased on sendRecallResponse.
+    // Used by EPRNFController::handleSnpCleanInvalid to detect RECALL-induced
+    // snoops and avoid spurious OuterUpgradeReq.
+    std::map<uint64_t, bool> _activeRecallPAs;
 
     // ---- M7: Writeback / Evict counters and envelopes ----
     uint64_t _writebackCount;
