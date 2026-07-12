@@ -1170,7 +1170,7 @@ UBAdapter::recvFromRouter(const CoherenceMessage &msg)
                         resp.h.homeLinePa = pagePa;
                         resp.b.metaRNF.pagePa = pagePa;
                         memcpy(resp.b.metaRNF.data, state->buf, 256);
-                        MemMessage *buf = tport->allocateSendBuffer(0);
+                        framework::MemMessage *buf = tport->allocateSendBuffer(0);
                         if (buf) { buf->setPayload(resp); tport->send(buf); }
                         delete state;
                     }
