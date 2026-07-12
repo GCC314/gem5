@@ -431,7 +431,7 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
 
         # Q3: Extend deadlock threshold to accommodate UBCC retry delays
         for seq in cpu_sequencers:
-            seq.deadlock_threshold = 200000000
+            seq.deadlock_threshold = 2000000000
 
         # Q2 Fix B: Set L1/L2 addr_ranges to include DSM PA ranges so
         # functionalRead() in populateGrantData() can find cached data
