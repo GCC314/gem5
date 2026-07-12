@@ -430,8 +430,9 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
             cpu_sequencers.extend(cluster.getSequencers())
 
         # Q3: Extend deadlock threshold to accommodate UBCC retry delays
+        # TC98 fix: Increase from 2G to 10G for hot-contention scenarios (16-core race)
         for seq in cpu_sequencers:
-            seq.deadlock_threshold = 2000000000
+            seq.deadlock_threshold = 10000000000
 
         # Q2 Fix B: Set L1/L2 addr_ranges to include DSM PA ranges so
         # functionalRead() in populateGrantData() can find cached data

@@ -1160,15 +1160,15 @@ UBAdapter::recvFromRouter(const CoherenceMessage &msg)
             auto *state = new MRState{0, {}};
             for (int i = 0; i < 4; i++) {
                 uint64_t blockPa = pagePa + i * 64;
-                metaRNF->issueRead(blockPa, [tport, reqId, state, i](bool ok, const DataBlock &db) {
-                    if (ok) memcpy(&state->buf[i*64], db.getData(0, 64), 64);
+                metaRNF->issueRead(blockPa, [tport, reqId, state, i, pagePa](bool ok, const MetaRNFController::MetaLine &db) {
+                    if (ok) memcpy(&state->buf[i*64], db.data(), 64);
                     if (++state->done == 4) {
                         CoherenceMessage resp;
                         resp.h.type = CoherenceMessageType::MetaRNFReadResp;
                         resp.h.srcNode = 0; resp.h.dstNode = 0;
                         resp.h.reqId = reqId;
-                        resp.h.homeLinePa = 0;
-                        resp.b.metaRNF.pagePa = 0;
+                        resp.h.homeLinePa = pagePa;
+                        resp.b.metaRNF.pagePa = pagePa;
                         memcpy(resp.b.metaRNF.data, state->buf, 256);
                         MemMessage *buf = tport->allocateSendBuffer(0);
                         if (buf) { buf->setPayload(resp); tport->send(buf); }
@@ -1182,8 +1182,11 @@ UBAdapter::recvFromRouter(const CoherenceMessage &msg)
             uint64_t pagePa = msg.h.homeLinePa;
             auto *metaRNF = MetaRNFController::getInstance(_nodeId, _socketId);
             if (!metaRNF) break;
-            for (int i = 0; i < 4; i++)
-                metaRNF->issueWrite(pagePa + i * 64, &msg.b.metaRNF.data[i * 64]);
+            for (int i = 0; i < 4; i++) {
+                MetaRNFController::MetaLine ml;
+                memcpy(ml.data(), &msg.b.metaRNF.data[i * 64], 64);
+                metaRNF->issueWrite(pagePa + i * 64, ml, nullptr);
+            }
             break;
         }
 
