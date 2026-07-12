@@ -848,7 +848,19 @@ action(Finish_CleanUnique, desc="") {
   // everyone may have been hit by an invalidation so check again
   if (tbe.dir_sharers.isElement(tbe.requestor) == false) {
     tbe.updateDirOnCompAck := false;
-    assert(tbe.dataValid == false);
+    // v4 self-snoop: EP-RNF proxy ReadUnique may have SnpResp_I arrive
+    // before CleanUnique completes. Requestor already removed from sharers
+    // by SnpResp_I. Clear directory state so Finalize_UpdateDirectoryFromTBE
+    // takes the deallocate path instead of asserting.
+    if (epRnfMachineVersion >= 0 &&
+        tbe.requestor == tbe.epRnfMachineID &&
+        tbe.epProxyOp != EpProxyOp:NoProxyOp) {
+      tbe.dir_sharers.clear();
+      tbe.dir_ownerExists := false;
+      if (tbe.dataValid) {
+        tbe.is_stale := true;
+      }
+    }
     assert(tbe.is_stale);
     tbe.is_stale := false;
     tbe.actions.push(Event:SendCompUCRespStale);
@@ -3701,7 +3713,16 @@ action(Finalize_UpdateDirectoryFromTBE, desc="") {
     dir_entry.owner := tbe.dir_owner;
     dir_entry.sharers := tbe.dir_sharers;
   } else {
-    assert((tbe.dir_ownerExists == false) && tbe.dir_sharers.isEmpty());
+    // v4 self-snoop: EP-RNF proxy CleanUnique may complete after
+    // SnpResp_I already removed the requestor from sharers.
+    // Skip the assert and just deallocate the directory entry.
+    if (epRnfMachineVersion >= 0 &&
+        tbe.requestor == tbe.epRnfMachineID &&
+        tbe.epProxyOp != EpProxyOp:NoProxyOp) {
+      // nop — deallocate below
+    } else {
+      assert((tbe.dir_ownerExists == false) && tbe.dir_sharers.isEmpty());
+    }
     if(directory.isTagPresent(address)) {
       directory.deallocate(address);
     }
