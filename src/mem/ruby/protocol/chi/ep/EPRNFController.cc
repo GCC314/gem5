@@ -1081,6 +1081,14 @@ EPRNFController::retryPendingCompAcks()
             continue;
         }
 
+        // Guard: hnfDest may be uninitialized (MachineType_NUM) for
+        // CleanUnique transactions started with needsCompAck=true before
+        // Comp_UC arrives to set hnfDest=msg->m_responder.
+        if (it->second.hnfDest.type == MachineType_NUM) {
+            ++it;
+            continue;
+        }
+
         // Try to send pending CompAck
         NetDest destNet(m_ruby_system);
         destNet.add(it->second.hnfDest);
@@ -1256,7 +1264,7 @@ EPRNFController::startCleanUnique(uint64_t linePa,
     // CleanUnique returns Comp_UC (completion token only, no data beats)
     txn.beatsExpected = 0;
     txn.beatsReceived = 0;
-    txn.needsCompAck = true;  // F6: must send CompAck to unblock HN-F WaitCompAck
+    txn.needsCompAck = false;  // hnfDest not yet known; set to true after Comp_UC sets hnfDest
     txn.recallDataValid = false;
     txn.outerTxnPending = false;
     txn.readUniqueDataComplete = false;
