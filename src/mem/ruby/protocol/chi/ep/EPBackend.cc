@@ -743,12 +743,16 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
     // Handle grant result and update bookkeeping
     OuterGrantType result = handleGrant(line_pa, grant, homeNode);
 
-    if (dataSource == GrantDataSource::RecallBuffer) {
-        setRecallCaptureData(routedGrantData, routedGrantDataValid);
+    // In split-mode all grant data arrives via ReadResp payload from ubio.
+    // Use payload whenever available; only fall back to zero-fill (NoData)
+    // for truly uninitialised DSM lines (first access, no prior write).
+    if (routedGrantDataValid) {
+        setRecallCaptureData(routedGrantData, true);
+        populateGrantData(homePa, GrantDataSource::RecallBuffer);
+    } else {
+        // No payload — uninitialised line, zero-fill is correct
+        populateGrantData(homePa, GrantDataSource::NoData);
     }
-
-    // v4: Populate grant data using formal F3 data source
-    populateGrantData(homePa, dataSource);
 
     int clearRet = sendClear(homePa, homeNode, grantEnv.epoch, grantEnv.reqId);
     if (clearRet == -2) return -2;
@@ -1285,12 +1289,13 @@ EPBackend::handleHomeWritebackComplete(uint64_t homePa)
 }
 
 int
-EPBackend::handleWriteback(uint64_t line_pa, bool keepAsClean)
+EPBackend::handleWriteback(uint64_t line_pa, bool keepAsClean,
+                           const uint8_t *dirtyData)
 {
     DPRINTF(RubyEP,
             "EPBackend node_id=%d: handleWriteback PA=0x%lx "
-            "keepAsClean=%d\n",
-            _nodeId, line_pa, keepAsClean);
+            "keepAsClean=%d hasData=%d\n",
+            _nodeId, line_pa, keepAsClean, dirtyData != nullptr);
 
     // Validate DSM address (Q2: accept cross-node PAs)
     if (!isDsmAddrCrossNode(line_pa)) {
@@ -1362,7 +1367,8 @@ EPBackend::handleWriteback(uint64_t line_pa, bool keepAsClean)
               _nodeId, line_pa, homeNode);
     }
     int wbRet = getUBAdapter(0)->sendWritebackReq(
-        homePa, requesterNode, epochVal, keepAsClean, homeNode, homeSocket);
+        homePa, requesterNode, epochVal, keepAsClean, homeNode, homeSocket,
+        dirtyData);
     bool wbPending = (wbRet == -2);
     bool ok = (wbRet > 0);
     if (wbPending) {

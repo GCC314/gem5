@@ -63,10 +63,11 @@ SyncWaitManager::barrierArrive(ThreadContext *tc, uint32_t mask,
         // callbacks, each with its own barrierBit. Workloads using per-node
         // masks (e.g. 0b111) in dual-socket mode need their masks enlarged
         // to account for per-socket senders (see per-TC audit in tests/).
+        uint32_t gen = bs.generation;  // TC90 fix: tag with current generation
         for (int s = 0; s < _numSockets; s++) {
             if (_sockActive[s] && _sockets[s].sendFn) {
                 _sockets[s].sendFn(mask,
-                    static_cast<uint32_t>(_sockets[s].barrierBit));
+                    static_cast<uint32_t>(_sockets[s].barrierBit), gen);
             }
         }
         if (!bs.remoteReleased) {
@@ -78,6 +79,7 @@ SyncWaitManager::barrierArrive(ThreadContext *tc, uint32_t mask,
             bs.activeThreads = 0;
             bs.remoteReleased = false;
             bs.crossNode = false;
+            bs.generation++;  // TC90 fix: advance generation for next barrier
         }
         return 0;
     }
@@ -110,6 +112,7 @@ SyncWaitManager::releaseBarrier(uint32_t mask)
         bs.activeThreads = 0;
         bs.remoteReleased = false;
         bs.crossNode = false;
+        bs.generation++;  // TC90 fix: advance generation for next barrier
     } else {
         bs.remoteReleased = true;
     }

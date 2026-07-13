@@ -528,13 +528,17 @@ EPSNFController::recvDataMsg(const CHIDataMsg *msg)
             // Notify UBCC that home data has been written to DRAM,
             // releasing directory ownership.
             if (_backend && _backend->isDsmAddr(writePa)) {
-                int wbRet = _backend->handleWriteback(writePa, false);
+                // Pass dirty data so ubio can persist to DsmDataStore
+                int wbRet = _backend->handleWriteback(writePa, false, buf);
                 if (wbRet == -2) {
                     std::fprintf(stderr,
                                  "[EPSNF-WB-PENDING] node=%d pa=0x%lx\n",
                                  _nodeId, writePa);
                     // Queue for retry in wakeup
-                    _pendingWritebacks.push_back({writePa, false});
+                    PendingWriteback pwb; pwb.linePa = writePa;
+                    pwb.keepAsClean = false; pwb.hasData = true;
+                    std::memcpy(pwb.data, buf, 64);
+                    _pendingWritebacks.push_back(pwb);
                 }
             }
 
@@ -573,7 +577,8 @@ EPSNFController::processPendingWritebacks()
 {
     if (_pendingWritebacks.empty()) return;
     for (auto it = _pendingWritebacks.begin(); it != _pendingWritebacks.end(); ) {
-        int wbRet = _backend->handleWriteback(it->linePa, it->keepAsClean);
+        int wbRet = _backend->handleWriteback(it->linePa, it->keepAsClean,
+                                               it->hasData ? it->data : nullptr);
         if (wbRet != -2) {
             // Writeback completed (or error) — remove from queue
             it = _pendingWritebacks.erase(it);

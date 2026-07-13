@@ -482,9 +482,11 @@ class EPBackend : public SimObject
      *
      * @param line_pa     Physical address (requester's view)
      * @param keepAsClean True if owner wants to keep clean exclusive copy
+     * @param dirtyData   64-byte dirty cacheline data (nullptr if unavailable)
      * @return            True if writeback was accepted by home
      */
-    int handleWriteback(uint64_t line_pa, bool keepAsClean);
+    int handleWriteback(uint64_t line_pa, bool keepAsClean,
+                        const uint8_t *dirtyData = nullptr);
 
     /**
      * Called by EPSNFController when HN-F completes a WriteNoSnp write

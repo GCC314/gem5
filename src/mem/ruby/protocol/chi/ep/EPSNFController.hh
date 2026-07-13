@@ -79,6 +79,8 @@ class EPSNFController : public EPController
     struct PendingWriteback {
         uint64_t linePa;
         bool keepAsClean;
+        uint8_t data[64];
+        bool hasData;
     };
     std::deque<PendingWriteback> _pendingWritebacks;
     void processPendingWritebacks();

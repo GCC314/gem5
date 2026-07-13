@@ -17,7 +17,8 @@ class SyncWaitManager
   public:
     static constexpr uint32_t MAX_NODE_COUNT = 16;
     static constexpr uint32_t MAX_SOCKETS = 2;
-    using BarrierSendFn = std::function<void(uint32_t mask, uint32_t srcBit)>;
+    using BarrierSendFn = std::function<void(uint32_t mask, uint32_t srcBit,
+                                            uint32_t seq)>;
 
   private:
     struct BarrierState
@@ -26,6 +27,8 @@ class SyncWaitManager
         std::set<ThreadContext *> waiting;
         bool crossNode = false;
         bool remoteReleased = false;
+        uint32_t generation = 0;  // TC90 fix: distinguishes successive barriers
+                                  // sharing the same mask
     };
 
     struct SocketReg {

@@ -88,7 +88,8 @@ class UBAdapter : public SimObject
     // ---- Phase 3: EPBackend→UBCC synchronous paths ----
     int sendWritebackReq(uint64_t homePa, int requesterNode,
                          uint64_t epochVal, bool keepAsClean,
-                         int homeNode, int homeSocket);
+                         int homeNode, int homeSocket,
+                         const uint8_t *dirtyData = nullptr);
 
     int sendEvictReq(uint64_t homePa, int evictingNode,
                      uint64_t epochVal, int homeNode, int homeSocket);
@@ -185,8 +186,8 @@ class UBAdapter : public SimObject
     bool transportSend(const CoherenceMessage &msg);
 
     /** Multi-process split: send a BarrierReached CoherenceMessage (PAYLOAD)
-     *  to ubio via Port. */
-    void sendBarrierReached(uint32_t mask, uint32_t nodeId);
+     *  to ubio via Port.  @p seq is the barrier generation (TC90 fix). */
+    void sendBarrierReached(uint32_t mask, uint32_t nodeId, uint32_t seq);
 
     /** Poll injected framework::Port and dispatch to recvFromRouter(). */
     bool transportRecv(CoherenceMessageType expectedType, uint64_t expectedReqId);

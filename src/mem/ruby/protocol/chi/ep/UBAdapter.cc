@@ -114,8 +114,8 @@ UBAdapter::init()
                     System *sys = System::systemList[0];
                     sys->syncWait.registerSocket(_socketId, barrierBit);
                     sys->syncWait.registerSocketFn(_socketId,
-                        [this](uint32_t mask, uint32_t srcBit) {
-                            sendBarrierReached(mask, srcBit);
+                        [this](uint32_t mask, uint32_t srcBit, uint32_t seq) {
+                            sendBarrierReached(mask, srcBit, seq);
                         });
                     std::fprintf(stderr,
                         "[UBADAPTER-BARRIER] node=%d socket=%d registered IPC barrier "
@@ -128,14 +128,14 @@ UBAdapter::init()
 }
 
 void
-UBAdapter::sendBarrierReached(uint32_t mask, uint32_t nodeId)
+UBAdapter::sendBarrierReached(uint32_t mask, uint32_t nodeId, uint32_t seq)
 {
     if (!_port) return;
     framework::MemMessage *buf = _port->allocateSendBuffer(curTick());
     if (!buf) {
         std::fprintf(stderr,
             "[UBADAPTER-BARRIER] node=%d sendBarrierReached FAILED (no tx buf) "
-            "mask=0x%x\n", _nodeId, mask);
+            "mask=0x%x seq=%u\n", _nodeId, mask, seq);
         return;
     }
     // Barrier is carried as a PAYLOAD CoherenceMessage (BarrierReached); the
@@ -148,17 +148,18 @@ UBAdapter::sendBarrierReached(uint32_t mask, uint32_t nodeId)
     bmsg.h.type = CoherenceMessageType::BarrierReached;
     bmsg.h.srcNode = static_cast<uint16_t>(nodeId);
     bmsg.b.barrier.mask = mask;
+    bmsg.b.barrier.seq = seq;   // TC90 fix: barrier generation
     if (!buf->setPayload(bmsg)) {
         delete buf;
         std::fprintf(stderr,
             "[UBADAPTER-BARRIER] node=%d sendBarrierReached setPayload failed "
-            "mask=0x%x\n", _nodeId, mask);
+            "mask=0x%x seq=%u\n", _nodeId, mask, seq);
         return;
     }
     bool ok = _port->send(buf);
     std::fprintf(stderr,
-        "[UBADAPTER-BARRIER-SEND] node=%d mask=0x%x ok=%d\n",
-        _nodeId, mask, ok);
+        "[UBADAPTER-BARRIER-SEND] node=%d mask=0x%x seq=%u ok=%d\n",
+        _nodeId, mask, seq, ok);
 }
 
 void
@@ -340,17 +341,11 @@ UBAdapter::sendReadReq(
             if (outPendingInvMask) *outPendingInvMask = resp.b.readResp.pendingInvMask;
             if (outCommittedEpoch) *outCommittedEpoch = resp.b.readResp.committedEpoch;
             if (outGrantData && outGrantDataValid) {
-                // Grant data is valid for Modified grants (dirty fill) AND
-                // whenever the home sourced the data from a recall buffer (the
-                // previous owner's dirty line). A remote ReadShared whose home
-                // just recalled the owner must still receive that recalled dirty
-                // data — gating only on GlobalGrantModified dropped it, so the
-                // requester read zeros. (See dataSource==RecallBuffer.)
+                // In split-mode, gem5 local physMem has no valid DSM data.
+                // All grant data comes from ubio via ReadResp payload.
+                // Accept payload whenever CFLAG_HAS_DATA is set.
                 *outGrantDataValid =
-                     (resp.b.readResp.grantType ==
-                         static_cast<int>(OuterGrantType::GlobalGrantModified)) ||
-                    (resp.b.readResp.dataSource ==
-                         static_cast<int>(GrantDataSource::RecallBuffer));
+                    (resp.h.flags & static_cast<uint32_t>(CFLAG_HAS_DATA)) != 0;
                 if (*outGrantDataValid) memcpy(outGrantData->getDataMod(0), resp.b.readResp.grantData, 64);
             }
             _inflightReadReqs.erase(reqId);
@@ -386,7 +381,8 @@ UBAdapter::sendReadReq(
 int
 UBAdapter::sendWritebackReq(uint64_t homePa, int requesterNode,
                              uint64_t epochVal, bool keepAsClean,
-                             int homeNode, int homeSocket)
+                             int homeNode, int homeSocket,
+                             const uint8_t *dirtyData)
 {
     if (!_port) {
         fatal("UBAdapter node=%d socket=%d: sendWritebackReq called with no transport bound\n",
@@ -411,6 +407,11 @@ UBAdapter::sendWritebackReq(uint64_t homePa, int requesterNode,
     req.h.readyTick = curTick();
     if (keepAsClean)
         req.h.flags |= static_cast<uint32_t>(CFLAG_KEEP_AS_CLEAN);
+    // Carry dirty cacheline data so ubio can persist to DsmDataStore
+    if (dirtyData) {
+        req.b.writebackReq.hasData = true;
+        std::memcpy(req.b.writebackReq.data, dirtyData, 64);
+    }
 
     _lastResponseValid = false;
     if (!transportSend(req)) {
@@ -1235,7 +1236,8 @@ UBAdapter::wakeup()
             if (bc->h.type == CoherenceMessageType::BarrierRelease) {
                 uint32_t mask = bc->b.barrier.mask;
                 std::fprintf(stderr,
-                    "[UBADAPTER-BARRIER-RELEASE] node=%d mask=0x%x\n", _nodeId, mask);
+                    "[UBADAPTER-BARRIER-RELEASE] node=%d mask=0x%x seq=%u\n",
+                    _nodeId, mask, bc->b.barrier.seq);
                 if (!System::systemList.empty())
                     System::systemList[0]->syncWait.releaseBarrier(mask);
                 m = _port->recv(curTick(), &st);
@@ -1319,6 +1321,10 @@ UBAdapter::wakeup()
                     // Peek for barrier control (now a PAYLOAD CoherenceMessage).
                     const CoherenceMessage *bc = wm->getPayload<CoherenceMessage>();
                     if (bc && bc->h.type == CoherenceMessageType::BarrierRelease) {
+                        std::fprintf(stderr,
+                            "[UBADAPTER-BARRIER-RELEASE] node=%d mask=0x%x "
+                            "seq=%u (busy-wait)\n",
+                            _nodeId, bc->b.barrier.mask, bc->b.barrier.seq);
                         if (!System::systemList.empty())
                             System::systemList[0]->syncWait.releaseBarrier(
                                 bc->b.barrier.mask);
@@ -1341,9 +1347,12 @@ UBAdapter::wakeup()
     // to the pending timestamp so the message can be delivered next wakeup.
     // This is critical for BARRIER_RELEASE from ubio: without it the release
     // stays in Port recv's _pending queue forever and the barrier never fires.
+    // TC90 fix: removed the impossible `pendingT < nextT` condition (nextT ==
+    // curT when stalled, so pendingT > curT && pendingT < curT was always
+    // false, making this block dead code).
     if (stalled) {
         uint64_t pendingT = _port->receiveTimestamp();
-        if (pendingT > curT && pendingT < nextT &&
+        if (pendingT > curT &&
             pendingT != ~static_cast<uint64_t>(0))
             nextT = pendingT;
     }
