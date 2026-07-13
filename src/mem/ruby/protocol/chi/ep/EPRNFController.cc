@@ -944,6 +944,7 @@ EPRNFController::finishChiTxn(uint64_t linePa, bool success)
 
     auto cb = txnIt->second.onComplete;
     bool hadQueuedSnoop = txnIt->second.snoopSlotValid;
+    bool isReadSharedRecall = (txnIt->second.op == PendingChiOp::ReadShared);
 
     // F2: Transfer recall capture data to EPBackend before erasing txn,
     // so that the callback (which runs after erase) can access it.
@@ -969,6 +970,13 @@ EPRNFController::finishChiTxn(uint64_t linePa, bool success)
     // §4.3.3: Queued snoop has higher priority than deferred CHI requests
     if (hadQueuedSnoop) {
         processQueuedSnoop(linePa);
+    }
+
+    // ReadShared RECALL does not trigger SnpCleanInvalid from HN-F,
+    // so _activeRecallPAs must be cleared here after queued snoops are
+    // drained, to avoid blocking subsequent upgrades (TC3/TC8 regression).
+    if (isReadSharedRecall && _backend) {
+        _backend->clearActiveRecall(linePa);
     }
 
     // Process retry queue entries (outbound CHI requests with strongest-op)
