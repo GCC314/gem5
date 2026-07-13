@@ -41,6 +41,11 @@ SyncWaitManager::barrierArrive(ThreadContext *tc, uint32_t mask,
     if (bs.activeThreads == 0)
         bs.activeThreads = __builtin_popcount(mask) * activeThreads;
 
+    // Local-node expected thread count for this barrier generation. This is
+    // the per-node thread count (`activeThreads` arg), NOT the global total.
+    if (bs.localExpected == 0)
+        bs.localExpected = (activeThreads == 0) ? 1 : activeThreads;
+
     if (bs.waiting.find(tc) != bs.waiting.end())
         return 0;
 
@@ -59,28 +64,42 @@ SyncWaitManager::barrierArrive(ThreadContext *tc, uint32_t mask,
     bs.waiting.insert(tc);
 
     if (bs.crossNode && _numSockets > 0) {
-        // Per-socket split mode: fire ALL registered sockets' BarrierReached
-        // callbacks, each with its own barrierBit. Workloads using per-node
-        // masks (e.g. 0b111) in dual-socket mode need their masks enlarged
-        // to account for per-socket senders (see per-TC audit in tests/).
-        uint32_t gen = bs.generation;  // TC90 fix: tag with current generation
-        for (int s = 0; s < _numSockets; s++) {
-            if (_sockActive[s] && _sockets[s].sendFn) {
-                _sockets[s].sendFn(mask,
-                    static_cast<uint32_t>(_sockets[s].barrierBit), gen);
-            }
-        }
-        if (!bs.remoteReleased) {
-            tc->suspend();
-        } else {
+        // Per-node/per-socket barrier semantics (TC80/82/91/98 fix):
+        // BarrierReached must be sent exactly ONCE per (node,socket) plane,
+        // and only AFTER all local participating threads have arrived. The
+        // ubio barrier coordinator aggregates by node/socket bit; firing
+        // per-thread let a node's first arriving thread complete the global
+        // barrier before its siblings arrived, desynchronizing `generation`.
+        //
+        // If a remote release already arrived for this generation, release
+        // immediately (the local threads were the stragglers).
+        if (bs.remoteReleased) {
             for (ThreadContext *t : bs.waiting)
                 t->activate();
             bs.waiting.clear();
             bs.activeThreads = 0;
+            bs.localExpected = 0;
             bs.remoteReleased = false;
+            bs.reachedSent = false;
             bs.crossNode = false;
-            bs.generation++;  // TC90 fix: advance generation for next barrier
+            bs.generation++;  // advance generation for next barrier
+            return 0;
         }
+
+        // Only fire BarrierReached once all local threads have arrived, and
+        // only once per generation.
+        if (!bs.reachedSent && bs.waiting.size() >= bs.localExpected) {
+            bs.reachedSent = true;
+            uint32_t gen = bs.generation;  // tag with current generation
+            for (int s = 0; s < _numSockets; s++) {
+                if (_sockActive[s] && _sockets[s].sendFn) {
+                    _sockets[s].sendFn(mask,
+                        static_cast<uint32_t>(_sockets[s].barrierBit), gen);
+                }
+            }
+        }
+
+        tc->suspend();
         return 0;
     }
 
@@ -98,22 +117,35 @@ SyncWaitManager::barrierArrive(ThreadContext *tc, uint32_t mask,
 }
 
 void
-SyncWaitManager::releaseBarrier(uint32_t mask)
+SyncWaitManager::releaseBarrier(uint32_t mask, uint32_t seq)
 {
     auto it = _barriers.find(mask);
     if (it == _barriers.end())
         return;
 
     auto &bs = it->second;
-    if (bs.crossNode) {
+
+    // Ignore stale releases: a release whose generation does not match the
+    // barrier's current generation belongs to an already-completed barrier
+    // and must not release the next one that reuses this mask. `seq` values
+    // strictly below the current generation are stale; a `seq` equal to the
+    // current generation is the release we are waiting for.
+    if (seq < bs.generation)
+        return;
+
+    if (bs.crossNode || !bs.waiting.empty()) {
         for (ThreadContext *t : bs.waiting)
             t->activate();
         bs.waiting.clear();
         bs.activeThreads = 0;
+        bs.localExpected = 0;
         bs.remoteReleased = false;
+        bs.reachedSent = false;
         bs.crossNode = false;
-        bs.generation++;  // TC90 fix: advance generation for next barrier
+        bs.generation++;  // advance generation for next barrier
     } else {
+        // Release arrived before any local thread reached this barrier
+        // generation. Record it so the next barrierArrive() releases at once.
         bs.remoteReleased = true;
     }
 }

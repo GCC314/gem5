@@ -1239,7 +1239,8 @@ UBAdapter::wakeup()
                     "[UBADAPTER-BARRIER-RELEASE] node=%d mask=0x%x seq=%u\n",
                     _nodeId, mask, bc->b.barrier.seq);
                 if (!System::systemList.empty())
-                    System::systemList[0]->syncWait.releaseBarrier(mask);
+                    System::systemList[0]->syncWait.releaseBarrier(
+                        mask, bc->b.barrier.seq);
                 m = _port->recv(curTick(), &st);
                 continue;
             }
@@ -1327,7 +1328,7 @@ UBAdapter::wakeup()
                             _nodeId, bc->b.barrier.mask, bc->b.barrier.seq);
                         if (!System::systemList.empty())
                             System::systemList[0]->syncWait.releaseBarrier(
-                                bc->b.barrier.mask);
+                                bc->b.barrier.mask, bc->b.barrier.seq);
                     } else {
                         handleResponse(wm);
                     }

@@ -944,7 +944,17 @@ EPRNFController::finishChiTxn(uint64_t linePa, bool success)
 
     auto cb = txnIt->second.onComplete;
     bool hadQueuedSnoop = txnIt->second.snoopSlotValid;
-    bool isReadSharedRecall = (txnIt->second.op == PendingChiOp::ReadShared);
+    // TC42 fix: clear the per-PA active-recall marker on completion of ANY
+    // recall transaction (ReadShared or ReadUnique). The marker exists only to
+    // let the RECALL-induced SnpCleanInvalid (if any) short-circuit to
+    // SnpResp_I. Previously only ReadShared recalls cleared it here; a
+    // ReadUnique recall left the marker stale (its "paired" SnpCleanInvalid
+    // never arrives on this path), so a later genuine store-upgrade
+    // CleanUnique on the same line was mis-detected as recall-induced and
+    // silently completed without OuterUpgradeReq — the home UBCC directory
+    // was never upgraded, producing a stale cross-node read (TC42 v3 vs v4).
+    bool isRecallTxn = (txnIt->second.op == PendingChiOp::ReadShared ||
+                        txnIt->second.op == PendingChiOp::ReadUnique);
 
     // F2: Transfer recall capture data to EPBackend before erasing txn,
     // so that the callback (which runs after erase) can access it.
@@ -972,10 +982,12 @@ EPRNFController::finishChiTxn(uint64_t linePa, bool success)
         processQueuedSnoop(linePa);
     }
 
-    // ReadShared RECALL does not trigger SnpCleanInvalid from HN-F,
-    // so _activeRecallPAs must be cleared here after queued snoops are
-    // drained, to avoid blocking subsequent upgrades (TC3/TC8 regression).
-    if (isReadSharedRecall && _backend) {
+    // Clear the active-recall marker once the recall txn completes and any
+    // queued RECALL-induced snoop has been drained (processQueuedSnoop above).
+    // Leaving it set past this point would block/mis-route a subsequent
+    // genuine store-upgrade CleanUnique on the same line
+    // (TC3/TC8/TC42 regression).
+    if (isRecallTxn && _backend) {
         _backend->clearActiveRecall(linePa);
     }
 

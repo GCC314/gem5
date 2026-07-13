@@ -29,6 +29,20 @@ class SyncWaitManager
         bool remoteReleased = false;
         uint32_t generation = 0;  // TC90 fix: distinguishes successive barriers
                                   // sharing the same mask
+
+        // Local-node expected thread count for this barrier (= active_threads
+        // arg from sync_wait). In cross-node mode BarrierReached must be sent
+        // exactly ONCE per (node,socket) plane — only after all localExpected
+        // threads have arrived locally. Sending per-thread (the old behavior)
+        // let a node's FIRST arriving thread satisfy the ubio per-node
+        // aggregation, releasing the barrier before the node's other threads
+        // arrived, desynchronizing `generation` across barriers and
+        // deadlocking later barriers (TC80/82/91/98).
+        uint32_t localExpected = 0;
+
+        // True once this node/socket plane has fired BarrierReached for the
+        // current generation, so later local threads don't re-send.
+        bool reachedSent = false;
     };
 
     struct SocketReg {
@@ -60,7 +74,11 @@ class SyncWaitManager
 
     int barrierArrive(ThreadContext *tc, uint32_t mask, uint32_t activeThreads);
 
-    void releaseBarrier(uint32_t mask);
+    // seq: the barrier generation carried by the incoming BarrierRelease.
+    // A release is honored only if it matches the current generation, so a
+    // stale release for an already-completed generation cannot spuriously
+    // release the next barrier that reuses the same mask.
+    void releaseBarrier(uint32_t mask, uint32_t seq);
 };
 
 } // namespace gem5

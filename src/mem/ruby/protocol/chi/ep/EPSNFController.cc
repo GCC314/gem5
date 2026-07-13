@@ -216,6 +216,10 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
     int neededPerm = msg->m_ubcc_needed_perm;  // 0=Shared, 1=Unique
     bool writeIntent = msg->m_ubcc_write_intent;
 
+    std::fprintf(stderr,
+        "[EP-SNF-DEBUG] node=%d type=%d addr=0x%lx neededPerm=%d writeIntent=%d\n",
+        _nodeId, (int)msg->m_type, msg->m_addr, neededPerm, (int)writeIntent);
+
     DPRINTF(RubyCHIGeneric,
             "EP_SNF node_id=%d: sideband neededPerm=%d writeIntent=%d\n",
             _nodeId, neededPerm, writeIntent);
