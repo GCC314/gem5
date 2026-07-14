@@ -808,6 +808,23 @@ EPBackend::handleGrant(uint64_t line_pa, OuterGrantType grant, int homeNode)
                   _nodeId, static_cast<int>(grant));
     }
 
+    // X-fix: clear stale active-recall markers when this requester line is
+    // re-acquired (R_S/R_E/R_M). This preserves RECALL-SNOOP protection for
+    // the immediate recall-induced SnpCleanInvalid (which arrives before any
+    // explicit re-fetch), while preventing old recall markers from poisoning a
+    // later genuine local upgrade on the same line (TC42 pattern).
+    clearActiveRecall(line_pa);
+    if (homeNode >= 0) {
+        int homeSocket = _addrMap.homeSocket(_nodeId, line_pa);
+        if (homeSocket < 0) homeSocket = 0;
+        uint64_t offset = _addrMap.dsmOffset(line_pa);
+        uint64_t homePa = _addrMap.buildDsmPA(homeNode, homeNode,
+                                              offset, homeSocket);
+        if (homePa != line_pa) {
+            clearActiveRecall(homePa);
+        }
+    }
+
     return grant;
 }
 
@@ -1270,9 +1287,11 @@ EPBackend::hasActiveRecall(uint64_t pa) const
 void
 EPBackend::clearActiveRecall(uint64_t pa)
 {
-    _activeRecallPAs.erase(pa);
-    printf("[RECALL-DIAG] node=%d active-recall-clear PA=0x%lx\n",
-           _nodeId, pa);
+    auto erased = _activeRecallPAs.erase(pa);
+    if (erased) {
+        printf("[RECALL-DIAG] node=%d active-recall-clear PA=0x%lx\n",
+               _nodeId, pa);
+    }
 }
 
 // ---- M7: Writeback / Evict ----
