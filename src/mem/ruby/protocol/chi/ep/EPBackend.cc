@@ -1525,13 +1525,21 @@ EPBackend::handleInvalidationRequest(const OuterInvalidateMsg &invMsg)
     _lastInvalidateMsg = invMsg;
     _invalidationReceivedCount++;
 
-    // Update requester-side bookkeeping
+    // Update requester-side bookkeeping. Capture the PRE-invalidation state so
+    // we can tell whether this node actually held a copy of the line.
     uint64_t lookupPa = (invMsg.sharerLocalPa != 0)
                            ? invMsg.sharerLocalPa
                            : invMsg.linePa;
+    bool hadLocalCopy = false;
     {
         auto it = _requesterLines.find(lookupPa);
         if (it != _requesterLines.end()) {
+            // A copy is held only in R_S/R_E/R_M. R_I means already invalid and
+            // R_WAIT_GRANT means a request is in flight but no copy is held yet.
+            RequesterLineState st = it->second.state;
+            hadLocalCopy = (st == RequesterLineState::R_S ||
+                            st == RequesterLineState::R_E ||
+                            st == RequesterLineState::R_M);
             it->second.state = RequesterLineState::R_I;
         }
     }
@@ -1593,6 +1601,33 @@ EPBackend::handleInvalidationRequest(const OuterInvalidateMsg &invMsg)
             _deferredInvalidationReqs[lookupPa] = invMsg;
             return true;
         }
+    }
+
+    // fix (stale-sharer invalidation): if this node holds NO local copy of the
+    // line (already recalled / evicted / never had one) and has no held upgrade
+    // snoop in progress, there is nothing to CleanUnique. startCleanUnique would
+    // stall forever (its callback never fires with no line to clean), leaving
+    // the home's INVALIDATE outstanding stuck in WAITING_ALL_ACKS and
+    // deadlocking all later upgrades (TC98). Invalidating an already-absent copy
+    // is idempotent, so ack immediately. This is the requester-side complement
+    // to keeping the home directory's sharer mask fresh: even if a stale sharer
+    // slips into the target mask, the invalidation still drains.
+    if (!hadLocalCopy) {
+        printf("[INVAL-DIAG] node=%d no local copy PA=0x%lx — immediate ack "
+               "(stale sharer)\n",
+               _nodeId, lookupPa);
+        DPRINTF(RubyEP,
+                "EPBackend node_id=%d: InvalidateReq PA=0x%lx — no local copy, "
+                "acking immediately (idempotent)\n",
+                _nodeId, lookupPa);
+        OuterInvalidationAck ack;
+        ack.linePa = invMsg.linePa;
+        ack.ackNode = _nodeId;
+        ack.homeNode = invMsg.homeNode;
+        ack.epoch = invMsg.epoch;
+        ack.reqId = invMsg.reqId;
+        sendInvalidationAck(ack);
+        return true;
     }
 
     // ---- v4 (§4.2.4): FIXED — use EP-RNF.startCleanUnique, wait for
@@ -1761,39 +1796,22 @@ EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
         outReqId = reqIdVal;
 
         if (upgradeTargetMask != 0) {
-            // Other sharers exist — must invalidate them before Ack(true)
+            // Other sharers exist — must invalidate them before Ack(true).
+            //
+            // fix1 (home-owned invalidation fanout): the InvalidateReq fanout to
+            // each target sharer is now emitted by the HOME UBCC when it creates
+            // the WAITING_ALL_ACKS outstanding (UBCCController::processOuterUpgradeReq
+            // → fanoutInvalidateTargets), unifying it with the plain-INVALIDATE
+            // path. The requester side must NOT also fan out here: doing both
+            // caused split ownership where, in the hot-line RS/RU + recall +
+            // batch-RS-replay interleaving, the fanout could be dropped, orphaning
+            // the outstanding (WAITING_ALL_ACKS forever) and deadlocking all later
+            // upgrades (TC98 stall at transfer #10). The requester only records
+            // the deferred (accepted=false) Ack and waits for the home to signal
+            // completion once all acks land.
             printf("[UPGRADE-DIAG] node=%d upgrade accepted PENDING PA=0x%lx "
-                   "targetMask=0x%lx — fanning out invalidations\n",
+                   "targetMask=0x%lx — home owns fanout (requester defers Ack)\n",
                    _nodeId, line_pa, upgradeTargetMask);
-
-            // Fanout invalidations to each target sharer
-            // Reuse existing EPBackend invalidation routing path
-            uint64_t homeEpoch = committedEpoch;
-            uint64_t offset = _addrMap.dsmOffset(line_pa);
-
-            uint64_t remainingMask = upgradeTargetMask;
-            for (int s = 0; s < 64 && remainingMask != 0; s++) {
-                uint64_t sBit = (1ULL << s);
-                if (remainingMask & sBit) {
-                    remainingMask &= ~sBit;
-
-                    OuterInvalidateMsg invMsg;
-                    invMsg.linePa = homePa;
-                    invMsg.sharerLocalPa = _addrMap.buildDsmPA(
-                        s, homeNode, offset, homeSocket);
-                    invMsg.sharerNode = s;
-                    invMsg.homeNode = homeNode;
-                    invMsg.epoch = homeEpoch;
-                    invMsg.reqId = reqIdVal;
-
-                    _lastInvalidateMsg = invMsg;
-
-                    DPRINTF(RubyEP,
-                            "EPBackend node_id=%d: upgrade fanout "
-                            "invalidation to node %d via UBAdapter\n", _nodeId, s);
-                    getUBAdapter(0)->sendInvalidateReqToSharer(s, invMsg, homeSocket);
-                }
-            }
 
             // Ack is NOT ready yet — will be sent when all acks arrive
             OuterUpgradeAck ack;

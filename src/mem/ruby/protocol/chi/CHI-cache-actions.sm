@@ -325,6 +325,8 @@ action(Initiate_Snoop, desc="") {
   State initial := getState(tbe, cache_entry, address);
   peek(snpRdyPort, CHIRequestMsg) {
     set_tbe(allocateSnoopTBE(address, in_msg));
+    DPRINTF(RubyGenerated, "[SNP-RECV] addr=%#x type=%d controller=%s state=%s\n",
+            address, in_msg.type, machineID, initial);
   }
   copyCacheAndDir(cache_entry, getDirEntry(address), tbe, initial);
 
@@ -345,6 +347,8 @@ action(Initiate_Snoop_Hazard, desc="") {
   TBE prev_tbe := tbe;
   peek(snpRdyPort, CHIRequestMsg) {
     set_tbe(allocateSnoopTBE(address, in_msg));
+    DPRINTF(RubyGenerated, "[SNP-HAZARD] addr=%#x type=%d controller=%s prev_state=%s\n",
+            address, in_msg.type, machineID, prev_tbe.state);
   }
   assert(tbe.is_snp_tbe);
   if (prev_tbe.is_req_tbe) {
@@ -1962,8 +1966,9 @@ action(Send_SnpCleanInvalid_NoReq, desc="") {
     out_msg.ns := tbe.ns;
     setExpectedForInvSnoop(tbe, false);
     tbe.expected_snp_resp.setExpectedCount(out_msg.Destination.count());
-    DPRINTF(RubyGenerated, "[HNF-CU-SNPCLN] addr=%#x targets=%d\n",
-            address, out_msg.Destination.count());
+    DPRINTF(RubyGenerated, "[HNF-CU-SNPCLN] addr=%#x targets=%d requestor=%d\n",
+            address, out_msg.Destination.count(),
+            machineIDToNodeID(tbe.requestor));
   }
 }
 
@@ -2904,8 +2909,9 @@ action(Receive_SnpResp, desc="") {
     }
     DPRINTF(RubyGenerated, "[STALE-MISMATCH] addr=%#x type=%d stale=%d tbe_stale=%d\n",
             address, in_msg.type, in_msg.stale, tbe.is_stale);
-    DPRINTF(RubyGenerated, "[HNF-CU-SNPRESP] addr=%#x type=%d remain=%d\n",
-            address, in_msg.type, tbe.expected_snp_resp.expected());
+    DPRINTF(RubyGenerated, "[HNF-CU-SNPRESP] addr=%#x type=%d remain=%d responder=%s\n",
+            address, in_msg.type, tbe.expected_snp_resp.expected(),
+            in_msg.responder);
   }
 }
 

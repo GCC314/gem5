@@ -364,6 +364,16 @@ UBAdapter::sendReadReq(
 
     // Port async path: schedule check, return pending
     if (_port) {
+        // Dedup guard: mark this reqId in-flight so subsequent retries of the
+        // SAME outer request (same reqId, driven by the local CPU/L2 miss
+        // re-issue at ~10ns cadence) hit the `_inflightReadReqs.count(reqId)`
+        // early-return above and do NOT re-transmit a duplicate ReadReq. The
+        // marker is cleared when the matching ReadResp arrives (ready-response
+        // consumption above, or the recvFromRouter callback). Without this
+        // insert the guard was dead (only erase/count, never insert), causing
+        // the TC98 retry storm: one line-hot reqId sent ~100k times, home
+        // BUSY-rejecting each and flooding a 300MB+ log.
+        _inflightReadReqs.insert(reqId);
         scheduleResponseCheck();
         return -2;
     }
@@ -1448,6 +1458,15 @@ UBAdapter::handleResponse(framework::MemMessage *m)
 
     // Store in ready-response cache for retry-based sendReadReq
     _readyResponses[key] = *coh;
+
+    // Dedup guard release: once the ReadResp for this reqId has landed in the
+    // ready-response cache, the outer request is no longer "in flight" — the
+    // next sendReadReq retry will consume the cached response (and would erase
+    // the marker there anyway). Clear it here unconditionally so the dedup
+    // marker can never outlive its response, even on paths without an onResp
+    // callback.
+    if (coh->h.type == CoherenceMessageType::ReadResp)
+        _inflightReadReqs.erase(coh->h.reqId);
 
     // Immediate response notification: fire the wired callback so the
     // EPSNFController wakes up NOW and processes this response via retry,
