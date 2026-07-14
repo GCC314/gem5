@@ -364,34 +364,99 @@ EPRNFController::recvSnoopMsg(const CHIRequestMsg *msg)
         _backend->checkAddr(msg->m_addr);
     }
 
-    // ---- Per-PA single-flight check (§4.3.3) ----
+    // ---- Per-PA conflict arbitration (§5.1 / §10.3) ----
+    // Replaces the old blind-queue logic.  When EP-RNF has an in-flight
+    // CHI transaction for this PA, incoming snoops are arbitrated based
+    // on the conflict matrix (§9.5):
+    //   - Benign self-snoops (recall-induced) → IMMED clean SnpResp_I
+    //   - Conflicting write-intent snoops → STALE SnpResp_I (abort-retry)
+    //   - SnpShared/SnpSharedFwd → fatal (must not target EP-RNF)
     auto txnIt = _pendingChiTxns.find(msg->m_addr);
     bool inflight = (txnIt != _pendingChiTxns.end());
+    bool hasRecall = _backend && _backend->hasActiveRecall(msg->m_addr);
 
-    if (inflight) {
-        // ---- CHI transaction already in flight for this PA ----
-        // Check 1-entry snoop slot: if already occupied, protocol violation
-        if (txnIt->second.snoopSlotValid) {
-            fatal("EP_RNF node_id=%d: second snoop for PA=0x%lx while "
-                  "snoop slot already occupied — protocol violation "
-                  "(HN-F single-flight assumption broken)\n",
-                  _nodeId, msg->m_addr);
-        }
-
-        // Queue this snoop in the 1-entry per-PA snoop slot (§4.3.3)
-        txnIt->second.snoopSlotValid = true;
-        txnIt->second.queuedSnoopType = msg->m_type;
-        txnIt->second.queuedRetToSrc = msg->m_retToSrc;
-
-        DPRINTF(RubyCHIGeneric,
-                "EP_RNF node_id=%d: queued snoop type=%d for PA=0x%lx "
-                "(CHI txn in flight)\n",
-                _nodeId, static_cast<int>(msg->m_type), msg->m_addr);
-        return true;
+    // ---- Fast path: no in-flight txn, no active recall ----
+    if (!inflight && !hasRecall) {
+        return processSnoopImmediate(msg);
     }
 
-    // ---- No in-flight CHI transaction — process snoop immediately ----
-    return processSnoopImmediate(msg);
+    // ---- §10.2: Benign self-snoop (recall-induced) → IMMED clean ----
+    // Must be checked BEFORE STALE arbitration, otherwise the recall's own
+    // post-RecallResponse cleanup snoop would be aborted, causing liveness bug.
+    if (hasRecall) {
+        printf("[RECALL-SNOOP] node=%d PA=0x%lx "
+               "recall-induced snoop — immediate clean SnpResp_I\n",
+               _nodeId, msg->m_addr);
+        _backend->clearActiveRecall(msg->m_addr);
+        return processSnoopImmediate(msg);
+    }
+
+    // ---- From here: inflight=true, hasRecall=false ----
+    // §3: HN-F excludes the requestor (EP-RNF itself) from snoop targets
+    // for write-class transactions (CleanUnique/ReadUnique).  So an incoming
+    // snoop during a write-class in-flight txn is always a CONFLICT, not a
+    // self-snoop.  For recall ops (ReadShared), the snoop is from another
+    // transaction (CHI serialisation) → also conflict under §9.5.
+
+    // 1-entry snoop slot guard: non-fatal (HN-F single-flight makes this
+    // unreachable in normal operation, but warn instead of fatal).
+    if (txnIt->second.snoopSlotValid) {
+        warn("EP_RNF node_id=%d: second snoop for PA=0x%lx while "
+             "snoop slot already occupied — protocol may be violated; "
+             "falling through to arbitration\n",
+             _nodeId, msg->m_addr);
+    }
+
+    MachineID hnfDest = msg->m_requestor;
+    uint64_t linePa = msg->m_addr;
+    PendingChiOp inFlightOp = txnIt->second.op;
+
+    // SnpOnce + ReadShared(NoProxyOp) in-flight → read/read coexistence
+    // (§9.5 table row 3, col 3): IMMED SnpRespData_SC, not STALE.
+    if (msg->m_type == CHIRequestType_SnpOnce &&
+        inFlightOp == PendingChiOp::ReadShared) {
+        printf("[SNOOP-IMMED-SnpOnce+ReadShared] node=%d PA=0x%lx "
+               "— read/read coexistence, immediate SnpRespData_SC\n",
+               _nodeId, linePa);
+        return processSnoopImmediate(msg);
+    }
+
+    // ---- Conflict arbitration: stale-retry (§9.5 matrix) ----
+    switch (msg->m_type) {
+        case CHIRequestType_SnpCleanInvalid:
+        case CHIRequestType_SnpUnique:
+            // Write-intent snoop during any in-flight → STALE (Q2).
+            printf("[SNOOP-STALE] node=%d PA=0x%lx snoop=%d inFlightOp=%d "
+                   "— sending stale SnpResp_I (abort-retry)\n",
+                   _nodeId, linePa, static_cast<int>(msg->m_type),
+                   static_cast<int>(inFlightOp));
+            sendSnpRespI(linePa, hnfDest, /*staleMark=*/true);
+            return true;
+        case CHIRequestType_SnpOnce:
+            // Q4-a: Conservative STALE for write-class in-flight.
+            // TODO: SnpOnce under ReadUnique(RecallUnique) could be
+            // optimised to IMMED snapshot (weak-order read), but for
+            // now we unify on STALE for maximum safety.
+            printf("[SNOOP-STALE-SnpOnce] node=%d PA=0x%lx inFlightOp=%d "
+                   "— conservative stale SnpResp_I\n",
+                   _nodeId, linePa, static_cast<int>(inFlightOp));
+            sendSnpRespI(linePa, hnfDest, /*staleMark=*/true);
+            return true;
+        case CHIRequestType_SnpShared:
+        case CHIRequestType_SnpSharedFwd:
+            // Preserving snoops must not target EP-RNF (retain fatal).
+            fatal("EP_RNF node_id=%d: unexpected SnpShared/SnpSharedFwd "
+                  "at PA=0x%lx (routing bug; preserving snoops must not "
+                  "target EP-RNF)\n",
+                  _nodeId, linePa);
+        default:
+            // Unknown snoop: conservative fallback STALE.
+            printf("[SNOOP-STALE-UNKNOWN] node=%d PA=0x%lx snoop=%d "
+                   "— conservative stale SnpResp_I\n",
+                   _nodeId, linePa, static_cast<int>(msg->m_type));
+            sendSnpRespI(linePa, hnfDest, /*staleMark=*/true);
+            return true;
+    }
 }
 
 bool
