@@ -2781,6 +2781,19 @@ action(UpdateDirState_FromSnpResp, desc="") {
         if (tbe.dir_sharers.isElement(tbe.requestor)) {
           tbe.dir_sharers.remove(tbe.requestor);
         }
+        // TC97 (8n2s recall→upgrade→invalidate race): a stale-abandoned
+        // CleanUnique means the requestor gives up this line and will re-fetch.
+        // If the directory still records an owner (e.g. this node became owner
+        // via an earlier upgrade that a recall then downgraded), removing the
+        // requestor sharer above can leave the illegal ownerExists && sharers==∅
+        // combination, which trips makeFinalState's RSD/RUSD assert
+        // (CHI-cache-funcs.sm:1204). Clear the dangling owner so the directory
+        // converges to a consistent (deallocated) state.
+        if (tbe.dir_ownerExists &&
+            ((tbe.dir_owner == tbe.requestor) || tbe.dir_sharers.isEmpty())) {
+          tbe.dir_ownerExists := false;
+          tbe.dir_ownerIsExcl := false;
+        }
         tbe.dataValid := false;
         tbe.is_stale := true;
       }
