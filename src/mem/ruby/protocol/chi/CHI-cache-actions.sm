@@ -865,6 +865,14 @@ action(Finish_CleanUnique, desc="") {
         tbe.is_stale := true;
       }
     }
+    // fix (TC98 node7 abort): when a regular CPU (not EP-RNF proxy) is
+    // removed from dir_sharers before its CleanUnique completes, it was
+    // snoop-invalidated in a cross-node write-race and must complete
+    // as stale. The assert(tbe.is_stale) below relies on this flag being
+    // unconditionally true when the requestor is no longer a sharer.
+    if (!tbe.is_stale) {
+      tbe.is_stale := true;
+    }
     assert(tbe.is_stale);
     tbe.is_stale := false;
     tbe.actions.push(Event:SendCompUCRespStale);
