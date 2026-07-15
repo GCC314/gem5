@@ -1,6 +1,7 @@
 #include "mem/ruby/protocol/chi/ep/EPBackend.hh"
 
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <cstdarg>
 #include <array>
@@ -1006,6 +1007,18 @@ EPBackend::diagnoseExpectedGrant(int neededPerm, bool writeIntent) const
 
 // ---- M6: Recall Management ----
 
+// Phase 0.4: C4 Direct-Forward gate — controlled by env var UBCC_DIRECT_FWD.
+// When set to "0", all direct-forward (owner→requester bypass) is disabled.
+// Default (unset or non-zero) enables direct-forward.
+static bool enableDirectFwd() {
+    static int v = -1;
+    if (v < 0) {
+        const char *e = std::getenv("UBCC_DIRECT_FWD");
+        v = (e && std::strtoull(e, nullptr, 10) == 0) ? 0 : 1;
+    }
+    return v == 1;
+}
+
 bool
 EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
 {
@@ -1108,7 +1121,8 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
                 }
                 // C4: Direct-forward data to requester (requester ≠ owner ≠ home)
                 {
-                    bool canForward = (capturedMsg.requesterNode >= 0 &&
+                    bool canForward = enableDirectFwd() &&
+                                      (capturedMsg.requesterNode >= 0 &&
                                        capturedMsg.requesterNode != capturedMsg.ownerNode &&
                                        capturedMsg.requesterNode != capturedMsg.homeNode);
                     if (canForward && resp.dataReturned && capturedMsg.requesterNode >= 0) {
@@ -1168,7 +1182,8 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
                 }
                 // C4: Direct-forward data to requester (requester ≠ owner ≠ home)
                 {
-                    bool canForward = (capturedMsg.requesterNode >= 0 &&
+                    bool canForward = enableDirectFwd() &&
+                                      (capturedMsg.requesterNode >= 0 &&
                                        capturedMsg.requesterNode != capturedMsg.ownerNode &&
                                        capturedMsg.requesterNode != capturedMsg.homeNode);
                     if (canForward && resp.dataReturned && capturedMsg.requesterNode >= 0) {

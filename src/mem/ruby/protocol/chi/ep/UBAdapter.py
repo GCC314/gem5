@@ -16,3 +16,4 @@ class UBAdapter(SimObject):
     # -1 = build all nodes in this process (legacy single-process mode);
     # otherwise this process owns exactly one node and only that node's Port binds.
     local_node = Param.Int(-1, "Node this gem5 process owns (-1 = all)")
+    wait_cap = Param.UInt64(0, "Wait cap for response polling (0=use env or default 2000000)")
