@@ -42,18 +42,13 @@ SyncWaitManager::barrierArrive(ThreadContext *tc, uint32_t mask,
         bs.activeThreads = __builtin_popcount(mask) * activeThreads;
 
     // Local-node expected thread count for this barrier generation.
-    // In per-socket split mode (_numSockets > 0) each registered socket
-    // has one primary thread that will arrive. Using the workload-supplied
-    // `activeThreads` (single-arg sync_wait defaults to 1) is too low when
-    // multiple sockets independently participate (dual-socket: 2 primaries
-    // per node). floorLocalExpected guarantees all local socket primaries
-    // arrive before the node fires BarrierReached, preventing a late-arriving
-    // primary from being counted in the next generation (phantom barrier,
-    // TC96/97 dual-socket barrier mismatch).
-    uint32_t floorLocalExpected = (uint32_t)(_numSockets > 0 ? _numSockets : 1);
+    // The workload supplies the authoritative per-node thread count via the
+    // second argument of sync_wait(mask, activeThreads).  Multi-socket
+    // workloads (8n2s) must pass NUM_SOCKETS explicitly; single-socket
+    // workloads (1s/2s/8n1s) use the default single-arg sync_wait(mask)
+    // which sets activeThreads = 1 (one primary per node).
     if (bs.localExpected == 0)
-        bs.localExpected = (activeThreads >= floorLocalExpected)
-            ? activeThreads : floorLocalExpected;
+        bs.localExpected = activeThreads;
 
     if (bs.waiting.find(tc) != bs.waiting.end())
         return 0;
