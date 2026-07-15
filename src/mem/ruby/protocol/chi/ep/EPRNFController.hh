@@ -500,10 +500,12 @@ class EPRNFController : public EPController
                                 // startCleanUnique to avoid HN-F TBE collision)
         bool needsRetry;        // true when rejected + InvalidateAck sent:
                                 // re-issue a fresh upgrade once the home drains
+        int retryCount;         // exponential backoff: increment on each retry
+                                // so the retry interval doubles each attempt
 
         UpgradePending() : valid(false), linePa(0), homeNode(-1), epoch(0),
                            reqId(0), ackReceived(false), rejected(false),
-                           needsRetry(false) {}
+                           needsRetry(false), retryCount(0) {}
     };
     std::map<uint64_t, UpgradePending> _upgradePending;
 

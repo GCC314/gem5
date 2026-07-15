@@ -38,6 +38,32 @@ static uint64_t eprn_wakeup_retry() {
     return v;
 }
 
+// ---- Exponential backoff for held-upgrade retries (§11) ----
+// When a held SnpCleanInvalid upgrade is TEMP-REJECTED by the home (another
+// global op is in progress), instead of always waiting 500µs (eprn_wakeup_retry),
+// use a short exponential backoff.  The leading global op takes ~2.1 µs to
+// commit (recall+grant+clear, measured from TC98 logs), so a minimum retry of
+// 5µs already covers the common case with safety margin.  On repeated failures
+// (rare in measured data: all 34% STALE-then-retry cases succeeded on first
+// attempt), the interval doubles up to a cap of 200µs.
+//
+// Sequence: 5 → 10 → 20 → 40 → 80 → 160 → 200 → 200 … µs
+// (@2 GHz: 1 cy = 500 ticks, so multiply by 2 to get Cycles).
+static uint64_t ep_upgrade_retry_backoff_cycles(int retryCount)
+{
+    static uint64_t minCycles = 0, maxCycles = 0;
+    if (minCycles == 0) {
+        const char *e = std::getenv("EP_UPGRADE_RETRY_MIN_CYCLES");
+        minCycles = e ? std::strtoull(e, nullptr, 10) : 10000;      // 5µs
+        e = std::getenv("EP_UPGRADE_RETRY_MAX_CYCLES");
+        maxCycles = e ? std::strtoull(e, nullptr, 10) : 400000;     // 200µs
+    }
+    uint64_t base = minCycles;
+    for (int i = 0; i < retryCount && base < maxCycles; i++)
+        base <<= 1;                    // double each retry
+    return (base < maxCycles) ? base : maxCycles;
+}
+
 EPController::EPController(const Params &p)
   : AbstractController(p),
     reqOut(p.reqOut), snpOut(p.snpOut),
@@ -1497,20 +1523,26 @@ EPRNFController::scheduleUpgradeRetryAfterRejection(uint64_t linePa)
     auto upIt = _upgradePending.find(linePa);
     if (upIt != _upgradePending.end() && upIt->second.valid) {
         upIt->second.rejected = false;
-        upIt->second.needsRetry = true;
-        // Clear pending txn in EPBackend so notifyLocalWriteUpgrade allocates
-        // a fresh reqId instead of reusing the rejected one (checkOnly).
-        EPBackend *backend = EPBackend::getBackendInstance(_nodeId);
-        if (backend) {
-            backend->clearPendingUpgradeTxn(linePa);
-            backend->clearCachedUpgradeResp(linePa);
-        }
+    upIt->second.needsRetry = true;
+    upIt->second.retryCount++;        // exponential backoff (§11)
+
+    // Clear pending txn in EPBackend so notifyLocalWriteUpgrade allocates
+    // a fresh reqId instead of reusing the rejected one (checkOnly).
+    EPBackend *backend = EPBackend::getBackendInstance(_nodeId);
+    if (backend) {
+        backend->clearPendingUpgradeTxn(linePa);
+        backend->clearCachedUpgradeResp(linePa);
     }
-    // Schedule the retry. The interval must be long enough for the other
-    // upgrade to fully drain at the home (InvalidateAck → commit →
-    // UpgradeAckNotify → UpgradeDone). ~1M cycles (500µs @2GHz) is generous.
+    }
+    // Schedule the retry using exponential backoff (§11).
+    // The leading global op takes ~2.1 µs to drain, so the first retry at
+    // 5 µs is generous.  On repeated failures the interval doubles up to a
+    // cap of 200 µs.  This replaces the old fixed ~500 µs (eprn_wakeup_retry)
+    // that was copied from the unrelated wakeup-retry path.
     _upgradeRetryLines.insert(linePa);
-    scheduleEvent(Cycles(eprn_wakeup_retry()));
+    scheduleEvent(Cycles(
+        ep_upgrade_retry_backoff_cycles(upIt != _upgradePending.end()
+            ? upIt->second.retryCount : 0)));
 }
 
 void
