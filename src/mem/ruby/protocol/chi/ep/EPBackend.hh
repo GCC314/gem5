@@ -441,7 +441,13 @@ class EPBackend : public SimObject
      * @param pa  Physical address (local node view)
      * @return    True if a recall is active for this PA
      */
-    bool hasActiveRecall(uint64_t pa) const;
+     bool hasActiveRecall(uint64_t pa) const;
+
+    /**
+     * Check if the local requester-side state for this PA is R_E
+     * (Clean exclusive owner). Used for silent upgrade optimization.
+     */
+    bool hasRequesterExclusive(uint64_t pa) const;
 
     /**
      * Clear active recall tracking for a PA after the associated

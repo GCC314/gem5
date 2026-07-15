@@ -1309,6 +1309,14 @@ EPBackend::clearActiveRecall(uint64_t pa)
     }
 }
 
+bool
+EPBackend::hasRequesterExclusive(uint64_t pa) const
+{
+    auto it = _requesterLines.find(pa);
+    return (it != _requesterLines.end() &&
+            it->second.state == RequesterLineState::R_E);
+}
+
 // ---- M7: Writeback / Evict ----
 
 void
