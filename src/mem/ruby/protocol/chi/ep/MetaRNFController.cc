@@ -246,7 +246,7 @@ MetaRNFController::sendReadOnce(uint64_t pa)
     auto req = std::make_shared<CHIRequestMsg>(curTick(), cacheLineSize,
                                                 m_ruby_system);
     req->m_addr = pa;
-    req->m_type = CHIRequestType_ReadOnce;
+    req->m_type = CHIRequestType_ReadShared;  // L3-cacheable (was ReadOnce)
     req->m_requestor = m_machineID;
     req->m_allowRetry = true;
     req->m_MessageSize = MessageSizeType_Control;
