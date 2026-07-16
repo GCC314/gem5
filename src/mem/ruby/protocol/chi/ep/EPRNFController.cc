@@ -834,9 +834,6 @@ EPRNFController::handleSnpCleanInvalid(const CHIRequestMsg *msg)
     }
 
     if (isDsmLine) {
-        printf("[UPGRADE-DIAG] node=%d SILENT-CHECK PA=0x%lx "
-               "backend=%p isDsmLine=%d\n",
-               _nodeId, msg->m_addr, (void*)backend, isDsmLine);
         // §5.2 Silent Upgrade: when the local requester holds R_E (clean
         // exclusive) or R_M (dirty modified), guaranteed sole owner by
         // directory one-hot invariant, the write upgrade can complete
