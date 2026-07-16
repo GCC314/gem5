@@ -1315,15 +1315,19 @@ bool
 EPBackend::hasRequesterExclusive(uint64_t pa) const
 {
     auto it = _requesterLines.find(pa);
-    bool result = (it != _requesterLines.end() &&
-                   (it->second.state == RequesterLineState::R_E ||
-                    it->second.state == RequesterLineState::R_M));
-    if (result) {
-        printf("[RE-DIAG] node=%d hasRequesterExclusive PA=0x%lx -> TRUE "
-               "(state=%s)\n",
-               _nodeId, pa,
-               it->second.state == RequesterLineState::R_E ? "R_E" : "R_M");
+    if (it == _requesterLines.end()) {
+        printf("[RE-DIAG] node=%d hasRequesterExclusive PA=0x%lx -> FALSE "
+               "(no entry, total=%zu)\n",
+               _nodeId, pa, _requesterLines.size());
+        return false;
     }
+    int st = static_cast<int>(it->second.state);
+    bool result = (it->second.state == RequesterLineState::R_E ||
+                    it->second.state == RequesterLineState::R_M);
+    printf("[RE-DIAG] node=%d hasRequesterExclusive PA=0x%lx -> %s "
+           "(state=%d, lineAddr=0x%lx)\n",
+           _nodeId, pa, result ? "TRUE" : "FALSE",
+           st, it->second.lineAddr);
     return result;
 }
 
