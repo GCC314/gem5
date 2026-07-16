@@ -1750,7 +1750,8 @@ bool
 EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
                                     int desiredPerm, UpgradeCause cause,
                                     uint64_t &outEpoch, uint64_t &outReqId,
-                                    bool *outRejected, bool *outNotSharer)
+                                    bool *outRejected, bool *outNotSharer,
+                                    bool forceResend)
 {
     if (outRejected) *outRejected = false;
     if (outNotSharer) *outNotSharer = false;
@@ -1801,11 +1802,20 @@ EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
 
     uint64_t upgradeTargetMask = 0;
     uint64_t committedEpoch = 0;
+    // DROP/NO-RESP recovery: when forceResend is set (watchdog fired for a
+    // held pending upgrade), retransmit the OuterUpgradeReq with the SAME
+    // reqId/epoch instead of merely polling (checkOnly). Reusing the same reqId
+    // keeps the home's dedup idempotent: if the original was dropped the home
+    // processes it fresh; if it was already accepted the home returns the cached
+    // grant (WAITING_CLEAR path) rather than a spurious "existing outstanding"
+    // reject. We must NOT allocate a fresh reqId (that churns the home into
+    // rejecting every retransmit — the TC3/8/10/11 livelock).
+    const bool checkOnly = hadPending && !forceResend;
     int upgradeRet = getUBAdapter(0)->sendUpgradeReq(
         homePa, _nodeId, epochVal, reqIdVal,
         desiredPerm, static_cast<int>(cause),
         &upgradeTargetMask, &committedEpoch, homeNode, homeSocket,
-        hadPending /*checkOnly: don't re-send an in-flight upgrade*/);
+        checkOnly /*checkOnly: don't re-send an in-flight upgrade*/);
     if (upgradeRet == -2) {
         std::fprintf(stderr,
                      "[EP-UPGRADE-PENDING] node=%d pa=0x%lx home=%d epoch=%lu reqId=%lu\n",
@@ -1829,12 +1839,15 @@ EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
 
     // upgradeRet == 0 means the home explicitly rejected this upgrade (an
     // upgrade for this line is already outstanding for another requester).
-    // The caller must NOT keep holding the snoop in that case — it has to fall
-    // back to a plain SnpResp_I, give up its copy, and retry the upgrade later.
+    // upgradeRet == -2 means pending (no response yet — possibly dropped),
+    // but that path already returned false above without setting rejected.
+    // Only an explicit TEMP-REJECT (upgradeRet == 0) sets rejected=true so
+    // completeHeldUpgrade can distinguish TEMP-REJECT (exponential backoff)
+    // from a still-pending / DROPped upgrade (hold + watchdog resend).
     // (Two requesters upgrading the same line otherwise deadlock: each holds
     // its SnpResp_I waiting for its own upgrade, so neither can be invalidated
     // for the other's upgrade. TC16/25/53 double-upgrade race.)
-    if (!accepted && outRejected)
+    if (upgradeRet == 0 && outRejected)
         *outRejected = true;
     // upgradeRet == -3: PERMANENT reject (requester no longer a committed
     // sharer — lost a dual-upgrade race). Caller must abandon + ReadUnique.

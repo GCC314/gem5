@@ -383,7 +383,8 @@ class EPBackend : public SimObject
                                   int desiredPerm, UpgradeCause cause,
                                   uint64_t &outEpoch, uint64_t &outReqId,
                                   bool *outRejected = nullptr,
-                                  bool *outNotSharer = nullptr);
+                                  bool *outNotSharer = nullptr,
+                                  bool forceResend = false);
 
     /**
      * Send OuterUpgradeDone after local upgrade completes.

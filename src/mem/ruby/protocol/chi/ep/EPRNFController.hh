@@ -238,7 +238,7 @@ class EPRNFController : public EPController
      *  no-op if no held upgrade exists for this line or it already completed.
      *  Called inline at first arrival and event-wise from
      *  EPBackend::onUpgradeRespArrived() when the OuterUpgradeResp arrives. */
-    void completeHeldUpgrade(uint64_t linePa);
+    void completeHeldUpgrade(uint64_t linePa, bool dropRecoveryResend = false);
 
     /** Check whether a SnpCleanInvalid-upgrade is currently held (pending
      *  or not-yet-resolved) for this line. Used by EPBackend to decide whether
@@ -502,10 +502,15 @@ class EPRNFController : public EPController
                                 // re-issue a fresh upgrade once the home drains
         int retryCount;         // exponential backoff: increment on each retry
                                 // so the retry interval doubles each attempt
+        bool dropWatchdogArmed; // true once a DROP/NO-RESP watchdog timer has
+                                // been scheduled for this held (pending) upgrade
+        int dropResendCount;    // number of DROP-recovery resends issued so far
+                                // (bounded to avoid infinite resend storms)
 
         UpgradePending() : valid(false), linePa(0), homeNode(-1), epoch(0),
                            reqId(0), ackReceived(false), rejected(false),
-                           needsRetry(false), retryCount(0) {}
+                           needsRetry(false), retryCount(0),
+                           dropWatchdogArmed(false), dropResendCount(0) {}
     };
     std::map<uint64_t, UpgradePending> _upgradePending;
 

@@ -26,6 +26,10 @@ static uint64_t s_compack_retry = 0;       // from _params.compack_retry_cycles
 static uint64_t s_wakeup_retry = 0;        // from _params.wakeup_retry_cycles
 static uint64_t s_upgrade_retry_min = 0;   // from _params.upgrade_retry_min_cycles
 static uint64_t s_upgrade_retry_max = 0;   // from _params.upgrade_retry_max_cycles
+// DROP/NO-RESP recovery: cap the number of watchdog-driven OuterUpgradeReq
+// resends for a single held upgrade. Bounds a livelock storm on a persistently
+// faulty link while still tolerating several transient drops (TC111 drops one).
+static const int s_upgrade_drop_max_resends = 8;
 
 static uint64_t eprn_compack_retry() {
     return s_compack_retry;
@@ -1581,20 +1585,64 @@ EPRNFController::processUpgradeRetries()
         if (upIt->second.ackReceived) {
             continue;
         }
-        // For needsRetry: clear the flag so completeHeldUpgrade proceeds
-        // normally (issues a fresh OuterUpgradeReq, not checkOnly).
-        upIt->second.needsRetry = false;
-        DPRINTF(RubyCHIGeneric,
-                "EP_RNF node_id=%d: retrying held upgrade PA=0x%lx\n",
-                _nodeId, linePa);
-        printf("[UPGRADE-DIAG] node=%d retry upgrade PA=0x%lx\n",
-               _nodeId, linePa);
-        completeHeldUpgrade(linePa);
+        // Two kinds of scheduled retries share this queue:
+        //
+        //  (1) TEMP-REJECT retry (scheduleUpgradeRetryAfterRejection): the home
+        //      explicitly rejected (existing outstanding). needsRetry is set and
+        //      the pending txn was already cleared, so completeHeldUpgrade issues
+        //      a FRESH OuterUpgradeReq (new reqId) after the backoff.
+        //
+        //  (2) DROP/NO-RESP watchdog (armed in the pending-hold branch): the
+        //      upgrade is still pending and its OuterUpgradeReq/UpgradeResp may
+        //      have been dropped. We must RETRANSMIT the SAME reqId (forceResend)
+        //      — NOT a fresh one, which would make the home reject every
+        //      retransmit as "existing outstanding" and livelock (TC3/8/10/11).
+        //      If the original was truly dropped the home accepts the retransmit
+        //      fresh; if it was already accepted the home idempotently returns
+        //      the cached grant.
+        const bool dropRecovery =
+            upIt->second.dropWatchdogArmed && !upIt->second.needsRetry;
+
+        if (dropRecovery) {
+            // Disarm so the next pending-hold re-arms with a wider backoff
+            // window if this retransmit is also dropped. Bound the number of
+            // retransmits to avoid storming a persistently faulty link; once
+            // exhausted we keep re-polling (forceResend=false) without churning.
+            bool doResend = (upIt->second.dropResendCount
+                             < s_upgrade_drop_max_resends);
+            if (doResend) {
+                upIt->second.dropWatchdogArmed = false;
+                upIt->second.dropResendCount++;
+                upIt->second.retryCount++;   // widen next watchdog window
+                printf("[UPGRADE-DIAG] node=%d DROP-recovery resend #%d "
+                       "PA=0x%lx (same reqId)\n",
+                       _nodeId, upIt->second.dropResendCount, linePa);
+            } else {
+                upIt->second.dropWatchdogArmed = false;
+                warn("EP_RNF node_id=%d: upgrade DROP-recovery exhausted "
+                     "(%d resends) PA=0x%lx — re-polling only\n",
+                     _nodeId, upIt->second.dropResendCount, linePa);
+            }
+            DPRINTF(RubyCHIGeneric,
+                    "EP_RNF node_id=%d: DROP-recovery retry held upgrade "
+                    "PA=0x%lx\n", _nodeId, linePa);
+            completeHeldUpgrade(linePa, doResend /*forceResend*/);
+        } else {
+            // TEMP-REJECT retry: fresh OuterUpgradeReq (checkOnly=false because
+            // pending txn was cleared by scheduleUpgradeRetryAfterRejection).
+            upIt->second.needsRetry = false;
+            DPRINTF(RubyCHIGeneric,
+                    "EP_RNF node_id=%d: retrying held upgrade PA=0x%lx\n",
+                    _nodeId, linePa);
+            printf("[UPGRADE-DIAG] node=%d retry upgrade PA=0x%lx\n",
+                   _nodeId, linePa);
+            completeHeldUpgrade(linePa);
+        }
     }
 }
 
 void
-EPRNFController::completeHeldUpgrade(uint64_t linePa)
+EPRNFController::completeHeldUpgrade(uint64_t linePa, bool dropRecoveryResend)
 {
     // Drive a held SnpCleanInvalid-upgrade to completion. Called:
     //   (a) inline from handleSnpCleanInvalid first-arrival, and
@@ -1634,7 +1682,8 @@ EPRNFController::completeHeldUpgrade(uint64_t linePa)
     bool accepted = backend->notifyLocalWriteUpgrade(
         linePa, homeNode, 1,
         UpgradeCause::LocalCleanUnique,
-        epoch, reqId, &rejected, &notSharer);
+        epoch, reqId, &rejected, &notSharer,
+        dropRecoveryResend /*forceResend: retransmit same reqId on DROP*/);
 
     // Decide between RETRY and ABANDON on a reject.
     //
@@ -1707,12 +1756,39 @@ EPRNFController::completeHeldUpgrade(uint64_t linePa)
     }
 
     if (!accepted) {
-        // Still pending — keep holding the snoop. Will be retried when the
-        // UpgradeResp arrives (onUpgradeRespArrived) or acks complete.
-        DPRINTF(RubyCHIGeneric,
-                "EP_RNF node_id=%d: completeHeldUpgrade PA=0x%lx still pending "
-                "— holding snoop\n",
-                _nodeId, linePa);
+        // Still pending — keep holding the snoop. In the fault-free case the
+        // OuterUpgradeResp arrives shortly and drives completion event-wise via
+        // EPBackend::onUpgradeRespArrived() -> completeHeldUpgrade(). TC3/8/10/11
+        // rely on this normal async-pending hold.
+        //
+        // DROP/NO-RESP recovery (TC111): if the OuterUpgradeReq (or its
+        // UpgradeResp) was dropped on the wire, onUpgradeRespArrived() will
+        // NEVER fire and the snoop would stay held forever (deadlock). To
+        // recover we arm a *watchdog* the FIRST time we observe a pending hold
+        // for this line: reuse the exponential-backoff retry timer. When the
+        // watchdog fires (processUpgradeRetries) it RETRANSMITS the SAME reqId
+        // (forceResend) so a dropped request is recovered idempotently while a
+        // merely-slow response is not disturbed. The watchdog period (>=5µs) is
+        // far longer than the fault-free response latency, so in the common case
+        // the response has already arrived and the "resend" idempotently returns
+        // the cached grant. We do NOT set needsRetry here (that marks a
+        // TEMP-REJECT fresh-reqId retry) and we do NOT give up the snoop (that is
+        // only correct for an explicit reject).
+        if (!upIt->second.dropWatchdogArmed) {
+            upIt->second.dropWatchdogArmed = true;
+            _upgradeRetryLines.insert(linePa);
+            scheduleEvent(Cycles(
+                ep_upgrade_retry_backoff_cycles(upIt->second.retryCount)));
+            DPRINTF(RubyCHIGeneric,
+                    "EP_RNF node_id=%d: completeHeldUpgrade PA=0x%lx pending "
+                    "— holding snoop, armed DROP watchdog\n",
+                    _nodeId, linePa);
+        } else {
+            DPRINTF(RubyCHIGeneric,
+                    "EP_RNF node_id=%d: completeHeldUpgrade PA=0x%lx still "
+                    "pending — holding snoop (watchdog already armed)\n",
+                    _nodeId, linePa);
+        }
         return;
     }
 
