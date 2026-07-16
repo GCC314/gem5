@@ -794,6 +794,8 @@ EPBackend::handleGrant(uint64_t line_pa, OuterGrantType grant, int homeNode)
             break;
         case OuterGrantType::GlobalGrantExclusive:
             it->second.state = RequesterLineState::R_E;
+            printf("[RE-DIAG] node=%d line 0x%lx -> R_E (GrantExclusive)\n",
+                   _nodeId, line_pa);
             DPRINTF(RubyCHIGeneric,
                     "EPBackend node_id=%d: line 0x%lx -> R_E (GrantExclusive)\n",
                     _nodeId, line_pa);
@@ -1313,8 +1315,16 @@ bool
 EPBackend::hasRequesterExclusive(uint64_t pa) const
 {
     auto it = _requesterLines.find(pa);
-    return (it != _requesterLines.end() &&
-            it->second.state == RequesterLineState::R_E);
+    bool result = (it != _requesterLines.end() &&
+                   (it->second.state == RequesterLineState::R_E ||
+                    it->second.state == RequesterLineState::R_M));
+    if (result) {
+        printf("[RE-DIAG] node=%d hasRequesterExclusive PA=0x%lx -> TRUE "
+               "(state=%s)\n",
+               _nodeId, pa,
+               it->second.state == RequesterLineState::R_E ? "R_E" : "R_M");
+    }
+    return result;
 }
 
 // ---- M7: Writeback / Evict ----
@@ -1432,6 +1442,8 @@ EPBackend::handleWriteback(uint64_t line_pa, bool keepAsClean,
             if (keepAsClean) {
                 // Owner retains clean exclusive (G_E)
                 it->second.state = RequesterLineState::R_E;
+                printf("[RE-DIAG] node=%d line 0x%lx -> R_E (writeback keepAsClean)\n",
+                       _nodeId, line_pa);
             } else {
                 // Owner drops the line (R_I)
                 it->second.state = RequesterLineState::R_I;

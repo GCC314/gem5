@@ -444,8 +444,8 @@ class EPBackend : public SimObject
      bool hasActiveRecall(uint64_t pa) const;
 
     /**
-     * Check if the local requester-side state for this PA is R_E
-     * (Clean exclusive owner). Used for silent upgrade optimization.
+     * Check if the local requester-side state for this PA is R_E or R_M
+     * (Clean or dirty exclusive owner). Used for silent upgrade optimization.
      */
     bool hasRequesterExclusive(uint64_t pa) const;
 

@@ -835,11 +835,11 @@ EPRNFController::handleSnpCleanInvalid(const CHIRequestMsg *msg)
 
     if (isDsmLine) {
         // §5.2 Silent Upgrade: when the local requester holds R_E (clean
-        // exclusive, guaranteed sole owner by directory one-hot invariant),
-        // the write upgrade can complete locally with zero cross-node
-        // messages — no OuterUpgradeReq, no hold, no epoch increment on
-        // the home.  This is the cross-node analogue of MESI's E→M
-        // silent upgrade.
+        // exclusive) or R_M (dirty modified), guaranteed sole owner by
+        // directory one-hot invariant, the write upgrade can complete
+        // locally with zero cross-node messages — no OuterUpgradeReq,
+        // no hold, no epoch increment on the home.  This is the cross-node
+        // analogue of MESI's E→M (or M→M store) silent upgrade.
         if (backend && backend->hasRequesterExclusive(msg->m_addr)) {
             bool silent = []{
                 const char *e = std::getenv("EP_SILENT_UPGRADE");
@@ -848,10 +848,10 @@ EPRNFController::handleSnpCleanInvalid(const CHIRequestMsg *msg)
             if (silent) {
                 DPRINTF(RubyCHIGeneric,
                         "EP_RNF node_id=%d: SnpCleanInvalid PA=0x%lx "
-                        "silent upgrade (R_E → R_M local, 0 cross-node msgs)\n",
+                        "silent upgrade (R_E/R_M→M local, 0 cross-node msgs)\n",
                         _nodeId, msg->m_addr);
                 printf("[UPGRADE-DIAG] node=%d silent upgrade PA=0x%lx "
-                       "(R_E→R_M, zero cross-node messages)\n",
+                       "(R_E/R_M→M, zero cross-node messages)\n",
                        _nodeId, msg->m_addr);
                 return sendSnpRespI(msg);
             }
