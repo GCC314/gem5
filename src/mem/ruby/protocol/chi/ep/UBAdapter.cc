@@ -1,7 +1,6 @@
 #include "mem/ruby/protocol/chi/ep/UBAdapter.hh"
 
 #include <cstdio>
-#include <cstdlib>
 #include <limits>
 #include <thread>
 
@@ -21,14 +20,11 @@ namespace gem5
 namespace ruby
 {
 
-// Phase 0.2: SimObject param → static local (set by UBAdapter::init).
-// When wait_cap param is 0 (default), fall back to env var or hard-coded default.
+// Phase 1: SimObject param → static local (set by UBAdapter::init).
 static uint64_t s_wait_cap = 0;
 
 static uint64_t ub_wait_cap() {
-    if (s_wait_cap > 0) return s_wait_cap;
-    const char *e = std::getenv("UB_WAIT_CAP");
-    return e ? std::strtoull(e, nullptr, 10) : 2000000;
+    return s_wait_cap;
 }
 
 UBAdapter::UBAdapter(const Params &p)
@@ -56,10 +52,9 @@ UBAdapter::init()
 {
     SimObject::init();
 
-    // Phase 0.2: Store SimObject param into file-local static so the
-    // ub_wait_cap() getter picks it up (priority over env var).
-    if (params().wait_cap > 0)
-        s_wait_cap = params().wait_cap;
+    // Phase 1: Store SimObject param into file-local static.
+    // Param always takes effect (no env fallback).
+    s_wait_cap = params().wait_cap;
 
     // Create Port directly (guarantees all nodes get one regardless of init order).
     // _localNode selects which node this process owns (-1 = all nodes bind, legacy

@@ -10,7 +10,6 @@
 #include "mem/packet.hh"
 #include "mem/request.hh"
 #include "params/EPSNFController.hh"
-#include <cstdlib>
 
 namespace gem5
 {
@@ -21,30 +20,16 @@ namespace ruby
 using namespace CHI;
 
 // ---- SimObject param → static locals (set by EPSNFController::init) ----
-// Phase 0.2: SimObject params take priority; env vars act as fallback
-// when the param is left at default (sentinel: 0 for delta_noc, non-zero
-// default for retry_cycles but still overridable by env when param is 0).
 static uint64_t s_retry_cycles = 0;        // from _params.retry_cycles
 static uint64_t s_delta_noc_cycles = 0;    // from _params.delta_noc_cycles
 
-// Retry cycle count after BUSY grant — configurable via SimObject param or env var.
-// Default 20,000 cycles = 10 µs @ 2 GHz.
 static uint64_t epsnf_retry_cycles() {
-    if (s_retry_cycles > 0) return s_retry_cycles;
-    const char *e = std::getenv("EP_RETRY_CYCLES");
-    return e ? std::strtoull(e, nullptr, 10) : 20000;  // default 10µs @2GHz
+    return s_retry_cycles;
 }
 
-// Δ_noc: cross-socket NoC extra latency (cycles).  In dual-socket topologies
-// the SN-F may sit on a different socket from the requester HN-F, adding NoC
-// hops inside gem5.  This configurable delay (default 0 = single-socket)
-// models that extra cross-socket routing latency.  See latency_tuning_constraints.md §6.1.
 static uint64_t epsnf_delta_noc_cycles() {
-    if (s_delta_noc_cycles > 0) return s_delta_noc_cycles;
-    const char *e = std::getenv("EP_DELTA_NOC_CYCLES");
-    return e ? std::strtoull(e, nullptr, 10) : 0;
+    return s_delta_noc_cycles;
 }
-// (note: env EP_DELTA_NOC_CYCLES is only checked when SimObject param is 0)
 
 EPSNFController::EPSNFController(const Params &p)
   : EPController(p), _backend(p.ep_backend),
@@ -62,12 +47,10 @@ EPSNFController::init()
     EPController::init();
     fatal_if(!_backend, "EP_SNF node_id=%d: no backend attached", _nodeId);
 
-    // Phase 0.2: Store SimObject params into file-local statics so the
-    // static getter functions pick them up (priority over env vars).
-    if (params().retry_cycles > 0)
-        s_retry_cycles = params().retry_cycles;
-    if (params().delta_noc_cycles > 0)
-        s_delta_noc_cycles = params().delta_noc_cycles;
+    // Phase 1: Store SimObject params into file-local statics.
+    // Params always take effect (no env fallback).
+    s_retry_cycles = params().retry_cycles;
+    s_delta_noc_cycles = params().delta_noc_cycles;
 
     // F4: selfTest disabled (§gap_analysis)
     // selfTest();

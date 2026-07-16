@@ -327,6 +327,10 @@ class EPBackend : public SimObject
 
     int nodeId() const { return _nodeId; }
 
+    // SimObject-param getters (replaces env-var reads)
+    bool silentUpgradeEnabled() const { return params().silent_upgrade; }
+    bool directFwdEnabled() const { return params().direct_fwd; }
+
     bool checkAddr(uint64_t pa) const;
     bool checkDsmAddr(uint64_t pa) const;
     bool isDsmAddrCrossNode(uint64_t pa) const;

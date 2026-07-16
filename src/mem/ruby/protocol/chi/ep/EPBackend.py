@@ -25,3 +25,5 @@ class EPBackend(SimObject):
     )
     metadata_private_base = Param.Addr(0, "metadata private DRAM base")
     metadata_private_size = Param.MemorySize("16MB", "metadata private DRAM size")
+    silent_upgrade = Param.Bool(False, "silent upgrade: complete write upgrade locally when requester holds E/M")
+    direct_fwd = Param.Bool(True, "enable direct-forward (owner->requester data bypass)")

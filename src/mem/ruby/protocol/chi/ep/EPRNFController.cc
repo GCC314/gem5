@@ -1,7 +1,6 @@
 #include "mem/ruby/protocol/chi/ep/EPRNFController.hh"
 
 #include <cassert>
-#include <cstdlib>
 
 #include "base/logging.hh"
 #include "debug/RubyCHIGeneric.hh"
@@ -29,15 +28,11 @@ static uint64_t s_upgrade_retry_min = 0;   // from _params.upgrade_retry_min_cyc
 static uint64_t s_upgrade_retry_max = 0;   // from _params.upgrade_retry_max_cycles
 
 static uint64_t eprn_compack_retry() {
-    if (s_compack_retry > 0) return s_compack_retry;
-    const char *e = std::getenv("EPRN_COMPACK_RETRY_CYCLES");
-    return e ? std::strtoull(e, nullptr, 10) : 100000;
+    return s_compack_retry;
 }
 
 static uint64_t eprn_wakeup_retry() {
-    if (s_wakeup_retry > 0) return s_wakeup_retry;
-    const char *e = std::getenv("EPRN_WAKEUP_RETRY_CYCLES");
-    return e ? std::strtoull(e, nullptr, 10) : 1000000;
+    return s_wakeup_retry;
 }
 
 // ---- Exponential backoff for held-upgrade retries (§11) ----
@@ -53,16 +48,8 @@ static uint64_t eprn_wakeup_retry() {
 // (@2 GHz: 1 cy = 500 ticks, so multiply by 2 to get Cycles).
 static uint64_t ep_upgrade_retry_backoff_cycles(int retryCount)
 {
-    uint64_t minCycles = s_upgrade_retry_min > 0
-        ? s_upgrade_retry_min : []() -> uint64_t {
-            const char *e = std::getenv("EP_UPGRADE_RETRY_MIN_CYCLES");
-            return e ? std::strtoull(e, nullptr, 10) : 10000;
-          }();
-    uint64_t maxCycles = s_upgrade_retry_max > 0
-        ? s_upgrade_retry_max : []() -> uint64_t {
-            const char *e = std::getenv("EP_UPGRADE_RETRY_MAX_CYCLES");
-            return e ? std::strtoull(e, nullptr, 10) : 400000;
-          }();
+    uint64_t minCycles = s_upgrade_retry_min;
+    uint64_t maxCycles = s_upgrade_retry_max;
     uint64_t base = minCycles;
     for (int i = 0; i < retryCount && base < maxCycles; i++)
         base <<= 1;                    // double each retry
@@ -317,16 +304,12 @@ EPRNFController::init()
     EPController::init();
     fatal_if(!_backend, "EP_RNF node_id=%d: no backend attached", _nodeId);
 
-    // Phase 0.2: Store SimObject params into file-local statics so the
-    // static getter functions pick them up (priority over env vars).
-    if (params().compack_retry_cycles > 0)
-        s_compack_retry = params().compack_retry_cycles;
-    if (params().wakeup_retry_cycles > 0)
-        s_wakeup_retry = params().wakeup_retry_cycles;
-    if (params().upgrade_retry_min_cycles > 0)
-        s_upgrade_retry_min = params().upgrade_retry_min_cycles;
-    if (params().upgrade_retry_max_cycles > 0)
-        s_upgrade_retry_max = params().upgrade_retry_max_cycles;
+    // Phase 1: Store SimObject params into file-local statics.
+    // Params always take effect (no env fallback).
+    s_compack_retry = params().compack_retry_cycles;
+    s_wakeup_retry = params().wakeup_retry_cycles;
+    s_upgrade_retry_min = params().upgrade_retry_min_cycles;
+    s_upgrade_retry_max = params().upgrade_retry_max_cycles;
 
     // v4-dual-socket: strict completeness check (§3.4 change 2)
     // num_sockets > 1 且 downstream_destinations.size() != num_sockets -> fatal
@@ -841,10 +824,7 @@ EPRNFController::handleSnpCleanInvalid(const CHIRequestMsg *msg)
         // no hold, no epoch increment on the home.  This is the cross-node
         // analogue of MESI's E→M (or M→M store) silent upgrade.
         if (backend && backend->hasRequesterExclusive(msg->m_addr)) {
-            bool silent = []{
-                const char *e = std::getenv("EP_SILENT_UPGRADE");
-                return !e || std::strtoull(e, nullptr, 10) != 0;
-            }();
+            bool silent = backend->silentUpgradeEnabled();
             if (silent) {
                 DPRINTF(RubyCHIGeneric,
                         "EP_RNF node_id=%d: SnpCleanInvalid PA=0x%lx "

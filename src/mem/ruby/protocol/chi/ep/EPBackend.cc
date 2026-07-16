@@ -1,7 +1,6 @@
 #include "mem/ruby/protocol/chi/ep/EPBackend.hh"
 
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <cstdarg>
 #include <array>
@@ -524,10 +523,7 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
         RequesterLineState st = existing->second.state;
         if (st == RequesterLineState::R_E ||
             st == RequesterLineState::R_M) {
-            bool silent = []{
-                const char *e = std::getenv("EP_SILENT_UPGRADE");
-                return !e || std::strtoull(e, nullptr, 10) != 0;
-            }();
+            bool silent = params().silent_upgrade;
             if (silent) {
                 // R_E → R_M (or R_M stays R_M): no outer request needed
                 existing->second.state = RequesterLineState::R_M;
@@ -1035,17 +1031,8 @@ EPBackend::diagnoseExpectedGrant(int neededPerm, bool writeIntent) const
 
 // ---- M6: Recall Management ----
 
-// Phase 0.4: C4 Direct-Forward gate — controlled by env var UBCC_DIRECT_FWD.
-// When set to "0", all direct-forward (owner→requester bypass) is disabled.
-// Default (unset or non-zero) enables direct-forward.
-static bool enableDirectFwd() {
-    static int v = -1;
-    if (v < 0) {
-        const char *e = std::getenv("UBCC_DIRECT_FWD");
-        v = (e && std::strtoull(e, nullptr, 10) == 0) ? 0 : 1;
-    }
-    return v == 1;
-}
+// Phase 0.4: C4 Direct-Forward gate — controlled by SimObject Param direct_fwd.
+// Default True enables direct-forward (owner→requester bypass).
 
 bool
 EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
@@ -1149,7 +1136,7 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
                 }
                 // C4: Direct-forward data to requester (requester ≠ owner ≠ home)
                 {
-                    bool canForward = enableDirectFwd() &&
+                    bool canForward = params().direct_fwd &&
                                       (capturedMsg.requesterNode >= 0 &&
                                        capturedMsg.requesterNode != capturedMsg.ownerNode &&
                                        capturedMsg.requesterNode != capturedMsg.homeNode);
@@ -1210,7 +1197,7 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
                 }
                 // C4: Direct-forward data to requester (requester ≠ owner ≠ home)
                 {
-                    bool canForward = enableDirectFwd() &&
+                    bool canForward = params().direct_fwd &&
                                       (capturedMsg.requesterNode >= 0 &&
                                        capturedMsg.requesterNode != capturedMsg.ownerNode &&
                                        capturedMsg.requesterNode != capturedMsg.homeNode);
