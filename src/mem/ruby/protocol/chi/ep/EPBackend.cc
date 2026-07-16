@@ -514,6 +514,32 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
         }
     }
 
+    // §5.2 Silent Upgrade (Write Hit): when the local requester already holds
+    // R_E (clean exclusive) or R_M (dirty modified), guaranteed sole owner by
+    // directory one-hot invariant, the write can complete locally with zero
+    // cross-node messages — no OuterUpgradeReq, no epoch increment on the home.
+    // This is the cross-node analogue of MESI's E→M (or M→M) silent upgrade.
+    if (neededPerm == 1 && existing != _requesterLines.end() &&
+        homeNode != _nodeId) {
+        RequesterLineState st = existing->second.state;
+        if (st == RequesterLineState::R_E ||
+            st == RequesterLineState::R_M) {
+            bool silent = []{
+                const char *e = std::getenv("EP_SILENT_UPGRADE");
+                return !e || std::strtoull(e, nullptr, 10) != 0;
+            }();
+            if (silent) {
+                // R_E → R_M (or R_M stays R_M): no outer request needed
+                existing->second.state = RequesterLineState::R_M;
+                printf("[UPGRADE-DIAG] node=%d SILENT-WRITE-HIT PA=0x%lx "
+                       "(state=%d→R_M, zero cross-node messages)\n",
+                       _nodeId, line_pa, static_cast<int>(st));
+                outHomeNode = homeNode;
+                return static_cast<int>(OuterGrantType::GlobalGrantModified);
+            }
+        }
+    }
+
     bool isRetry = (existing != _requesterLines.end() &&
                     existing->second.state == RequesterLineState::R_WAIT_GRANT);
 
