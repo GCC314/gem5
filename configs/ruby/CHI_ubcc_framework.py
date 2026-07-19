@@ -287,9 +287,12 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
         nd['ub_adapter'] = nd['ub_adapters'][0] if nd['ub_adapters'] else None
         nd['meta_rnf'] = None
 
+        import os
+        _silent_env = os.environ.get("EP_SILENT_UPGRADE")
+        _direct_env = os.environ.get("EP_DIRECT_FWD")
         ep_backend = EPBackend(node_id=node_id, ruby_system=ruby_system,
-                                meta_rnf=NULL,
-                                ub_adapter=nd['ub_adapter'],
+                                 meta_rnf=NULL,
+                                 ub_adapter=nd['ub_adapter'],
                                 # Socket-plane: pass ALL per-socket UBAdapters so
                                 # each becomes a tree child (init() runs, binds its
                                 # own ubio Port) and is registered for getUBAdapter.
@@ -298,10 +301,14 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
                                 num_nodes=num_nodes,
                                 ubcc_epoch_bits=ubcc_epoch_bits,
                                 ubcc_bf_bytes=ubcc_bf_bytes,
-                                ubcc_force_resident_entries=
-                                     ubcc_force_resident_entries,
-                                metadata_private_base=cfg.metadata_private_base,
-                                metadata_private_size=f"{metadata_private_size}B")
+                                 ubcc_force_resident_entries=
+                                      ubcc_force_resident_entries,
+                                 metadata_private_base=cfg.metadata_private_base,
+                                 metadata_private_size=f"{metadata_private_size}B",
+                                 silent_upgrade=bool(int(_silent_env))
+                                      if _silent_env is not None else False,
+                                 direct_fwd=bool(int(_direct_env))
+                                      if _direct_env is not None else True)
 
         # v4-dual-socket: Create per-socket EP-SNF controllers (§3.2 change 2)
         nd['ep_snf_cntrls'] = []

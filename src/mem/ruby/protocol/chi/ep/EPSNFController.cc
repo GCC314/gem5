@@ -470,6 +470,11 @@ EPSNFController::recvDataMsg(const CHIDataMsg *msg)
 {
     DPRINTF(RubyCHIGeneric, "EP_SNF node_id=%d recvDataMsg type=%d addr=0x%lx\n",
             _nodeId, msg->m_type, msg->m_addr);
+    std::fprintf(stderr,
+                 "[EPSNF-DATA-RECV] node=%d type=%d addr=0x%lx pendingWrite=%d\n",
+                 _nodeId, msg->m_type, msg->m_addr,
+                 _pendingWrites.count(msg->m_addr) ? 1 : 0);
+    std::fflush(stderr);
 
     // Q2: Write NCBWrData to DDR4 (SimpleMemory) via functionalAccess
     if (msg->m_type == CHIDataType_NCBWrData ||
@@ -562,6 +567,11 @@ EPSNFController::recvDataMsg(const CHIDataMsg *msg)
                     "EP_SNF node_id=%d: CompDBIDResp sent for write "
                     "addr=0x%lx\n", _nodeId, msg->m_addr);
             _pendingWrites.erase(it);
+        } else {
+            std::fprintf(stderr,
+                         "[EPSNF-DATA-NO-PENDING-WRITE] node=%d type=%d addr=0x%lx\n",
+                         _nodeId, msg->m_type, msg->m_addr);
+            std::fflush(stderr);
         }
         return true;
     }

@@ -1039,6 +1039,12 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
 {
     printf("[RECALL-ENTRY] EPBackend node=%d PA=0x%lx ownerNode=%d homeNode=%d\n",
            _nodeId, recallMsg.linePa, recallMsg.ownerNode, recallMsg.homeNode);
+    std::fprintf(stderr,
+                 "[RECALL-ENTRY-ERR] node=%d PA=0x%lx ownerNode=%d homeNode=%d reqId=%lu isRead=%d dataNeeded=%d curT=%lu\n",
+                 _nodeId, recallMsg.linePa, recallMsg.ownerNode,
+                 recallMsg.homeNode, recallMsg.reqId,
+                 recallMsg.isReadRequest ? 1 : 0,
+                 recallMsg.dataNeeded ? 1 : 0, curTick());
     DPRINTF(RubyEP,
             "EPBackend node_id=%d: handleRecallRequest "
             "PA=0x%lx ownerNode=%d homeNode=%d epoch=%lu "
@@ -1114,12 +1120,21 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
         // Read recall: ReadShared to downgrade owner to R_S
         printf("[RECALL-DIAG] node=%d initiating ReadShared recall PA=0x%lx\n",
                _nodeId, recallMsg.linePa);
+        std::fprintf(stderr,
+                     "[RECALL-START-ERR] node=%d kind=ReadShared linePA=0x%lx localPA=0x%lx reqId=%lu curT=%lu\n",
+                     _nodeId, recallMsg.linePa, ownerLocalPa,
+                     recallMsg.reqId, curTick());
         // R2: Clear stale recall capture data before initiating new recall
         setRecallCaptureData(DataBlock(64), false);
         _epRnfCtrl->startReadShared(ownerLocalPa,
             [this, capturedMsg](bool success) {
                 printf("[RECALL-DIAG] node=%d ReadShared callback success=%d valid=%d\n",
                        _nodeId, success, _recallCaptureDataValid);
+                std::fprintf(stderr,
+                             "[RECALL-CB-ERR] node=%d kind=ReadShared linePA=0x%lx reqId=%lu success=%d valid=%d curT=%lu\n",
+                             _nodeId, capturedMsg.linePa, capturedMsg.reqId,
+                             success ? 1 : 0,
+                             _recallCaptureDataValid ? 1 : 0, curTick());
                 OuterRecallResponse resp;
                 resp.linePa = capturedMsg.linePa;
                 resp.ownerNode = capturedMsg.ownerNode;
@@ -1175,12 +1190,21 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
         // Write recall: ReadUnique with RecallUnique proxy op
         printf("[RECALL-DIAG] node=%d initiating ReadUnique recall PA=0x%lx\n",
                _nodeId, recallMsg.linePa);
+        std::fprintf(stderr,
+                     "[RECALL-START-ERR] node=%d kind=ReadUnique linePA=0x%lx localPA=0x%lx reqId=%lu curT=%lu\n",
+                     _nodeId, recallMsg.linePa, ownerLocalPa,
+                     recallMsg.reqId, curTick());
         // R2: Clear stale recall capture data before initiating new recall
         setRecallCaptureData(DataBlock(64), false);
         _epRnfCtrl->startReadUnique(ownerLocalPa,
             [this, capturedMsg](bool success) {
                 printf("[RECALL-DIAG] node=%d ReadUnique callback success=%d\n",
                        _nodeId, success);
+                std::fprintf(stderr,
+                             "[RECALL-CB-ERR] node=%d kind=ReadUnique linePA=0x%lx reqId=%lu success=%d valid=%d curT=%lu\n",
+                             _nodeId, capturedMsg.linePa, capturedMsg.reqId,
+                             success ? 1 : 0,
+                             _recallCaptureDataValid ? 1 : 0, curTick());
                 OuterRecallResponse resp;
                 resp.linePa = capturedMsg.linePa;
                 resp.ownerNode = capturedMsg.ownerNode;
@@ -1243,6 +1267,10 @@ EPBackend::sendRecallResponse(const OuterRecallResponse &response)
 {
     printf("[RECALL-RESP] node=%d PA=0x%lx homeNode=%d dataReturned=%d\n",
            _nodeId, response.linePa, response.homeNode, response.dataReturned);
+    std::fprintf(stderr,
+                 "[RECALL-RESP-ERR] node=%d PA=0x%lx homeNode=%d reqId=%lu dataReturned=%d curT=%lu\n",
+                 _nodeId, response.linePa, response.homeNode,
+                 response.reqId, response.dataReturned ? 1 : 0, curTick());
     DPRINTF(RubyEP,
             "EPBackend node_id=%d: sendRecallResponse "
             "PA=0x%lx homeNode=%d dataReturned=%d hasData=%d\n",

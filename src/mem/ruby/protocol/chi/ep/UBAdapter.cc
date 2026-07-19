@@ -1433,6 +1433,11 @@ UBAdapter::handleResponse(framework::MemMessage *m)
       case CoherenceMessageType::InvalidateReq:
       case CoherenceMessageType::RecallReq:
       case CoherenceMessageType::UpgradeAckNotify:
+        std::fprintf(stderr,
+                     "[ASYNC-CTRL-ENQ] node=%d type=%s reqId=%lu pa=0x%lx src=%d dst=%d curT=%lu depth=%zu\n",
+                     _nodeId, coherenceMsgTypeName(coh->h.type), coh->h.reqId,
+                     coh->h.homeLinePa, coh->h.srcNode, coh->h.dstNode,
+                     curTick(), _deferredControls.size() + 1);
         _deferredControls.push_back(*coh);
         return;
       default:
@@ -1538,6 +1543,10 @@ UBAdapter::drainDeferredControls()
     while (!_deferredControls.empty()) {
         CoherenceMessage msg = _deferredControls.front();
         _deferredControls.pop_front();
+        std::fprintf(stderr,
+                     "[ASYNC-CTRL-DRAIN] node=%d type=%s reqId=%lu pa=0x%lx curT=%lu remaining=%zu\n",
+                     _nodeId, coherenceMsgTypeName(msg.h.type), msg.h.reqId,
+                     msg.h.homeLinePa, curTick(), _deferredControls.size());
         recvFromRouter(msg);
     }
     _drainingDeferredControls = false;
