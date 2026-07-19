@@ -167,10 +167,9 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
          "dataToFwdReq=%d\n",
          _nodeId, msg->m_type, msg->m_addr, msg->m_dataToFwdRequestor);
 
-    // Q2: Handle WriteNoSnp / WriteNoSnpPtl — forward to DDR4 directly.
-    // No UBCC directory involvement needed for writes.
-    // Store pending write requestor; CompDBIDResp sent after NCBWrData
-    // arrives via recvDataMsg.
+    // A WriteNoSnp is a two-phase operation.  CompDBIDResp grants the
+    // sender permission to transmit NCBWrData; waiting for that data before
+    // replying deadlocks the request/data handshake.
     if (msg->m_type == CHIRequestType_WriteNoSnp ||
         msg->m_type == CHIRequestType_WriteNoSnpPtl) {
 
@@ -179,8 +178,27 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
         }
         _backend->checkDsmAddr(msg->m_addr);
 
-        // Store pending write: addr → requestor (HN-F)
-        _pendingWrites[msg->m_addr] = msg->m_requestor;
+        PendingWrite pending;
+        if (msg->m_type == CHIRequestType_WriteNoSnpPtl) {
+            const int offset = msg->m_accAddr - msg->m_addr;
+            pending.expectedMask = ((1ULL << msg->m_accSize) - 1) << offset;
+        } else {
+            pending.expectedMask = ~0ULL;
+        }
+        _pendingWrites[msg->m_addr] = pending;
+
+        NetDest hnDest(m_ruby_system);
+        hnDest.add(msg->m_requestor);
+        auto rsp = std::make_shared<CHIResponseMsg>(
+            curTick(), cacheLineSize, m_ruby_system,
+            msg->m_addr, CHIResponseType_CompDBIDResp,
+            m_machineID, hnDest,
+            false, false, 0, 0, MessageSizeType_Control);
+        sendResponseMsg(rsp);
+        std::fprintf(stderr,
+                     "[EPSNF-WRITE-DBID] node=%d addr=0x%lx expected=0x%lx\n",
+                     _nodeId, msg->m_addr, pending.expectedMask);
+        std::fflush(stderr);
 
         DPRINTF(RubyCHIGeneric,
                 "EP_SNF node_id=%d: WriteNoSnp pending, "
@@ -470,10 +488,11 @@ EPSNFController::recvDataMsg(const CHIDataMsg *msg)
 {
     DPRINTF(RubyCHIGeneric, "EP_SNF node_id=%d recvDataMsg type=%d addr=0x%lx\n",
             _nodeId, msg->m_type, msg->m_addr);
+    auto pendingIt = _pendingWrites.find(msg->m_addr);
     std::fprintf(stderr,
                  "[EPSNF-DATA-RECV] node=%d type=%d addr=0x%lx pendingWrite=%d\n",
                  _nodeId, msg->m_type, msg->m_addr,
-                 _pendingWrites.count(msg->m_addr) ? 1 : 0);
+                 pendingIt != _pendingWrites.end() ? 1 : 0);
     std::fflush(stderr);
 
     // Q2: Write NCBWrData to DDR4 (SimpleMemory) via functionalAccess
@@ -484,12 +503,13 @@ EPSNFController::recvDataMsg(const CHIDataMsg *msg)
         msg->m_type == CHIDataType_CBWrData_SD_PD ||
         msg->m_type == CHIDataType_CBWrData_I) {
 
+        uint64_t writePa = msg->m_addr;
+        uint8_t buf[64]{};
         auto *phys_mem = m_ruby_system->getPhysMem();
         if (phys_mem) {
             // ---- v4: Cross-node NCBWrData routing (§4.4.2 item 3) ----
             // Translate local PA to home PA so data goes to home node's DDR4,
             // not the local node's memory.
-            uint64_t writePa = msg->m_addr;  // default: local PA
             if (_backend && _backend->isDsmAddrCrossNode(msg->m_addr)) {
                 auto &addrMap = _backend->addrMap();
                 int homeNode = addrMap.homeNode(_nodeId, msg->m_addr);
@@ -503,8 +523,6 @@ EPSNFController::recvDataMsg(const CHIDataMsg *msg)
 
             const DataBlock &db = msg->m_dataBlk;
             const WriteMask &wm = msg->m_bitMask;
-            uint8_t buf[64];
-
             // Read current line from DDR4 (at home PA), then apply write mask
             RequestPtr req = std::make_shared<Request>(
                 writePa, cacheLineSize, 0, RequestorID(0));
@@ -525,48 +543,39 @@ EPSNFController::recvDataMsg(const CHIDataMsg *msg)
             wrPkt.dataStatic(buf);
             phys_mem->functionalAccess(&wrPkt);
 
-            // v4: Follow WriteNoSnp through EPBackend chain to UBCC,
-            // same pattern as ReadNoSnp → handleRemoteMiss → UBCC.
-            // Notify UBCC that home data has been written to DRAM,
-            // releasing directory ownership.
-            if (_backend && _backend->isDsmAddr(writePa)) {
-                // Pass dirty data so ubio can persist to DsmDataStore
-                int wbRet = _backend->handleWriteback(writePa, false, buf);
-                if (wbRet == -2) {
-                    std::fprintf(stderr,
-                                 "[EPSNF-WB-PENDING] node=%d pa=0x%lx\n",
-                                 _nodeId, writePa);
-                    // Queue for retry in wakeup
-                    PendingWriteback pwb; pwb.linePa = writePa;
-                    pwb.keepAsClean = false; pwb.hasData = true;
-                    std::memcpy(pwb.data, buf, 64);
-                    _pendingWritebacks.push_back(pwb);
-                }
-            }
-
             DPRINTF(RubyCHIGeneric,
                     "EP_SNF node_id=%d: wrote data to DDR4 "
                     "addr=0x%lx type=%d\n",
                     _nodeId, writePa, msg->m_type);
         }
 
-        // Send CompDBIDResp if there's a pending write for this address
-        auto it = _pendingWrites.find(msg->m_addr);
-        if (it != _pendingWrites.end()) {
-            NetDest hnDest(m_ruby_system);
-            hnDest.add(it->second);  // requestor = HN-F
-
-            auto rsp = std::make_shared<CHIResponseMsg>(
-                curTick(), cacheLineSize, m_ruby_system,
-                msg->m_addr, CHIResponseType_CompDBIDResp,
-                m_machineID, hnDest,
-                false, false, 0, 0, MessageSizeType_Control);
-            sendResponseMsg(rsp);
-
-            DPRINTF(RubyCHIGeneric,
-                    "EP_SNF node_id=%d: CompDBIDResp sent for write "
-                    "addr=0x%lx\n", _nodeId, msg->m_addr);
-            _pendingWrites.erase(it);
+        if (pendingIt != _pendingWrites.end()) {
+            uint64_t beatMask = 0;
+            for (int i = 0; i < cacheLineSize; ++i) {
+                if (msg->m_bitMask.test(i))
+                    beatMask |= 1ULL << i;
+            }
+            pendingIt->second.receivedMask |= beatMask;
+            if ((pendingIt->second.receivedMask & pendingIt->second.expectedMask) ==
+                pendingIt->second.expectedMask) {
+                if (_backend && _backend->isDsmAddr(writePa)) {
+                    int wbRet = _backend->handleWriteback(writePa, false, buf);
+                    if (wbRet == -2) {
+                        std::fprintf(stderr,
+                                     "[EPSNF-WB-PENDING] node=%d pa=0x%lx\n",
+                                     _nodeId, writePa);
+                        PendingWriteback pwb; pwb.linePa = writePa;
+                        pwb.keepAsClean = false; pwb.hasData = true;
+                        std::memcpy(pwb.data, buf, 64);
+                        _pendingWritebacks.push_back(pwb);
+                    }
+                }
+                std::fprintf(stderr,
+                             "[EPSNF-WRITE-DONE] node=%d addr=0x%lx received=0x%lx\n",
+                             _nodeId, msg->m_addr, pendingIt->second.receivedMask);
+                std::fflush(stderr);
+                _pendingWrites.erase(pendingIt);
+            }
         } else {
             std::fprintf(stderr,
                          "[EPSNF-DATA-NO-PENDING-WRITE] node=%d type=%d addr=0x%lx\n",

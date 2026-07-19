@@ -38,8 +38,14 @@ class EPSNFController : public EPController
     EPBackend *_backend = nullptr;
     int _socketId = 0;  // v4-dual-socket
 
-    // Q2: Pending write tracking — maps address → HN-F requestor.
-    std::map<Addr, MachineID> _pendingWrites;
+    // A WriteNoSnp grants the DBID before its data beats arrive.  Keep the
+    // transaction until every expected byte has reached home memory, then
+    // publish the completed writeback to UBCC exactly once.
+    struct PendingWrite {
+        uint64_t expectedMask = 0;
+        uint64_t receivedMask = 0;
+    };
+    std::map<Addr, PendingWrite> _pendingWrites;
 
     // Q3: Retry queue for blocked grants
     struct RetryEntry {
