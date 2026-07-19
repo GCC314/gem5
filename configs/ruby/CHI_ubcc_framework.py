@@ -305,10 +305,10 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
                                       ubcc_force_resident_entries,
                                  metadata_private_base=cfg.metadata_private_base,
                                  metadata_private_size=f"{metadata_private_size}B",
-                                 silent_upgrade=bool(int(_silent_env))
-                                      if _silent_env is not None else False,
-                                 direct_fwd=bool(int(_direct_env))
-                                      if _direct_env is not None else True)
+                                  silent_upgrade=bool(int(_silent_env))
+                                       if _silent_env is not None else False,
+                                  direct_fwd=bool(int(_direct_env))
+                                       if _direct_env is not None else False)
 
         # v4-dual-socket: Create per-socket EP-SNF controllers (§3.2 change 2)
         nd['ep_snf_cntrls'] = []
