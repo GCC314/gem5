@@ -16,6 +16,17 @@ using namespace CHI;
 
 std::map<std::pair<int,int>, MetaRNFController*> MetaRNFController::_instances;
 
+namespace
+{
+
+bool
+tracePageOne(uint64_t pa)
+{
+    return pa >= 0x28000a00 && pa < 0x28000b00;
+}
+
+} // anonymous namespace
+
 MetaRNFController::MetaRNFController(const Params &p)
   : EPController(p),
     _metadataRange(p.metadata_private_range),
@@ -56,6 +67,8 @@ void
 MetaRNFController::wakeup()
 {
     EPController::wakeup();
+    completeDeferredReads();
+    completeDeferredWrites();
 }
 
 void
@@ -102,6 +115,11 @@ MetaRNFController::issueRead(uint64_t metadataPa, ReadCallback cb)
 
     auto sbIt = _scoreboard.find(metadataPa);
     if (sbIt != _scoreboard.end()) {
+        if (tracePageOne(metadataPa)) {
+            std::fprintf(stderr,
+                         "[META-TRACE] node=%d op=read-queue pa=0x%lx slot=%d active=%d\n",
+                         _nodeId, metadataPa, sbIt->second, activeFlightCount());
+        }
         QueuedOp q;
         q.op = OpType::Read;
         q.pa = metadataPa;
@@ -112,6 +130,11 @@ MetaRNFController::issueRead(uint64_t metadataPa, ReadCallback cb)
 
     int slot = findFreeSlot();
     if (slot < 0) {
+        if (tracePageOne(metadataPa)) {
+            std::fprintf(stderr,
+                         "[META-TRACE] node=%d op=read-no-slot pa=0x%lx active=%d\n",
+                         _nodeId, metadataPa, activeFlightCount());
+        }
         if (cb) cb(false, zero);
         return;
     }
@@ -122,6 +145,12 @@ MetaRNFController::issueRead(uint64_t metadataPa, ReadCallback cb)
     fs.pa = metadataPa;
     fs.readCb = cb;
     _scoreboard[metadataPa] = slot;
+
+    if (tracePageOne(metadataPa)) {
+        std::fprintf(stderr,
+                     "[META-TRACE] node=%d op=read-issue pa=0x%lx slot=%d active=%d\n",
+                     _nodeId, metadataPa, slot, activeFlightCount());
+    }
 
     if (!sendReadOnce(metadataPa)) {
         _scoreboard.erase(metadataPa);
@@ -141,6 +170,11 @@ MetaRNFController::issueWrite(uint64_t metadataPa, const MetaLine &line,
 
     auto sbIt = _scoreboard.find(metadataPa);
     if (sbIt != _scoreboard.end()) {
+        if (tracePageOne(metadataPa)) {
+            std::fprintf(stderr,
+                         "[META-TRACE] node=%d op=write-queue pa=0x%lx slot=%d active=%d\n",
+                         _nodeId, metadataPa, sbIt->second, activeFlightCount());
+        }
         QueuedOp q;
         q.op = OpType::Write;
         q.pa = metadataPa;
@@ -152,6 +186,11 @@ MetaRNFController::issueWrite(uint64_t metadataPa, const MetaLine &line,
 
     int slot = findFreeSlot();
     if (slot < 0) {
+        if (tracePageOne(metadataPa)) {
+            std::fprintf(stderr,
+                         "[META-TRACE] node=%d op=write-no-slot pa=0x%lx active=%d\n",
+                         _nodeId, metadataPa, activeFlightCount());
+        }
         if (cb) cb(false);
         return;
     }
@@ -163,6 +202,12 @@ MetaRNFController::issueWrite(uint64_t metadataPa, const MetaLine &line,
     fs.writeCb = cb;
     fs.writeData.setData(line.data(), 0, 64);
     _scoreboard[metadataPa] = slot;
+
+    if (tracePageOne(metadataPa)) {
+        std::fprintf(stderr,
+                     "[META-TRACE] node=%d op=write-issue pa=0x%lx slot=%d active=%d\n",
+                     _nodeId, metadataPa, slot, activeFlightCount());
+    }
 
     if (!sendWriteUnique(metadataPa)) {
         _scoreboard.erase(metadataPa);
@@ -248,6 +293,8 @@ MetaRNFController::sendReadOnce(uint64_t pa)
     req->m_addr = pa;
     req->m_type = CHIRequestType_ReadShared;  // L3-cacheable (was ReadOnce)
     req->m_requestor = m_machineID;
+    req->m_accAddr = pa;
+    req->m_accSize = cacheLineSize;
     req->m_allowRetry = true;
     req->m_MessageSize = MessageSizeType_Control;
     MachineID hnfId;
@@ -257,6 +304,11 @@ MetaRNFController::sendReadOnce(uint64_t pa)
     req->m_Destination.add(hnfId);
 
     bool sent = sendRequestMsg(req);
+    if (tracePageOne(pa)) {
+        std::fprintf(stderr,
+                     "[META-TRACE] node=%d op=read-send pa=0x%lx sent=%d\n",
+                     _nodeId, pa, sent ? 1 : 0);
+    }
     if (sent) {
         auto sbIt = _scoreboard.find(pa);
         if (sbIt != _scoreboard.end())
@@ -273,6 +325,8 @@ MetaRNFController::sendWriteUnique(uint64_t pa)
     req->m_addr = pa;
     req->m_type = CHIRequestType_WriteUniqueFull;
     req->m_requestor = m_machineID;
+    req->m_accAddr = pa;
+    req->m_accSize = cacheLineSize;
     req->m_allowRetry = true;
     req->m_MessageSize = MessageSizeType_Control;
     MachineID hnfId;
@@ -282,6 +336,11 @@ MetaRNFController::sendWriteUnique(uint64_t pa)
     req->m_Destination.add(hnfId);
 
     bool sent = sendRequestMsg(req);
+    if (tracePageOne(pa)) {
+        std::fprintf(stderr,
+                     "[META-TRACE] node=%d op=write-send pa=0x%lx sent=%d\n",
+                     _nodeId, pa, sent ? 1 : 0);
+    }
     if (sent) {
         auto sbIt = _scoreboard.find(pa);
         if (sbIt != _scoreboard.end())
@@ -300,21 +359,30 @@ MetaRNFController::sendWriteData(uint64_t pa, MachineID dst, uint64_t dbid)
     int slot = sbIt->second;
     FlightSlot &fs = _flightSlots[slot];
 
-    auto dat = std::make_shared<CHIDataMsg>(curTick(), cacheLineSize,
-                                             m_ruby_system);
-    dat->m_addr = pa;
-    dat->m_type = CHIDataType_NCBWrData;
-    dat->m_responder = m_machineID;
-    dat->m_Destination.clear();
-    dat->m_Destination.add(dst);
-    dat->m_dataBlk = fs.writeData;
-    WriteMask wm(cacheLineSize);
-    wm.setMask(0, cacheLineSize);
-    dat->m_bitMask = wm;
-    dat->m_usesTxnId = true;
-    dat->m_txnId = dbid;
-    dat->m_MessageSize = MessageSizeType_Data;
-    return sendDataMsg(dat);
+    bool sent = true;
+    for (int offset = 0; offset < cacheLineSize; offset += dataChannelSize) {
+        const int bytes = std::min(dataChannelSize, cacheLineSize - offset);
+        auto dat = std::make_shared<CHIDataMsg>(curTick(), cacheLineSize,
+                                                 m_ruby_system);
+        dat->m_addr = pa;
+        dat->m_type = CHIDataType_NCBWrData;
+        dat->m_responder = m_machineID;
+        dat->m_Destination.clear();
+        dat->m_Destination.add(dst);
+        dat->m_dataBlk = fs.writeData;
+        WriteMask wm(cacheLineSize);
+        wm.setMask(offset, bytes);
+        dat->m_bitMask = wm;
+        dat->m_txnId = dbid;
+        dat->m_MessageSize = MessageSizeType_Data;
+        sent = sendDataMsg(dat) && sent;
+    }
+    if (tracePageOne(pa)) {
+        std::fprintf(stderr,
+                     "[META-TRACE] node=%d op=write-data pa=0x%lx dbid=%lu dst=%d sent=%d\n",
+                     _nodeId, pa, dbid, dst.num, sent ? 1 : 0);
+    }
+    return sent;
 }
 
 bool
@@ -338,6 +406,12 @@ MetaRNFController::completeRead(int slotIdx, bool success,
     auto cb = fs.readCb;
     uint64_t pa = fs.pa;
 
+    if (tracePageOne(pa)) {
+        std::fprintf(stderr,
+                     "[META-TRACE] node=%d op=read-complete pa=0x%lx slot=%d success=%d\n",
+                     _nodeId, pa, slotIdx, success ? 1 : 0);
+    }
+
     MetaLine line{};
     if (success && data) {
         for (int i = 0; i < 64; ++i)
@@ -359,12 +433,55 @@ MetaRNFController::completeWrite(int slotIdx, bool success)
     auto cb = fs.writeCb;
     uint64_t pa = fs.pa;
 
+    if (tracePageOne(pa)) {
+        std::fprintf(stderr,
+                     "[META-TRACE] node=%d op=write-complete pa=0x%lx slot=%d success=%d\n",
+                     _nodeId, pa, slotIdx, success ? 1 : 0);
+    }
+
     _scoreboard.erase(pa);
     fs.reset();
 
     if (cb) cb(success);
 
     drainWaitQueue(pa);
+}
+
+void
+MetaRNFController::completeDeferredReads()
+{
+    const Tick now = curTick();
+    for (auto it = _deferredReadCompletions.begin();
+         it != _deferredReadCompletions.end();) {
+        if (it->ready > now) {
+            ++it;
+            continue;
+        }
+
+        const int slot = it->slot;
+        DataBlock data = it->data;
+        it = _deferredReadCompletions.erase(it);
+        if (_flightSlots[slot].state != SlotState::Free)
+            completeRead(slot, true, &data);
+    }
+}
+
+void
+MetaRNFController::completeDeferredWrites()
+{
+    const Tick now = curTick();
+    for (auto it = _deferredWriteCompletions.begin();
+         it != _deferredWriteCompletions.end();) {
+        if (it->second > now) {
+            ++it;
+            continue;
+        }
+
+        const int slot = it->first;
+        it = _deferredWriteCompletions.erase(it);
+        if (_flightSlots[slot].state != SlotState::Free)
+            completeWrite(slot, true);
+    }
 }
 
 bool
@@ -395,6 +512,13 @@ MetaRNFController::recvResponseMsg(const CHIResponseMsg *msg)
     int slot = sbIt->second;
     FlightSlot &fs = _flightSlots[slot];
 
+    if (tracePageOne(msg->m_addr)) {
+        std::fprintf(stderr,
+                     "[META-TRACE] node=%d op=recv-rsp pa=0x%lx slot=%d type=%d flight-op=%d\n",
+                     _nodeId, msg->m_addr, slot, static_cast<int>(msg->m_type),
+                     static_cast<int>(fs.op));
+    }
+
     if (msg->m_type == CHIResponseType_RetryAck ||
         msg->m_type == CHIResponseType_PCrdGrant) {
         return true;
@@ -419,7 +543,12 @@ MetaRNFController::recvResponseMsg(const CHIResponseMsg *msg)
             }
 
             if (msg->m_type == CHIResponseType_CompDBIDResp) {
-                completeWrite(slot, true);
+                // This is the completion response for WriteUniqueFull. Keep
+                // the slot until its data flits have reached the HN-F so a
+                // same-address request cannot overtake them.
+                _deferredWriteCompletions.emplace_back(
+                    slot, curTick() + cyclesToTicks(Cycles(16)));
+                scheduleEvent(Cycles(16));
             } else {
                 fs.waitingCompAfterDbid = true;
             }
@@ -446,6 +575,13 @@ MetaRNFController::recvDataMsg(const CHIDataMsg *msg)
     int slot = sbIt->second;
     FlightSlot &fs = _flightSlots[slot];
 
+    if (tracePageOne(msg->m_addr)) {
+        std::fprintf(stderr,
+                     "[META-TRACE] node=%d op=recv-data pa=0x%lx slot=%d type=%d flight-op=%d\n",
+                     _nodeId, msg->m_addr, slot, static_cast<int>(msg->m_type),
+                     static_cast<int>(fs.op));
+    }
+
     if (fs.op != OpType::Read)
         return true;
 
@@ -459,7 +595,11 @@ MetaRNFController::recvDataMsg(const CHIDataMsg *msg)
 
     sendCompAck(msg->m_addr, msg->m_responder);
     DataBlock db = msg->getdataBlk();
-    completeRead(slot, true, &db);
+    // The HN-F cannot accept a same-address write until it consumes this
+    // CompAck. Keep the scoreboard entry until the acknowledgement arrives.
+    _deferredReadCompletions.push_back(
+        {slot, curTick() + cyclesToTicks(Cycles(16)), db});
+    scheduleEvent(Cycles(16));
     return true;
 }
 

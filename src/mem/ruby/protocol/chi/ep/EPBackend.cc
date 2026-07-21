@@ -793,6 +793,24 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
     return -1;
 }
 
+int
+EPBackend::handleRemoteDemandMiss(uint64_t line_pa, int neededPerm,
+                                  bool writeIntent, int ingressSocket,
+                                  int& outHomeNode)
+{
+    auto existing = _requesterLines.find(line_pa);
+    if (existing != _requesterLines.end() &&
+        existing->second.state != RequesterLineState::R_WAIT_GRANT) {
+        DPRINTF(RubyEP,
+                "EPBackend node_id=%d: HN-F confirmed local miss PA=0x%lx "
+                "invalidating stale requester state=%d\n",
+                _nodeId, line_pa, static_cast<int>(existing->second.state));
+        existing->second.state = RequesterLineState::R_I;
+    }
+    return handleRemoteMiss(line_pa, neededPerm, writeIntent,
+                            ingressSocket, outHomeNode);
+}
+
 OuterGrantType
 EPBackend::handleGrant(uint64_t line_pa, OuterGrantType grant, int homeNode)
 {

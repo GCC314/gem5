@@ -41,6 +41,8 @@ class MetaRNFController : public EPController
     int activeFlightCount() const;
     int activeSlots() const { return activeFlightCount(); }
     int maxFlightSlots() const { return _maxFlights; }
+    uint64_t metadataRangeStart() const { return _metadataRange.start(); }
+    uint64_t metadataRangeEnd() const { return _metadataRange.end(); }
 
   protected:
     bool recvRequestMsg(const CHIRequestMsg *msg) override;
@@ -90,6 +92,8 @@ class MetaRNFController : public EPController
     bool inMetadataRange(uint64_t pa) const;
     void completeRead(int slotIdx, bool success, const DataBlock *data);
     void completeWrite(int slotIdx, bool success);
+    void completeDeferredReads();
+    void completeDeferredWrites();
 
   private:
     AddrRange _metadataRange;
@@ -99,6 +103,13 @@ class MetaRNFController : public EPController
     FlightSlot _flightSlots[8];
     std::map<uint64_t, int> _scoreboard;
     std::map<uint64_t, std::deque<QueuedOp>> _waitQueues;
+    struct DeferredReadCompletion {
+        int slot;
+        Tick ready;
+        DataBlock data;
+    };
+    std::deque<DeferredReadCompletion> _deferredReadCompletions;
+    std::deque<std::pair<int, Tick>> _deferredWriteCompletions;
 
     static std::map<std::pair<int,int>, MetaRNFController*> _instances;
 };

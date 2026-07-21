@@ -249,7 +249,7 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
 
     // Map sideband to outer request and dispatch
     int homeNode = -1;
-    int grantResult = _backend->handleRemoteMiss(
+    int grantResult = _backend->handleRemoteDemandMiss(
         msg->m_addr, neededPerm, writeIntent, _socketId, homeNode);
 
     // Q3: If grant blocked, queue for retry instead of sending stale data

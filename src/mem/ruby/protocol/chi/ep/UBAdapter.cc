@@ -720,8 +720,12 @@ UBAdapter::sendClearReq(uint64_t linePa, int srcNode,
             std::fprintf(stderr, "[CLR-CACHE-HIT] node=%d reqId=%lu accepted=%d\n",
                          _nodeId, reqId, rit->second.b.clearResp.accepted ? 1 : 0);
             bool a = rit->second.b.clearResp.accepted;
+            _inflightClearReqs.erase(reqId);
             _readyResponses.erase(rit);
             return a ? 1 : 0;
+        }
+        if (_inflightClearReqs.count(reqId)) {
+            return -2;
         }
         std::fprintf(stderr, "[CLR-CACHE-MISS] node=%d reqId=%lu sending new ClearReq\n",
                      _nodeId, reqId);
@@ -755,6 +759,9 @@ UBAdapter::sendClearReq(uint64_t linePa, int srcNode,
 
     // Port async path: schedule check, return pending
     if (_port) {
+        // Clear is retried until its response is cached. Keep one network copy
+        // in flight for this reqId; otherwise every local retry retransmits it.
+        _inflightClearReqs.insert(reqId);
         scheduleResponseCheck();
         return -2;
     }
@@ -1163,27 +1170,43 @@ UBAdapter::recvFromRouter(const CoherenceMessage &msg)
         }
 
         case CoherenceMessageType::MetaRNFReadReq: {
-            uint64_t pagePa = msg.h.homeLinePa;
-            uint64_t reqId = msg.h.reqId;
+            // UBIO's backstore schema uses compact page IDs. Map the ID into
+            // this socket's metadata DRAM range before issuing CHI accesses.
+            uint64_t pageId = msg.h.homeLinePa;
             auto *metaRNF = MetaRNFController::getInstance(_nodeId, _socketId);
             if (!metaRNF) break;
+            constexpr uint64_t pageBytes = 256;
+            uint64_t pagePa = metaRNF->metadataRangeStart() + pageId * pageBytes;
+            uint64_t reqId = msg.h.reqId;
+            if (pagePa < metaRNF->metadataRangeStart() ||
+                pagePa + pageBytes > metaRNF->metadataRangeEnd()) {
+                warn("UBAdapter node=%d: metadata page ID 0x%lx out of range",
+                     _nodeId, pageId);
+                break;
+            }
             auto tport = _port;
             struct MRState { int done; uint8_t buf[256]; };
             auto *state = new MRState{0, {}};
             for (int i = 0; i < 4; i++) {
                 uint64_t blockPa = pagePa + i * 64;
-                metaRNF->issueRead(blockPa, [tport, reqId, state, i, pagePa](bool ok, const MetaRNFController::MetaLine &db) {
+                metaRNF->issueRead(blockPa, [tport, reqId, state, i, pageId](bool ok, const MetaRNFController::MetaLine &db) {
                     if (ok) memcpy(&state->buf[i*64], db.data(), 64);
                     if (++state->done == 4) {
                         CoherenceMessage resp;
                         resp.h.type = CoherenceMessageType::MetaRNFReadResp;
                         resp.h.srcNode = 0; resp.h.dstNode = 0;
                         resp.h.reqId = reqId;
-                        resp.h.homeLinePa = pagePa;
-                        resp.b.metaRNF.pagePa = pagePa;
+                        resp.h.homeLinePa = pageId;
+                        resp.b.metaRNF.pagePa = pageId;
                         memcpy(resp.b.metaRNF.data, state->buf, 256);
                         framework::MemMessage *buf = tport->allocateSendBuffer(0);
-                        if (buf) { buf->setPayload(resp); tport->send(buf); }
+                        if (buf) {
+                            buf->hdr.type = static_cast<uint32_t>(framework::MemMessageType::PAYLOAD);
+                            buf->hdr.req_id = reqId;
+                            buf->hdr.targetId = 0;
+                            if (!buf->setPayload(resp) || !tport->send(buf))
+                                delete buf;
+                        }
                         delete state;
                     }
                 });
@@ -1191,9 +1214,17 @@ UBAdapter::recvFromRouter(const CoherenceMessage &msg)
             break;
         }
         case CoherenceMessageType::MetaRNFWriteReq: {
-            uint64_t pagePa = msg.h.homeLinePa;
+            uint64_t pageId = msg.h.homeLinePa;
             auto *metaRNF = MetaRNFController::getInstance(_nodeId, _socketId);
             if (!metaRNF) break;
+            constexpr uint64_t pageBytes = 256;
+            uint64_t pagePa = metaRNF->metadataRangeStart() + pageId * pageBytes;
+            if (pagePa < metaRNF->metadataRangeStart() ||
+                pagePa + pageBytes > metaRNF->metadataRangeEnd()) {
+                warn("UBAdapter node=%d: metadata page ID 0x%lx out of range",
+                     _nodeId, pageId);
+                break;
+            }
             for (int i = 0; i < 4; i++) {
                 MetaRNFController::MetaLine ml;
                 memcpy(ml.data(), &msg.b.metaRNF.data[i * 64], 64);
@@ -1444,6 +1475,18 @@ UBAdapter::handleResponse(framework::MemMessage *m)
         break;
     }
 
+    // UBIO initiates MetaRNF requests through this Port. They are requests to
+    // gem5, not responses to a gem5 transaction, so they must not enter the
+    // response cache below.
+    switch (coh->h.type) {
+      case CoherenceMessageType::MetaRNFReadReq:
+      case CoherenceMessageType::MetaRNFWriteReq:
+        recvFromRouter(*coh);
+        return;
+      default:
+        break;
+    }
+
     // RecallResp is consumed by the home UBCC first; if ubio mirrors it back
     // to local gem5, use it only as an event-driven wakeup so the requester's
     // EP-SNF retry queue replays immediately after RECALL.DONE instead of
@@ -1473,6 +1516,8 @@ UBAdapter::handleResponse(framework::MemMessage *m)
     // callback.
     if (coh->h.type == CoherenceMessageType::ReadResp)
         _inflightReadReqs.erase(coh->h.reqId);
+    if (coh->h.type == CoherenceMessageType::ClearResp)
+        _inflightClearReqs.erase(coh->h.reqId);
 
     // Immediate response notification: fire the wired callback so the
     // EPSNFController wakes up NOW and processes this response via retry,

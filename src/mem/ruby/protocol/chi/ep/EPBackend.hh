@@ -347,6 +347,12 @@ class EPBackend : public SimObject
     int handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
                          int ingressSocket, int& outHomeNode);
 
+    // ReadNoSnp from HN-F proves the local cache hierarchy has missed, so any
+    // older R_S/R_E/R_M bookkeeping cannot suppress the required outer fetch.
+    int handleRemoteDemandMiss(uint64_t line_pa, int neededPerm,
+                               bool writeIntent, int ingressSocket,
+                               int& outHomeNode);
+
     // Called after home UBCC makes a grant decision.
     // Returns the OuterGrantType that was granted.
     OuterGrantType handleGrant(uint64_t line_pa, OuterGrantType grant,

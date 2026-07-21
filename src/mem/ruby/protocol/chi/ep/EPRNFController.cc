@@ -979,18 +979,10 @@ EPRNFController::sendSnpRespSC(const CHIRequestMsg *msg)
 bool
 EPRNFController::sendSnpRespDataSC(const CHIRequestMsg *msg)
 {
-    // SnpRespData_SC: shared clean data response.
-    // Send SnpResp_SC first (response), then SnpRespData_SC (data).
+    // Send_SnpOnce expects SnpRespData_SC only. A separate SnpResp_SC can
+    // arrive after the data channel and violate HN-F's completed expectation.
     NetDest dest(m_ruby_system);
     dest.add(msg->m_requestor);
-
-    // Response: SnpResp_SC
-    auto rsp = std::make_shared<CHIResponseMsg>(
-        curTick(), cacheLineSize, m_ruby_system,
-        msg->m_addr, CHIResponseType_SnpResp_SC,
-        m_machineID, dest,
-        false, false, 0, 0, MessageSizeType_Control);
-    sendResponseMsg(rsp);
 
     // Data: SnpRespData_SC (zero data — EP-RNF has no cached data)
     for (int i = 0; i < dataMsgsPerLine; i++) {

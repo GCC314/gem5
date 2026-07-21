@@ -435,6 +435,11 @@ action(StallRequest, desc="") {
   // tracks pending
   tbe.wakeup_pending_req := true;
 
+  if (address >= 671091200 && address < 671091456) {
+    DPRINTF(RubyGenerated, "[META-HNF-STALL] addr=%#x activeReq=%d pendReq=%d exp=%d\n",
+      address, tbe.reqType, tbe.pendReqType, tbe.expected_req_resp.expected());
+  }
+
   // F6-diag: log CleanUnique stall
   if (tbe.reqType == CHIRequestType:CleanUnique) {
     DPRINTF(RubyGenerated, "[HNF-CU-STALLED] addr=%#x activeReq=%d pendReq=%d expReq=%d expSnp=%d\n",
@@ -532,28 +537,46 @@ action(Initiate_ReadShared_HitUpstream, desc="") {
 }
 
 action(Initiate_ReadShared_HitUpstream_NoOwner, desc="") {
-  tbe.actions.push(Event:ReadMissPipe);
-  // F7: DCT fallback — if requester is EP-RNF, force non-DCT snoop path
-  if (tbe.use_DCT && epRnfMachineVersion >= 0 &&
-      tbe.requestor == tbe.epRnfMachineID) {
-    tbe.use_DCT := false;
-  }
-  // F1: DCT fallback — if sole sharer is EP-RNF, force non-DCT snoop path
-  if (tbe.use_DCT && epRnfMachineVersion >= 0 &&
+  // EP-RNF records remote-access bookkeeping, not a data-bearing cache copy.
+  // A private-cache eviction can therefore leave it as the only local directory
+  // sharer. Treat that case as a data miss instead of snooping zero-filled data.
+  if (epRnfMachineVersion >= 0 &&
       tbe.dir_sharers.count() == 1 &&
       tbe.dir_sharers.isElement(tbe.epRnfMachineID)) {
-    tbe.use_DCT := false;
-  }
-  if (tbe.use_DCT) {
-    tbe.actions.push(Event:SendSnpSharedFwdToSharer);
-    tbe.actions.pushNB(Event:WaitCompAck);
-    tbe.updateDirOnCompAck := false;
+    DPRINTF(RubyCHIGeneric,
+            "[HNF-EP-PROXY-MISS] addr=%#x dropping sole EP-RNF proxy sharer\n",
+            address);
+    tbe.dir_sharers.remove(tbe.epRnfMachineID);
+    tbe.actions.push(Event:ReadMissPipe);
+    if (is_HN) {
+      tbe.actions.push(Event:SendReadNoSnp);
+      tbe.actions.push(Event:WaitCompAck);
+      tbe.actions.pushNB(Event:SendCompData);
+    } else {
+      tbe.actions.push(Event:SendReadShared);
+      tbe.actions.push(Event:WaitCompAck);
+      tbe.actions.pushNB(Event:SendCompData);
+    }
+    tbe.actions.push(Event:CheckCacheFill);
+    tbe.actions.push(Event:TagArrayWrite);
   } else {
-    tbe.actions.push(Event:SendSnpOnce);
-    tbe.actions.push(Event:WaitCompAck);
-    tbe.actions.pushNB(Event:SendCompData);
+    tbe.actions.push(Event:ReadMissPipe);
+    // F7: DCT fallback — if requester is EP-RNF, force non-DCT snoop path
+    if (tbe.use_DCT && epRnfMachineVersion >= 0 &&
+        tbe.requestor == tbe.epRnfMachineID) {
+      tbe.use_DCT := false;
+    }
+    if (tbe.use_DCT) {
+      tbe.actions.push(Event:SendSnpSharedFwdToSharer);
+      tbe.actions.pushNB(Event:WaitCompAck);
+      tbe.updateDirOnCompAck := false;
+    } else {
+      tbe.actions.push(Event:SendSnpOnce);
+      tbe.actions.push(Event:WaitCompAck);
+      tbe.actions.pushNB(Event:SendCompData);
+    }
+    tbe.actions.push(Event:MaintainCoherence);
   }
-  tbe.actions.push(Event:MaintainCoherence);
 }
 
 action(Initiate_ReadNoSnp, desc="") {
@@ -1132,6 +1155,10 @@ action(Initiate_WriteUnique_Zero, desc="") {
 action(Initiate_WriteUnique_LocalWrite, desc="") {
   // auto-upgrade if hn but state was not unique
   assert(is_HN || tbe.dataUnique);
+  if (address >= 671091200 && address < 671091456) {
+    DPRINTF(RubyGenerated, "[META-HNF-WU] addr=%#x requestor=%s reqType=%d\n",
+      address, tbe.requestor, tbe.reqType);
+  }
   tbe.dataUnique := true;
   if (tbe.dir_sharers.count() > 0) {
     tbe.actions.push(Event:SendSnpCleanInvalid);
@@ -2302,6 +2329,10 @@ action(Receive_ReqDataResp, desc="") {
   assert(is_valid(tbe));
   assert(tbe.expected_req_resp.hasExpected());
   peek(datInPort, CHIDataMsg) {
+    if (address >= 671091200 && address < 671091456) {
+      DPRINTF(RubyGenerated, "[META-HNF-DATA] addr=%#x type=%d txnId=%d\n",
+        address, in_msg.type, in_msg.txnId);
+    }
     // Decrement pending
     if (tbe.expected_req_resp.receiveData(in_msg.type) == false) {
       error("Received unexpected message");
@@ -3496,6 +3527,10 @@ action(Send_CompDBIDResp, desc="") {
     out_msg.Destination.add(tbe.requestor);
     out_msg.txnId := tbe.txnId;
     out_msg.dbid := tbe.txnId;
+    if (address >= 671091200 && address < 671091456) {
+      DPRINTF(RubyGenerated, "[META-HNF-DBID] addr=%#x requestor=%s dbid=%d\n",
+        address, tbe.requestor, tbe.txnId);
+    }
   }
 }
 
