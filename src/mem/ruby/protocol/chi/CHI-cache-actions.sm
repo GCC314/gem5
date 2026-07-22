@@ -276,6 +276,14 @@ action(Initiate_Request, desc="") {
   bool alloc_entry := needCacheEntry(tbe.reqType,
                                      cache_entry, dir_entry,
                                      tbe.is_local_pf);
+  // Metadata reads are deliberately ReadOnce so the MetaRNF is never a
+  // directory sharer. Cache them locally at the HN-F without changing the
+  // policy for ordinary DSM ReadOnce traffic.
+  if (tbe.reqType == CHIRequestType:ReadOnce &&
+      metaRnfMachineVersion >= 0 &&
+      tbe.requestor == tbe.metaRnfMachineID) {
+    alloc_entry := true;
+  }
   bool dealloc_entry := needDeallocCacheEntry(tbe.reqType);
   assert((alloc_entry && dealloc_entry) == false);
 

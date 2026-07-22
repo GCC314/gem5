@@ -291,7 +291,9 @@ MetaRNFController::sendReadOnce(uint64_t pa)
     auto req = std::make_shared<CHIRequestMsg>(curTick(), cacheLineSize,
                                                 m_ruby_system);
     req->m_addr = pa;
-    req->m_type = CHIRequestType_ReadShared;  // L3-cacheable (was ReadOnce)
+    // HN-F recognizes MetaRNF ReadOnce and caches it locally while leaving
+    // MetaRNF out of dir_sharers; MetaRNF has no data-bearing cache copy.
+    req->m_type = CHIRequestType_ReadOnce;
     req->m_requestor = m_machineID;
     req->m_accAddr = pa;
     req->m_accSize = cacheLineSize;
@@ -593,10 +595,21 @@ MetaRNFController::recvDataMsg(const CHIDataMsg *msg)
         return true;
     }
 
+    const WriteMask &mask = msg->m_bitMask;
+    fatal_if(fs.readValid.isOverlap(mask),
+             "MetaRNF node=%d: duplicate CompData bytes for %#x",
+             _nodeId, msg->m_addr);
+    fs.readData.copyPartial(msg->m_dataBlk, mask);
+    fs.readValid.orMask(mask);
+    if (!fs.readValid.isFull())
+        return true;
+
+    // One 64B CHI transaction completes only after every data-channel flit
+    // has arrived. The HN-F expects exactly one CompAck for that transaction.
     sendCompAck(msg->m_addr, msg->m_responder);
-    DataBlock db = msg->getdataBlk();
-    // The HN-F cannot accept a same-address write until it consumes this
-    // CompAck. Keep the scoreboard entry until the acknowledgement arrives.
+    DataBlock db = fs.readData;
+    // Keep the scoreboard entry until the acknowledgement reaches the HN-F,
+    // so a queued same-address write cannot overtake it.
     _deferredReadCompletions.push_back(
         {slot, curTick() + cyclesToTicks(Cycles(16)), db});
     scheduleEvent(Cycles(16));

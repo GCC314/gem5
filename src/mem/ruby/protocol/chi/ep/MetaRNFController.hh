@@ -60,6 +60,8 @@ class MetaRNFController : public EPController
         OpType op = OpType::Read;
         uint64_t pa = 0;
         DataBlock writeData{64};
+        DataBlock readData{64};
+        WriteMask readValid{64};
         ReadCallback readCb;
         WriteCallback writeCb;
         bool waitingCompAfterDbid = false;
@@ -68,6 +70,7 @@ class MetaRNFController : public EPController
         {
             state = SlotState::Free;
             pa = 0;
+            readValid.clear();
             readCb = nullptr;
             writeCb = nullptr;
             waitingCompAfterDbid = false;

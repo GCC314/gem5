@@ -32,6 +32,7 @@ def _make_hnf(ruby_system, addr_ranges, llcache_type, node_id):
     # prevent same-tick TBE reservation races.
     hnf_cntrl.enable_DMT = False
     hnf_cntrl.epRnfMachineVersion = -1  # v4: default, overridden if EP-RNF exists
+    hnf_cntrl.metaRnfMachineVersion = -1
     hnf_cntrl.number_of_TBEs = 4096
     hnf_cntrl.number_of_repl_TBEs = 4096
     hnf_cntrl.number_of_snoop_TBEs = 4096
@@ -413,6 +414,8 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
         # epRnfMachineID in initializeTBE for dir_sharers tracking.
         for hnf_cntrl in nd['hnf_cntrls']:
             hnf_cntrl.epRnfMachineVersion = nd['ep_rnf_cntrl'].version
+        for sid, hnf_cntrl in enumerate(nd['hnf_cntrls']):
+            hnf_cntrl.metaRnfMachineVersion = nd['meta_rnf_cntrls'][sid].version
 
         nd['clusters'] = []
         node_cpus = _node_cpu_slice(node_id)
