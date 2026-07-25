@@ -78,13 +78,22 @@ FDArray::FDArray(std::string const& input, std::string const& output,
      * Search through the output/error options and setup the default fd if
      * match is found; otherwise, open an output file and seek to location.
      */
-    if ((it = _oemap.find(output)) != _oemap.end())
+    const std::string append_prefix = "append:";
+    const bool append_output = output.compare(0, append_prefix.size(),
+                                              append_prefix) == 0;
+    const std::string output_name = append_output
+        ? output.substr(append_prefix.size()) : output;
+    if ((it = _oemap.find(output_name)) != _oemap.end())
         sim_fd = it->second;
     else
-        sim_fd = openOutputFile(output);
+        sim_fd = append_output
+            ? openFile(simout.resolve(output_name), O_WRONLY | O_CREAT | O_APPEND,
+                       0664)
+            : openOutputFile(output_name);
 
-    ffd = std::make_shared<FileFDEntry>(sim_fd, O_WRONLY | O_CREAT | O_TRUNC,
-                                        output, false);
+    ffd = std::make_shared<FileFDEntry>(
+        sim_fd, O_WRONLY | O_CREAT | (append_output ? O_APPEND : O_TRUNC),
+        output_name, false);
     _fdArray[STDOUT_FILENO] = ffd;
 
     if (output == errout)
