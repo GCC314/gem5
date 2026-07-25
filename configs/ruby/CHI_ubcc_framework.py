@@ -182,6 +182,8 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
     ubcc_epoch_bits = int(_opt("ubcc_epoch_bits", 64))
     ubcc_bf_bytes = int(_opt("ubcc_bf_bytes", 65536))
     ubcc_force_resident_entries = int(_opt("ubcc_force_resident_entries", 0))
+    # Phase 0: metadata DRAM capacity (default 128 MiB for rearchitecture validation)
+    ubcc_metadata_size = int(_opt("ubcc_metadata_size", 128 * 1024 * 1024))
     ubcc_meta_max_flights = int(_opt("ubcc_meta_max_flights", 8))
     ubcc_meta_read_ticks = int(_opt("ubcc_meta_read_ticks", 8000))
     ubcc_meta_write_ticks = int(_opt("ubcc_meta_write_ticks", 7500))
@@ -197,6 +199,7 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
     cpus_per_node = DEFAULT_D * DEFAULT_L
     print(f"[UBCC-CONFIG] epoch_bits={ubcc_epoch_bits} num_sockets={num_sockets} "
           f"num_nodes={num_nodes} local_node={local_node} "
+          f"metadata_size={ubcc_metadata_size//(1024*1024)}MiB "
           f"build_nodes={node_list}")
     addr_map = NodeAddressMap(num_nodes, seg_size, num_sockets)
     params = chi_defs.NoC_Params
@@ -227,13 +230,14 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
 
     for node_id in node_list:
         nd = per_node[node_id]
-        cfg = NodeConfig(node_id, num_nodes, seg_size, num_sockets)
+        cfg = NodeConfig(node_id, num_nodes, seg_size, num_sockets,
+                         metadata_private_size=ubcc_metadata_size)
 
         # ── Create SNFs FIRST (before HN-F) ─────────────────────────
         # Q2 FIX: SNF controllers must be added to the SimObject tree
         # BEFORE the HN-F so their C++ objects exist when HN-F's
         # downstream_destinations param is resolved during instantiation.
-        metadata_private_size = 16 * 1024 * 1024
+        metadata_private_size = cfg.metadata_private_size
         cfg.metadata_private_size = metadata_private_size
         cfg.metadata_private_end = cfg.metadata_private_base + metadata_private_size
 

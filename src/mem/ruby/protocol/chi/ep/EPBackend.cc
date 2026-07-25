@@ -140,6 +140,17 @@ EPBackend::EPBackend(const Params &p)
 
     // M6: Register this EPBackend in the static cross-node routing registry
     _backendInstances[_nodeId] = this;
+
+    // Phase 0: startup manifest — metadata DRAM range reporting
+    std::fprintf(stderr,
+        "[EPBACKEND-MANIFEST] node=%d num_sockets=%d "
+        "metadata_dram_base=0x%lx metadata_dram_total=%lu MiB "
+        "per_socket=%lu MiB\n",
+        _nodeId, _numSockets,
+        _metadataPrivateBase,
+        _metadataPrivateSize / (1024 * 1024),
+        (_metadataPrivateSize / _numSockets) / (1024 * 1024));
+    std::fflush(stderr);
 }
 
 // v4-dual-socket: per-socket EP-SNF registration (§3.6)
@@ -163,11 +174,15 @@ EPBackend::registerEpSnf(int socketId, EPSNFController *ctrl)
         _numSockets = _epSnfs.size();
 
     if (_ubAdapters.size() > (size_t)socketId && _ubAdapters[socketId]) {
+        if (_verboseLog) {
         std::fprintf(stderr, "[WIRE] node=%d wiring adapter[%d]->snf callback\n",
                      _nodeId, socketId);
+        }
         _ubAdapters[socketId]->setOnResponseWired([this, socketId]{
+            if (_verboseLog) {
             std::fprintf(stderr, "[RSP-FIRE] node=%d socket=%d scheduling EPSNF wakeup\n",
                          _nodeId, socketId);
+            }
             if (socketId < (int)_epSnfs.size() && _epSnfs[socketId])
                 _epSnfs[socketId]->scheduleEvent(Cycles(1));
         });
@@ -213,6 +228,8 @@ void m7SelfTest_run(EPBackend*);
  */
 void m8SelfTest_run(EPBackend*);
 
+void m9SelfTest_run(EPBackend*);
+
 
 void
 EPBackend::init()
@@ -237,8 +254,9 @@ EPBackend::init()
         UBAdapter *adapter = getUBAdapter(s);
         EPSNFController *snf = getEpSnf(s);
         if (adapter && snf) {
-            adapter->setOnResponseWired([snf]{
-                std::fprintf(stderr, "[RSP-FIRE] scheduling EPSNF wakeup\n");
+            adapter->setOnResponseWired([this, snf]{
+                if (_verboseLog)
+                    std::fprintf(stderr, "[RSP-FIRE] scheduling EPSNF wakeup\n");
                 snf->scheduleEvent(Cycles(1));
             });
         }
@@ -480,7 +498,16 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
                 return -2;   // ClearResp not here yet; keep waiting (same reqId)
             // ClearResp accepted: sendClear() has consumed the txn. Finish up.
             OuterGrantType g = pgt->second.grantType;
+            const Tick start = pgt->second.outerStartTick;
+            const uint64_t completedReqId = pgt->second.reqId;
             _pendingGrantTxns.erase(pgt);
+            if (start) {
+                std::fprintf(stderr,
+                    "[EP-PERF] kind=outer node=%d pa=0x%lx reqId=%lu "
+                    "start=%lu end=%lu latency_ps=%lu\n",
+                    _nodeId, homePa, completedReqId, start, curTick(),
+                    curTick() - start);
+            }
             if (_epRnfCtrl) {
                 _epRnfCtrl->setOuterTxnPending(line_pa, false);
                 _epRnfCtrl->signalOuterTxnComplete(line_pa);
@@ -527,9 +554,15 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
             if (silent) {
                 // R_E → R_M (or R_M stays R_M): no outer request needed
                 existing->second.state = RequesterLineState::R_M;
+                if (_verboseLog) {
                 printf("[UPGRADE-DIAG] node=%d SILENT-WRITE-HIT PA=0x%lx "
                        "(state=%d→R_M, zero cross-node messages)\n",
-                       _nodeId, line_pa, static_cast<int>(st));
+                        _nodeId, line_pa, static_cast<int>(st));
+                }
+                std::fprintf(stderr,
+                    "[EP-PERF] kind=upgrade_silent node=%d pa=0x%lx "
+                    "start=%lu end=%lu latency_ps=0\n",
+                    _nodeId, line_pa, curTick(), curTick());
                 outHomeNode = homeNode;
                 return static_cast<int>(OuterGrantType::GlobalGrantModified);
             }
@@ -543,7 +576,10 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
     RequesterLineEntry entry;
     if (isRetry) {
         reqIdVal = existing->second.reqId;
-        entry = existing->second;   // preserve original epoch/reqId
+        // A retry belongs to the already-issued outer transaction. Preserve its
+        // first issue tick so capacity waits and transport retries remain part
+        // of the reported end-to-end protocol latency.
+        entry = existing->second;
         entry.pendingReq = reqType;
         entry.writeIntent = writeIntent;
         entry.homeNode = homeNode;
@@ -558,6 +594,8 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
         entry.writeIntent = writeIntent;
         entry.homeNode = homeNode;
     }
+    if (!isRetry)
+        entry.outerStartTick = curTick();
     _requesterLines[line_pa] = entry;
 
     if (!adapter) {
@@ -627,20 +665,20 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
 
     grantTypeVar = static_cast<OuterGrantType>(grantInt);
 
-    printf("[TC5-CLEAR-TRACE] handleRemoteMiss node=%d localPA=0x%lx homePA=0x%lx "
-           "grantTypeVar=%d reqId=%lu entryEpoch=%lu authEpoch=%lu recallNeeded=%d owner=%d\n",
-           _nodeId, line_pa, homePa, static_cast<int>(grantTypeVar), reqIdVal,
-           entry.epoch, authEpoch, recallNeeded, recallOwnerNode);
-    printf("[RECALL-OUTPUT] EPBackend n=%d PA=0x%lx recallNeeded=%d recallOwnerNode=%d\n",
-           _nodeId, line_pa, recallNeeded, recallOwnerNode);
+    DPRINTF(RubyEP, "[DEBUG-TC5-CLEAR-TRACE] handleRemoteMiss node=%d localPA=0x%lx homePA=0x%lx "
+            "grantTypeVar=%d reqId=%lu entryEpoch=%lu authEpoch=%lu recallNeeded=%d owner=%d\n",
+            _nodeId, line_pa, homePa, static_cast<int>(grantTypeVar), reqIdVal,
+            entry.epoch, authEpoch, recallNeeded, recallOwnerNode);
+    DPRINTF(RubyEP, "[DEBUG-RECALL-OUTPUT] EPBackend n=%d PA=0x%lx recallNeeded=%d recallOwnerNode=%d\n",
+            _nodeId, line_pa, recallNeeded, recallOwnerNode);
 
     // ---- M6: Handle recall path ----
     // If the home UBCC signals that a recall is needed, we must
     // route the recall through the owner node's EPBackend
     // (not bypass it with a direct processRecallResponse call).
     if (recallNeeded && recallOwnerNode >= 0) {
-        printf("[RECALL-ROUTE] EPBackend node=%d PA=0x%lx ownerNode=%d\n",
-               _nodeId, line_pa, recallOwnerNode);
+        DPRINTF(RubyEP, "[DEBUG-RECALL-ROUTE] EPBackend node=%d PA=0x%lx ownerNode=%d\n",
+                _nodeId, line_pa, recallOwnerNode);
         DPRINTF(RubyEP,
                 "EPBackend node_id=%d: M6 recall needed PA=0x%lx "
                 "ownerNode=%d requesterNode=%d\n",
@@ -750,11 +788,12 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
         txn.baseEpoch = grantBaseEpoch;
         txn.reqId = reqIdVal;
         txn.grantType = grantEnv.grantType;
+        txn.outerStartTick = entry.outerStartTick;
         _pendingGrantTxns[homePa] = txn;
-        printf("[TC5-CLEAR-TRACE] savePendingGrantTxn node=%d keyPA=0x%lx homePA=0x%lx "
-               "baseEpoch=%lu reqId=%lu grantType=%d\n",
-               _nodeId, homePa, homePa, txn.baseEpoch, txn.reqId,
-               static_cast<int>(txn.grantType));
+        DPRINTF(RubyEP, "[DEBUG-TC5-CLEAR-TRACE] savePendingGrantTxn node=%d keyPA=0x%lx homePA=0x%lx "
+                "baseEpoch=%lu reqId=%lu grantType=%d\n",
+                _nodeId, homePa, homePa, txn.baseEpoch, txn.reqId,
+                static_cast<int>(txn.grantType));
     }
 
     DPRINTF(RubyCHIGeneric,
@@ -769,9 +808,32 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
     // In split-mode all grant data arrives via ReadResp payload from ubio.
     // Use payload whenever available; only fall back to zero-fill (NoData)
     // for truly uninitialised DSM lines (first access, no prior write).
+    // Phase C1: route push/ReadResp grant data directly to _lastGrantDataBlock.
+    // Do NOT use _recallCaptureData* — it is a controller-global slot shared
+    // across all PAs and can be cleared by a concurrent unrelated Recall.
     if (routedGrantDataValid) {
-        setRecallCaptureData(routedGrantData, true);
-        populateGrantData(homePa, GrantDataSource::RecallBuffer);
+        _lastGrantDataBlock = routedGrantData;
+        _lastGrantDataValid = true;
+        _lastGrantDataSource = GrantDataSource::RecallBuffer;
+        std::fprintf(stderr,
+                     "[C1-GRANT-DATA-DIRECT] node=%d pa=0x%lx "
+                     "grant data routed directly (bypass recall capture)\n",
+                     _nodeId, homePa);
+        std::fflush(stderr);
+        // ── Phase C4 trace point 7: EPBackend routed grant word ──
+        {
+            uint64_t off = homePa & 0x1FFFULL;
+            uint64_t ckOff = homePa & 0xFFFFFULL;
+            if (ckOff < 0x80000ULL && (off % 64 == 0)) {
+                uint64_t w0 = 0;
+                for (int i = 0; i < 8; i++)
+                    ((uint8_t*)&w0)[i] = _lastGrantDataBlock.getByte(i);
+                std::fprintf(stderr,
+                    "[C4-EPB-DIRECT] node=%d pa=0x%lx off=0x%lx w0=0x%016lx\n",
+                    _nodeId, homePa, off, w0);
+                std::fflush(stderr);
+            }
+        }
     } else {
         // No payload — uninitialised line, zero-fill is correct
         populateGrantData(homePa, GrantDataSource::NoData);
@@ -834,8 +896,10 @@ EPBackend::handleGrant(uint64_t line_pa, OuterGrantType grant, int homeNode)
             break;
         case OuterGrantType::GlobalGrantExclusive:
             it->second.state = RequesterLineState::R_E;
+            if (_verboseLog) {
             printf("[RE-DIAG] node=%d line 0x%lx -> R_E (GrantExclusive)\n",
                    _nodeId, line_pa);
+            }
             DPRINTF(RubyCHIGeneric,
                     "EPBackend node_id=%d: line 0x%lx -> R_E (GrantExclusive)\n",
                     _nodeId, line_pa);
@@ -877,8 +941,8 @@ void
 EPBackend::populateGrantData(uint64_t homePa, GrantDataSource dataSource)
 {
     static const int lineSize = 64; // cache line size
-    printf("[F3-DEBUG] populateGrantData node=%d homePA=0x%lx dataSource=%d\n",
-           _nodeId, homePa, static_cast<int>(dataSource));
+    DPRINTF(RubyEP, "[DEBUG-F3-DEBUG] populateGrantData node=%d homePA=0x%lx dataSource=%d\n",
+            _nodeId, homePa, static_cast<int>(dataSource));
 
     uint8_t buf[64] = {};
     bool dataPopulated = false;
@@ -1055,8 +1119,10 @@ EPBackend::diagnoseExpectedGrant(int neededPerm, bool writeIntent) const
 bool
 EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
 {
+    if (_verboseLog) {
     printf("[RECALL-ENTRY] EPBackend node=%d PA=0x%lx ownerNode=%d homeNode=%d\n",
            _nodeId, recallMsg.linePa, recallMsg.ownerNode, recallMsg.homeNode);
+    }
     std::fprintf(stderr,
                  "[RECALL-ENTRY-ERR] node=%d PA=0x%lx ownerNode=%d homeNode=%d reqId=%lu isRead=%d dataNeeded=%d curT=%lu\n",
                  _nodeId, recallMsg.linePa, recallMsg.ownerNode,
@@ -1092,8 +1158,10 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
                               : recallMsg.linePa;
         _activeRecallPAs[localPA] = true;
         _activeRecallPAs[recallMsg.linePa] = true;
+        if (_verboseLog) {
         printf("[RECALL-DIAG] node=%d active-recall-set linePA=0x%lx localPA=0x%lx\n",
                _nodeId, recallMsg.linePa, localPA);
+        }
     }
 
     // ---- M7: Update requester-side bookkeeping ----
@@ -1136,8 +1204,10 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
 
     if (recallMsg.isReadRequest) {
         // Read recall: ReadShared to downgrade owner to R_S
+        if (_verboseLog) {
         printf("[RECALL-DIAG] node=%d initiating ReadShared recall PA=0x%lx\n",
                _nodeId, recallMsg.linePa);
+        }
         std::fprintf(stderr,
                      "[RECALL-START-ERR] node=%d kind=ReadShared linePA=0x%lx localPA=0x%lx reqId=%lu curT=%lu\n",
                      _nodeId, recallMsg.linePa, ownerLocalPa,
@@ -1146,8 +1216,10 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
         setRecallCaptureData(DataBlock(64), false);
         _epRnfCtrl->startReadShared(ownerLocalPa,
             [this, capturedMsg](bool success) {
+                if (_verboseLog) {
                 printf("[RECALL-DIAG] node=%d ReadShared callback success=%d valid=%d\n",
                        _nodeId, success, _recallCaptureDataValid);
+                }
                 std::fprintf(stderr,
                              "[RECALL-CB-ERR] node=%d kind=ReadShared linePA=0x%lx reqId=%lu success=%d valid=%d curT=%lu\n",
                              _nodeId, capturedMsg.linePa, capturedMsg.reqId,
@@ -1197,8 +1269,10 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
                             getUBAdapter(0)->sendDirectData(directData);
                             resp.dataForwarded = true;
                             resp.dataForwardedTo = capturedMsg.requesterNode;
+                            if (_verboseLog) {
                             printf("[C4-FORWARD] RS node=%d forward data to requester=%d PA=0x%lx\n",
                                    _nodeId, capturedMsg.requesterNode, capturedMsg.linePa);
+                            }
                         }
                     }
                 }
@@ -1206,18 +1280,29 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
             });
     } else {
         // Write recall: ReadUnique with RecallUnique proxy op
+        if (_verboseLog) {
         printf("[RECALL-DIAG] node=%d initiating ReadUnique recall PA=0x%lx\n",
                _nodeId, recallMsg.linePa);
+        }
         std::fprintf(stderr,
                      "[RECALL-START-ERR] node=%d kind=ReadUnique linePA=0x%lx localPA=0x%lx reqId=%lu curT=%lu\n",
                      _nodeId, recallMsg.linePa, ownerLocalPa,
-                     recallMsg.reqId, curTick());
+                      recallMsg.reqId, curTick());
+
         // R2: Clear stale recall capture data before initiating new recall
         setRecallCaptureData(DataBlock(64), false);
         _epRnfCtrl->startReadUnique(ownerLocalPa,
             [this, capturedMsg](bool success) {
+                std::fprintf(stderr,
+                             "[RECALL-PROXY-CALLBACK] node=%d homePA=0x%lx "
+                             "reqId=%lu success=%d dataValid=%d tick=%lu\n",
+                             _nodeId, capturedMsg.linePa, capturedMsg.reqId,
+                             success ? 1 : 0,
+                             _recallCaptureDataValid ? 1 : 0, curTick());
+                if (_verboseLog) {
                 printf("[RECALL-DIAG] node=%d ReadUnique callback success=%d\n",
                        _nodeId, success);
+                }
                 std::fprintf(stderr,
                              "[RECALL-CB-ERR] node=%d kind=ReadUnique linePA=0x%lx reqId=%lu success=%d valid=%d curT=%lu\n",
                              _nodeId, capturedMsg.linePa, capturedMsg.reqId,
@@ -1266,8 +1351,10 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
                             getUBAdapter(0)->sendDirectData(directData);
                             resp.dataForwarded = true;
                             resp.dataForwardedTo = capturedMsg.requesterNode;
+                            if (_verboseLog) {
                             printf("[C4-FORWARD] RU node=%d forward data to requester=%d PA=0x%lx\n",
                                    _nodeId, capturedMsg.requesterNode, capturedMsg.linePa);
+                            }
                         }
                     }
                 }
@@ -1283,8 +1370,10 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
 bool
 EPBackend::sendRecallResponse(const OuterRecallResponse &response)
 {
+    if (_verboseLog) {
     printf("[RECALL-RESP] node=%d PA=0x%lx homeNode=%d dataReturned=%d\n",
            _nodeId, response.linePa, response.homeNode, response.dataReturned);
+    }
     std::fprintf(stderr,
                  "[RECALL-RESP-ERR] node=%d PA=0x%lx homeNode=%d reqId=%lu dataReturned=%d curT=%lu\n",
                  _nodeId, response.linePa, response.homeNode,
@@ -1325,9 +1414,11 @@ EPBackend::sendRecallResponse(const OuterRecallResponse &response)
         uint8_t buf[64] = {};
         memcpy(buf, response.dataPayload.getData(0, 64), 64);
         bool installed = hms.write(response.linePa, buf, 64);
+        if (_verboseLog) {
         printf("[RECALL-DIAG] home-install node=%d home=%d PA=0x%lx installed=%d hasData=%d\n",
                _nodeId, response.homeNode, response.linePa,
                installed, response.hasDataPayload);
+        }
     }
 
     if (!getUBAdapter(0)) {
@@ -1365,8 +1456,10 @@ EPBackend::clearActiveRecall(uint64_t pa)
 {
     auto erased = _activeRecallPAs.erase(pa);
     if (erased) {
+        if (_verboseLog) {
         printf("[RECALL-DIAG] node=%d active-recall-clear PA=0x%lx\n",
                _nodeId, pa);
+        }
     }
 }
 
@@ -1375,18 +1468,22 @@ EPBackend::hasRequesterExclusive(uint64_t pa) const
 {
     auto it = _requesterLines.find(pa);
     if (it == _requesterLines.end()) {
+        if (_verboseLog) {
         printf("[RE-DIAG] node=%d hasRequesterExclusive PA=0x%lx -> FALSE "
                "(no entry, total=%zu)\n",
                _nodeId, pa, _requesterLines.size());
+        }
         return false;
     }
     int st = static_cast<int>(it->second.state);
     bool result = (it->second.state == RequesterLineState::R_E ||
                     it->second.state == RequesterLineState::R_M);
+    if (_verboseLog) {
     printf("[RE-DIAG] node=%d hasRequesterExclusive PA=0x%lx -> %s "
            "(state=%d, lineAddr=0x%lx)\n",
            _nodeId, pa, result ? "TRUE" : "FALSE",
            st, it->second.lineAddr);
+    }
     return result;
 }
 
@@ -1395,7 +1492,7 @@ EPBackend::hasRequesterExclusive(uint64_t pa) const
 void
 EPBackend::handleHomeWritebackComplete(uint64_t homePa)
 {
-    printf("[EP-HOME-WB] node=%d pa=0x%lx\n", _nodeId, homePa);
+        if (_verboseLog) printf("[EP-HOME-WB] node=%d pa=0x%lx\n", _nodeId, homePa);
     // v4-dual-socket: Send HomeWritebackNotify through adapter instead of
     // For single-socket backward compat, homeSocket = 0.
     int homeSocket = _addrMap.homeSocket(_nodeId, homePa);
@@ -1405,12 +1502,16 @@ EPBackend::handleHomeWritebackComplete(uint64_t homePa)
 
 int
 EPBackend::handleWriteback(uint64_t line_pa, bool keepAsClean,
-                           const uint8_t *dirtyData)
+                           const uint8_t *dirtyData,
+                           const WritebackQueryMeta *queryMeta,
+                           uint64_t *outQueryReqId,
+                           uint64_t cachedQlmReqId)
 {
     DPRINTF(RubyEP,
             "EPBackend node_id=%d: handleWriteback PA=0x%lx "
-            "keepAsClean=%d hasData=%d\n",
-            _nodeId, line_pa, keepAsClean, dirtyData != nullptr);
+            "keepAsClean=%d hasData=%d cachedQlmReqId=%lu\n",
+            _nodeId, line_pa, keepAsClean,
+            dirtyData != nullptr, cachedQlmReqId);
 
     // Validate DSM address (Q2: accept cross-node PAs)
     if (!isDsmAddrCrossNode(line_pa)) {
@@ -1424,50 +1525,89 @@ EPBackend::handleWriteback(uint64_t line_pa, bool keepAsClean,
               "PA=0x%lx\n", _nodeId, line_pa);
     }
 
-    // Translate PA to home node's view
     uint64_t offset = _addrMap.dsmOffset(line_pa);
-    // v4-dual-socket: derive homeSocket from PA (always 0 for single-socket)
     int homeSocket = _addrMap.homeSocket(_nodeId, line_pa);
     if (homeSocket < 0) homeSocket = 0;
-    uint64_t homePa = _addrMap.buildDsmPA(homeNode, homeNode, offset, homeSocket);
 
-    // Look up requester entry to get epoch
-    // For home-local writebacks (called from EPSNF), fall back to UBCC
-    // directory which holds the authoritative epoch and owner.
-    // when _requesterLines miss and multiple sockets are active.
     uint64_t epochVal = 0;
     int requesterNode = _nodeId;
     auto it = _requesterLines.find(line_pa);
-    if (it != _requesterLines.end()) {
+
+    if (queryMeta && queryMeta->valid) {
+        // Phase 2 async: use pre-resolved metadata — skip QLM entirely
+        epochVal = queryMeta->epochVal;
+        requesterNode = queryMeta->requesterNode;
+        std::fprintf(stderr,
+            "[EP-WB-CACHED-META] node=%d pa=0x%lx epoch=%lu owner=%d keepAsClean=%d\n",
+            _nodeId, line_pa, epochVal, requesterNode, keepAsClean);
+    } else if (it != _requesterLines.end()) {
         epochVal = it->second.epoch;
     } else {
-        // Query home UBCC via message for epoch + owner
+        // Query home UBCC via async QLM (Phase 2)
         uint64_t qEpoch = 0;
         int qOwnerNode = -1;
         bool qFound = false;
         UBAdapter *wa = getUBAdapter(0);
         if (wa) {
             int qRet = wa->sendQueryLineMetaReq(line_pa, homeNode, homeSocket,
-                                                qEpoch, qOwnerNode, qFound);
+                                                qEpoch, qOwnerNode, qFound,
+                                                outQueryReqId,
+                                                cachedQlmReqId);
             if (qRet == -2) {
+                // QLM is in-flight (or re-check with cachedReqId returned -2
+                // meaning the response hasn't arrived yet).  Caller must retry.
                 std::fprintf(stderr,
-                             "[EP-QLM-PENDING] node=%d pa=0x%lx home=%d socket=%d\n",
-                             _nodeId, line_pa, homeNode, homeSocket);
-                return -2;  // pending — caller must retry
+                    "[EP-QLM-PENDING] node=%d pa=0x%lx cachedReqId=%lu\n",
+                    _nodeId, line_pa, cachedQlmReqId);
+                return -2;
             }
         }
-        if (qFound) {
+        if (qFound && qOwnerNode >= 0) {
             epochVal = qEpoch;
-            if (qOwnerNode >= 0) requesterNode = qOwnerNode;
-        }
-        if (epochVal == 0) {
-            _epochCounter++;
-            epochVal = _epochCounter;
+            requesterNode = qOwnerNode;
+        } else {
+            // ── Phase 2 corrective: found=false, owner<0, epoch=0 ──
+            // These are terminal failures.  Do NOT fabricate an epoch and
+            // do NOT silently drop dirty data.  Report explicit diagnostics
+            // and return a definitive failure so the caller can retire the
+            // pending writeback with audit evidence.
+            std::fprintf(stderr,
+                "[EP-WB-QLM-FAIL] node=%d pa=0x%lx found=%d owner=%d epoch=%lu "
+                "cachedReqId=%lu — terminal, NOT fabricating epoch\n",
+                _nodeId, line_pa, qFound ? 1 : 0, qOwnerNode, qEpoch,
+                cachedQlmReqId);
+            return -3;   // terminal failure — retire pending writeback
         }
     }
 
+    return handleWritebackWithMeta(line_pa, keepAsClean, dirtyData,
+                                    epochVal, requesterNode);
+}
+
+int
+EPBackend::handleWritebackWithMeta(uint64_t line_pa, bool keepAsClean,
+                                    const uint8_t *dirtyData,
+                                    uint64_t epochVal, int requesterNode)
+{
+    DPRINTF(RubyEP,
+            "EPBackend node_id=%d: handleWritebackWithMeta PA=0x%lx "
+            "epoch=%lu requester=%d keepAsClean=%d\n",
+            _nodeId, line_pa, epochVal, requesterNode, keepAsClean);
+
+    int homeNode = homeNodeCrossNode(line_pa);
+    if (homeNode < 0) {
+        fatal("EPBackend node_id=%d: invalid home node for writeback "
+              "PA=0x%lx\n", _nodeId, line_pa);
+    }
+    uint64_t offset = _addrMap.dsmOffset(line_pa);
+    int homeSocket = _addrMap.homeSocket(_nodeId, line_pa);
+    if (homeSocket < 0) homeSocket = 0;
+    uint64_t homePa = _addrMap.buildDsmPA(homeNode, homeNode, offset, homeSocket);
+
+    if (_verboseLog) {
     printf("[EP-HANDLE-WB] node=%d pa=0x%lx epoch=%lu requester=%d keepAsClean=%d\n",
            _nodeId, line_pa, epochVal, requesterNode, keepAsClean);
+    }
 
     // Build writeback message envelope
     _lastWritebackMsg.linePa = homePa;
@@ -1499,14 +1639,17 @@ EPBackend::handleWriteback(uint64_t line_pa, bool keepAsClean,
     _lastAckMsg.success = ok || wbPending;
 
     // Update requester bookkeeping based on result
+    auto it = _requesterLines.find(line_pa);
     if (ok) {
         _writebackCount++;
         if (it != _requesterLines.end()) {
             if (keepAsClean) {
                 // Owner retains clean exclusive (G_E)
                 it->second.state = RequesterLineState::R_E;
+                if (_verboseLog) {
                 printf("[RE-DIAG] node=%d line 0x%lx -> R_E (writeback keepAsClean)\n",
                        _nodeId, line_pa);
+                }
             } else {
                 // Owner drops the line (R_I)
                 it->second.state = RequesterLineState::R_I;
@@ -1604,8 +1747,10 @@ EPBackend::handleEvict(uint64_t line_pa)
 bool
 EPBackend::handleInvalidationRequest(const OuterInvalidateMsg &invMsg)
 {
+    if (_verboseLog) {
     printf("[INVAL-DIAG] node=%d handleInvalidationRequest PA=0x%lx home=%d sharerLocalPA=0x%lx\n",
            _nodeId, invMsg.linePa, invMsg.homeNode, invMsg.sharerLocalPa);
+    }
     DPRINTF(RubyEP,
             "EPBackend node_id=%d: handleInvalidationRequest "
             "PA=0x%lx sharerNode=%d homeNode=%d epoch=%lu reqId=%lu\n",
@@ -1711,9 +1856,11 @@ EPBackend::handleInvalidationRequest(const OuterInvalidateMsg &invMsg)
     // to keeping the home directory's sharer mask fresh: even if a stale sharer
     // slips into the target mask, the invalidation still drains.
     if (!hadLocalCopy) {
+        if (_verboseLog) {
         printf("[INVAL-DIAG] node=%d no local copy PA=0x%lx — immediate ack "
                "(stale sharer)\n",
                _nodeId, lookupPa);
+        }
         DPRINTF(RubyEP,
                 "EPBackend node_id=%d: InvalidateReq PA=0x%lx — no local copy, "
                 "acking immediately (idempotent)\n",
@@ -1734,13 +1881,17 @@ EPBackend::handleInvalidationRequest(const OuterInvalidateMsg &invMsg)
     if (_epRnfCtrl) {
         // Capture invMsg by value for the callback
         OuterInvalidateMsg capturedMsg = invMsg;
+        if (_verboseLog) {
         printf("[INVAL-DIAG] node=%d calling startCleanUnique PA=0x%lx\n",
                _nodeId, capturedMsg.sharerLocalPa);
+        }
         _epRnfCtrl->startCleanUnique(
             capturedMsg.sharerLocalPa,
             [this, capturedMsg](bool ok) {
+                if (_verboseLog) {
                 printf("[INVAL-DIAG] node=%d startCleanUnique callback PA=0x%lx ok=%d\n",
                        _nodeId, capturedMsg.linePa, ok);
+                }
                 OuterInvalidationAck ack;
                 ack.linePa = capturedMsg.linePa;
                 ack.ackNode = _nodeId;
@@ -1829,6 +1980,7 @@ EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
         epochVal = _epochCounter;
         reqIdVal = makeRequesterReqId(_nodeId, _epochCounter);
     }
+    const Tick upgradeStartTick = hadPending ? put->second.startTick : curTick();
 
     if (!getUBAdapter(0)) {
         fatal("EPBackend node_id=%d: UBAdapter required for upgrade "
@@ -1875,6 +2027,7 @@ EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
         txn.homeNode = homeNode;
         txn.epoch = epochVal;
         txn.reqId = reqIdVal;
+        txn.startTick = upgradeStartTick;
         _pendingUpgradeTxns[line_pa] = txn;
         return false;
     }
@@ -1882,6 +2035,13 @@ EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
     if (put != _pendingUpgradeTxns.end() && put->second.valid)
         put->second.valid = false;
     bool accepted = (upgradeRet > 0);
+    if (accepted) {
+        std::fprintf(stderr,
+            "[EP-PERF] kind=upgrade_network node=%d pa=0x%lx reqId=%lu "
+            "start=%lu end=%lu latency_ps=%lu\n",
+            _nodeId, homePa, reqIdVal, upgradeStartTick, curTick(),
+            curTick() - upgradeStartTick);
+    }
 
     // upgradeRet == 0 means the home explicitly rejected this upgrade (an
     // upgrade for this line is already outstanding for another requester).
@@ -1920,9 +2080,11 @@ EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
             // upgrades (TC98 stall at transfer #10). The requester only records
             // the deferred (accepted=false) Ack and waits for the home to signal
             // completion once all acks land.
+            if (_verboseLog) {
             printf("[UPGRADE-DIAG] node=%d upgrade accepted PENDING PA=0x%lx "
                    "targetMask=0x%lx — home owns fanout (requester defers Ack)\n",
                    _nodeId, line_pa, upgradeTargetMask);
+            }
 
             // Ack is NOT ready yet — will be sent when all acks arrive
             OuterUpgradeAck ack;
@@ -2041,10 +2203,10 @@ EPBackend::sendClear(uint64_t line_pa, int homeNode,
         // cached ClearResp. We invalidate below only once the clear is accepted.
     }
 
-    printf("[TC5-CLEAR-TRACE] sendClear node=%d linePA=0x%lx homeNode=%d "
-           "callerEpoch=%lu clearEpoch=%lu reqId=%lu pendingTxnHit=%d\n",
-           _nodeId, line_pa, homeNode, epoch, clearEpoch, reqId,
-           foundPendingGrantTxn);
+    DPRINTF(RubyEP, "[DEBUG-TC5-CLEAR-TRACE] sendClear node=%d linePA=0x%lx homeNode=%d "
+            "callerEpoch=%lu clearEpoch=%lu reqId=%lu pendingTxnHit=%d\n",
+            _nodeId, line_pa, homeNode, epoch, clearEpoch, reqId,
+            foundPendingGrantTxn);
 
     OuterClearMsg clearMsg;
     clearMsg.linePa = line_pa;
@@ -2076,9 +2238,9 @@ EPBackend::sendClear(uint64_t line_pa, int homeNode,
         txnIt->second.valid = false;
     }
 
-    printf("[TC5-CLEAR-TRACE] sendClearResult node=%d linePA=0x%lx homeNode=%d "
-           "clearEpoch=%lu reqId=%lu accepted=%d\n",
-           _nodeId, line_pa, homeNode, clearEpoch, reqId, accepted);
+    DPRINTF(RubyEP, "[DEBUG-TC5-CLEAR-TRACE] sendClearResult node=%d linePA=0x%lx homeNode=%d "
+            "clearEpoch=%lu reqId=%lu accepted=%d\n",
+            _nodeId, line_pa, homeNode, clearEpoch, reqId, accepted);
 
     OuterClearAckMsg ack;
     ack.linePa = line_pa;
@@ -2294,13 +2456,20 @@ void
 EPBackend::handleQueryLineMetaResp(const CoherenceMessage &msg)
 {
     // Called when UBAdapter receives a QueryLineMetaResp from the router.
-    // The response is already stored in _lastResponse by UBAdapter::recvFromRouter.
-    // This is a notification hook for future async query support.
-    printf("[EP-QLM-RESP] node=%d pa=0x%lx found=%d epoch=%lu ownerNode=%d\n",
+    // Phase 2 async: the response is also stored in _readyResponses keyed by
+    // reqId, so EPSNFController can look it up in processPendingWritebacks()
+    // without blocking.
+    if (_verboseLog) {
+    printf("[EP-QLM-RESP] node=%d pa=0x%lx found=%d epoch=%lu ownerNode=%d reqId=%lu\n",
            _nodeId, msg.h.homeLinePa,
            msg.b.queryLineMetaResp.found,
            msg.b.queryLineMetaResp.epoch,
-           msg.b.queryLineMetaResp.ownerNode);
+           msg.b.queryLineMetaResp.ownerNode,
+           msg.h.reqId);
+    }
+    // If found=false or owner/epoch inconsistency, do NOT silently discard
+    // dirty data — the caller (processPendingWritebacks) will fabricate a
+    // best-effort epoch rather than dropping the line. See handleWriteback.
 }
 
 } // namespace ruby

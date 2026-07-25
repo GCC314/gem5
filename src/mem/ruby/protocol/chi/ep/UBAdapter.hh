@@ -137,15 +137,37 @@ class UBAdapter : public SimObject
      * Query line metadata (epoch, ownerNode) from home UBCC.
      * Used for writeback fallback when _requesterLines has no entry.
      */
+    /**
+     * Query line metadata from home UBCC.
+     *
+     * @param cachedReqId  If >0, check _readyResponses by exact key
+     *                     (QueryLineMetaResp, cachedReqId).  If found
+     *                     returns immediately without sending.  If NOT
+     *                     found returns -2 (pending — the original
+     *                     request is still in-flight).  MUST NOT scan
+     *                     by PA.
+     * @param outReqId     If non-null, receives the stable reqId.
+     */
     int sendQueryLineMetaReq(uint64_t homePa, int homeNode, int homeSocket,
                               uint64_t &outEpoch, int &outOwnerNode,
-                              bool &outFound);
+                              bool &outFound,
+                              uint64_t *outReqId = nullptr,
+                              uint64_t cachedReqId = 0);
 
     /**
      * Send HomeWritebackNotify to home UBCC after HN-F DDR4 write complete.
      */
     void sendHomeWritebackNotify(uint64_t homePa, uint64_t epoch,
                                   int homeNode, int homeSocket);
+
+    /**
+     * Phase 2 async: try to retrieve a cached QueryLineMetaResp from
+     * _readyResponses. Used by EPSNFController to resolve pending
+     * writeback metadata without a blocking transportRecv.
+     */
+    bool tryGetQueryLineMetaResp(uint64_t reqId,
+                                 uint64_t &outEpoch, int &outOwnerNode,
+                                 bool &outFound);
 
     /** Clear cached ready-responses for a given line PA (e.g. a rejected
      *  UpgradeResp) so a retry sends a fresh request. */

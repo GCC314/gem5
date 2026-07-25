@@ -8,6 +8,7 @@
 #include "debug/RubyEP.hh"
 #include "framework/MemMessage.hh"
 #include "framework/Port.hh"
+#include "framework/TracePerfPolicy.hh"
 #include "mem/ruby/protocol/chi/ep/EPBackend.hh"
 #include "mem/ruby/protocol/chi/ep/MetaRNFController.hh"
 #include "sim/core.hh"
@@ -118,9 +119,10 @@ UBAdapter::init()
                         [this](uint32_t mask, uint32_t srcBit, uint32_t seq) {
                             sendBarrierReached(mask, srcBit, seq);
                         });
-                    std::fprintf(stderr,
-                        "[UBADAPTER-BARRIER] node=%d socket=%d registered IPC barrier "
-                        "callback (barrierBit=%d)\n", _nodeId, _socketId, barrierBit);
+                    DPRINTF(RubyEP,
+                        "[DEBUG-UBADAPTER-BARRIER] node=%d socket=%d "
+                        "registered IPC barrier callback (barrierBit=%d)\n",
+                        _nodeId, _socketId, barrierBit);
                 }
             }
         }
@@ -158,8 +160,8 @@ UBAdapter::sendBarrierReached(uint32_t mask, uint32_t nodeId, uint32_t seq)
         return;
     }
     bool ok = _port->send(buf);
-    std::fprintf(stderr,
-        "[UBADAPTER-BARRIER-SEND] node=%d mask=0x%x seq=%u ok=%d\n",
+    DPRINTF(RubyEP,
+        "[DEBUG-UBADAPTER-BARRIER-SEND] node=%d mask=0x%x seq=%u ok=%d\n",
         _nodeId, mask, seq, ok);
 }
 
@@ -171,9 +173,9 @@ UBAdapter::startup()
     if (_port && !_eventArmed) {
         schedule(_responseCheckEvent, curTick());
         _eventArmed = true;
-        std::fprintf(stderr,
-                     "[UBADAPTER-STARTUP] node=%d socket=%d schedule sync wakeup @%lu\n",
-                     _nodeId, _socketId, curTick());
+        DPRINTF(RubyEP,
+                "[DEBUG-UBADAPTER-STARTUP] node=%d socket=%d schedule sync wakeup @%lu\n",
+                _nodeId, _socketId, curTick());
     }
 }
 
@@ -208,9 +210,11 @@ UBAdapter::transportSend(const CoherenceMessage &msg)
         if (msg.h.type == CoherenceMessageType::ReadReq && ++_tscount <= 3)
             std::fprintf(stderr, "[GEM5-SEND] node=%d type=ReadReq reqId=%lu gem5_tick=%lu buf_ts=%lu\n",
                           _nodeId, msg.h.reqId, curTick(), sendTs);
-        std::fprintf(stderr, "[TRACE-PERF] %lu|%d|gem5|%lu|0x%lx|SEND|%s|dst=%d\n",
-                     sendTs, _nodeId, msg.h.reqId, msg.h.homeLinePa,
-                     coherenceMsgTypeName(msg.h.type), msg.h.dstNode);
+        if (TracePerfPolicy::get().shouldEmit("gem5")) {
+            std::fprintf(stderr, "[TRACE-PERF] %lu|%d|gem5|%lu|0x%lx|SEND|%s|dst=%d\n",
+                         sendTs, _nodeId, msg.h.reqId, msg.h.homeLinePa,
+                         coherenceMsgTypeName(msg.h.type), msg.h.dstNode);
+        }
         return true;
     }
 
@@ -422,6 +426,19 @@ UBAdapter::sendWritebackReq(uint64_t homePa, int requesterNode,
     if (dirtyData) {
         req.b.writebackReq.hasData = true;
         std::memcpy(req.b.writebackReq.data, dirtyData, 64);
+    }
+    // ── Phase C4 trace point 3: WriteBackReq send ──
+    {
+        uint64_t off = homePa & 0x1FFFULL;
+        uint64_t ckOff = homePa & 0xFFFFFULL;
+        if (ckOff < 0x80000ULL && (off % 64 == 0)) {
+            uint64_t w0;
+            std::memcpy(&w0, dirtyData ? dirtyData : req.b.writebackReq.data, 8);
+            std::fprintf(stderr,
+                "[C4-WBREQ-SEND] node=%d pa=0x%lx off=0x%lx hasData=%d w0=0x%016lx\n",
+                _nodeId, homePa, off, dirtyData ? 1 : 0, w0);
+            std::fflush(stderr);
+        }
     }
 
     _lastResponseValid = false;
@@ -962,32 +979,50 @@ UBAdapter::sendInvalidateReqToSharer(int targetNode,
     (void)transportSend(req);
 }
 
-// ---- v4-dual-socket: QueryLineMetaReq (synchronous query) ----
+// ---- v4-dual-socket: QueryLineMetaReq (async with stable reqId) ----
 
 int
 UBAdapter::sendQueryLineMetaReq(uint64_t homePa, int homeNode, int homeSocket,
                                  uint64_t &outEpoch, int &outOwnerNode,
-                                 bool &outFound)
+                                 bool &outFound,
+                                 uint64_t *outReqId,
+                                 uint64_t cachedReqId)
 {
     DPRINTF(RubyEP,
             "UBAdapter node=%d socket=%d: sendQueryLineMetaReq homePa=0x%lx "
-            "homeNode=%d homeSocket=%d\n",
-            _nodeId, _socketId, homePa, homeNode, homeSocket);
+            "homeNode=%d homeSocket=%d cachedReqId=%lu\n",
+            _nodeId, _socketId, homePa, homeNode, homeSocket, cachedReqId);
 
     if (!_port) {
         fatal("UBAdapter node=%d socket=%d: sendQueryLineMetaReq called with no transport bound\n",
               _nodeId, _socketId);
     }
 
-    // Port async: check cached response first
-    if (_port && _lastResponseValid &&
-        _lastResponse.h.type == CoherenceMessageType::QueryLineMetaResp &&
-        _lastResponse.h.homeLinePa == homePa) {
-        outFound = _lastResponse.b.queryLineMetaResp.found;
-        outEpoch = _lastResponse.b.queryLineMetaResp.epoch;
-        outOwnerNode = _lastResponse.b.queryLineMetaResp.ownerNode;
-        return outFound ? 0 : -1;
+    // ── Phase 2 async: retry path — check cached response by exact reqId ──
+    if (cachedReqId > 0) {
+        PendingKey key{CoherenceMessageType::QueryLineMetaResp, cachedReqId};
+        auto it = _readyResponses.find(key);
+        if (it != _readyResponses.end()) {
+            outFound = it->second.b.queryLineMetaResp.found;
+            outEpoch = it->second.b.queryLineMetaResp.epoch;
+            outOwnerNode = it->second.b.queryLineMetaResp.ownerNode;
+            _readyResponses.erase(it);   // consume
+            std::fprintf(stderr,
+                "[QLM-CACHED-REQID] node=%d reqId=%lu pa=0x%lx found=%d epoch=%lu owner=%d\n",
+                _nodeId, cachedReqId, homePa, outFound, outEpoch, outOwnerNode);
+            return outFound ? 0 : -1;
+        }
+        // Response not yet arrived — the original request is still in-flight.
+        // Do NOT send a duplicate; the caller will poll again.
+        std::fprintf(stderr,
+            "[QLM-WAIT-REQID] node=%d reqId=%lu pa=0x%lx — not yet cached\n",
+            _nodeId, cachedReqId, homePa);
+        return -2;
     }
+
+    // ── Phase 2 async: fresh request — allocate stable reqId ──
+    uint64_t reqId = allocLocalReqId();
+    if (outReqId) *outReqId = reqId;
 
     CoherenceMessage req;
     req.h.type = CoherenceMessageType::QueryLineMetaReq;
@@ -999,7 +1034,7 @@ UBAdapter::sendQueryLineMetaReq(uint64_t homePa, int homeNode, int homeSocket,
     req.h.homeSocket = homeSocket;
     req.h.ingressSocket = _socketId;
     req.h.homeLinePa = homePa;
-    req.h.reqId = 0;
+    req.h.reqId = reqId;           // Phase 2 async: unique stable reqId
     req.h.seqNum = _nextSeq++;
     req.h.enqueueTick = curTick();
     req.h.readyTick = curTick();
@@ -1012,9 +1047,13 @@ UBAdapter::sendQueryLineMetaReq(uint64_t homePa, int homeNode, int homeSocket,
     // Port async path: schedule check, return pending
     if (_port) {
         scheduleResponseCheck();
+        std::fprintf(stderr,
+            "[QLM-SENT] node=%d pa=0x%lx reqId=%lu\n",
+            _nodeId, homePa, reqId);
         return -2;
     }
 
+    // Sync fallback (no port) — not expected in production
     if (!transportRecv(CoherenceMessageType::QueryLineMetaResp, req.h.reqId)) {
         warn("UBAdapter node=%d socket=%d: sendQueryLineMetaReq: no response PA=0x%lx\n",
              _nodeId, _socketId, homePa);
@@ -1032,6 +1071,28 @@ UBAdapter::sendQueryLineMetaReq(uint64_t homePa, int homeNode, int homeSocket,
     outEpoch = resp.b.queryLineMetaResp.epoch;
     outOwnerNode = resp.b.queryLineMetaResp.ownerNode;
     return outFound ? 0 : -1;
+}
+
+// Phase 2 async: try to retrieve a cached QueryLineMetaResp by reqId.
+bool
+UBAdapter::tryGetQueryLineMetaResp(uint64_t reqId,
+                                    uint64_t &outEpoch, int &outOwnerNode,
+                                    bool &outFound)
+{
+    PendingKey key{CoherenceMessageType::QueryLineMetaResp, reqId};
+    auto it = _readyResponses.find(key);
+    if (it != _readyResponses.end()) {
+        outFound = it->second.b.queryLineMetaResp.found;
+        outEpoch = it->second.b.queryLineMetaResp.epoch;
+        outOwnerNode = it->second.b.queryLineMetaResp.ownerNode;
+        // Consume the response so it's not reused for the wrong PA
+        _readyResponses.erase(it);
+        std::fprintf(stderr,
+            "[QLM-FOUND] node=%d reqId=%lu pa=0x%lx found=%d epoch=%lu owner=%d\n",
+            _nodeId, reqId, outFound ? 0UL : 0UL, outFound, outEpoch, outOwnerNode);
+        return true;
+    }
+    return false;
 }
 
 // ---- v4-dual-socket: HomeWritebackNotify (fire-and-forget) ----
@@ -1071,6 +1132,48 @@ UBAdapter::sendHomeWritebackNotify(uint64_t homePa, uint64_t epoch,
 
 // ---- Receive message from router ----
 
+// Phase 2: typed error response helper for MetaRNF line requests.
+// Always makes best-effort to send a response; never silently drops.
+static void
+sendMetaRNFLineErrorResponse(framework::Port *port,
+                              CoherenceMessageType respType,
+                              MetaRNFLineStatus st,
+                              uint64_t reqId, uint64_t bucketOffset,
+                              int nodeId)
+{
+    CoherenceMessage resp;
+    resp.h.type = respType;
+    resp.h.srcNode = static_cast<uint16_t>(nodeId);
+    resp.h.dstNode = 0;
+    resp.h.reqId = reqId;
+    if (respType == CoherenceMessageType::MetaRNFLineReadResp) {
+        resp.b.metaRNFLineReadResp.status = st;
+        resp.b.metaRNFLineReadResp.bucketOffset = bucketOffset;
+    } else {
+        resp.b.metaRNFLineWriteResp.status = st;
+        resp.b.metaRNFLineWriteResp.bucketOffset = bucketOffset;
+    }
+
+    framework::MemMessage *buf = nullptr;
+        if (port)
+        buf = port->allocateSendBuffer(curTick());
+    if (buf) {
+        buf->hdr.type = static_cast<uint32_t>(framework::MemMessageType::PAYLOAD);
+        buf->hdr.req_id = reqId;
+        buf->hdr.targetId = 0;
+        if (!buf->setPayload(resp)) {
+            delete buf;
+        } else {
+            port->send(buf); // port deletes buf on both success/failure
+        }
+    } else {
+        // Port unavailable — log DEBUG-only, not stderr.
+        DPRINTF(RubyEP,
+                "[DEBUG-PHASE2] node=%d: cannot send %s for reqId=%lu bucketOffset=0x%lx (no port/buffer)\n",
+                nodeId, coherenceMsgTypeName(respType), reqId, bucketOffset);
+    }
+}
+
 void
 UBAdapter::recvFromRouter(const CoherenceMessage &msg)
 {
@@ -1106,9 +1209,13 @@ UBAdapter::recvFromRouter(const CoherenceMessage &msg)
                          msg.h.epoch, msg.h.reqId);
             [[fallthrough]];
         case CoherenceMessageType::QueryLineMetaResp:
-            // Synchronous response — store for caller
+            // Store for caller AND in _readyResponses keyed by reqId (Phase 2 async)
             _lastResponse = msg;
             _lastResponseValid = true;
+            {
+                PendingKey qk{CoherenceMessageType::QueryLineMetaResp, msg.h.reqId};
+                _readyResponses[qk] = msg;
+            }
             break;
 
         case CoherenceMessageType::UpgradeAckNotify: {
@@ -1199,13 +1306,16 @@ UBAdapter::recvFromRouter(const CoherenceMessage &msg)
                         resp.h.homeLinePa = pageId;
                         resp.b.metaRNF.pagePa = pageId;
                         memcpy(resp.b.metaRNF.data, state->buf, 256);
-                        framework::MemMessage *buf = tport->allocateSendBuffer(0);
+                        framework::MemMessage *buf = tport->allocateSendBuffer(curTick());
                         if (buf) {
                             buf->hdr.type = static_cast<uint32_t>(framework::MemMessageType::PAYLOAD);
                             buf->hdr.req_id = reqId;
                             buf->hdr.targetId = 0;
-                            if (!buf->setPayload(resp) || !tport->send(buf))
+                            if (!buf->setPayload(resp)) {
                                 delete buf;
+                            } else {
+                                tport->send(buf); // port deletes buf on both success/failure
+                            }
                         }
                         delete state;
                     }
@@ -1225,11 +1335,169 @@ UBAdapter::recvFromRouter(const CoherenceMessage &msg)
                      _nodeId, pageId);
                 break;
             }
+            // Phase D2: track completion of all 4 sub-writes, then send
+            // MetaRNFWriteResp back to UBIO with aggregate success/failure.
+            std::fprintf(stderr,
+                "[D2-MRNFRECV] node=%d pageId=0x%lx pagePa=0x%lx\n",
+                _nodeId, pageId, pagePa);
+            std::fflush(stderr);
+            struct WriteState {
+                int pending = 4;
+                bool anyFailed = false;
+                framework::Port *port;
+                uint64_t reqId;
+                int nodeId;
+                uint64_t pagePa;
+            };
+            auto *ws = new WriteState;
+            ws->port = _port;
+            ws->reqId = msg.h.reqId;
+            ws->nodeId = _nodeId;
+            ws->pagePa = pagePa;
             for (int i = 0; i < 4; i++) {
                 MetaRNFController::MetaLine ml;
                 memcpy(ml.data(), &msg.b.metaRNF.data[i * 64], 64);
-                metaRNF->issueWrite(pagePa + i * 64, ml, nullptr);
+                metaRNF->issueWrite(pagePa + i * 64, ml,
+                    [ws](bool ok) {
+                        if (!ok) ws->anyFailed = true;
+                        if (--ws->pending > 0) return;
+                        // All 4 sub-writes done — send ack to UBIO
+                        std::fprintf(stderr,
+                            "[D2-WRITE-CB] node=%d pagePa=0x%lx anyFailed=%d port=%p\n",
+                            ws->nodeId, ws->pagePa, ws->anyFailed ? 1 : 0,
+                            (void*)ws->port);
+                        std::fflush(stderr);
+                        CoherenceMessage resp;
+                        resp.h.type = CoherenceMessageType::MetaRNFWriteResp;
+                        resp.h.srcNode = ws->nodeId;
+                        resp.h.dstNode = ws->nodeId;
+                        resp.h.homeLinePa = ws->pagePa;
+                        resp.h.reqId = ws->reqId;
+                        resp.b.metaRNF.pagePa = ws->pagePa;
+                        // Use flags bit 0 to signal success/failure
+                        if (ws->anyFailed)
+                            resp.h.flags = 0;
+                        else
+                            resp.h.flags = 1;  // D2: bit 0 = durable
+                        framework::MemMessage *buf = ws->port
+                            ? ws->port->allocateSendBuffer(curTick()) : nullptr;
+                        if (buf) {
+                            buf->hdr.type = static_cast<uint32_t>(
+                                framework::MemMessageType::PAYLOAD);
+                            buf->hdr.req_id = ws->reqId;
+                            buf->hdr.targetId = 0;
+                            if (!buf->setPayload(resp)) {
+                                delete buf;
+                            } else {
+                                ws->port->send(buf); // port deletes buf on both success/failure
+                            }
+                        }
+                        delete ws;
+                    });
             }
+            break;
+        }
+
+        // ---- Phase 2+3: 64B line operations with typed status ----
+        // Req B: ubio sends logical bucketOffset; UBAdapter computes physical PA.
+        case CoherenceMessageType::MetaRNFLineReadReq: {
+            uint64_t bucketOffset = msg.b.metaRNFLineReadReq.bucketOffset;
+            auto *metaRNF = MetaRNFController::getInstance(_nodeId, _socketId);
+            if (!metaRNF) {
+                sendMetaRNFLineErrorResponse(_port,
+                    CoherenceMessageType::MetaRNFLineReadResp,
+                    MetaRNFLineStatus::IoError,
+                    msg.h.reqId, bucketOffset, _nodeId);
+                break;
+            }
+            uint64_t physPa = metaRNF->metadataRangeStart() +
+                              bucketOffset * 64ULL;
+            if (physPa < metaRNF->metadataRangeStart() ||
+                physPa + 64 > metaRNF->metadataRangeEnd()) {
+                sendMetaRNFLineErrorResponse(_port,
+                    CoherenceMessageType::MetaRNFLineReadResp,
+                    MetaRNFLineStatus::RangeError,
+                    msg.h.reqId, bucketOffset, _nodeId);
+                break;
+            }
+            uint64_t reqId = msg.h.reqId;
+            auto tport = _port;
+            metaRNF->issueReadLine(physPa,
+                [tport, reqId, bucketOffset, nodeId = _nodeId]
+                (MetaRNFLineStatus st, const MetaRNFController::MetaLine &data) {
+                    CoherenceMessage resp;
+                    resp.h.type = CoherenceMessageType::MetaRNFLineReadResp;
+                    resp.h.srcNode = static_cast<uint16_t>(nodeId);
+                    resp.h.dstNode = 0;
+                    resp.h.reqId = reqId;
+                    resp.b.metaRNFLineReadResp.status = st;
+                    resp.b.metaRNFLineReadResp.bucketOffset = bucketOffset;
+                    if (st == MetaRNFLineStatus::Ok)
+                        memcpy(resp.b.metaRNFLineReadResp.data, data.data(), 64);
+                    framework::MemMessage *buf =
+                        tport ? tport->allocateSendBuffer(curTick()) : nullptr;
+                    if (buf) {
+                        buf->hdr.type = static_cast<uint32_t>(
+                            framework::MemMessageType::PAYLOAD);
+                        buf->hdr.req_id = reqId;
+                        buf->hdr.targetId = 0;
+                        if (!buf->setPayload(resp)) {
+                            delete buf;
+                        } else {
+                            tport->send(buf); // port deletes buf on both success/failure
+                        }
+                    }
+                });
+            break;
+        }
+        case CoherenceMessageType::MetaRNFLineWriteReq: {
+            uint64_t bucketOffset = msg.b.metaRNFLineWriteReq.bucketOffset;
+            auto *metaRNF = MetaRNFController::getInstance(_nodeId, _socketId);
+            if (!metaRNF) {
+                sendMetaRNFLineErrorResponse(_port,
+                    CoherenceMessageType::MetaRNFLineWriteResp,
+                    MetaRNFLineStatus::IoError,
+                    msg.h.reqId, bucketOffset, _nodeId);
+                break;
+            }
+            uint64_t physPa = metaRNF->metadataRangeStart() +
+                              bucketOffset * 64ULL;
+            if (physPa < metaRNF->metadataRangeStart() ||
+                physPa + 64 > metaRNF->metadataRangeEnd()) {
+                sendMetaRNFLineErrorResponse(_port,
+                    CoherenceMessageType::MetaRNFLineWriteResp,
+                    MetaRNFLineStatus::RangeError,
+                    msg.h.reqId, bucketOffset, _nodeId);
+                break;
+            }
+            uint64_t reqId = msg.h.reqId;
+            auto tport = _port;
+            MetaRNFController::MetaLine ml;
+            memcpy(ml.data(), msg.b.metaRNFLineWriteReq.data, 64);
+            metaRNF->issueWriteLine(physPa, ml,
+                [tport, reqId, bucketOffset, nodeId = _nodeId]
+                (MetaRNFLineStatus st) {
+                    CoherenceMessage resp;
+                    resp.h.type = CoherenceMessageType::MetaRNFLineWriteResp;
+                    resp.h.srcNode = static_cast<uint16_t>(nodeId);
+                    resp.h.dstNode = 0;
+                    resp.h.reqId = reqId;
+                    resp.b.metaRNFLineWriteResp.status = st;
+                    resp.b.metaRNFLineWriteResp.bucketOffset = bucketOffset;
+                    framework::MemMessage *buf =
+                        tport ? tport->allocateSendBuffer(curTick()) : nullptr;
+                    if (buf) {
+                        buf->hdr.type = static_cast<uint32_t>(
+                            framework::MemMessageType::PAYLOAD);
+                        buf->hdr.req_id = reqId;
+                        buf->hdr.targetId = 0;
+                        if (!buf->setPayload(resp)) {
+                            delete buf;
+                        } else {
+                            tport->send(buf); // port deletes buf on both success/failure
+                        }
+                    }
+                });
             break;
         }
 
@@ -1290,9 +1558,11 @@ UBAdapter::wakeup()
                 m = _port->recv(curTick(), &st);
                 continue;
             }
-            std::fprintf(stderr, "[TRACE-PERF] %lu|%d|gem5|%lu|0x%lx|RECV|%s|src=%d\n",
-                         m->hdr.timestamp, _nodeId, bc->h.reqId, bc->h.homeLinePa,
-                         coherenceMsgTypeName(bc->h.type), bc->h.srcNode);
+            if (TracePerfPolicy::get().shouldEmit("gem5")) {
+                std::fprintf(stderr, "[TRACE-PERF] %lu|%d|gem5|%lu|0x%lx|RECV|%s|src=%d\n",
+                             m->hdr.timestamp, _nodeId, bc->h.reqId, bc->h.homeLinePa,
+                             coherenceMsgTypeName(bc->h.type), bc->h.srcNode);
+            }
         }
         // PortAsync: dispatch to handleResponse (pendingByReqId map)
         static int cohcnt = 0;
@@ -1364,8 +1634,8 @@ UBAdapter::wakeup()
                     // Peek for barrier control (now a PAYLOAD CoherenceMessage).
                     const CoherenceMessage *bc = wm->getPayload<CoherenceMessage>();
                     if (bc && bc->h.type == CoherenceMessageType::BarrierRelease) {
-                        std::fprintf(stderr,
-                            "[UBADAPTER-BARRIER-RELEASE] node=%d mask=0x%x "
+                        DPRINTF(RubyEP,
+                            "[DEBUG-UBADAPTER-BARRIER-RELEASE] node=%d mask=0x%x "
                             "seq=%u (busy-wait)\n",
                             _nodeId, bc->b.barrier.mask, bc->b.barrier.seq);
                         if (!System::systemList.empty())
@@ -1407,11 +1677,11 @@ UBAdapter::wakeup()
 
     if (_responseCheckCount % 2000 == 0) {
         uint64_t rxt = _port->receiveTimestamp();
-        std::fprintf(stderr,
-                     "[CLK-SYNC] node=%d curT=%lu rxt=%lu safeT=%lu %s cnt=%lu\n",
-                     _nodeId, curT, rxt, safeT,
-                     stalled ? "WAIT" : "advance",
-                     (unsigned long)_responseCheckCount);
+        DPRINTF(RubyEP,
+                "[DEBUG-CLK-SYNC] node=%d curT=%lu rxt=%lu safeT=%lu %s cnt=%lu\n",
+                _nodeId, curT, rxt, safeT,
+                stalled ? "WAIT" : "advance",
+                (unsigned long)_responseCheckCount);
     }
 }
 
@@ -1444,11 +1714,12 @@ UBAdapter::handleResponse(framework::MemMessage *m)
     if (!_port) return;
 
     const CoherenceMessage *coh = m->getPayload<CoherenceMessage>();
-    std::fprintf(stderr, "[HR-ENTRY] node=%d msg_type=%u msg_sz=%u payload=%s coh_type=%d reqId=%lu\n",
-                 _nodeId, m->hdr.type, m->hdr.size,
-                 coh ? "OK" : "NULL",
-                 coh ? static_cast<int>(coh->h.type) : -1,
-                 coh ? coh->h.reqId : 0UL);
+    DPRINTF(RubyEP,
+            "[DEBUG-UBADAPTER-RECV] node=%d msg_type=%u msg_sz=%u payload=%s coh_type=%d reqId=%lu\n",
+            _nodeId, m->hdr.type, m->hdr.size,
+            coh ? "OK" : "NULL",
+            coh ? static_cast<int>(coh->h.type) : -1,
+            coh ? coh->h.reqId : 0UL);
     if (!coh) return;
 
     if (coh->h.type == CoherenceMessageType::ClearResp) {
@@ -1481,6 +1752,8 @@ UBAdapter::handleResponse(framework::MemMessage *m)
     switch (coh->h.type) {
       case CoherenceMessageType::MetaRNFReadReq:
       case CoherenceMessageType::MetaRNFWriteReq:
+      case CoherenceMessageType::MetaRNFLineReadReq:
+      case CoherenceMessageType::MetaRNFLineWriteReq:
         recvFromRouter(*coh);
         return;
       default:
@@ -1526,7 +1799,8 @@ UBAdapter::handleResponse(framework::MemMessage *m)
                               coh->h.type == CoherenceMessageType::ClearResp ||
                               coh->h.type == CoherenceMessageType::UpgradeResp ||
                               coh->h.type == CoherenceMessageType::WritebackResp ||
-                              coh->h.type == CoherenceMessageType::EvictResp)) {
+                              coh->h.type == CoherenceMessageType::EvictResp ||
+                              coh->h.type == CoherenceMessageType::QueryLineMetaResp)) {
         std::fprintf(stderr, "[RSP-WIRED] node=%d socket=%d firing immediate wakeup for type=%d reqId=%lu\n",
                      _nodeId, _socketId, static_cast<int>(coh->h.type), coh->h.reqId);
         _onResponseWired();

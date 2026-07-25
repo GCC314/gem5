@@ -1,6 +1,7 @@
 #ifndef __MEM_RUBY_PROTOCOL_CHI_EP_EPSNFCONTROLLER_HH__
 #define __MEM_RUBY_PROTOCOL_CHI_EP_EPSNFCONTROLLER_HH__
 
+#include <cstring>
 #include <deque>
 #include <map>
 #include <set>
@@ -81,15 +82,38 @@ class EPSNFController : public EPController
     std::vector<DeferredGrantEntry> _deferredGrants;
     void processDeferredGrants();
 
-    // Pending writeback retry
+    // Pending writeback retry (Phase 2 async: metadata-resolution aware)
     struct PendingWriteback {
         uint64_t linePa;
         bool keepAsClean;
         uint8_t data[64];
         bool hasData;
+
+        // Phase 2 async: QueryLineMeta state
+        uint64_t queryReqId;       // stable QLM reqId (0 = no query sent yet)
+        bool queryInFlight;        // true while QLM is outstanding
+        uint64_t cachedEpoch;      // metadata from QLM response
+        int cachedOwnerNode;
+        bool cachedFound;
+
+        // Phase 2 async: bounded retry / backoff
+        int retryCount;
+        Tick nextRetryTick;
+
+        PendingWriteback()
+            : linePa(0), keepAsClean(false), hasData(false),
+              queryReqId(0), queryInFlight(false),
+              cachedEpoch(0), cachedOwnerNode(-1), cachedFound(false),
+              retryCount(0), nextRetryTick(0)
+        {
+            std::memset(data, 0, sizeof(data));
+        }
     };
     std::deque<PendingWriteback> _pendingWritebacks;
     void processPendingWritebacks();
+
+    // Phase 4: verbose diagnostic logging gate (I14)
+    bool _verboseLog = false;
 };
 
 } // namespace ruby

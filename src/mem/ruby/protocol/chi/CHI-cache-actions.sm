@@ -552,9 +552,14 @@ action(Initiate_ReadShared_HitUpstream_NoOwner, desc="") {
       tbe.dir_sharers.count() == 1 &&
       tbe.dir_sharers.isElement(tbe.epRnfMachineID)) {
     DPRINTF(RubyCHIGeneric,
-            "[HNF-EP-PROXY-MISS] addr=%#x dropping sole EP-RNF proxy sharer\n",
-            address);
+             "[HNF-EP-PROXY-MISS] addr=%#x dropping sole EP-RNF proxy sharer\n",
+             address);
     tbe.dir_sharers.remove(tbe.epRnfMachineID);
+    // This path reissues a shared data miss. Any unique permission inherited
+    // from the evicted cache state is no longer valid once the proxy sharer
+    // is dropped, so CompData_SC must enter a non-unique transaction.
+    tbe.dataUnique := false;
+    tbe.dataMaybeDirtyUpstream := false;
     tbe.actions.push(Event:ReadMissPipe);
     if (is_HN) {
       tbe.actions.push(Event:SendReadNoSnp);
@@ -693,7 +698,12 @@ action(Initiate_ReadOnce_HitUpstream, desc="") {
 
 action(Initiate_ReadUnique_Miss, desc="") {
   tbe.actions.push(Event:ReadMissPipe);
-  if (is_HN && tbe.use_DMT) {
+  // RecallUnique is a local ownership-return operation, not a DSM demand
+  // miss. A home-side miss means this node has no tracked local copy: return
+  // a no-data Comp_UC to EP-RNF rather than re-entering EP-SNF/Outer.
+  if (is_HN && tbe.epProxyOp == EpProxyOp:RecallUnique) {
+    tbe.actions.push(Event:SendCompUCResp);
+  } else if (is_HN && tbe.use_DMT) {
     tbe.requestorToBeExclusiveOwner := true;
     tbe.dataMaybeDirtyUpstream := true; // SNF always replies with CompData_UC
     if (enable_DMT_early_dealloc) {
@@ -1723,6 +1733,10 @@ action(Send_ReadNoSnp, desc="") {
   tbe.expected_req_resp.setExpectedCount(2);
   tbe.dataBlkValid.clear();
   outgoingTransactionStart(address, curTransitionEvent());
+  if (tbe.epProxyOp == EpProxyOp:RecallUnique) {
+    DPRINTF(RubyGenerated, "[RECALL-PROXY-HNF-DOWNSTREAM] addr=%#x reqType=%d requestor=%d proxy=%d\n",
+            address, tbe.reqType, tbe.requestor, tbe.epProxyOp);
+  }
 
   enqueue(reqOutPort, CHIRequestMsg, request_latency) {
     prepareRequest(tbe, CHIRequestType:ReadNoSnp, out_msg);

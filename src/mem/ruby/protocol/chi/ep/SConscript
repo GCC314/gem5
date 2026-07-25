@@ -44,6 +44,7 @@ Source('M5SelfTest.cc')
 Source('M6SelfTest.cc')
 Source('M7SelfTest.cc')
 Source('M8SelfTest.cc')
+Source('M9SelfTest.cc')
 # framework/Port.cc is now linked via build/framework/lib/libframework.a (above)
 
 DebugFlag('RubyEP')

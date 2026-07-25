@@ -278,6 +278,7 @@ struct RequesterLineEntry {
     uint64_t reqId;        // v4: outer transaction ID
     bool writeIntent;
     int homeNode;      // Home node for this remote line (-1 if local)
+    Tick outerStartTick = 0; // First issue tick for protocol latency evidence
 };
 
 // ---- M5 Inspection API return types ----
@@ -502,8 +503,44 @@ class EPBackend : public SimObject
      * @param dirtyData   64-byte dirty cacheline data (nullptr if unavailable)
      * @return            True if writeback was accepted by home
      */
+    /**
+     * Handle a writeback from a dirty owner (requester→home).
+     * Called by EPSNFController when HN sends a writeback.
+     *
+     * Phase 2 async: populates *outQueryReqId with a stable QLM reqId
+     * when the internal QueryLineMetaReq is sent. If queryMeta is
+     * non-null and queryMeta->valid, skips QLM entirely and uses the
+     * supplied epoch/owner.
+     *
+     * @param line_pa      Physical address (requester's view)
+     * @param keepAsClean  True if owner wants to keep clean exclusive copy
+     * @param dirtyData    64-byte dirty cacheline data (nullptr if unavailable)
+     * @param queryMeta    Pre-resolved metadata (nullptr = query fresh)
+     * @param outQueryReqId If non-null, receives the QLM reqId sent
+     * @return             >0 writeback accepted, 0 rejected, -2 pending (retry)
+     */
+    struct WritebackQueryMeta {
+        bool valid;
+        uint64_t epochVal;
+        int requesterNode;
+        WritebackQueryMeta() : valid(false), epochVal(0), requesterNode(-1) {}
+    };
     int handleWriteback(uint64_t line_pa, bool keepAsClean,
-                        const uint8_t *dirtyData = nullptr);
+                        const uint8_t *dirtyData = nullptr,
+                        const WritebackQueryMeta *queryMeta = nullptr,
+                        uint64_t *outQueryReqId = nullptr,
+                        uint64_t cachedQlmReqId = 0);
+
+    /**
+     * Phase 2 async: fire a WritebackReq with previously-resolved metadata
+     * (epoch + owner). Bypasses the QueryLineMetaReq entirely. Called by
+     * EPSNFController when a cached QLM response is available.
+     *
+     * @return same semantics as handleWriteback
+     */
+    int handleWritebackWithMeta(uint64_t line_pa, bool keepAsClean,
+                                 const uint8_t *dirtyData,
+                                 uint64_t epochVal, int requesterNode);
 
     /**
      * Called by EPSNFController when HN-F completes a WriteNoSnp write
@@ -777,6 +814,9 @@ class EPBackend : public SimObject
     DataBlock _recallCaptureDataBlock;
     bool _recallCaptureDataValid = false;
 
+    // Phase 4: verbose diagnostic logging gate (I14)
+    bool _verboseLog = false;
+
     /**
      * F3: Populate the grant data buffer from a formal data source.
      * Replaces the old functionalRead/scavenge/back-fill approach.
@@ -847,10 +887,12 @@ class EPBackend : public SimObject
         uint64_t baseEpoch;   // home-approved GRANT_HANDSHAKE baseEpoch
         uint64_t reqId;
         OuterGrantType grantType;
+        Tick outerStartTick;
 
         PendingGrantTxn() : valid(false), linePa(0), homeNode(-1),
                             baseEpoch(0), reqId(0),
-                            grantType(OuterGrantType::GlobalGrantShared) {}
+                            grantType(OuterGrantType::GlobalGrantShared),
+                            outerStartTick(0) {}
     };
     std::map<uint64_t, PendingGrantTxn> _pendingGrantTxns;
 
@@ -865,8 +907,9 @@ class EPBackend : public SimObject
         int homeNode;
         uint64_t epoch;
         uint64_t reqId;
+        Tick startTick;
         PendingUpgradeTxn() : valid(false), linePa(0), homeNode(-1),
-                              epoch(0), reqId(0) {}
+                               epoch(0), reqId(0), startTick(0) {}
     };
     std::map<uint64_t, PendingUpgradeTxn> _pendingUpgradeTxns;
 

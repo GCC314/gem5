@@ -33,11 +33,16 @@ MetaRNFController::MetaRNFController(const Params &p)
     _hnfVersion(-1),
     _maxFlights(p.flight_slots)
 {
+    fatal_if(_maxFlights > kMaxLineFlightSlots,
+             "MetaRNF node_id=%d: flight_slots=%d exceeds physical array [%d]",
+             _nodeId, _maxFlights, kMaxLineFlightSlots);
+    if (_maxFlights < 1) _maxFlights = 1;
+
     if (!p.downstream_destinations.empty()) {
         _hnfVersion = p.downstream_destinations[0]->getVersion();
     }
 
-    for (int i = 0; i < 8; ++i)
+    for (int i = 0; i < kMaxLineFlightSlots; ++i)
         _flightSlots[i] = FlightSlot();
 
     _instances[{_nodeId, p.socket_id}] = this;
@@ -186,12 +191,32 @@ MetaRNFController::issueWrite(uint64_t metadataPa, const MetaLine &line,
 
     int slot = findFreeSlot();
     if (slot < 0) {
-        if (tracePageOne(metadataPa)) {
-            std::fprintf(stderr,
-                         "[META-TRACE] node=%d op=write-no-slot pa=0x%lx active=%d\n",
-                         _nodeId, metadataPa, activeFlightCount());
+        // Phase D7: queue writes when all flight slots are full.
+        // Deduplicate by PA: replace older queued write for same PA.
+        for (auto it = _pendingWrites.begin(); it != _pendingWrites.end(); ++it) {
+            if (it->pa == metadataPa) {
+                std::fprintf(stderr,
+                    "[METARNF-WRITE-COALESCE] node=%d pa=0x%lx "
+                    "queueDepth=%zu\n",
+                    _nodeId, metadataPa, _pendingWrites.size());
+                std::fflush(stderr);
+                it->data = line;
+                it->cb = cb;
+                return;
+            }
         }
-        if (cb) cb(false);
+        if ((int)_pendingWrites.size() >= kMaxPendingWrites) {
+            // Queue full — backpressure caller
+            if (cb) cb(false);
+            return;
+        }
+        _pendingWrites.push_back({metadataPa, line, cb});
+        int qd = (int)_pendingWrites.size();
+        if (qd > _pendingWritesHighwater) _pendingWritesHighwater = qd;
+        std::fprintf(stderr,
+            "[METARNF-WRITE-QUEUE] node=%d pa=0x%lx depth=%d\n",
+            _nodeId, metadataPa, qd);
+        std::fflush(stderr);
         return;
     }
 
@@ -257,6 +282,186 @@ MetaRNFController::issueDelete(uint64_t metadataPa, WriteCallback cb)
     }
 }
 
+// ---- Phase 2: 64B line read with typed status and bounded queues ----
+
+void
+MetaRNFController::issueReadLine(uint64_t linePa, LineReadCallback cb)
+{
+    MetaLine zero{};
+    if (!inMetadataRange(linePa)) {
+        ++_lineRangeErrors;
+        if (cb) cb(MetaRNFLineStatus::RangeError, zero);
+        return;
+    }
+
+    auto sbIt = _scoreboard.find(linePa);
+    if (sbIt != _scoreboard.end()) {
+        // Same-address already in flight: check per-address bound
+        int perAddrCount = _perAddressPendingCount[linePa];
+        if (perAddrCount >= kMaxLineOpsPerAddress) {
+            if (cb) cb(MetaRNFLineStatus::RetryableBusy, zero);
+            ++_lineOpsRejected;
+            return;
+        }
+        PendingLineOp op;
+        op.pa = linePa;
+        op.readCb = cb;
+        if ((int)_pendingLineOps.size() >= kMaxPendingLineOps) {
+            if (cb) cb(MetaRNFLineStatus::RetryableBusy, zero);
+            ++_lineOpsRejected;
+            return;
+        }
+        _pendingLineOps.push_back(op);
+        _perAddressPendingCount[linePa]++;
+        int qd = (int)_pendingLineOps.size();
+        if (qd > _pendingLineOpsHighwater) _pendingLineOpsHighwater = qd;
+        return;
+    }
+
+    int slot = findFreeSlot();
+    if (slot < 0) {
+        // No flight slot: queue if bounded limits permit
+        int perAddrCount = _perAddressPendingCount[linePa];
+        if (perAddrCount >= kMaxLineOpsPerAddress) {
+            if (cb) cb(MetaRNFLineStatus::RetryableBusy, zero);
+            ++_lineOpsRejected;
+            return;
+        }
+        if ((int)_pendingLineOps.size() >= kMaxPendingLineOps) {
+            if (cb) cb(MetaRNFLineStatus::RetryableBusy, zero);
+            ++_lineOpsRejected;
+            return;
+        }
+        PendingLineOp op;
+        op.pa = linePa;
+        op.readCb = cb;
+        _pendingLineOps.push_back(op);
+        _perAddressPendingCount[linePa]++;
+        int qd = (int)_pendingLineOps.size();
+        if (qd > _pendingLineOpsHighwater) _pendingLineOpsHighwater = qd;
+        return;
+    }
+
+    FlightSlot &fs = _flightSlots[slot];
+    fs.state = SlotState::Allocated;
+    fs.op = OpType::Read;
+    fs.pa = linePa;
+    fs.isLineOp = true;
+    fs.lineReadCb = cb;
+    _scoreboard[linePa] = slot;
+
+    // Phase 2 line trace: DEBUG-gated only, not [META-TRACE].
+    DPRINTF(RubyCHIGeneric,
+            "[DEBUG-PHASE2] node=%d op=readLine-issue pa=0x%lx slot=%d active=%d\n",
+            _nodeId, linePa, slot, activeFlightCount());
+
+    if (!sendReadOnce(linePa)) {
+        // Send failed (TBE full, port busy). Queue for later retry
+        // instead of failing immediately. drainPendingLineOps will
+        // retry when a flight slot or TBE becomes free.
+        _scoreboard.erase(linePa);
+        fs.reset();
+        PendingLineOp op;
+        op.pa = linePa;
+        op.readCb = cb;
+        op.isWrite = false;
+        _pendingLineOps.push_back(op);
+        _perAddressPendingCount[linePa]++;
+        int qd = (int)_pendingLineOps.size();
+        if (qd > _pendingLineOpsHighwater) _pendingLineOpsHighwater = qd;
+    }
+}
+
+// ---- Phase 2: 64B line write with typed status and bounded queues ----
+
+void
+MetaRNFController::issueWriteLine(uint64_t linePa, const MetaLine &line,
+                                  LineWriteCallback cb)
+{
+    if (!inMetadataRange(linePa)) {
+        ++_lineRangeErrors;
+        if (cb) cb(MetaRNFLineStatus::RangeError);
+        return;
+    }
+
+    auto sbIt = _scoreboard.find(linePa);
+    if (sbIt != _scoreboard.end()) {
+        int perAddrCount = _perAddressPendingCount[linePa];
+        if (perAddrCount >= kMaxLineOpsPerAddress) {
+            if (cb) cb(MetaRNFLineStatus::RetryableBusy);
+            ++_lineOpsRejected;
+            return;
+        }
+        if ((int)_pendingLineOps.size() >= kMaxPendingLineOps) {
+            if (cb) cb(MetaRNFLineStatus::RetryableBusy);
+            ++_lineOpsRejected;
+            return;
+        }
+        PendingLineOp op;
+        op.pa = linePa;
+        op.data = line;
+        op.writeCb = cb;
+        _pendingLineOps.push_back(op);
+        _perAddressPendingCount[linePa]++;
+        int qd = (int)_pendingLineOps.size();
+        if (qd > _pendingLineOpsHighwater) _pendingLineOpsHighwater = qd;
+        return;
+    }
+
+    int slot = findFreeSlot();
+    if (slot < 0) {
+        int perAddrCount = _perAddressPendingCount[linePa];
+        if (perAddrCount >= kMaxLineOpsPerAddress) {
+            if (cb) cb(MetaRNFLineStatus::RetryableBusy);
+            ++_lineOpsRejected;
+            return;
+        }
+        if ((int)_pendingLineOps.size() >= kMaxPendingLineOps) {
+            if (cb) cb(MetaRNFLineStatus::RetryableBusy);
+            ++_lineOpsRejected;
+            return;
+        }
+        PendingLineOp op;
+        op.pa = linePa;
+        op.data = line;
+        op.writeCb = cb;
+        _pendingLineOps.push_back(op);
+        _perAddressPendingCount[linePa]++;
+        int qd = (int)_pendingLineOps.size();
+        if (qd > _pendingLineOpsHighwater) _pendingLineOpsHighwater = qd;
+        return;
+    }
+
+    FlightSlot &fs = _flightSlots[slot];
+    fs.state = SlotState::Allocated;
+    fs.op = OpType::Write;
+    fs.pa = linePa;
+    fs.isLineOp = true;
+    fs.lineWriteCb = cb;
+    fs.writeData.setData(line.data(), 0, 64);
+    _scoreboard[linePa] = slot;
+
+    // Phase 2 line trace: DEBUG-gated only, not [META-TRACE].
+    DPRINTF(RubyCHIGeneric,
+            "[DEBUG-PHASE2] node=%d op=writeLine-issue pa=0x%lx slot=%d active=%d\n",
+            _nodeId, linePa, slot, activeFlightCount());
+
+    if (!sendWriteUnique(linePa)) {
+        // Send failed — queue for retry, don't fail immediately
+        _scoreboard.erase(linePa);
+        fs.reset();
+        PendingLineOp op;
+        op.pa = linePa;
+        op.data = line;
+        op.writeCb = cb;
+        op.isWrite = true;
+        _pendingLineOps.push_back(op);
+        _perAddressPendingCount[linePa]++;
+        int qd = (int)_pendingLineOps.size();
+        if (qd > _pendingLineOpsHighwater) _pendingLineOpsHighwater = qd;
+    }
+}
+
 void
 MetaRNFController::drainWaitQueue(uint64_t metadataPa)
 {
@@ -282,6 +487,23 @@ MetaRNFController::drainWaitQueue(uint64_t metadataPa)
       case OpType::Delete:
         issueDelete(metadataPa, q.writeCb);
         break;
+    }
+}
+
+// Phase D7: drain queued writes when a flight slot frees up
+void
+MetaRNFController::drainPendingWrites()
+{
+    while (!_pendingWrites.empty()) {
+        int slot = findFreeSlot();
+        if (slot < 0) break;
+        PendingWrite pw = _pendingWrites.front();
+        _pendingWrites.pop_front();
+        std::fprintf(stderr,
+            "[METARNF-WRITE-DEQUEUE] node=%d pa=0x%lx depth=%zu\n",
+            _nodeId, pw.pa, _pendingWrites.size());
+        std::fflush(stderr);
+        issueWrite(pw.pa, pw.data, pw.cb);
     }
 }
 
@@ -405,8 +627,16 @@ MetaRNFController::completeRead(int slotIdx, bool success,
                                 const DataBlock *data)
 {
     FlightSlot &fs = _flightSlots[slotIdx];
-    auto cb = fs.readCb;
     uint64_t pa = fs.pa;
+
+    if (fs.isLineOp) {
+        MetaRNFLineStatus st = success ? MetaRNFLineStatus::Ok
+                                        : MetaRNFLineStatus::IoError;
+        completeReadLine(slotIdx, st, success ? data : nullptr);
+        return;
+    }
+
+    auto cb = fs.readCb;
 
     if (tracePageOne(pa)) {
         std::fprintf(stderr,
@@ -426,14 +656,50 @@ MetaRNFController::completeRead(int slotIdx, bool success,
     if (cb) cb(success, line);
 
     drainWaitQueue(pa);
+    drainPendingWrites();  // Phase D7
+}
+
+void
+MetaRNFController::completeReadLine(int slotIdx, MetaRNFLineStatus st,
+                                    const DataBlock *data)
+{
+    FlightSlot &fs = _flightSlots[slotIdx];
+    auto cb = fs.lineReadCb;
+    uint64_t pa = fs.pa;
+
+    MetaLine line{};
+    if (st == MetaRNFLineStatus::Ok && data) {
+        for (int i = 0; i < 64; ++i)
+            line[i] = data->getByte(i);
+    }
+
+    _scoreboard.erase(pa);
+    // NOTE: _perAddressPendingCount is NOT decremented here.
+    // It is decremented only in drainPendingLineOps() when a queued item
+    // for this PA is actually issued. The count tracks items still in the
+    // pending queue, not completed flights.
+    fs.reset();
+
+    if (cb) cb(st, line);
+
+    drainPendingLineOps();
+    drainPendingWrites();  // Legacy path may also drain
 }
 
 void
 MetaRNFController::completeWrite(int slotIdx, bool success)
 {
     FlightSlot &fs = _flightSlots[slotIdx];
-    auto cb = fs.writeCb;
     uint64_t pa = fs.pa;
+
+    if (fs.isLineOp) {
+        MetaRNFLineStatus st = success ? MetaRNFLineStatus::Ok
+                                        : MetaRNFLineStatus::IoError;
+        completeWriteLine(slotIdx, st);
+        return;
+    }
+
+    auto cb = fs.writeCb;
 
     if (tracePageOne(pa)) {
         std::fprintf(stderr,
@@ -447,6 +713,84 @@ MetaRNFController::completeWrite(int slotIdx, bool success)
     if (cb) cb(success);
 
     drainWaitQueue(pa);
+    drainPendingWrites();  // Phase D7
+}
+
+void
+MetaRNFController::completeWriteLine(int slotIdx, MetaRNFLineStatus st)
+{
+    FlightSlot &fs = _flightSlots[slotIdx];
+    auto cb = fs.lineWriteCb;
+    uint64_t pa = fs.pa;
+
+    _scoreboard.erase(pa);
+    // NOTE: _perAddressPendingCount is NOT decremented here.
+    // See completeReadLine for rationale.
+    fs.reset();
+
+    if (cb) cb(st);
+
+    drainPendingLineOps();
+    drainPendingWrites();  // Legacy path may also drain
+}
+
+// Phase 2: drain pending line ops (per-PA FIFO, bounded).
+//
+// Scans the queue once: issues every ready item (PA not in scoreboard) while
+// flight slots remain. Items blocked on a PA that is still in-flight are
+// re-queued at the tail so that unrelated PAs can proceed. Same-PA FIFO is
+// preserved because items for a single PA stay consecutive in the queue and
+// are only re-queued when all of them are blocked.
+void
+MetaRNFController::drainPendingLineOps()
+{
+    if (_pendingLineOps.empty()) return;
+
+    std::deque<PendingLineOp> remaining;
+    int issued = 0;
+
+    while (!_pendingLineOps.empty()) {
+        int slot = findFreeSlot();
+        if (slot < 0) {
+            // No more flight slots: re-queue everything that's left.
+            remaining.insert(remaining.end(),
+                             std::make_move_iterator(_pendingLineOps.begin()),
+                             std::make_move_iterator(_pendingLineOps.end()));
+            break;
+        }
+
+        PendingLineOp op = std::move(_pendingLineOps.front());
+        _pendingLineOps.pop_front();
+
+        if (_scoreboard.find(op.pa) != _scoreboard.end()) {
+            // PA is still in-flight — keep this op in the backlog.
+            remaining.push_back(std::move(op));
+            continue;
+        }
+
+        // Ready to issue: decrement per-address pending count.
+        auto pcIt = _perAddressPendingCount.find(op.pa);
+        if (pcIt != _perAddressPendingCount.end() && pcIt->second > 0) {
+            pcIt->second--;
+            if (pcIt->second == 0)
+                _perAddressPendingCount.erase(pcIt);
+        }
+
+        if (op.readCb) {
+            issueReadLine(op.pa, op.readCb);
+        } else if (op.writeCb) {
+            issueWriteLine(op.pa, op.data, op.writeCb);
+        }
+        ++issued;
+    }
+
+    _pendingLineOps = std::move(remaining);
+
+    if (issued > 0) {
+        DPRINTF(RubyCHIGeneric,
+                "MetaRNF node=%d: drainPendingLineOps issued=%d remaining=%zu\n",
+                _nodeId, issued, _pendingLineOps.size());
+    }
 }
 
 void

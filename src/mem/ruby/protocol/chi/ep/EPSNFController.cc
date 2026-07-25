@@ -1,11 +1,14 @@
 #include "mem/ruby/protocol/chi/ep/EPSNFController.hh"
 
+#include <cstring>
+
 #include "base/logging.hh"
 #include "debug/RubyCHIGeneric.hh"
 #include "mem/ruby/common/DataBlock.hh"
 #include "mem/ruby/protocol/CHI/CHIDataMsg.hh"
 #include "mem/ruby/protocol/CHI/CHIRequestMsg.hh"
 #include "mem/ruby/protocol/CHI/CHIResponseMsg.hh"
+#include "mem/ruby/protocol/chi/ep/UBAdapter.hh"
 #include "mem/simple_mem.hh"
 #include "mem/packet.hh"
 #include "mem/request.hh"
@@ -89,13 +92,15 @@ EPSNFController::wakeup()
     // v4: Send deferred grants (§4.4.2, I10 timing invariant)
     processDeferredGrants();
 
-    // v4: Process pending writebacks
-    processPendingWritebacks();
-
-    // Poll backend first so newly-arrived responses are available
-    // for retry queue evaluation below
+    // Phase 2 async: Poll backend first so newly-arrived QLM responses
+    // are available for pending writeback evaluation (§5.3).
     if (_backend)
         _backend->wakeup();
+
+    // Phase 2 async: Process pending writebacks after backend poll so that
+    // freshly arrived QueryLineMetaResp messages cached in _readyResponses
+    // can resolve metadata before the WriteBackReq is attempted.
+    processPendingWritebacks();
 
     // Q3: Process retry queue — request grants that were previously BUSY
     if (!_retryQueue.empty()) {
@@ -159,9 +164,7 @@ EPSNFController::print(std::ostream& out) const
 bool
 EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
 {
-    printf("[EPSNF-RECV] node=%d type=%d addr=0x%lx\n",
-           _nodeId, msg->m_type, msg->m_addr);
-    DPRINTF(RubyCHIGeneric, "EP_SNF node_id=%d recvRequestMsg type=%s addr=0x%lx\n",
+    DPRINTF(RubyCHIGeneric, "[DEBUG-EPSNF-RECV] EP_SNF node_id=%d recvRequestMsg type=%s addr=0x%lx\n",
             _nodeId, msg->m_type, msg->m_addr);
     warn("EP_SNF node_id=%d recvRequestMsg type=%d addr=0x%lx "
          "dataToFwdReq=%d\n",
@@ -186,6 +189,19 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
             pending.expectedMask = ~0ULL;
         }
         _pendingWrites[msg->m_addr] = pending;
+
+        // ── Phase C4 trace point 2: WriteNoSnp receipt ──
+        {
+            uint64_t off = msg->m_addr & 0x1FFFULL;
+            uint64_t ckOff = msg->m_addr & 0xFFFFFULL;
+            if (ckOff < 0x80000ULL && (off % 64 == 0)) {
+                std::fprintf(stderr,
+                    "[C4-ESNF-WNOSNP] node=%d addr=0x%lx off=0x%lx "
+                    "expectedMask=0x%lx\n",
+                    _nodeId, msg->m_addr, off, pending.expectedMask);
+                std::fflush(stderr);
+            }
+        }
 
         NetDest hnDest(m_ruby_system);
         hnDest.add(msg->m_requestor);
@@ -223,12 +239,21 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
 
     _backend->checkDsmAddr(msg->m_addr);
 
+    if (msg->m_ep_proxy_op == EpProxyOp_RecallUnique) {
+        std::fprintf(stderr,
+                     "[RECALL-PROXY-EPSNF] node=%d localPA=0x%lx type=%d "
+                     "proxy=RecallUnique neededPerm=%d writeIntent=%d tick=%lu\n",
+                     _nodeId, msg->m_addr, static_cast<int>(msg->m_type),
+                     msg->m_ubcc_needed_perm,
+                     msg->m_ubcc_write_intent ? 1 : 0, curTick());
+    }
+
     // ---- M5: Read UBCC Sideband Fields ----
     int neededPerm = msg->m_ubcc_needed_perm;  // 0=Shared, 1=Unique
     bool writeIntent = msg->m_ubcc_write_intent;
 
-    std::fprintf(stderr,
-        "[EP-SNF-DEBUG] node=%d type=%d addr=0x%lx neededPerm=%d writeIntent=%d\n",
+    DPRINTF(RubyCHIGeneric,
+        "[DEBUG-EP-SNF] node=%d type=%d addr=0x%lx neededPerm=%d writeIntent=%d\n",
         _nodeId, (int)msg->m_type, msg->m_addr, neededPerm, (int)writeIntent);
 
     DPRINTF(RubyCHIGeneric,
@@ -249,6 +274,12 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
 
     // Map sideband to outer request and dispatch
     int homeNode = -1;
+    if (msg->m_ep_proxy_op == EpProxyOp_RecallUnique) {
+        std::fprintf(stderr,
+                     "[RECALL-PROXY-OUTER-ENTER] node=%d localPA=0x%lx "
+                     "tick=%lu\n",
+                     _nodeId, msg->m_addr, curTick());
+    }
     int grantResult = _backend->handleRemoteDemandMiss(
         msg->m_addr, neededPerm, writeIntent, _socketId, homeNode);
 
@@ -538,6 +569,26 @@ EPSNFController::recvDataMsg(const CHIDataMsg *msg)
                 }
             }
 
+            // ── Phase C4 trace point 1: assembled NCBWrData payload ──
+            {
+                uint64_t off = writePa & 0x1FFFULL;
+                uint64_t absOff = writePa & 0xFFFFFULL;
+                // TC132 checkpoint PAs: offsets 0x000-0x7FFC0 (ACTIVE=8192*64)
+                if (absOff < 0x80000ULL && (off % 64 == 0)) {
+                    uint64_t w0;
+                    std::memcpy(&w0, buf, 8);
+                    bool full = true;
+                    for (int i = 0; i < 64; i++)
+                        if (!msg->m_bitMask.test(i)) { full = false; break; }
+                    std::fprintf(stderr,
+                        "[C4-EPSNF-BEAT] node=%d pa=0x%lx writePa=0x%lx "
+                        "off=0x%lx fullMask=%d w0=0x%016lx pending=%d\n",
+                        _nodeId, msg->m_addr, writePa, absOff, full ? 1 : 0, w0,
+                        pendingIt != _pendingWrites.end() ? 1 : 0);
+                    std::fflush(stderr);
+                }
+            }
+
             // Write back to DDR4 (at home PA)
             Packet wrPkt(req, MemCmd::WriteReq);
             wrPkt.dataStatic(buf);
@@ -558,14 +609,53 @@ EPSNFController::recvDataMsg(const CHIDataMsg *msg)
             pendingIt->second.receivedMask |= beatMask;
             if ((pendingIt->second.receivedMask & pendingIt->second.expectedMask) ==
                 pendingIt->second.expectedMask) {
-                if (_backend && _backend->isDsmAddr(writePa)) {
-                    int wbRet = _backend->handleWriteback(writePa, false, buf);
-                    if (wbRet == -2) {
-                        std::fprintf(stderr,
-                                     "[EPSNF-WB-PENDING] node=%d pa=0x%lx\n",
-                                     _nodeId, writePa);
-                        PendingWriteback pwb; pwb.linePa = writePa;
-                        pwb.keepAsClean = false; pwb.hasData = true;
+                // writePa has been translated into the home node's address
+                // view, so a local-only DSM test suppresses remote writeback
+                // notifications after a normal L2 eviction.
+                if (_backend && _backend->isDsmAddrCrossNode(writePa)) {
+                    // Phase 2 async: do NOT call handleWriteback here —
+                    // it would send an untracked QLM whose reqId is lost.
+                    // Instead, enqueue directly and let processPendingWritebacks
+                    // handle both QLM query and WriteBackReq with stable reqId.
+                    std::fprintf(stderr,
+                                 "[EPSNF-WB-PENDING] node=%d pa=0x%lx\n",
+                                 _nodeId, writePa);
+                    // Phase 2 async item 5: Deduplicate pending writebacks
+                    // per line — retain newest dirty payload.
+                    bool replaced = false;
+                    for (auto &pwb : _pendingWritebacks) {
+                        if (pwb.linePa == writePa) {
+                            // Phase 2 corrective item 3: consume stale QLM
+                            if (pwb.queryInFlight && _backend) {
+                                UBAdapter *wa = _backend->getUBAdapter(0);
+                                if (wa) {
+                                    uint64_t _dE; int _dO; bool _dF;
+                                    wa->tryGetQueryLineMetaResp(
+                                        pwb.queryReqId, _dE, _dO, _dF);
+                                }
+                            }
+                            pwb.keepAsClean = false;
+                            pwb.hasData = true;
+                            std::memcpy(pwb.data, buf, 64);
+                            // Reset query state — new identity
+                            pwb.queryReqId = 0;
+                            pwb.queryInFlight = false;
+                            pwb.cachedFound = false;
+                            pwb.retryCount = 0;
+                            pwb.nextRetryTick = 0;
+                            replaced = true;
+                            std::fprintf(stderr,
+                                "[EPSNF-WB-DEDUP] node=%d pa=0x%lx "
+                                "(replaced existing entry)\n",
+                                _nodeId, writePa);
+                            break;
+                        }
+                    }
+                    if (!replaced) {
+                        PendingWriteback pwb;
+                        pwb.linePa = writePa;
+                        pwb.keepAsClean = false;
+                        pwb.hasData = true;
                         std::memcpy(pwb.data, buf, 64);
                         _pendingWritebacks.push_back(pwb);
                     }
@@ -592,19 +682,141 @@ void
 EPSNFController::processPendingWritebacks()
 {
     if (_pendingWritebacks.empty()) return;
+
+    // Phase 2 async: exponential backoff constants
+    static const int MAX_RETRIES = 128;
+    static const Tick BASE_BACKOFF_TICKS = 20000;  // 20k ticks (~20 µs)
+    static const Tick MAX_BACKOFF_TICKS = 100000000; // 100M ticks cap
+
     for (auto it = _pendingWritebacks.begin(); it != _pendingWritebacks.end(); ) {
-        int wbRet = _backend->handleWriteback(it->linePa, it->keepAsClean,
-                                               it->hasData ? it->data : nullptr);
-        if (wbRet != -2) {
-            // Writeback completed (or error) — remove from queue
-            it = _pendingWritebacks.erase(it);
-        } else {
+        Tick now = curTick();
+
+        // Bounded retry with backoff: skip if not yet time to retry
+        if (it->retryCount > 0 && now < it->nextRetryTick) {
             ++it;
+            continue;
+        }
+
+        // ── Poll for QLM response if one is in-flight ──
+        if (it->queryInFlight && _backend) {
+            UBAdapter *wa = _backend->getUBAdapter(0);
+            if (wa) {
+                uint64_t resolvedEpoch = 0;
+                int resolvedOwner = -1;
+                bool resolvedFound = false;
+                if (wa->tryGetQueryLineMetaResp(it->queryReqId,
+                                                resolvedEpoch,
+                                                resolvedOwner,
+                                                resolvedFound)) {
+                    it->queryInFlight = false;
+                    it->cachedEpoch = resolvedEpoch;
+                    it->cachedOwnerNode = resolvedOwner;
+                    it->cachedFound = resolvedFound;
+                    std::fprintf(stderr,
+                        "[EPSNF-QLM-READY] node=%d pa=0x%lx reqId=%lu "
+                        "found=%d epoch=%lu owner=%d\n",
+                        _nodeId, it->linePa, it->queryReqId,
+                        resolvedFound, resolvedEpoch, resolvedOwner);
+                }
+            }
+        }
+
+        int wbRet;
+
+        if (it->cachedFound && !it->queryInFlight) {
+            // ── Phase 2 item 4: cached metadata → exactly one writeback ──
+            EPBackend::WritebackQueryMeta meta;
+            meta.valid = true;
+            meta.epochVal = it->cachedEpoch;
+            meta.requesterNode = (it->cachedOwnerNode >= 0)
+                                 ? it->cachedOwnerNode : _nodeId;
+            wbRet = _backend->handleWriteback(it->linePa, it->keepAsClean,
+                                               it->hasData ? it->data : nullptr,
+                                               &meta);
+
+        } else if (it->queryReqId > 0) {
+            // ── Phase 2 item 4: retry with stable queryReqId ──
+            // Reuse the existing reqId as cachedQlmReqId so
+            // sendQueryLineMetaReq checks _readyResponses by exact key
+            // without allocating a new reqId or scanning by PA.
+            wbRet = _backend->handleWriteback(
+                it->linePa, it->keepAsClean,
+                it->hasData ? it->data : nullptr,
+                nullptr,           // no pre-resolved meta
+                nullptr,           // no new outQueryReqId (reusing existing)
+                it->queryReqId);   // stable cached reqId
+            // If handleWriteback consumed a cached QLM response,
+            // wbRet will be the writeback result (not -2).
+            // If still pending, wbRet == -2 and we back off.
+
+        } else {
+            // ── First attempt: send fresh QLM ──
+            uint64_t qlmReqId = 0;
+            wbRet = _backend->handleWriteback(it->linePa, it->keepAsClean,
+                                               it->hasData ? it->data : nullptr,
+                                               nullptr,  // no cached meta
+                                               &qlmReqId, // get the new reqId
+                                               0);        // no cached reqId
+            if (wbRet == -2 && qlmReqId > 0) {
+                it->queryReqId = qlmReqId;
+                it->queryInFlight = true;
+                std::fprintf(stderr,
+                    "[EPSNF-WB-QLM-ENQ] node=%d pa=0x%lx reqId=%lu\n",
+                    _nodeId, it->linePa, qlmReqId);
+            }
+        }
+
+        if (wbRet == -2) {
+            // Writeback (or QLM) still pending — keep in queue with backoff
+            it->retryCount++;
+            if (it->retryCount > MAX_RETRIES) {
+                std::fprintf(stderr,
+                    "[EPSNF-WB-FATAL] node=%d pa=0x%lx max retries exceeded\n",
+                    _nodeId, it->linePa);
+                std::fflush(stderr);
+                it = _pendingWritebacks.erase(it);
+                continue;
+            }
+            Tick delay = BASE_BACKOFF_TICKS;
+            if (it->retryCount > 4) {
+                int shift = (it->retryCount - 4) / 4;
+                if (shift > 10) shift = 10;
+                delay = BASE_BACKOFF_TICKS * (1ULL << shift);
+                if (delay > MAX_BACKOFF_TICKS) delay = MAX_BACKOFF_TICKS;
+            }
+            it->nextRetryTick = now + delay;
+            std::fprintf(stderr,
+                "[EPSNF-WB-RETRY] node=%d pa=0x%lx retry=%d delay=%lu\n",
+                _nodeId, it->linePa, it->retryCount, delay);
+            ++it;
+
+        } else if (wbRet == -3) {
+            // ── Phase 2 corrective: terminal QLM failure ──
+            // found=false, owner<0, epoch=0 — do NOT silently discard.
+            // Retire the entry with explicit diagnostic data.
+            std::fprintf(stderr,
+                "[EPSNF-WB-TERMINAL] node=%d pa=0x%lx queryReqId=%lu "
+                "retries=%d — QLM metadata resolution FAILED\n",
+                _nodeId, it->linePa, it->queryReqId, it->retryCount);
+            std::fflush(stderr);
+            it = _pendingWritebacks.erase(it);
+
+        } else {
+            // Writeback completed (or rejected) — remove from queue
+            std::fprintf(stderr,
+                "[EPSNF-WB-DONE] node=%d pa=0x%lx ret=%d retries=%d\n",
+                _nodeId, it->linePa, wbRet, it->retryCount);
+            it = _pendingWritebacks.erase(it);
         }
     }
+
+    // Schedule next wakeup if there are still pending entries
     if (!_pendingWritebacks.empty())
         scheduleEvent(Cycles(epsnf_retry_cycles()));
 }
+
+// ---- v4: write-data completion path with dedup (§5.5) ----
+// (called from recvDataMsg when a WriteNoSnp beat completes)
 
 } // namespace ruby
 } // namespace gem5

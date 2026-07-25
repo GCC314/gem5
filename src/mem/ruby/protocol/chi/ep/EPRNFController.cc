@@ -516,6 +516,14 @@ EPRNFController::recvResponseMsg(const CHIResponseMsg *msg)
     // For ReadUnique: data arrives via CompData first, then Comp_UC finalizes.
     if (msg->m_type == CHIResponseType_Comp_UC) {
         auto it = _pendingChiTxns.find(msg->m_addr);
+        if (it != _pendingChiTxns.end() &&
+            it->second.proxyOp == EpProxyOp_RecallUnique) {
+            std::fprintf(stderr,
+                         "[RECALL-PROXY-COMPUC] node=%d localPA=0x%lx "
+                         "beats=%d/%d tick=%lu\n",
+                         _nodeId, msg->m_addr, it->second.beatsReceived,
+                         it->second.beatsExpected, curTick());
+        }
         printf("[COMPUC-DIAG] node=%d received Comp_UC PA=0x%lx found=%d needsCompAck=%d\n",
                _nodeId, msg->m_addr,
                it != _pendingChiTxns.end(),
@@ -526,8 +534,15 @@ EPRNFController::recvResponseMsg(const CHIResponseMsg *msg)
 
             // For ReadUnique: data beats drive completion, not Comp_UC.
             // The last data beat already sent CompAck + finishChiTxn.
-            // If we get here, beats may still be pending — defer.
+            // A RecallUnique miss is different: HN-F reports that this node
+            // has no local copy with Comp_UC, allowing a clean no-data recall
+            // to complete without entering EP-SNF or the outer protocol.
             if (it->second.op == PendingChiOp::ReadUnique) {
+                if (it->second.proxyOp == EpProxyOp_RecallUnique &&
+                    it->second.beatsReceived == 0) {
+                    it->second.hnfDest = msg->m_responder;
+                    finishChiTxn(msg->m_addr, true);
+                }
                 return true;
             }
 
@@ -640,6 +655,14 @@ EPRNFController::recvDataMsg(const CHIDataMsg *msg)
     // FV risk P1-R5: ReadUnique completes on last data beat (relaxed completion).
     // TODO strict: wait for Comp_UC+CompAck before callback
     if (it->second.op == PendingChiOp::ReadUnique) {
+        if (it->second.proxyOp == EpProxyOp_RecallUnique) {
+            std::fprintf(stderr,
+                         "[RECALL-PROXY-DATA] node=%d localPA=0x%lx "
+                         "type=%d nextBeat=%d/%d tick=%lu\n",
+                         _nodeId, msg->m_addr, static_cast<int>(msg->m_type),
+                         it->second.beatsReceived + 1,
+                         it->second.beatsExpected, curTick());
+        }
         it->second.hnfDest = msg->m_responder;
         it->second.beatsReceived++;
         it->second.recallDataBlk = msg->getdataBlk();
@@ -1329,6 +1352,10 @@ EPRNFController::startReadUnique(uint64_t linePa,
     txn.onComplete = onComplete;
     _pendingChiTxns[linePa] = txn;
 
+    std::fprintf(stderr,
+                 "[RECALL-PROXY-ISSUE] node=%d localPA=0x%lx proxy=RecallUnique "
+                 "tick=%lu\n",
+                 _nodeId, linePa, curTick());
     bool sent = sendChiRequest(linePa, CHIRequestType_ReadUnique,
                                EpProxyOp_RecallUnique);
     printf("[EPRNF-RECALL] node=%d startReadUnique PA=0x%lx sent=%d\n",
