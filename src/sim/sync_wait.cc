@@ -65,6 +65,9 @@ SyncWaitManager::barrierArrive(ThreadContext *tc, uint32_t mask,
         crossNode = (mask & ~localBits) != 0;
     bs.crossNode = crossNode;
 
+    if (bs.earlyReleases.erase(bs.generation) != 0)
+        bs.remoteReleased = true;
+
     bs.waiting.insert(tc);
 
     if (bs.crossNode && _numSockets > 0) {
@@ -129,13 +132,11 @@ SyncWaitManager::releaseBarrier(uint32_t mask, uint32_t seq)
 
     auto &bs = it->second;
 
-    // Ignore stale releases: a release whose generation does not match the
-    // barrier's current generation belongs to an already-completed barrier
-    // and must not release the next one that reuses this mask. `seq` values
-    // strictly below the current generation are stale; a `seq` equal to the
-    // current generation is the release we are waiting for.
-    if (seq < bs.generation)
-        return;
+    // Distributed releases are emitted by the single UBIO leader only after
+    // it has observed exactly one arrival from every participating plane.
+    // The seq values originate in independent gem5 processes and are not a
+    // globally comparable clock, so the leader-authorized release applies to
+    // this process's current waiting generation.
 
     if (bs.crossNode || !bs.waiting.empty()) {
         for (ThreadContext *t : bs.waiting)

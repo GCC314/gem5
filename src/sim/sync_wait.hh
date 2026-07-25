@@ -28,7 +28,10 @@ class SyncWaitManager
         bool crossNode = false;
         bool remoteReleased = false;
         uint32_t generation = 0;  // TC90 fix: distinguishes successive barriers
-                                  // sharing the same mask
+                                   // sharing the same mask
+        // Independent gem5 processes can observe a release before their local
+        // thread reaches that generation. Keep only bounded lookahead state.
+        std::set<uint32_t> earlyReleases;
 
         // Local-node expected thread count for this barrier (= active_threads
         // arg from sync_wait). In cross-node mode BarrierReached must be sent
