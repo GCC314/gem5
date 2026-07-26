@@ -1405,7 +1405,7 @@ EPBackend::sendRecallResponse(const OuterRecallResponse &response)
     // home node's UBCC/UBAdapter applies. This in-process write is only a
     // same-process fast path / redundant shortcut.
     // C4: Direct-forward sends extra copy to requester; home still needs the
-    // data via RecallResp for its _lineDataCache / grant construction.
+    // data via RecallResp for its authoritative home-data grant construction.
     if (response.dataReturned && response.hasDataPayload) {
         EPBackend *homeBackend = EPBackend::getBackendInstance(response.homeNode);
         RubySystem *homeRuby = homeBackend ? homeBackend->getRubySystem() : nullptr;
