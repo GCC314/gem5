@@ -688,11 +688,11 @@ ISA::readMiscReg(RegIndex idx)
       // Generic Timer registers
       case MISCREG_CNTFRQ ... MISCREG_CNTVOFF:
       case MISCREG_CNTFRQ_EL0 ... MISCREG_CNTVOFF_EL2:
-          if (FullSystem) {
+          if (system && system->getGenericTimer()) {
               return getGenericTimer().readMiscReg(idx);
           } else {
               warn("Call to %s attempts to access a system timer which is "
-                   "inaccessible within SE mode. Divergent behaviour is "
+                   "not configured for this system. Divergent behaviour is "
                    "possible.",
                    miscRegName[idx]);
               return 0;

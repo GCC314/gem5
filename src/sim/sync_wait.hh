@@ -1,6 +1,7 @@
 #ifndef __SIM_SYNC_WAIT_HH__
 #define __SIM_SYNC_WAIT_HH__
 
+#include <array>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -28,10 +29,13 @@ class SyncWaitManager
         bool crossNode = false;
         bool remoteReleased = false;
         uint32_t generation = 0;  // TC90 fix: distinguishes successive barriers
-                                   // sharing the same mask
-        // Independent gem5 processes can observe a release before their local
-        // thread reaches that generation. Keep only bounded lookahead state.
-        std::set<uint32_t> earlyReleases;
+                                    // sharing the same mask
+        // The coordinator returns each process's own generation in a release.
+        // Retain bounded, exact-sequence lookahead so a future release cannot
+        // spuriously free an earlier barrier that is still waiting.
+        static constexpr uint32_t NoEarlyRelease = UINT32_MAX;
+        std::array<uint32_t, 4> earlyReleases = {
+            NoEarlyRelease, NoEarlyRelease, NoEarlyRelease, NoEarlyRelease};
 
         // Local-node expected thread count for this barrier (= active_threads
         // arg from sync_wait). In cross-node mode BarrierReached must be sent

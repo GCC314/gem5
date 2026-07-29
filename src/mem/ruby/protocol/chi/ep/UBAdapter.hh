@@ -246,6 +246,7 @@ class UBAdapter : public SimObject
 
     std::set<uint64_t> _inflightReadReqs;
     std::set<uint64_t> _inflightClearReqs;
+    std::map<uint64_t, Tick> _clearRetryTick;
 
     std::map<PendingKey, PendingTxn> _pendingByReqId;
     std::map<PendingKey, CoherenceMessage> _readyResponses;

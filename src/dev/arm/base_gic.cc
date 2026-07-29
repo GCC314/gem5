@@ -210,12 +210,14 @@ ArmPPI::ArmPPI(
     const ArmPPIParams &p, ThreadContext *tc)
       : ArmInterruptPin(p, tc)
 {
-    fatal_if(!platform, "Interrupt not connected to a RealView platform");
+    // Bare SE systems can use the architected counter without a platform or
+    // GIC. Raising an actual timer interrupt remains unsupported below.
 }
 
 void
 ArmPPI::raise()
 {
+    fatal_if(!platform, "PPI raised without a RealView platform\n");
     _active = true;
     platform->gic->sendPPInt(intNum, targetContext());
 }
@@ -223,6 +225,7 @@ ArmPPI::raise()
 void
 ArmPPI::clear()
 {
+    fatal_if(!platform, "PPI cleared without a RealView platform\n");
     _active = false;
     platform->gic->clearPPInt(intNum, targetContext());
 }

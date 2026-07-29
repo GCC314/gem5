@@ -84,21 +84,27 @@ ArmSystem::ArmSystem(const Params &p)
       release(p.release),
       multiProc(p.multi_proc)
 {
-    if (p.auto_reset_addr) {
-        _resetAddr = workload->getEntry();
+    // SEWorkload is populated after System construction, whereas full-system
+    // configurations need the image entry point to establish the reset PC.
+    if (FullSystem && workload) {
+        if (p.auto_reset_addr) {
+            _resetAddr = workload->getEntry();
+        } else {
+            _resetAddr = p.reset_addr;
+            warn_if(workload->getEntry() != _resetAddr,
+                    "Workload entry point %#x and reset address %#x are different",
+                    workload->getEntry(), _resetAddr);
+        }
+
+        bool wl_is_64 = (workload->getArch() == loader::Arm64);
+        if (wl_is_64 != _highestELIs64) {
+            warn("Highest ARM exception-level set to AArch%d but the workload "
+                 "is for AArch%d. Assuming you wanted these to match.",
+                 _highestELIs64 ? 64 : 32, wl_is_64 ? 64 : 32);
+            _highestELIs64 = wl_is_64;
+        }
     } else {
         _resetAddr = p.reset_addr;
-        warn_if(workload->getEntry() != _resetAddr,
-                "Workload entry point %#x and reset address %#x are different",
-                workload->getEntry(), _resetAddr);
-    }
-
-    bool wl_is_64 = (workload->getArch() == loader::Arm64);
-    if (wl_is_64 != _highestELIs64) {
-        warn("Highest ARM exception-level set to AArch%d but the workload "
-              "is for AArch%d. Assuming you wanted these to match.",
-              _highestELIs64 ? 64 : 32, wl_is_64 ? 64 : 32);
-        _highestELIs64 = wl_is_64;
     }
 
     if (_highestELIs64 && (

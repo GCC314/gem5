@@ -65,8 +65,13 @@ SyncWaitManager::barrierArrive(ThreadContext *tc, uint32_t mask,
         crossNode = (mask & ~localBits) != 0;
     bs.crossNode = crossNode;
 
-    if (bs.earlyReleases.erase(bs.generation) != 0)
-        bs.remoteReleased = true;
+    for (uint32_t &seq : bs.earlyReleases) {
+        if (seq == bs.generation) {
+            seq = BarrierState::NoEarlyRelease;
+            bs.remoteReleased = true;
+            break;
+        }
+    }
 
     bs.waiting.insert(tc);
 
@@ -126,11 +131,9 @@ SyncWaitManager::barrierArrive(ThreadContext *tc, uint32_t mask,
 void
 SyncWaitManager::releaseBarrier(uint32_t mask, uint32_t seq)
 {
-    auto it = _barriers.find(mask);
-    if (it == _barriers.end())
-        return;
-
-    auto &bs = it->second;
+    // A fast peer may finish the first barrier before this process reaches
+    // sync_wait. Materialize state so that release is retained below.
+    auto &bs = _barriers[mask];
 
     // Distributed releases are emitted by the single UBIO leader only after
     // it has observed exactly one arrival from every participating plane.
@@ -138,7 +141,7 @@ SyncWaitManager::releaseBarrier(uint32_t mask, uint32_t seq)
     // globally comparable clock, so the leader-authorized release applies to
     // this process's current waiting generation.
 
-    if (bs.crossNode || !bs.waiting.empty()) {
+    if (seq == bs.generation && (bs.crossNode || !bs.waiting.empty())) {
         for (ThreadContext *t : bs.waiting)
             t->activate();
         bs.waiting.clear();
@@ -148,10 +151,15 @@ SyncWaitManager::releaseBarrier(uint32_t mask, uint32_t seq)
         bs.reachedSent = false;
         bs.crossNode = false;
         bs.generation++;  // advance generation for next barrier
-    } else {
-        // Release arrived before any local thread reached this barrier
-        // generation. Record it so the next barrierArrive() releases at once.
-        bs.remoteReleased = true;
+    } else if (seq >= bs.generation) {
+        for (uint32_t &saved : bs.earlyReleases) {
+            if (saved == seq)
+                return;
+            if (saved == BarrierState::NoEarlyRelease) {
+                saved = seq;
+                return;
+            }
+        }
     }
 }
 

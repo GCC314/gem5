@@ -8,7 +8,7 @@
 #include "debug/RubyEP.hh"
 #include "framework/MemMessage.hh"
 #include "framework/Port.hh"
-#include "framework/TracePerfPolicy.hh"
+#include "protocol/TracePerfPolicy.hh"
 #include "mem/ruby/protocol/chi/ep/EPBackend.hh"
 #include "mem/ruby/protocol/chi/ep/MetaRNFController.hh"
 #include "sim/core.hh"
@@ -176,6 +176,20 @@ UBAdapter::startup()
         DPRINTF(RubyEP,
                 "[DEBUG-UBADAPTER-STARTUP] node=%d socket=%d schedule sync wakeup @%lu\n",
                 _nodeId, _socketId, curTick());
+        // Startup diagnostic: confirm this socket-plane adapter is alive and
+        // its Port is bound. Paired with STEP5 log from init() so the launcher
+        // can verify every (node,socket) plane before starting ubio peers.
+        std::fprintf(stderr,
+            "[UBADAPTER-STARTUP] node=%d socket=%d port=%s armed=%d curTick=%lu\n",
+            _nodeId, _socketId, _port ? "bound" : "MISSING",
+            _eventArmed ? 1 : 0, curTick());
+        std::fflush(stdout);
+        std::fflush(stderr);
+    } else if (!_port) {
+        std::fprintf(stderr,
+            "[UBADAPTER-STARTUP] node=%d socket=%d NO PORT — adapter will not poll for messages\n",
+            _nodeId, _socketId);
+        std::fflush(stderr);
     }
 }
 
@@ -738,11 +752,18 @@ UBAdapter::sendClearReq(uint64_t linePa, int srcNode,
                          _nodeId, reqId, rit->second.b.clearResp.accepted ? 1 : 0);
             bool a = rit->second.b.clearResp.accepted;
             _inflightClearReqs.erase(reqId);
+            _clearRetryTick.erase(reqId);
             _readyResponses.erase(rit);
             return a ? 1 : 0;
         }
         if (_inflightClearReqs.count(reqId)) {
-            return -2;
+            auto retry = _clearRetryTick.find(reqId);
+            if (retry != _clearRetryTick.end() && curTick() < retry->second)
+                return -2;
+            // A dropped ClearReq has no response to release the dedup guard.
+            // Retransmit the same tuple after bounded virtual time so the home
+            // can deduplicate it without allocating a new grant transaction.
+            _inflightClearReqs.erase(reqId);
         }
         std::fprintf(stderr, "[CLR-CACHE-MISS] node=%d reqId=%lu sending new ClearReq\n",
                      _nodeId, reqId);
@@ -779,6 +800,7 @@ UBAdapter::sendClearReq(uint64_t linePa, int srcNode,
         // Clear is retried until its response is cached. Keep one network copy
         // in flight for this reqId; otherwise every local retry retransmits it.
         _inflightClearReqs.insert(reqId);
+        _clearRetryTick[reqId] = curTick() + 1000000;
         scheduleResponseCheck();
         return -2;
     }
@@ -1136,15 +1158,16 @@ UBAdapter::sendHomeWritebackNotify(uint64_t homePa, uint64_t epoch,
 // Always makes best-effort to send a response; never silently drops.
 static void
 sendMetaRNFLineErrorResponse(framework::Port *port,
-                              CoherenceMessageType respType,
-                              MetaRNFLineStatus st,
-                              uint64_t reqId, uint64_t bucketOffset,
-                              int nodeId)
+                               CoherenceMessageType respType,
+                               MetaRNFLineStatus st,
+                               uint64_t reqId, uint64_t bucketOffset,
+                               int nodeId, int dstNode, int dstSocket)
 {
     CoherenceMessage resp;
     resp.h.type = respType;
     resp.h.srcNode = static_cast<uint16_t>(nodeId);
-    resp.h.dstNode = 0;
+    resp.h.dstNode = static_cast<uint16_t>(dstNode);
+    resp.h.dstSocket = static_cast<uint16_t>(dstSocket);
     resp.h.reqId = reqId;
     if (respType == CoherenceMessageType::MetaRNFLineReadResp) {
         resp.b.metaRNFLineReadResp.status = st;
@@ -1407,7 +1430,8 @@ UBAdapter::recvFromRouter(const CoherenceMessage &msg)
                 sendMetaRNFLineErrorResponse(_port,
                     CoherenceMessageType::MetaRNFLineReadResp,
                     MetaRNFLineStatus::IoError,
-                    msg.h.reqId, bucketOffset, _nodeId);
+                    msg.h.reqId, bucketOffset, _nodeId,
+                    msg.h.srcNode, msg.h.srcSocket);
                 break;
             }
             uint64_t physPa = metaRNF->metadataRangeStart() +
@@ -1417,18 +1441,22 @@ UBAdapter::recvFromRouter(const CoherenceMessage &msg)
                 sendMetaRNFLineErrorResponse(_port,
                     CoherenceMessageType::MetaRNFLineReadResp,
                     MetaRNFLineStatus::RangeError,
-                    msg.h.reqId, bucketOffset, _nodeId);
+                    msg.h.reqId, bucketOffset, _nodeId,
+                    msg.h.srcNode, msg.h.srcSocket);
                 break;
             }
             uint64_t reqId = msg.h.reqId;
+            int dstNode = msg.h.srcNode;
+            int dstSocket = msg.h.srcSocket;
             auto tport = _port;
             metaRNF->issueReadLine(physPa,
-                [tport, reqId, bucketOffset, nodeId = _nodeId]
+                [tport, reqId, bucketOffset, nodeId = _nodeId, dstNode, dstSocket]
                 (MetaRNFLineStatus st, const MetaRNFController::MetaLine &data) {
                     CoherenceMessage resp;
                     resp.h.type = CoherenceMessageType::MetaRNFLineReadResp;
                     resp.h.srcNode = static_cast<uint16_t>(nodeId);
-                    resp.h.dstNode = 0;
+                    resp.h.dstNode = static_cast<uint16_t>(dstNode);
+                    resp.h.dstSocket = static_cast<uint16_t>(dstSocket);
                     resp.h.reqId = reqId;
                     resp.b.metaRNFLineReadResp.status = st;
                     resp.b.metaRNFLineReadResp.bucketOffset = bucketOffset;
@@ -1457,7 +1485,8 @@ UBAdapter::recvFromRouter(const CoherenceMessage &msg)
                 sendMetaRNFLineErrorResponse(_port,
                     CoherenceMessageType::MetaRNFLineWriteResp,
                     MetaRNFLineStatus::IoError,
-                    msg.h.reqId, bucketOffset, _nodeId);
+                    msg.h.reqId, bucketOffset, _nodeId,
+                    msg.h.srcNode, msg.h.srcSocket);
                 break;
             }
             uint64_t physPa = metaRNF->metadataRangeStart() +
@@ -1467,20 +1496,24 @@ UBAdapter::recvFromRouter(const CoherenceMessage &msg)
                 sendMetaRNFLineErrorResponse(_port,
                     CoherenceMessageType::MetaRNFLineWriteResp,
                     MetaRNFLineStatus::RangeError,
-                    msg.h.reqId, bucketOffset, _nodeId);
+                    msg.h.reqId, bucketOffset, _nodeId,
+                    msg.h.srcNode, msg.h.srcSocket);
                 break;
             }
             uint64_t reqId = msg.h.reqId;
+            int dstNode = msg.h.srcNode;
+            int dstSocket = msg.h.srcSocket;
             auto tport = _port;
             MetaRNFController::MetaLine ml;
             memcpy(ml.data(), msg.b.metaRNFLineWriteReq.data, 64);
             metaRNF->issueWriteLine(physPa, ml,
-                [tport, reqId, bucketOffset, nodeId = _nodeId]
+                [tport, reqId, bucketOffset, nodeId = _nodeId, dstNode, dstSocket]
                 (MetaRNFLineStatus st) {
                     CoherenceMessage resp;
                     resp.h.type = CoherenceMessageType::MetaRNFLineWriteResp;
                     resp.h.srcNode = static_cast<uint16_t>(nodeId);
-                    resp.h.dstNode = 0;
+                    resp.h.dstNode = static_cast<uint16_t>(dstNode);
+                    resp.h.dstSocket = static_cast<uint16_t>(dstSocket);
                     resp.h.reqId = reqId;
                     resp.b.metaRNFLineWriteResp.status = st;
                     resp.b.metaRNFLineWriteResp.bucketOffset = bucketOffset;
@@ -1787,10 +1820,14 @@ UBAdapter::handleResponse(framework::MemMessage *m)
     // the marker there anyway). Clear it here unconditionally so the dedup
     // marker can never outlive its response, even on paths without an onResp
     // callback.
-    if (coh->h.type == CoherenceMessageType::ReadResp)
+    if (coh->h.type == CoherenceMessageType::ReadResp) {
         _inflightReadReqs.erase(coh->h.reqId);
+    }
     if (coh->h.type == CoherenceMessageType::ClearResp)
+    {
         _inflightClearReqs.erase(coh->h.reqId);
+        _clearRetryTick.erase(coh->h.reqId);
+    }
 
     // Immediate response notification: fire the wired callback so the
     // EPSNFController wakes up NOW and processes this response via retry,
