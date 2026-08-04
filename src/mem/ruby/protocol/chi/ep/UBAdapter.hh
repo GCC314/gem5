@@ -81,6 +81,7 @@ class UBAdapter : public SimObject
         Tick *outGrantVisibleTick, Tick *outSentinelVisibleTick,
         bool *outRecallNeeded, int *outRecallOwnerNode,
         GrantDataSource *outDataSource, uint64_t *outAuthEpoch,
+        uint64_t *outGrantEpoch,
         int *outPendingInvCount, uint64_t *outPendingInvMask,
         uint64_t *outCommittedEpoch,
         DataBlock *outGrantData, bool *outGrantDataValid);
@@ -100,7 +101,8 @@ class UBAdapter : public SimObject
                        uint64_t *outUpgradeTargetMask,
                        uint64_t *outCommittedEpoch,
                        int homeNode, int homeSocket,
-                       bool checkOnly = false);
+                       bool checkOnly = false,
+                       bool forceWire = false);
 
     int sendUpgradeDoneReq(uint64_t homePa, int requesterNode,
                            uint64_t epoch, uint64_t reqId,

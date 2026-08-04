@@ -301,6 +301,7 @@ UBAdapter::sendReadReq(
     Tick *outGrantVisibleTick, Tick *outSentinelVisibleTick,
     bool *outRecallNeeded, int *outRecallOwnerNode,
     GrantDataSource *outDataSource, uint64_t *outAuthEpoch,
+    uint64_t *outGrantEpoch,
     int *outPendingInvCount, uint64_t *outPendingInvMask,
     uint64_t *outCommittedEpoch,
     DataBlock *outGrantData, bool *outGrantDataValid)
@@ -356,6 +357,7 @@ UBAdapter::sendReadReq(
             if (outRecallOwnerNode) *outRecallOwnerNode = resp.b.readResp.recallOwnerNode;
             if (outDataSource) *outDataSource = static_cast<GrantDataSource>(resp.b.readResp.dataSource);
             if (outAuthEpoch) *outAuthEpoch = resp.b.readResp.authEpoch;
+            if (outGrantEpoch) *outGrantEpoch = resp.b.readResp.grantEpoch;
             if (outPendingInvCount) *outPendingInvCount = resp.b.readResp.pendingInvCount;
             if (outPendingInvMask) *outPendingInvMask = resp.b.readResp.pendingInvMask;
             if (outCommittedEpoch) *outCommittedEpoch = resp.b.readResp.committedEpoch;
@@ -557,9 +559,9 @@ UBAdapter::sendUpgradeReq(uint64_t homePa, int requesterNode,
                             uint64_t epoch, uint64_t reqId,
                             int desiredPerm, int cause,
                             uint64_t *outUpgradeTargetMask,
-                            uint64_t *outCommittedEpoch,
-                            int homeNode, int homeSocket,
-                            bool checkOnly)
+                             uint64_t *outCommittedEpoch,
+                             int homeNode, int homeSocket,
+                             bool checkOnly, bool forceWire)
 {
     DPRINTF(RubyEP,
             "UBAdapter node=%d socket=%d: sendUpgradeReq homePa=0x%lx "
@@ -579,8 +581,11 @@ UBAdapter::sendUpgradeReq(uint64_t homePa, int requesterNode,
     // outstanding) — the death loop that hung TC3/8/10/11.
     if (_port) {
         PendingKey rkey{CoherenceMessageType::UpgradeResp, reqId};
+        if (forceWire) {
+            _readyResponses.erase(rkey);
+        }
         auto rit = _readyResponses.find(rkey);
-        if (rit != _readyResponses.end()) {
+        if (!forceWire && rit != _readyResponses.end()) {
             const CoherenceMessage &resp = rit->second;
             if (outUpgradeTargetMask)
                 *outUpgradeTargetMask = resp.b.upgradeResp.upgradeTargetMask;

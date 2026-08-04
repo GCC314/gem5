@@ -644,6 +644,7 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
     int recallOwnerNode = -1;
     GrantDataSource dataSource = GrantDataSource::HomeMemory;
     uint64_t authEpoch = 0;
+    uint64_t grantEpoch = 0;
 
     OuterGrantType grantTypeVar;
     int pendingInvCount = -1;
@@ -656,7 +657,7 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
         entry.epoch, reqIdVal, homeNode, ingressSocket, homeSocket,
         &grantVisibleTick, &sentinelVisibleTick,
         &recallNeeded, &recallOwnerNode,
-        &dataSource, &authEpoch,
+        &dataSource, &authEpoch, &grantEpoch,
         &pendingInvCount, &pendingInvMask, &committedEpoch,
         &routedGrantData, &routedGrantDataValid);
 
@@ -733,8 +734,10 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
     grantEnv.grantVisibleTick = grantVisibleTick;
     grantEnv.sentinelVisibleTick = sentinelVisibleTick;
 
-    // Also update local entry.epoch to match for future retries
-    entry.epoch = grantBaseEpoch;
+    // Clear identifies the pending transaction with the base epoch, while the
+    // granted cache line must carry the epoch Home commits on that Clear.
+    uint64_t ownerEpoch = grantEpoch ? grantEpoch : grantBaseEpoch;
+    entry.epoch = ownerEpoch;
     _requesterLines[line_pa] = entry;
 
     // Self-test assertion: sentinelVisibleTick <= grantVisibleTick
@@ -1998,6 +2001,25 @@ EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
     upgradeReq.cause = cause;
     _lastUpgradeReq = upgradeReq;
 
+    // Publish the stable tuple before transportSend(). The Port path can
+    // deliver an UpgradeResp and re-enter completeHeldUpgrade() before the
+    // original sendUpgradeReq() returns. Without this pre-registration, that
+    // callback observes no pending transaction and emits a duplicate request
+    // with the same reqId; the accepted and temporary-reject responses then
+    // race and can drive fresh-reqId churn.
+    if (!hadPending) {
+        PendingUpgradeTxn txn;
+        txn.valid = true;
+        txn.linePa = line_pa;
+        txn.homeNode = homeNode;
+        txn.epoch = epochVal;
+        txn.reqId = reqIdVal;
+        txn.startTick = upgradeStartTick;
+        txn.acceptedPending = false;
+        _pendingUpgradeTxns[line_pa] = txn;
+        put = _pendingUpgradeTxns.find(line_pa);
+    }
+
     uint64_t upgradeTargetMask = 0;
     uint64_t committedEpoch = 0;
     // DROP/NO-RESP recovery: when forceResend is set (watchdog fired for a
@@ -2009,11 +2031,19 @@ EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
     // reject. We must NOT allocate a fresh reqId (that churns the home into
     // rejecting every retransmit — the TC3/8/10/11 livelock).
     const bool checkOnly = hadPending && !forceResend;
+    if (forceResend) {
+        // The first accepted response can still be cached with a non-zero
+        // target mask while its later UpgradeAckNotify is the message that was
+        // lost. A recovery resend must bypass that stale stage and actually
+        // reach the home with the same tuple so it can replay current progress.
+        getUBAdapter(0)->clearReadyResponsesForLine(homePa);
+    }
     int upgradeRet = getUBAdapter(0)->sendUpgradeReq(
         homePa, _nodeId, epochVal, reqIdVal,
         desiredPerm, static_cast<int>(cause),
         &upgradeTargetMask, &committedEpoch, homeNode, homeSocket,
-        checkOnly /*checkOnly: don't re-send an in-flight upgrade*/);
+        checkOnly /*checkOnly: don't re-send an in-flight upgrade*/,
+        forceResend /*forceWire: bypass stale accepted-pending response*/);
     if (upgradeRet == -2) {
         std::fprintf(stderr,
                      "[EP-UPGRADE-PENDING] node=%d pa=0x%lx home=%d epoch=%lu reqId=%lu\n",
@@ -2028,13 +2058,26 @@ EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
         txn.epoch = epochVal;
         txn.reqId = reqIdVal;
         txn.startTick = upgradeStartTick;
+        txn.acceptedPending = hadPending && put->second.acceptedPending;
         _pendingUpgradeTxns[line_pa] = txn;
         return false;
     }
-    // UpgradeResp arrived: clear any pending txn for this line.
-    if (put != _pendingUpgradeTxns.end() && put->second.valid)
-        put->second.valid = false;
+    // Keep the stable tuple while an accepted upgrade is still waiting for
+    // remote invalidation acks. If UpgradeAckNotify is lost, the held-upgrade
+    // watchdog must resend the same reqId and let the home replay its current
+    // accepted stage. Immediate upgrades have no notification to wait for.
     bool accepted = (upgradeRet > 0);
+    if (upgradeRet == 0 && hadPending && put->second.acceptedPending) {
+        // Accepted-pending is monotonic for a stable tuple. A temporary reject
+        // with the same reqId can be an older duplicate response that arrived
+        // after the accepted response; it must not clear the tuple and start
+        // fresh-reqId retries while the home is waiting for UpgradeDone.
+        std::fprintf(stderr,
+            "[EP-UPGRADE-STALE-REJECT] node=%d pa=0x%lx epoch=%lu reqId=%lu "
+            "ignored_after_accepted_pending=1\n",
+            _nodeId, homePa, epochVal, reqIdVal);
+        return false;
+    }
     if (accepted) {
         std::fprintf(stderr,
             "[EP-PERF] kind=upgrade_network node=%d pa=0x%lx reqId=%lu "
@@ -2095,6 +2138,16 @@ EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
             ack.reqId = reqIdVal;
             ack.accepted = false;  // deferred: not yet ready
             _lastUpgradeAck = ack;
+
+            PendingUpgradeTxn txn;
+            txn.valid = true;
+            txn.linePa = line_pa;
+            txn.homeNode = homeNode;
+            txn.epoch = epochVal;
+            txn.reqId = reqIdVal;
+            txn.startTick = upgradeStartTick;
+            txn.acceptedPending = true;
+            _pendingUpgradeTxns[line_pa] = txn;
         } else {
             // No other sharers — immediate Ack(true)
             OuterUpgradeAck ack;
@@ -2105,6 +2158,9 @@ EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
             ack.reqId = reqIdVal;
             ack.accepted = true;  // immediate: Ack(true) ready now
             _lastUpgradeAck = ack;
+
+            if (put != _pendingUpgradeTxns.end())
+                put->second.valid = false;
 
             DPRINTF(RubyEP,
                     "EPBackend node_id=%d: upgrade accepted immediate "
@@ -2276,6 +2332,7 @@ EPBackend::notifyUpgradeAckReady(uint64_t linePa)
             callbackPa = _addrMap.buildDsmPA(_nodeId, homeNode, offset,
                                              homeSocket);
             _lastUpgradeAck.accepted = true;
+            clearPendingUpgradeTxn(callbackPa);
         }
         DPRINTF(RubyEP,
                 "EPBackend node_id=%d: notifyUpgradeAckReady PA=0x%lx "

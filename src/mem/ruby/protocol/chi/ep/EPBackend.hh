@@ -908,8 +908,10 @@ class EPBackend : public SimObject
         uint64_t epoch;
         uint64_t reqId;
         Tick startTick;
+        bool acceptedPending;
         PendingUpgradeTxn() : valid(false), linePa(0), homeNode(-1),
-                               epoch(0), reqId(0), startTick(0) {}
+                               epoch(0), reqId(0), startTick(0),
+                               acceptedPending(false) {}
     };
     std::map<uint64_t, PendingUpgradeTxn> _pendingUpgradeTxns;
 

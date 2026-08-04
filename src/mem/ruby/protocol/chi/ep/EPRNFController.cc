@@ -1582,9 +1582,11 @@ EPRNFController::scheduleUpgradeRetryAfterRejection(uint64_t linePa)
     // cap of 200 µs.  This replaces the old fixed ~500 µs (eprn_wakeup_retry)
     // that was copied from the unrelated wakeup-retry path.
     _upgradeRetryLines.insert(linePa);
-    scheduleEvent(Cycles(
-        ep_upgrade_retry_backoff_cycles(upIt != _upgradePending.end()
-            ? upIt->second.retryCount : 0)));
+    const Cycles delay(ep_upgrade_retry_backoff_cycles(
+        upIt != _upgradePending.end() ? upIt->second.retryCount : 0));
+    if (upIt != _upgradePending.end())
+        upIt->second.retryReadyTick = clockEdge(delay);
+    scheduleEvent(delay);
 }
 
 void
@@ -1595,15 +1597,20 @@ EPRNFController::processUpgradeRetries()
     printf("[RETRY-DIAG] node=%d processUpgradeRetries lines=%zu\n",
            _nodeId, _upgradeRetryLines.size());
     auto lines = _upgradeRetryLines;
-    _upgradeRetryLines.clear();
     for (uint64_t linePa : lines) {
         auto upIt = _upgradePending.find(linePa);
         if (upIt == _upgradePending.end() || !upIt->second.valid) {
+            _upgradeRetryLines.erase(linePa);
             continue;
         }
         if (upIt->second.ackReceived) {
+            _upgradeRetryLines.erase(linePa);
             continue;
         }
+        if (curTick() < upIt->second.retryReadyTick) {
+            continue;
+        }
+        _upgradeRetryLines.erase(linePa);
         // Two kinds of scheduled retries share this queue:
         //
         //  (1) TEMP-REJECT retry (scheduleUpgradeRetryAfterRejection): the home
@@ -1704,6 +1711,20 @@ EPRNFController::completeHeldUpgrade(uint64_t linePa, bool dropRecoveryResend)
         epoch, reqId, &rejected, &notSharer,
         dropRecoveryResend /*forceResend: retransmit same reqId on DROP*/);
 
+    if (accepted) {
+        upIt->second.homeAccepted = true;
+    } else if (rejected && upIt->second.homeAccepted && !notSharer) {
+        // Accepted is monotonic for the held tuple. A later temporary reject
+        // can only be a delayed response to an earlier duplicate request; the
+        // home is already committed to finishing this upgrade. Keep the same
+        // reqId and continue AckNotify-loss recovery instead of entering the
+        // fresh-transaction retry path.
+        printf("[UPGRADE-DIAG] node=%d ignored stale reject after accept "
+               "PA=0x%lx reqId=%lu\n",
+               _nodeId, linePa, upIt->second.reqId);
+        rejected = false;
+    }
+
     // Decide between RETRY and ABANDON on a reject.
     //
     // ABANDON is required when continuing to hold+retry would deadlock. That
@@ -1796,8 +1817,10 @@ EPRNFController::completeHeldUpgrade(uint64_t linePa, bool dropRecoveryResend)
         if (!upIt->second.dropWatchdogArmed) {
             upIt->second.dropWatchdogArmed = true;
             _upgradeRetryLines.insert(linePa);
-            scheduleEvent(Cycles(
-                ep_upgrade_retry_backoff_cycles(upIt->second.retryCount)));
+            const Cycles delay(
+                ep_upgrade_retry_backoff_cycles(upIt->second.retryCount));
+            upIt->second.retryReadyTick = clockEdge(delay);
+            scheduleEvent(delay);
             DPRINTF(RubyCHIGeneric,
                     "EP_RNF node_id=%d: completeHeldUpgrade PA=0x%lx pending "
                     "— holding snoop, armed DROP watchdog\n",
@@ -1823,7 +1846,17 @@ EPRNFController::completeHeldUpgrade(uint64_t linePa, bool dropRecoveryResend)
         // Fast path: no other sharers, immediate Ack(true)
         receiveUpgradeAck(linePa);
     } else {
-        // Deferred: wait for all invalidation acks to arrive
+        // Deferred: wait for all invalidation acks to arrive. Keep a watchdog
+        // armed even after an accepted-pending UpgradeResp: AckNotify is a
+        // separate asynchronous message and may be the message that was lost.
+        if (!upIt->second.dropWatchdogArmed) {
+            upIt->second.dropWatchdogArmed = true;
+            _upgradeRetryLines.insert(linePa);
+            const Cycles delay(
+                ep_upgrade_retry_backoff_cycles(upIt->second.retryCount));
+            upIt->second.retryReadyTick = clockEdge(delay);
+            scheduleEvent(delay);
+        }
         printf("[UPGRADE-DIAG] node=%d upgrade deferred ack PA=0x%lx "
                "— waiting for invalidation acks\n",
                _nodeId, linePa);

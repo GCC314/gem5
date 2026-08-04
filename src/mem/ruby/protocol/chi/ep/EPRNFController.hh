@@ -494,6 +494,7 @@ class EPRNFController : public EPController
         uint64_t reqId;
         MachineID hnfDest;      // HN-F that sent SnpCleanInvalid
         bool ackReceived;       // true when OuterUpgradeAck(true) arrived
+        bool homeAccepted;      // monotonic once any accepted UpgradeResp lands
         bool rejected;          // true when home rejected: give up upgrade, but
                                 // keep snoop held until the line is invalidated
                                 // via a deferred InvalidateReq (direct ack, no
@@ -504,13 +505,16 @@ class EPRNFController : public EPController
                                 // so the retry interval doubles each attempt
         bool dropWatchdogArmed; // true once a DROP/NO-RESP watchdog timer has
                                 // been scheduled for this held (pending) upgrade
+        Tick retryReadyTick;    // do not consume retry work on unrelated wakeups
         int dropResendCount;    // number of DROP-recovery resends issued so far
                                 // (bounded to avoid infinite resend storms)
 
         UpgradePending() : valid(false), linePa(0), homeNode(-1), epoch(0),
-                           reqId(0), ackReceived(false), rejected(false),
+                           reqId(0), ackReceived(false), homeAccepted(false),
+                           rejected(false),
                            needsRetry(false), retryCount(0),
-                           dropWatchdogArmed(false), dropResendCount(0) {}
+                           dropWatchdogArmed(false), retryReadyTick(0),
+                           dropResendCount(0) {}
     };
     std::map<uint64_t, UpgradePending> _upgradePending;
 

@@ -717,6 +717,17 @@ EPSNFController::processPendingWritebacks()
                         "found=%d epoch=%lu owner=%d\n",
                         _nodeId, it->linePa, it->queryReqId,
                         resolvedFound, resolvedEpoch, resolvedOwner);
+                    if (!resolvedFound || resolvedOwner < 0) {
+                        std::fprintf(stderr,
+                            "[EPSNF-WB-QLM-FAIL] node=%d pa=0x%lx reqId=%lu "
+                            "found=%d owner=%d epoch=%lu — terminal\n",
+                            _nodeId, it->linePa, it->queryReqId,
+                            resolvedFound ? 1 : 0, resolvedOwner,
+                            resolvedEpoch);
+                        std::fflush(stderr);
+                        it = _pendingWritebacks.erase(it);
+                        continue;
+                    }
                 }
             }
         }
