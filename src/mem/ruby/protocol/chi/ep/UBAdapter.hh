@@ -5,6 +5,7 @@
 #include <deque>
 #include <functional>
 #include <map>
+#include <memory>
 #include <set>
 
 #include "mem/ruby/common/DataBlock.hh"
@@ -15,7 +16,7 @@
 #include "sim/eventq.hh"
 
 namespace pseudo { class PseudoMemPort; class PseudoManager; }
-namespace framework { class Port; struct MemMessage; }
+namespace framework { struct Message; struct Port; }
 
 namespace gem5
 {
@@ -58,13 +59,11 @@ class UBAdapter : public SimObject
     void setPseudoPort(pseudo::PseudoMemPort *port) { _pseudoPort = port; }
     pseudo::PseudoMemPort* pseudoPort() const { return _pseudoPort; }
 
-    /** Optional external transport port (injected by launcher/module). */
-    void setPort(framework::Port *port) { _port = port; }
+    /** Opaque transport availability (used by EPBackend during init). */
     framework::Port* port() const { return _port; }
 
     void setOnResponseWired(std::function<void()> cb) { _onResponseWired = std::move(cb); }
 
-    /**
     /**
      * Phase 2: Synchronous Read Request.
      *
@@ -185,7 +184,7 @@ class UBAdapter : public SimObject
     void wakeup();
     void checkResponseCallbacks();
     void scheduleResponseCheck();
-    void handleResponse(framework::MemMessage *m);
+    void handleResponse(const framework::Message *m);
 
     /** Set transport mode — instance-level fixed after init. */
 
@@ -203,17 +202,22 @@ class UBAdapter : public SimObject
     EPBackend *_backend = nullptr;
     pseudo::PseudoMemPort *_pseudoPort = nullptr;
     framework::Port *_port = nullptr;
+    struct PortExitState {
+        framework::Port *port = nullptr;
+        bool terminated = false;
+    };
+    std::shared_ptr<PortExitState> _portExitState;
     NodeAddressMap _addrMap;
     uint64_t _nextSeq = 1;
 
-    /** Send via injected framework::Port when available, else via router. */
+    /** Send through the owned opaque framework port. */
     bool transportSend(const CoherenceMessage &msg);
 
     /** Multi-process split: send a BarrierReached CoherenceMessage (PAYLOAD)
      *  to ubio via Port.  @p seq is the barrier generation (TC90 fix). */
     void sendBarrierReached(uint32_t mask, uint32_t nodeId, uint32_t seq);
 
-    /** Poll injected framework::Port and dispatch to recvFromRouter(). */
+    /** Poll the opaque framework port and dispatch to recvFromRouter(). */
     bool transportRecv(CoherenceMessageType expectedType, uint64_t expectedReqId);
 
     void drainDeferredControls();

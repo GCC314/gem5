@@ -1,9 +1,8 @@
 #include "mem/ruby/protocol/chi/ep/EPRNFController.hh"
 
-#include <cassert>
-
 #include "base/logging.hh"
 #include "debug/RubyCHIGeneric.hh"
+#include "debug/RubyEP.hh"
 #include "mem/ruby/network/Network.hh"
 #include "mem/ruby/protocol/CHI/CHIProtocolInfo.hh"
 #include "mem/ruby/protocol/MemoryMsg.hh"
@@ -86,7 +85,8 @@ EPController::initNetQueues()
 {
     int base = m_ruby_system->MachineType_base_number(m_machineID.type);
 
-    assert(m_net_ptr != nullptr);
+    panic_if(m_net_ptr == nullptr,
+             "EPController node_id=%d: network pointer is null", _nodeId);
 
     m_net_ptr->setToNetQueue(m_version + base, reqOut->getOrdered(),
                              CHI_REQ, "none", reqOut);
@@ -123,7 +123,8 @@ EPController::init()
 void
 EPController::addSequencer(RubyPort *seq)
 {
-    assert(seq != nullptr);
+    panic_if(seq == nullptr,
+             "EPController node_id=%d: cannot add null sequencer", _nodeId);
     sequencers.emplace_back(seq);
 }
 
@@ -413,7 +414,7 @@ EPRNFController::recvSnoopMsg(const CHIRequestMsg *msg)
     // Must be checked BEFORE STALE arbitration, otherwise the recall's own
     // post-RecallResponse cleanup snoop would be aborted, causing liveness bug.
     if (hasRecall) {
-        printf("[RECALL-SNOOP] node=%d PA=0x%lx "
+        DPRINTF(RubyEP, "[RECALL-SNOOP] node=%d PA=0x%lx "
                "recall-induced snoop — immediate clean SnpResp_I\n",
                _nodeId, msg->m_addr);
         _backend->clearActiveRecall(msg->m_addr);
@@ -444,7 +445,7 @@ EPRNFController::recvSnoopMsg(const CHIRequestMsg *msg)
     // (§9.5 table row 3, col 3): IMMED SnpRespData_SC, not STALE.
     if (msg->m_type == CHIRequestType_SnpOnce &&
         inFlightOp == PendingChiOp::ReadShared) {
-        printf("[SNOOP-IMMED-SnpOnce+ReadShared] node=%d PA=0x%lx "
+        DPRINTF(RubyEP, "[SNOOP-IMMED-SnpOnce+ReadShared] node=%d PA=0x%lx "
                "— read/read coexistence, immediate SnpRespData_SC\n",
                _nodeId, linePa);
         return processSnoopImmediate(msg);
@@ -455,7 +456,7 @@ EPRNFController::recvSnoopMsg(const CHIRequestMsg *msg)
         case CHIRequestType_SnpCleanInvalid:
         case CHIRequestType_SnpUnique:
             // Write-intent snoop during any in-flight → STALE (Q2).
-            printf("[SNOOP-STALE] node=%d PA=0x%lx snoop=%d inFlightOp=%d "
+            DPRINTF(RubyEP, "[SNOOP-STALE] node=%d PA=0x%lx snoop=%d inFlightOp=%d "
                    "— sending stale SnpResp_I (abort-retry)\n",
                    _nodeId, linePa, static_cast<int>(msg->m_type),
                    static_cast<int>(inFlightOp));
@@ -466,7 +467,7 @@ EPRNFController::recvSnoopMsg(const CHIRequestMsg *msg)
             // TODO: SnpOnce under ReadUnique(RecallUnique) could be
             // optimised to IMMED snapshot (weak-order read), but for
             // now we unify on STALE for maximum safety.
-            printf("[SNOOP-STALE-SnpOnce] node=%d PA=0x%lx inFlightOp=%d "
+            DPRINTF(RubyEP, "[SNOOP-STALE-SnpOnce] node=%d PA=0x%lx inFlightOp=%d "
                    "— conservative stale SnpResp_I\n",
                    _nodeId, linePa, static_cast<int>(inFlightOp));
             sendSnpRespI(linePa, hnfDest, /*staleMark=*/true);
@@ -480,7 +481,7 @@ EPRNFController::recvSnoopMsg(const CHIRequestMsg *msg)
                   _nodeId, linePa);
         default:
             // Unknown snoop: conservative fallback STALE.
-            printf("[SNOOP-STALE-UNKNOWN] node=%d PA=0x%lx snoop=%d "
+            warn("[SNOOP-STALE-UNKNOWN] node=%d PA=0x%lx snoop=%d "
                    "— conservative stale SnpResp_I\n",
                    _nodeId, linePa, static_cast<int>(msg->m_type));
             sendSnpRespI(linePa, hnfDest, /*staleMark=*/true);
@@ -499,7 +500,7 @@ EPRNFController::recvResponseMsg(const CHIResponseMsg *msg)
     if (msg->m_type == CHIResponseType_RetryAck ||
         msg->m_type == CHIResponseType_PCrdGrant) {
         auto it = _pendingChiTxns.find(msg->m_addr);
-        printf("[EPRNF-RETRY-DIAG] node=%d type=%s PA=0x%lx chiInFlight=%d pendingFound=%d\n",
+        DPRINTF(RubyEP, "[EPRNF-RETRY-DIAG] node=%d type=%s PA=0x%lx chiInFlight=%d pendingFound=%d\n",
                _nodeId, msg->m_type == CHIResponseType_RetryAck ? "RetryAck" : "PCrdGrant",
                msg->m_addr, _chiRequestInFlight,
                it != _pendingChiTxns.end());
@@ -518,13 +519,13 @@ EPRNFController::recvResponseMsg(const CHIResponseMsg *msg)
         auto it = _pendingChiTxns.find(msg->m_addr);
         if (it != _pendingChiTxns.end() &&
             it->second.proxyOp == EpProxyOp_RecallUnique) {
-            std::fprintf(stderr,
+            inform(
                          "[RECALL-PROXY-COMPUC] node=%d localPA=0x%lx "
                          "beats=%d/%d tick=%lu\n",
                          _nodeId, msg->m_addr, it->second.beatsReceived,
                          it->second.beatsExpected, curTick());
         }
-        printf("[COMPUC-DIAG] node=%d received Comp_UC PA=0x%lx found=%d needsCompAck=%d\n",
+        DPRINTF(RubyEP, "[COMPUC-DIAG] node=%d received Comp_UC PA=0x%lx found=%d needsCompAck=%d\n",
                _nodeId, msg->m_addr,
                it != _pendingChiTxns.end(),
                it != _pendingChiTxns.end() ? it->second.needsCompAck : -1);
@@ -573,7 +574,7 @@ EPRNFController::recvResponseMsg(const CHIResponseMsg *msg)
                 // CompAck failed — will retry
                 it->second.needsCompAck = true;
                 scheduleEvent(Cycles(1));
-                DPRINTF(RubyCHIGeneric,
+                warn(
                         "EP_RNF node_id=%d: %s complete for "
                         "PA=0x%lx but CompAck failed, will retry\n",
                         _nodeId,
@@ -585,7 +586,7 @@ EPRNFController::recvResponseMsg(const CHIResponseMsg *msg)
             return true;
         }
 
-        DPRINTF(RubyCHIGeneric,
+        warn(
                 "EP_RNF node_id=%d: Comp_UC for PA=0x%lx but no pending "
                 "CleanUnique/ReadUnique txn\n",
                 _nodeId, msg->m_addr);
@@ -656,7 +657,7 @@ EPRNFController::recvDataMsg(const CHIDataMsg *msg)
     // TODO strict: wait for Comp_UC+CompAck before callback
     if (it->second.op == PendingChiOp::ReadUnique) {
         if (it->second.proxyOp == EpProxyOp_RecallUnique) {
-            std::fprintf(stderr,
+            inform(
                          "[RECALL-PROXY-DATA] node=%d localPA=0x%lx "
                          "type=%d nextBeat=%d/%d tick=%lu\n",
                          _nodeId, msg->m_addr, static_cast<int>(msg->m_type),
@@ -824,7 +825,7 @@ EPRNFController::handleSnpCleanInvalid(const CHIRequestMsg *msg)
     if (isDsmLine) {
         auto chiIt = _pendingChiTxns.find(msg->m_addr);
         if (chiIt != _pendingChiTxns.end()) {
-            printf("[SELF-SNOOP] node=%d SnpCleanInvalid PA=0x%lx "
+            DPRINTF(RubyEP, "[SELF-SNOOP] node=%d SnpCleanInvalid PA=0x%lx "
                    "pendingChiTxn op=%d — immediate SnpResp_I\n",
                    _nodeId, msg->m_addr,
                    static_cast<int>(chiIt->second.op));
@@ -836,7 +837,7 @@ EPRNFController::handleSnpCleanInvalid(const CHIRequestMsg *msg)
     //     the SnpCleanInvalid is RECALL-induced (TC98 §6.1) — the UBCC RECALL
     //     handles ownership transfer, so no OuterUpgradeReq is needed.
     if (isDsmLine && backend && backend->hasActiveRecall(msg->m_addr)) {
-        printf("[RECALL-SNOOP] node=%d SnpCleanInvalid PA=0x%lx "
+        DPRINTF(RubyEP, "[RECALL-SNOOP] node=%d SnpCleanInvalid PA=0x%lx "
                "during active recall — immediate SnpResp_I\n",
                _nodeId, msg->m_addr);
         backend->clearActiveRecall(msg->m_addr);
@@ -857,7 +858,7 @@ EPRNFController::handleSnpCleanInvalid(const CHIRequestMsg *msg)
                         "EP_RNF node_id=%d: SnpCleanInvalid PA=0x%lx "
                         "silent upgrade (R_E/R_M→M local, 0 cross-node msgs)\n",
                         _nodeId, msg->m_addr);
-                printf("[UPGRADE-DIAG] node=%d silent upgrade PA=0x%lx "
+                DPRINTF(RubyEP, "[UPGRADE-DIAG] node=%d silent upgrade PA=0x%lx "
                        "(R_E/R_M→M, zero cross-node messages)\n",
                        _nodeId, msg->m_addr);
                 return sendSnpRespI(msg);
@@ -872,7 +873,7 @@ EPRNFController::handleSnpCleanInvalid(const CHIRequestMsg *msg)
                 "EP_RNF node_id=%d: SnpCleanInvalid first-arrival upgrade path "
                 "for PA=0x%lx home=%d — issuing OuterUpgradeReq\n",
                 _nodeId, msg->m_addr, homeNode);
-        printf("[UPGRADE-DIAG] node=%d first SnpCleanInvalid PA=0x%lx home=%d\n",
+        DPRINTF(RubyEP, "[UPGRADE-DIAG] node=%d first SnpCleanInvalid PA=0x%lx home=%d\n",
                _nodeId, msg->m_addr, homeNode);
 
         // CHI §4.3.3 / §5.5: a snoop whose upgrade is not yet complete must be
@@ -1064,8 +1065,8 @@ EPRNFController::processQueuedSnoop(uint64_t linePa)
 void
 EPRNFController::finishChiTxn(uint64_t linePa, bool success)
 {
-    printf("[EPRNF-FINISH] node=%d PA=0x%lx success=%d\n",
-           _nodeId, linePa, success);
+    DPRINTF(RubyEP, "[EPRNF-FINISH] node=%d PA=0x%lx success=%d\n",
+            _nodeId, linePa, success);
     auto txnIt = _pendingChiTxns.find(linePa);
     if (txnIt == _pendingChiTxns.end()) {
         return;
@@ -1129,8 +1130,8 @@ EPRNFController::sendChiRequest(uint64_t linePa, CHIRequestType reqType,
     // twice for a single incrementReserved, triggering assertion failure.
     if (_chiRequestInFlight) {
         // Defer: queue the request for later processing
-        printf("[EPRNF-DEFER] node=%d PA=0x%lx type=%d — queued\n",
-               _nodeId, linePa, static_cast<int>(reqType));
+        DPRINTF(RubyEP, "[EPRNF-DEFER] node=%d PA=0x%lx type=%d — queued\n",
+                _nodeId, linePa, static_cast<int>(reqType));
         DeferredChiRequest d;
         d.linePa = linePa;
         d.reqType = reqType;
@@ -1277,7 +1278,7 @@ EPRNFController::startReadShared(uint64_t linePa,
             _nodeId, linePa);
 
     if (_pendingChiTxns.find(linePa) != _pendingChiTxns.end()) {
-        DPRINTF(RubyCHIGeneric,
+        warn(
                 "EP_RNF node_id=%d: startReadShared addr=0x%lx "
                 "already has pending txn\n",
                 _nodeId, linePa);
@@ -1307,7 +1308,7 @@ EPRNFController::startReadShared(uint64_t linePa,
                                EpProxyOp_NoProxyOp);
     if (!sent) {
         _pendingChiTxns.erase(linePa);
-        DPRINTF(RubyCHIGeneric,
+        warn(
                 "EP_RNF node_id=%d: startReadShared addr=0x%lx "
                 "send failed\n", _nodeId, linePa);
         if (onComplete) onComplete(false);
@@ -1325,7 +1326,7 @@ EPRNFController::startReadUnique(uint64_t linePa,
             _nodeId, linePa);
 
     if (_pendingChiTxns.find(linePa) != _pendingChiTxns.end()) {
-        DPRINTF(RubyCHIGeneric,
+        warn(
                 "EP_RNF node_id=%d: startReadUnique addr=0x%lx "
                 "already has pending txn\n",
                 _nodeId, linePa);
@@ -1352,17 +1353,17 @@ EPRNFController::startReadUnique(uint64_t linePa,
     txn.onComplete = onComplete;
     _pendingChiTxns[linePa] = txn;
 
-    std::fprintf(stderr,
+    inform(
                  "[RECALL-PROXY-ISSUE] node=%d localPA=0x%lx proxy=RecallUnique "
                  "tick=%lu\n",
                  _nodeId, linePa, curTick());
     bool sent = sendChiRequest(linePa, CHIRequestType_ReadUnique,
                                EpProxyOp_RecallUnique);
-    printf("[EPRNF-RECALL] node=%d startReadUnique PA=0x%lx sent=%d\n",
-           _nodeId, linePa, sent);
+    DPRINTF(RubyEP, "[EPRNF-RECALL] node=%d startReadUnique PA=0x%lx sent=%d\n",
+            _nodeId, linePa, sent);
     if (!sent) {
         _pendingChiTxns.erase(linePa);
-        DPRINTF(RubyCHIGeneric,
+        warn(
                 "EP_RNF node_id=%d: startReadUnique addr=0x%lx "
                 "send failed\n", _nodeId, linePa);
         if (onComplete) onComplete(false);
@@ -1379,9 +1380,9 @@ EPRNFController::startCleanUnique(uint64_t linePa,
 
     // Check for duplicate pending transaction on this line
     if (_pendingChiTxns.find(linePa) != _pendingChiTxns.end()) {
-        printf("[CLEANUNIQUE-DIAG] node=%d PA=0x%lx DUPLICATE — already has pending txn op=%d\n",
-               _nodeId, linePa, (int)_pendingChiTxns[linePa].op);
-        DPRINTF(RubyCHIGeneric,
+        DPRINTF(RubyEP, "[CLEANUNIQUE-DIAG] node=%d PA=0x%lx DUPLICATE — already has pending txn op=%d\n",
+                _nodeId, linePa, (int)_pendingChiTxns[linePa].op);
+        warn(
                 "EP_RNF node_id=%d: startCleanUnique addr=0x%lx "
                 "already has pending txn\n",
                 _nodeId, linePa);
@@ -1412,12 +1413,12 @@ EPRNFController::startCleanUnique(uint64_t linePa,
     // Send CleanUnique to HN-F via reqOut with InvalidateOnly proxy op
     bool sent = sendChiRequest(linePa, CHIRequestType_CleanUnique,
                                EpProxyOp_InvalidateOnly);
-    printf("[CLEANUNIQUE-DIAG] node=%d PA=0x%lx sendChiRequest sent=%d\n",
-           _nodeId, linePa, sent);
+    DPRINTF(RubyEP, "[CLEANUNIQUE-DIAG] node=%d PA=0x%lx sendChiRequest sent=%d\n",
+            _nodeId, linePa, sent);
     if (!sent) {
         // Send failed — clean up pending txn and notify caller
         _pendingChiTxns.erase(linePa);
-        DPRINTF(RubyCHIGeneric,
+        warn(
                 "EP_RNF node_id=%d: startCleanUnique addr=0x%lx "
                 "send failed, notifying caller\n",
                 _nodeId, linePa);
@@ -1452,7 +1453,7 @@ EPRNFController::enqueueRetry(uint64_t linePa, uint64_t epoch, uint64_t reqId,
     if (it != _retryEntries.end()) {
         // §4.3.4: stale epoch → discard
         if (epoch < it->second.epoch) {
-            DPRINTF(RubyCHIGeneric,
+            warn(
                     "EP_RNF node_id=%d: retry stale epoch %lu < %lu for "
                     "PA=0x%lx — discarding\n",
                     _nodeId, epoch, it->second.epoch, linePa);
@@ -1594,8 +1595,8 @@ EPRNFController::processUpgradeRetries()
 {
     if (_upgradeRetryLines.empty())
         return;
-    printf("[RETRY-DIAG] node=%d processUpgradeRetries lines=%zu\n",
-           _nodeId, _upgradeRetryLines.size());
+    DPRINTF(RubyEP, "[RETRY-DIAG] node=%d processUpgradeRetries lines=%zu\n",
+            _nodeId, _upgradeRetryLines.size());
     auto lines = _upgradeRetryLines;
     for (uint64_t linePa : lines) {
         auto upIt = _upgradePending.find(linePa);
@@ -1640,7 +1641,7 @@ EPRNFController::processUpgradeRetries()
                 upIt->second.dropWatchdogArmed = false;
                 upIt->second.dropResendCount++;
                 upIt->second.retryCount++;   // widen next watchdog window
-                printf("[UPGRADE-DIAG] node=%d DROP-recovery resend #%d "
+                warn("[UPGRADE-DIAG] node=%d DROP-recovery resend #%d "
                        "PA=0x%lx (same reqId)\n",
                        _nodeId, upIt->second.dropResendCount, linePa);
             } else {
@@ -1660,8 +1661,8 @@ EPRNFController::processUpgradeRetries()
             DPRINTF(RubyCHIGeneric,
                     "EP_RNF node_id=%d: retrying held upgrade PA=0x%lx\n",
                     _nodeId, linePa);
-            printf("[UPGRADE-DIAG] node=%d retry upgrade PA=0x%lx\n",
-                   _nodeId, linePa);
+            DPRINTF(RubyEP, "[UPGRADE-DIAG] node=%d retry upgrade PA=0x%lx\n",
+                    _nodeId, linePa);
             completeHeldUpgrade(linePa);
         }
     }
@@ -1719,7 +1720,7 @@ EPRNFController::completeHeldUpgrade(uint64_t linePa, bool dropRecoveryResend)
         // home is already committed to finishing this upgrade. Keep the same
         // reqId and continue AckNotify-loss recovery instead of entering the
         // fresh-transaction retry path.
-        printf("[UPGRADE-DIAG] node=%d ignored stale reject after accept "
+        warn("[UPGRADE-DIAG] node=%d ignored stale reject after accept "
                "PA=0x%lx reqId=%lu\n",
                _nodeId, linePa, upIt->second.reqId);
         rejected = false;
@@ -1821,7 +1822,7 @@ EPRNFController::completeHeldUpgrade(uint64_t linePa, bool dropRecoveryResend)
                 ep_upgrade_retry_backoff_cycles(upIt->second.retryCount));
             upIt->second.retryReadyTick = clockEdge(delay);
             scheduleEvent(delay);
-            DPRINTF(RubyCHIGeneric,
+            inform(
                     "EP_RNF node_id=%d: completeHeldUpgrade PA=0x%lx pending "
                     "— holding snoop, armed DROP watchdog\n",
                     _nodeId, linePa);
@@ -1857,7 +1858,7 @@ EPRNFController::completeHeldUpgrade(uint64_t linePa, bool dropRecoveryResend)
             upIt->second.retryReadyTick = clockEdge(delay);
             scheduleEvent(delay);
         }
-        printf("[UPGRADE-DIAG] node=%d upgrade deferred ack PA=0x%lx "
+        DPRINTF(RubyEP, "[UPGRADE-DIAG] node=%d upgrade deferred ack PA=0x%lx "
                "— waiting for invalidation acks\n",
                _nodeId, linePa);
     }
@@ -1896,9 +1897,9 @@ EPRNFController::receiveUpgradeAck(uint64_t linePa)
             "EP_RNF node_id=%d: OuterUpgradeAck received for PA=0x%lx "
             "— sending deferred SnpResp_I to HN-F\n",
             _nodeId, linePa);
-    printf("[UPGRADE-DIAG] node=%d UpgradeAck PA=0x%lx home=%d epoch=%lu reqId=%lu\n",
-           _nodeId, linePa, upIt->second.homeNode,
-           upIt->second.epoch, upIt->second.reqId);
+    DPRINTF(RubyEP, "[UPGRADE-DIAG] node=%d UpgradeAck PA=0x%lx home=%d epoch=%lu reqId=%lu\n",
+            _nodeId, linePa, upIt->second.homeNode,
+            upIt->second.epoch, upIt->second.reqId);
 
     // Send deferred SnpResp_I to HN-F
     NetDest dest(m_ruby_system);
@@ -1922,9 +1923,9 @@ EPRNFController::receiveUpgradeAck(uint64_t linePa)
     bool doneOk = backend->sendUpgradeDone(
         linePa, upIt->second.homeNode, upIt->second.epoch,
         upIt->second.reqId);
-    printf("[UPGRADE-DIAG] node=%d UpgradeDone PA=0x%lx ok=%d home=%d epoch=%lu reqId=%lu\n",
-           _nodeId, linePa, doneOk, upIt->second.homeNode,
-           upIt->second.epoch, upIt->second.reqId);
+    DPRINTF(RubyEP, "[UPGRADE-DIAG] node=%d UpgradeDone PA=0x%lx ok=%d home=%d epoch=%lu reqId=%lu\n",
+            _nodeId, linePa, doneOk, upIt->second.homeNode,
+            upIt->second.epoch, upIt->second.reqId);
     if (!doneOk) {
         warn("EP_RNF node_id=%d: sendUpgradeDone failed for PA=0x%lx "
              "home=%d epoch=%lu reqId=%lu\n",

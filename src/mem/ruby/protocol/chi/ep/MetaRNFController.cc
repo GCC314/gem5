@@ -4,6 +4,7 @@
 
 #include "base/logging.hh"
 #include "debug/RubyCHIGeneric.hh"
+#include "debug/RubyEP.hh"
 #include "mem/ruby/protocol/CHI/CHIProtocolInfo.hh"
 
 namespace gem5
@@ -121,7 +122,7 @@ MetaRNFController::issueRead(uint64_t metadataPa, ReadCallback cb)
     auto sbIt = _scoreboard.find(metadataPa);
     if (sbIt != _scoreboard.end()) {
         if (tracePageOne(metadataPa)) {
-            std::fprintf(stderr,
+            inform(
                          "[META-TRACE] node=%d op=read-queue pa=0x%lx slot=%d active=%d\n",
                          _nodeId, metadataPa, sbIt->second, activeFlightCount());
         }
@@ -136,7 +137,7 @@ MetaRNFController::issueRead(uint64_t metadataPa, ReadCallback cb)
     int slot = findFreeSlot();
     if (slot < 0) {
         if (tracePageOne(metadataPa)) {
-            std::fprintf(stderr,
+            inform(
                          "[META-TRACE] node=%d op=read-no-slot pa=0x%lx active=%d\n",
                          _nodeId, metadataPa, activeFlightCount());
         }
@@ -152,7 +153,7 @@ MetaRNFController::issueRead(uint64_t metadataPa, ReadCallback cb)
     _scoreboard[metadataPa] = slot;
 
     if (tracePageOne(metadataPa)) {
-        std::fprintf(stderr,
+        inform(
                      "[META-TRACE] node=%d op=read-issue pa=0x%lx slot=%d active=%d\n",
                      _nodeId, metadataPa, slot, activeFlightCount());
     }
@@ -176,7 +177,7 @@ MetaRNFController::issueWrite(uint64_t metadataPa, const MetaLine &line,
     auto sbIt = _scoreboard.find(metadataPa);
     if (sbIt != _scoreboard.end()) {
         if (tracePageOne(metadataPa)) {
-            std::fprintf(stderr,
+            inform(
                          "[META-TRACE] node=%d op=write-queue pa=0x%lx slot=%d active=%d\n",
                          _nodeId, metadataPa, sbIt->second, activeFlightCount());
         }
@@ -195,11 +196,10 @@ MetaRNFController::issueWrite(uint64_t metadataPa, const MetaLine &line,
         // Deduplicate by PA: replace older queued write for same PA.
         for (auto it = _pendingWrites.begin(); it != _pendingWrites.end(); ++it) {
             if (it->pa == metadataPa) {
-                std::fprintf(stderr,
+                DPRINTF(RubyEP,
                     "[METARNF-WRITE-COALESCE] node=%d pa=0x%lx "
                     "queueDepth=%zu\n",
                     _nodeId, metadataPa, _pendingWrites.size());
-                std::fflush(stderr);
                 it->data = line;
                 it->cb = cb;
                 return;
@@ -213,10 +213,9 @@ MetaRNFController::issueWrite(uint64_t metadataPa, const MetaLine &line,
         _pendingWrites.push_back({metadataPa, line, cb});
         int qd = (int)_pendingWrites.size();
         if (qd > _pendingWritesHighwater) _pendingWritesHighwater = qd;
-        std::fprintf(stderr,
+        DPRINTF(RubyEP,
             "[METARNF-WRITE-QUEUE] node=%d pa=0x%lx depth=%d\n",
             _nodeId, metadataPa, qd);
-        std::fflush(stderr);
         return;
     }
 
@@ -229,7 +228,7 @@ MetaRNFController::issueWrite(uint64_t metadataPa, const MetaLine &line,
     _scoreboard[metadataPa] = slot;
 
     if (tracePageOne(metadataPa)) {
-        std::fprintf(stderr,
+        inform(
                      "[META-TRACE] node=%d op=write-issue pa=0x%lx slot=%d active=%d\n",
                      _nodeId, metadataPa, slot, activeFlightCount());
     }
@@ -499,10 +498,9 @@ MetaRNFController::drainPendingWrites()
         if (slot < 0) break;
         PendingWrite pw = _pendingWrites.front();
         _pendingWrites.pop_front();
-        std::fprintf(stderr,
+        DPRINTF(RubyEP,
             "[METARNF-WRITE-DEQUEUE] node=%d pa=0x%lx depth=%zu\n",
             _nodeId, pw.pa, _pendingWrites.size());
-        std::fflush(stderr);
         issueWrite(pw.pa, pw.data, pw.cb);
     }
 }
@@ -529,7 +527,7 @@ MetaRNFController::sendReadOnce(uint64_t pa)
 
     bool sent = sendRequestMsg(req);
     if (tracePageOne(pa)) {
-        std::fprintf(stderr,
+        inform(
                      "[META-TRACE] node=%d op=read-send pa=0x%lx sent=%d\n",
                      _nodeId, pa, sent ? 1 : 0);
     }
@@ -561,7 +559,7 @@ MetaRNFController::sendWriteUnique(uint64_t pa)
 
     bool sent = sendRequestMsg(req);
     if (tracePageOne(pa)) {
-        std::fprintf(stderr,
+        inform(
                      "[META-TRACE] node=%d op=write-send pa=0x%lx sent=%d\n",
                      _nodeId, pa, sent ? 1 : 0);
     }
@@ -602,7 +600,7 @@ MetaRNFController::sendWriteData(uint64_t pa, MachineID dst, uint64_t dbid)
         sent = sendDataMsg(dat) && sent;
     }
     if (tracePageOne(pa)) {
-        std::fprintf(stderr,
+        inform(
                      "[META-TRACE] node=%d op=write-data pa=0x%lx dbid=%lu dst=%d sent=%d\n",
                      _nodeId, pa, dbid, dst.num, sent ? 1 : 0);
     }
@@ -639,7 +637,7 @@ MetaRNFController::completeRead(int slotIdx, bool success,
     auto cb = fs.readCb;
 
     if (tracePageOne(pa)) {
-        std::fprintf(stderr,
+        inform(
                      "[META-TRACE] node=%d op=read-complete pa=0x%lx slot=%d success=%d\n",
                      _nodeId, pa, slotIdx, success ? 1 : 0);
     }
@@ -702,7 +700,7 @@ MetaRNFController::completeWrite(int slotIdx, bool success)
     auto cb = fs.writeCb;
 
     if (tracePageOne(pa)) {
-        std::fprintf(stderr,
+        inform(
                      "[META-TRACE] node=%d op=write-complete pa=0x%lx slot=%d success=%d\n",
                      _nodeId, pa, slotIdx, success ? 1 : 0);
     }
@@ -859,7 +857,7 @@ MetaRNFController::recvResponseMsg(const CHIResponseMsg *msg)
     FlightSlot &fs = _flightSlots[slot];
 
     if (tracePageOne(msg->m_addr)) {
-        std::fprintf(stderr,
+        inform(
                      "[META-TRACE] node=%d op=recv-rsp pa=0x%lx slot=%d type=%d flight-op=%d\n",
                      _nodeId, msg->m_addr, slot, static_cast<int>(msg->m_type),
                      static_cast<int>(fs.op));
@@ -922,7 +920,7 @@ MetaRNFController::recvDataMsg(const CHIDataMsg *msg)
     FlightSlot &fs = _flightSlots[slot];
 
     if (tracePageOne(msg->m_addr)) {
-        std::fprintf(stderr,
+        inform(
                      "[META-TRACE] node=%d op=recv-data pa=0x%lx slot=%d type=%d flight-op=%d\n",
                      _nodeId, msg->m_addr, slot, static_cast<int>(msg->m_type),
                      static_cast<int>(fs.op));

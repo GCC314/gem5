@@ -3,28 +3,54 @@
 Import('*')
 
 import os
+import shlex
 import SCons.Errors
 
 if env['CONF']['PROTOCOL'] != 'CHI':
     Return()
 
 repo_root = os.path.abspath(os.path.join(Dir('#').abspath, '..'))
-zmq_include = os.path.join(repo_root, 'thirdparty/zeromq/include')
-zmq_lib = os.path.join(repo_root, 'thirdparty/zeromq/lib')
+zmq_include = os.path.join(repo_root, 'thirdparty', 'zeromq', 'include')
+zmq_lib = os.path.join(repo_root, 'thirdparty', 'zeromq', 'lib')
 
-# Framework is now built externally by scripts/build_framework.sh into
-# build/framework/{lib,include}. gem5 links the prebuilt libframework.a
-# instead of compiling framework/Port.cc in-tree.
+# gem5 always sees the frozen iface headers and links the selected opaque
+# backend.  Relative archive paths are resolved against the workspace root.
+fw_backend = os.environ.get('FRAMEWORK_BACKEND', 'local')
 fw_prefix = os.path.join(repo_root, 'build', 'framework')
-fw_lib = os.path.join(fw_prefix, 'lib', 'libframework.a')
+fw_include = os.path.join(fw_prefix, 'include')
+fw_lib_value = os.environ.get(
+    'FRAMEWORK_BACKEND_LIB',
+    os.path.join('build', 'framework', 'lib',
+                 'libframework_%s.a' % fw_backend))
+fw_lib = (fw_lib_value if os.path.isabs(fw_lib_value)
+          else os.path.join(repo_root, fw_lib_value))
+fw_lib = os.path.normpath(fw_lib)
 if not os.path.isfile(fw_lib):
     raise SCons.Errors.StopError(
-        'libframework.a not found at %s. Run scripts/build_framework.sh first.' % fw_lib)
+        "framework backend '%s' archive not found at %s. Build/provide it "
+        'and set FRAMEWORK_BACKEND_LIB to an absolute or workspace-relative archive.' %
+        (fw_backend, fw_lib))
 
-env.Append(CPPPATH=[repo_root, zmq_include, os.path.join(fw_prefix, 'include')])
-env.Append(LIBPATH=[zmq_lib, os.path.join(fw_prefix, 'lib')])
-env.Append(LIBS=['framework', 'zmq'])
-env.Append(LINKFLAGS=['-pthread', f'-Wl,-rpath,{zmq_lib}'])
+env.Append(CPPPATH=[repo_root, fw_include])
+if fw_backend == 'local':
+    env.Append(CPPPATH=[zmq_include])
+    env.Append(LIBPATH=[zmq_lib])
+
+# Put the backend archive before its dependency libraries.  Parse environment
+# flags with shlex rather than evaluating shell text.
+env.Append(LIBS=[File(fw_lib)])
+if fw_backend == 'local':
+    env.Append(LIBS=['zmq'])
+    env.Append(LINKFLAGS=['-pthread', '-Wl,-rpath,%s' % zmq_lib])
+
+backend_cppflags = shlex.split(
+    os.environ.get('FRAMEWORK_BACKEND_CPPFLAGS', ''))
+backend_ldflags = shlex.split(
+    os.environ.get('FRAMEWORK_BACKEND_LDFLAGS', ''))
+if backend_cppflags:
+    env.MergeFlags(backend_cppflags)
+if backend_ldflags:
+    env.MergeFlags(backend_ldflags)
 
 SimObject('EPController.py', sim_objects=['EPController'])
 SimObject('EPRNFController.py', sim_objects=['EPRNFController'])
@@ -45,7 +71,7 @@ Source('M6SelfTest.cc')
 Source('M7SelfTest.cc')
 Source('M8SelfTest.cc')
 Source('M9SelfTest.cc')
-# framework/Port.cc is now linked via build/framework/lib/libframework.a (above)
+# The opaque framework implementation is linked from the selected backend.
 
 DebugFlag('RubyEP')
 DebugFlag('RubyEPVerbose')

@@ -1,12 +1,8 @@
 #include "mem/ruby/protocol/chi/ep/EPBackend.hh"
 
-#include <cstdio>
 #include <cstring>
-#include <cstdarg>
 #include <array>
-#include <execinfo.h>
 #include <sstream>
-#include <unistd.h>
 
 #include "base/logging.hh"
 #include "debug/RubyCHIGeneric.hh"
@@ -31,23 +27,6 @@ namespace ruby
 
 namespace
 {
-
-void
-appendTmpLog(const char *file, const char *fmt, ...)
-{
-    char path[256];
-    std::snprintf(path, sizeof(path), "/workspace/tmp_logs/%s", file);
-    FILE *fp = std::fopen(path, "a");
-    if (!fp) {
-        return;
-    }
-
-    va_list ap;
-    va_start(ap, fmt);
-    std::vfprintf(fp, fmt, ap);
-    va_end(ap);
-    std::fclose(fp);
-}
 
 uint64_t
 makeRequesterReqId(int nodeId, uint64_t seq)
@@ -142,7 +121,7 @@ EPBackend::EPBackend(const Params &p)
     _backendInstances[_nodeId] = this;
 
     // Phase 0: startup manifest — metadata DRAM range reporting
-    std::fprintf(stderr,
+    inform(
         "[EPBACKEND-MANIFEST] node=%d num_sockets=%d "
         "metadata_dram_base=0x%lx metadata_dram_total=%lu MiB "
         "per_socket=%lu MiB\n",
@@ -150,7 +129,6 @@ EPBackend::EPBackend(const Params &p)
         _metadataPrivateBase,
         _metadataPrivateSize / (1024 * 1024),
         (_metadataPrivateSize / _numSockets) / (1024 * 1024));
-    std::fflush(stderr);
 }
 
 // v4-dual-socket: per-socket EP-SNF registration (§3.6)
@@ -175,13 +153,13 @@ EPBackend::registerEpSnf(int socketId, EPSNFController *ctrl)
 
     if (_ubAdapters.size() > (size_t)socketId && _ubAdapters[socketId]) {
         if (_verboseLog) {
-        std::fprintf(stderr, "[WIRE] node=%d wiring adapter[%d]->snf callback\n",
-                     _nodeId, socketId);
+        DPRINTF(RubyEP, "[WIRE] node=%d wiring adapter[%d]->snf callback\n",
+                _nodeId, socketId);
         }
         _ubAdapters[socketId]->setOnResponseWired([this, socketId]{
             if (_verboseLog) {
-            std::fprintf(stderr, "[RSP-FIRE] node=%d socket=%d scheduling EPSNF wakeup\n",
-                         _nodeId, socketId);
+            DPRINTF(RubyEP, "[RSP-FIRE] node=%d socket=%d scheduling EPSNF wakeup\n",
+                    _nodeId, socketId);
             }
             if (socketId < (int)_epSnfs.size() && _epSnfs[socketId])
                 _epSnfs[socketId]->scheduleEvent(Cycles(1));
@@ -256,7 +234,7 @@ EPBackend::init()
         if (adapter && snf) {
             adapter->setOnResponseWired([this, snf]{
                 if (_verboseLog)
-                    std::fprintf(stderr, "[RSP-FIRE] scheduling EPSNF wakeup\n");
+                    DPRINTF(RubyEP, "[RSP-FIRE] scheduling EPSNF wakeup\n");
                 snf->scheduleEvent(Cycles(1));
             });
         }
@@ -502,7 +480,7 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
             const uint64_t completedReqId = pgt->second.reqId;
             _pendingGrantTxns.erase(pgt);
             if (start) {
-                std::fprintf(stderr,
+                inform(
                     "[EP-PERF] kind=outer node=%d pa=0x%lx reqId=%lu "
                     "start=%lu end=%lu latency_ps=%lu\n",
                     _nodeId, homePa, completedReqId, start, curTick(),
@@ -555,11 +533,11 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
                 // R_E → R_M (or R_M stays R_M): no outer request needed
                 existing->second.state = RequesterLineState::R_M;
                 if (_verboseLog) {
-                printf("[UPGRADE-DIAG] node=%d SILENT-WRITE-HIT PA=0x%lx "
+                DPRINTF(RubyEP, "[UPGRADE-DIAG] node=%d SILENT-WRITE-HIT PA=0x%lx "
                        "(state=%d→R_M, zero cross-node messages)\n",
                         _nodeId, line_pa, static_cast<int>(st));
                 }
-                std::fprintf(stderr,
+                inform(
                     "[EP-PERF] kind=upgrade_silent node=%d pa=0x%lx "
                     "start=%lu end=%lu latency_ps=0\n",
                     _nodeId, line_pa, curTick(), curTick());
@@ -818,11 +796,10 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
         _lastGrantDataBlock = routedGrantData;
         _lastGrantDataValid = true;
         _lastGrantDataSource = GrantDataSource::RecallBuffer;
-        std::fprintf(stderr,
+        DPRINTF(RubyEP,
                      "[C1-GRANT-DATA-DIRECT] node=%d pa=0x%lx "
                      "grant data routed directly (bypass recall capture)\n",
                      _nodeId, homePa);
-        std::fflush(stderr);
         // ── Phase C4 trace point 7: EPBackend routed grant word ──
         {
             uint64_t off = homePa & 0x1FFFULL;
@@ -831,10 +808,9 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
                 uint64_t w0 = 0;
                 for (int i = 0; i < 8; i++)
                     ((uint8_t*)&w0)[i] = _lastGrantDataBlock.getByte(i);
-                std::fprintf(stderr,
+                DPRINTF(RubyEP,
                     "[C4-EPB-DIRECT] node=%d pa=0x%lx off=0x%lx w0=0x%016lx\n",
                     _nodeId, homePa, off, w0);
-                std::fflush(stderr);
             }
         }
     } else {
@@ -900,8 +876,8 @@ EPBackend::handleGrant(uint64_t line_pa, OuterGrantType grant, int homeNode)
         case OuterGrantType::GlobalGrantExclusive:
             it->second.state = RequesterLineState::R_E;
             if (_verboseLog) {
-            printf("[RE-DIAG] node=%d line 0x%lx -> R_E (GrantExclusive)\n",
-                   _nodeId, line_pa);
+            DPRINTF(RubyEP, "[RE-DIAG] node=%d line 0x%lx -> R_E (GrantExclusive)\n",
+                    _nodeId, line_pa);
             }
             DPRINTF(RubyCHIGeneric,
                     "EPBackend node_id=%d: line 0x%lx -> R_E (GrantExclusive)\n",
@@ -1123,10 +1099,10 @@ bool
 EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
 {
     if (_verboseLog) {
-    printf("[RECALL-ENTRY] EPBackend node=%d PA=0x%lx ownerNode=%d homeNode=%d\n",
-           _nodeId, recallMsg.linePa, recallMsg.ownerNode, recallMsg.homeNode);
+    DPRINTF(RubyEP, "[RECALL-ENTRY] EPBackend node=%d PA=0x%lx ownerNode=%d homeNode=%d\n",
+            _nodeId, recallMsg.linePa, recallMsg.ownerNode, recallMsg.homeNode);
     }
-    std::fprintf(stderr,
+    inform(
                  "[RECALL-ENTRY-ERR] node=%d PA=0x%lx ownerNode=%d homeNode=%d reqId=%lu isRead=%d dataNeeded=%d curT=%lu\n",
                  _nodeId, recallMsg.linePa, recallMsg.ownerNode,
                  recallMsg.homeNode, recallMsg.reqId,
@@ -1162,8 +1138,8 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
         _activeRecallPAs[localPA] = true;
         _activeRecallPAs[recallMsg.linePa] = true;
         if (_verboseLog) {
-        printf("[RECALL-DIAG] node=%d active-recall-set linePA=0x%lx localPA=0x%lx\n",
-               _nodeId, recallMsg.linePa, localPA);
+        DPRINTF(RubyEP, "[RECALL-DIAG] node=%d active-recall-set linePA=0x%lx localPA=0x%lx\n",
+                _nodeId, recallMsg.linePa, localPA);
         }
     }
 
@@ -1208,10 +1184,10 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
     if (recallMsg.isReadRequest) {
         // Read recall: ReadShared to downgrade owner to R_S
         if (_verboseLog) {
-        printf("[RECALL-DIAG] node=%d initiating ReadShared recall PA=0x%lx\n",
-               _nodeId, recallMsg.linePa);
+        DPRINTF(RubyEP, "[RECALL-DIAG] node=%d initiating ReadShared recall PA=0x%lx\n",
+                _nodeId, recallMsg.linePa);
         }
-        std::fprintf(stderr,
+        inform(
                      "[RECALL-START-ERR] node=%d kind=ReadShared linePA=0x%lx localPA=0x%lx reqId=%lu curT=%lu\n",
                      _nodeId, recallMsg.linePa, ownerLocalPa,
                      recallMsg.reqId, curTick());
@@ -1220,10 +1196,10 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
         _epRnfCtrl->startReadShared(ownerLocalPa,
             [this, capturedMsg](bool success) {
                 if (_verboseLog) {
-                printf("[RECALL-DIAG] node=%d ReadShared callback success=%d valid=%d\n",
-                       _nodeId, success, _recallCaptureDataValid);
+                DPRINTF(RubyEP, "[RECALL-DIAG] node=%d ReadShared callback success=%d valid=%d\n",
+                        _nodeId, success, _recallCaptureDataValid);
                 }
-                std::fprintf(stderr,
+                inform(
                              "[RECALL-CB-ERR] node=%d kind=ReadShared linePA=0x%lx reqId=%lu success=%d valid=%d curT=%lu\n",
                              _nodeId, capturedMsg.linePa, capturedMsg.reqId,
                              success ? 1 : 0,
@@ -1273,8 +1249,8 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
                             resp.dataForwarded = true;
                             resp.dataForwardedTo = capturedMsg.requesterNode;
                             if (_verboseLog) {
-                            printf("[C4-FORWARD] RS node=%d forward data to requester=%d PA=0x%lx\n",
-                                   _nodeId, capturedMsg.requesterNode, capturedMsg.linePa);
+                            DPRINTF(RubyEP, "[C4-FORWARD] RS node=%d forward data to requester=%d PA=0x%lx\n",
+                                    _nodeId, capturedMsg.requesterNode, capturedMsg.linePa);
                             }
                         }
                     }
@@ -1284,10 +1260,10 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
     } else {
         // Write recall: ReadUnique with RecallUnique proxy op
         if (_verboseLog) {
-        printf("[RECALL-DIAG] node=%d initiating ReadUnique recall PA=0x%lx\n",
-               _nodeId, recallMsg.linePa);
+        DPRINTF(RubyEP, "[RECALL-DIAG] node=%d initiating ReadUnique recall PA=0x%lx\n",
+                _nodeId, recallMsg.linePa);
         }
-        std::fprintf(stderr,
+        inform(
                      "[RECALL-START-ERR] node=%d kind=ReadUnique linePA=0x%lx localPA=0x%lx reqId=%lu curT=%lu\n",
                      _nodeId, recallMsg.linePa, ownerLocalPa,
                       recallMsg.reqId, curTick());
@@ -1296,17 +1272,17 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
         setRecallCaptureData(DataBlock(64), false);
         _epRnfCtrl->startReadUnique(ownerLocalPa,
             [this, capturedMsg](bool success) {
-                std::fprintf(stderr,
+                inform(
                              "[RECALL-PROXY-CALLBACK] node=%d homePA=0x%lx "
                              "reqId=%lu success=%d dataValid=%d tick=%lu\n",
                              _nodeId, capturedMsg.linePa, capturedMsg.reqId,
                              success ? 1 : 0,
                              _recallCaptureDataValid ? 1 : 0, curTick());
                 if (_verboseLog) {
-                printf("[RECALL-DIAG] node=%d ReadUnique callback success=%d\n",
-                       _nodeId, success);
+                DPRINTF(RubyEP, "[RECALL-DIAG] node=%d ReadUnique callback success=%d\n",
+                        _nodeId, success);
                 }
-                std::fprintf(stderr,
+                inform(
                              "[RECALL-CB-ERR] node=%d kind=ReadUnique linePA=0x%lx reqId=%lu success=%d valid=%d curT=%lu\n",
                              _nodeId, capturedMsg.linePa, capturedMsg.reqId,
                              success ? 1 : 0,
@@ -1355,8 +1331,8 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
                             resp.dataForwarded = true;
                             resp.dataForwardedTo = capturedMsg.requesterNode;
                             if (_verboseLog) {
-                            printf("[C4-FORWARD] RU node=%d forward data to requester=%d PA=0x%lx\n",
-                                   _nodeId, capturedMsg.requesterNode, capturedMsg.linePa);
+                            DPRINTF(RubyEP, "[C4-FORWARD] RU node=%d forward data to requester=%d PA=0x%lx\n",
+                                    _nodeId, capturedMsg.requesterNode, capturedMsg.linePa);
                             }
                         }
                     }
@@ -1374,10 +1350,10 @@ bool
 EPBackend::sendRecallResponse(const OuterRecallResponse &response)
 {
     if (_verboseLog) {
-    printf("[RECALL-RESP] node=%d PA=0x%lx homeNode=%d dataReturned=%d\n",
-           _nodeId, response.linePa, response.homeNode, response.dataReturned);
+    DPRINTF(RubyEP, "[RECALL-RESP] node=%d PA=0x%lx homeNode=%d dataReturned=%d\n",
+            _nodeId, response.linePa, response.homeNode, response.dataReturned);
     }
-    std::fprintf(stderr,
+    inform(
                  "[RECALL-RESP-ERR] node=%d PA=0x%lx homeNode=%d reqId=%lu dataReturned=%d curT=%lu\n",
                  _nodeId, response.linePa, response.homeNode,
                  response.reqId, response.dataReturned ? 1 : 0, curTick());
@@ -1418,9 +1394,9 @@ EPBackend::sendRecallResponse(const OuterRecallResponse &response)
         memcpy(buf, response.dataPayload.getData(0, 64), 64);
         bool installed = hms.write(response.linePa, buf, 64);
         if (_verboseLog) {
-        printf("[RECALL-DIAG] home-install node=%d home=%d PA=0x%lx installed=%d hasData=%d\n",
-               _nodeId, response.homeNode, response.linePa,
-               installed, response.hasDataPayload);
+        DPRINTF(RubyEP, "[RECALL-DIAG] home-install node=%d home=%d PA=0x%lx installed=%d hasData=%d\n",
+                _nodeId, response.homeNode, response.linePa,
+                installed, response.hasDataPayload);
         }
     }
 
@@ -1460,8 +1436,8 @@ EPBackend::clearActiveRecall(uint64_t pa)
     auto erased = _activeRecallPAs.erase(pa);
     if (erased) {
         if (_verboseLog) {
-        printf("[RECALL-DIAG] node=%d active-recall-clear PA=0x%lx\n",
-               _nodeId, pa);
+        DPRINTF(RubyEP, "[RECALL-DIAG] node=%d active-recall-clear PA=0x%lx\n",
+                _nodeId, pa);
         }
     }
 }
@@ -1472,7 +1448,7 @@ EPBackend::hasRequesterExclusive(uint64_t pa) const
     auto it = _requesterLines.find(pa);
     if (it == _requesterLines.end()) {
         if (_verboseLog) {
-        printf("[RE-DIAG] node=%d hasRequesterExclusive PA=0x%lx -> FALSE "
+        DPRINTF(RubyEP, "[RE-DIAG] node=%d hasRequesterExclusive PA=0x%lx -> FALSE "
                "(no entry, total=%zu)\n",
                _nodeId, pa, _requesterLines.size());
         }
@@ -1482,7 +1458,7 @@ EPBackend::hasRequesterExclusive(uint64_t pa) const
     bool result = (it->second.state == RequesterLineState::R_E ||
                     it->second.state == RequesterLineState::R_M);
     if (_verboseLog) {
-    printf("[RE-DIAG] node=%d hasRequesterExclusive PA=0x%lx -> %s "
+    DPRINTF(RubyEP, "[RE-DIAG] node=%d hasRequesterExclusive PA=0x%lx -> %s "
            "(state=%d, lineAddr=0x%lx)\n",
            _nodeId, pa, result ? "TRUE" : "FALSE",
            st, it->second.lineAddr);
@@ -1495,7 +1471,7 @@ EPBackend::hasRequesterExclusive(uint64_t pa) const
 void
 EPBackend::handleHomeWritebackComplete(uint64_t homePa)
 {
-        if (_verboseLog) printf("[EP-HOME-WB] node=%d pa=0x%lx\n", _nodeId, homePa);
+        if (_verboseLog) DPRINTF(RubyEP, "[EP-HOME-WB] node=%d pa=0x%lx\n", _nodeId, homePa);
     // v4-dual-socket: Send HomeWritebackNotify through adapter instead of
     // For single-socket backward compat, homeSocket = 0.
     int homeSocket = _addrMap.homeSocket(_nodeId, homePa);
@@ -1540,7 +1516,7 @@ EPBackend::handleWriteback(uint64_t line_pa, bool keepAsClean,
         // Phase 2 async: use pre-resolved metadata — skip QLM entirely
         epochVal = queryMeta->epochVal;
         requesterNode = queryMeta->requesterNode;
-        std::fprintf(stderr,
+        DPRINTF(RubyEP,
             "[EP-WB-CACHED-META] node=%d pa=0x%lx epoch=%lu owner=%d keepAsClean=%d\n",
             _nodeId, line_pa, epochVal, requesterNode, keepAsClean);
     } else if (it != _requesterLines.end()) {
@@ -1559,7 +1535,7 @@ EPBackend::handleWriteback(uint64_t line_pa, bool keepAsClean,
             if (qRet == -2) {
                 // QLM is in-flight (or re-check with cachedReqId returned -2
                 // meaning the response hasn't arrived yet).  Caller must retry.
-                std::fprintf(stderr,
+                DPRINTF(RubyEP,
                     "[EP-QLM-PENDING] node=%d pa=0x%lx cachedReqId=%lu\n",
                     _nodeId, line_pa, cachedQlmReqId);
                 return -2;
@@ -1574,7 +1550,7 @@ EPBackend::handleWriteback(uint64_t line_pa, bool keepAsClean,
             // do NOT silently drop dirty data.  Report explicit diagnostics
             // and return a definitive failure so the caller can retire the
             // pending writeback with audit evidence.
-            std::fprintf(stderr,
+            warn(
                 "[EP-WB-QLM-FAIL] node=%d pa=0x%lx found=%d owner=%d epoch=%lu "
                 "cachedReqId=%lu — terminal, NOT fabricating epoch\n",
                 _nodeId, line_pa, qFound ? 1 : 0, qOwnerNode, qEpoch,
@@ -1608,8 +1584,8 @@ EPBackend::handleWritebackWithMeta(uint64_t line_pa, bool keepAsClean,
     uint64_t homePa = _addrMap.buildDsmPA(homeNode, homeNode, offset, homeSocket);
 
     if (_verboseLog) {
-    printf("[EP-HANDLE-WB] node=%d pa=0x%lx epoch=%lu requester=%d keepAsClean=%d\n",
-           _nodeId, line_pa, epochVal, requesterNode, keepAsClean);
+    DPRINTF(RubyEP, "[EP-HANDLE-WB] node=%d pa=0x%lx epoch=%lu requester=%d keepAsClean=%d\n",
+            _nodeId, line_pa, epochVal, requesterNode, keepAsClean);
     }
 
     // Build writeback message envelope
@@ -1630,7 +1606,7 @@ EPBackend::handleWritebackWithMeta(uint64_t line_pa, bool keepAsClean,
     bool wbPending = (wbRet == -2);
     bool ok = (wbRet > 0);
     if (wbPending) {
-        std::fprintf(stderr,
+        DPRINTF(RubyEP,
                      "[EP-WB-PENDING] node=%d pa=0x%lx home=%d epoch=%lu\n",
                      _nodeId, homePa, homeNode, epochVal);
     }
@@ -1650,8 +1626,8 @@ EPBackend::handleWritebackWithMeta(uint64_t line_pa, bool keepAsClean,
                 // Owner retains clean exclusive (G_E)
                 it->second.state = RequesterLineState::R_E;
                 if (_verboseLog) {
-                printf("[RE-DIAG] node=%d line 0x%lx -> R_E (writeback keepAsClean)\n",
-                       _nodeId, line_pa);
+                DPRINTF(RubyEP, "[RE-DIAG] node=%d line 0x%lx -> R_E (writeback keepAsClean)\n",
+                        _nodeId, line_pa);
                 }
             } else {
                 // Owner drops the line (R_I)
@@ -1719,7 +1695,7 @@ EPBackend::handleEvict(uint64_t line_pa)
     bool evPending = (evRet == -2);
     bool ok = (evRet > 0);
     if (evPending) {
-        std::fprintf(stderr,
+        DPRINTF(RubyEP,
                      "[EP-EVICT-PENDING] node=%d pa=0x%lx home=%d epoch=%lu\n",
                      _nodeId, homePa, homeNode, epochVal);
     }
@@ -1751,8 +1727,8 @@ bool
 EPBackend::handleInvalidationRequest(const OuterInvalidateMsg &invMsg)
 {
     if (_verboseLog) {
-    printf("[INVAL-DIAG] node=%d handleInvalidationRequest PA=0x%lx home=%d sharerLocalPA=0x%lx\n",
-           _nodeId, invMsg.linePa, invMsg.homeNode, invMsg.sharerLocalPa);
+    DPRINTF(RubyEP, "[INVAL-DIAG] node=%d handleInvalidationRequest PA=0x%lx home=%d sharerLocalPA=0x%lx\n",
+            _nodeId, invMsg.linePa, invMsg.homeNode, invMsg.sharerLocalPa);
     }
     DPRINTF(RubyEP,
             "EPBackend node_id=%d: handleInvalidationRequest "
@@ -1860,7 +1836,7 @@ EPBackend::handleInvalidationRequest(const OuterInvalidateMsg &invMsg)
     // slips into the target mask, the invalidation still drains.
     if (!hadLocalCopy) {
         if (_verboseLog) {
-        printf("[INVAL-DIAG] node=%d no local copy PA=0x%lx — immediate ack "
+        DPRINTF(RubyEP, "[INVAL-DIAG] node=%d no local copy PA=0x%lx — immediate ack "
                "(stale sharer)\n",
                _nodeId, lookupPa);
         }
@@ -1885,15 +1861,15 @@ EPBackend::handleInvalidationRequest(const OuterInvalidateMsg &invMsg)
         // Capture invMsg by value for the callback
         OuterInvalidateMsg capturedMsg = invMsg;
         if (_verboseLog) {
-        printf("[INVAL-DIAG] node=%d calling startCleanUnique PA=0x%lx\n",
-               _nodeId, capturedMsg.sharerLocalPa);
+        DPRINTF(RubyEP, "[INVAL-DIAG] node=%d calling startCleanUnique PA=0x%lx\n",
+                _nodeId, capturedMsg.sharerLocalPa);
         }
         _epRnfCtrl->startCleanUnique(
             capturedMsg.sharerLocalPa,
             [this, capturedMsg](bool ok) {
                 if (_verboseLog) {
-                printf("[INVAL-DIAG] node=%d startCleanUnique callback PA=0x%lx ok=%d\n",
-                       _nodeId, capturedMsg.linePa, ok);
+                DPRINTF(RubyEP, "[INVAL-DIAG] node=%d startCleanUnique callback PA=0x%lx ok=%d\n",
+                        _nodeId, capturedMsg.linePa, ok);
                 }
                 OuterInvalidationAck ack;
                 ack.linePa = capturedMsg.linePa;
@@ -2045,7 +2021,7 @@ EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
         checkOnly /*checkOnly: don't re-send an in-flight upgrade*/,
         forceResend /*forceWire: bypass stale accepted-pending response*/);
     if (upgradeRet == -2) {
-        std::fprintf(stderr,
+        DPRINTF(RubyEP,
                      "[EP-UPGRADE-PENDING] node=%d pa=0x%lx home=%d epoch=%lu reqId=%lu\n",
                      _nodeId, homePa, homeNode, epochVal, reqIdVal);
         // Save the pending reqId/epoch so the next snoop retry reuses them and
@@ -2072,14 +2048,14 @@ EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
         // with the same reqId can be an older duplicate response that arrived
         // after the accepted response; it must not clear the tuple and start
         // fresh-reqId retries while the home is waiting for UpgradeDone.
-        std::fprintf(stderr,
+        warn(
             "[EP-UPGRADE-STALE-REJECT] node=%d pa=0x%lx epoch=%lu reqId=%lu "
             "ignored_after_accepted_pending=1\n",
             _nodeId, homePa, epochVal, reqIdVal);
         return false;
     }
     if (accepted) {
-        std::fprintf(stderr,
+        inform(
             "[EP-PERF] kind=upgrade_network node=%d pa=0x%lx reqId=%lu "
             "start=%lu end=%lu latency_ps=%lu\n",
             _nodeId, homePa, reqIdVal, upgradeStartTick, curTick(),
@@ -2124,7 +2100,7 @@ EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
             // the deferred (accepted=false) Ack and waits for the home to signal
             // completion once all acks land.
             if (_verboseLog) {
-            printf("[UPGRADE-DIAG] node=%d upgrade accepted PENDING PA=0x%lx "
+            DPRINTF(RubyEP, "[UPGRADE-DIAG] node=%d upgrade accepted PENDING PA=0x%lx "
                    "targetMask=0x%lx — home owns fanout (requester defers Ack)\n",
                    _nodeId, line_pa, upgradeTargetMask);
             }
@@ -2214,7 +2190,7 @@ EPBackend::sendUpgradeDone(uint64_t line_pa, int homeNode,
     bool donePending = (doneRet == -2);
     bool accepted = (doneRet > 0);
     if (donePending) {
-        std::fprintf(stderr,
+        DPRINTF(RubyEP,
                      "[EP-UPGDONE-PENDING] node=%d pa=0x%lx home=%d epoch=%lu reqId=%lu\n",
                      _nodeId, homePa, homeNode, epoch, reqId);
     }
@@ -2237,7 +2213,7 @@ EPBackend::sendUpgradeDone(uint64_t line_pa, int homeNode,
 EPBackend::sendClear(uint64_t line_pa, int homeNode,
                       uint64_t epoch, uint64_t reqId)
 {
-    std::fprintf(stderr,
+    inform(
                  "[CLEAR-SEND] node=%d pa=0x%lx homeNode=%d epoch=%lu reqId=%lu\n",
                  _nodeId, line_pa, homeNode, epoch, reqId);
     DPRINTF(RubyEP,
@@ -2458,8 +2434,8 @@ EPBackend::onUpgradeRespArrived(uint64_t reqId)
 void
 EPBackend::sendHomeWritebackNotify(uint64_t homePa, int homeSocket)
 {
-    printf("[EP-HOME-WB-NOTIFY] node=%d pa=0x%lx homeSocket=%d\n",
-           _nodeId, homePa, homeSocket);
+    DPRINTF(RubyEP, "[EP-HOME-WB-NOTIFY] node=%d pa=0x%lx homeSocket=%d\n",
+            _nodeId, homePa, homeSocket);
 
     // Determine homeNode from PA
     int homeNode = _addrMap.homeNode(_nodeId, homePa);
@@ -2496,7 +2472,7 @@ EPBackend::sendHomeWritebackNotify(uint64_t homePa, int homeSocket)
             int qRet = na->sendQueryLineMetaReq(homePa, homeNode, homeSocket,
                                                 qEpoch, qOwnerNode, qFound);
             if (qRet == -2) {
-                std::fprintf(stderr,
+                DPRINTF(RubyEP,
                              "[EP-HWB-QLM-PENDING] node=%d pa=0x%lx home=%d socket=%d\n",
                              _nodeId, homePa, homeNode, homeSocket);
             }
@@ -2517,12 +2493,12 @@ EPBackend::handleQueryLineMetaResp(const CoherenceMessage &msg)
     // reqId, so EPSNFController can look it up in processPendingWritebacks()
     // without blocking.
     if (_verboseLog) {
-    printf("[EP-QLM-RESP] node=%d pa=0x%lx found=%d epoch=%lu ownerNode=%d reqId=%lu\n",
-           _nodeId, msg.h.homeLinePa,
-           msg.b.queryLineMetaResp.found,
-           msg.b.queryLineMetaResp.epoch,
-           msg.b.queryLineMetaResp.ownerNode,
-           msg.h.reqId);
+    DPRINTF(RubyEP, "[EP-QLM-RESP] node=%d pa=0x%lx found=%d epoch=%lu ownerNode=%d reqId=%lu\n",
+            _nodeId, msg.h.homeLinePa,
+            msg.b.queryLineMetaResp.found,
+            msg.b.queryLineMetaResp.epoch,
+            msg.b.queryLineMetaResp.ownerNode,
+            msg.h.reqId);
     }
     // If found=false or owner/epoch inconsistency, do NOT silently discard
     // dirty data — the caller (processPendingWritebacks) will fabricate a

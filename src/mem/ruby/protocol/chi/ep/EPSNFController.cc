@@ -4,6 +4,7 @@
 
 #include "base/logging.hh"
 #include "debug/RubyCHIGeneric.hh"
+#include "debug/RubyEP.hh"
 #include "mem/ruby/common/DataBlock.hh"
 #include "mem/ruby/protocol/CHI/CHIDataMsg.hh"
 #include "mem/ruby/protocol/CHI/CHIRequestMsg.hh"
@@ -195,11 +196,10 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
             uint64_t off = msg->m_addr & 0x1FFFULL;
             uint64_t ckOff = msg->m_addr & 0xFFFFFULL;
             if (ckOff < 0x80000ULL && (off % 64 == 0)) {
-                std::fprintf(stderr,
+                inform(
                     "[C4-ESNF-WNOSNP] node=%d addr=0x%lx off=0x%lx "
                     "expectedMask=0x%lx\n",
                     _nodeId, msg->m_addr, off, pending.expectedMask);
-                std::fflush(stderr);
             }
         }
 
@@ -211,10 +211,9 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
             m_machineID, hnDest,
             false, false, 0, 0, MessageSizeType_Control);
         sendResponseMsg(rsp);
-        std::fprintf(stderr,
+        inform(
                      "[EPSNF-WRITE-DBID] node=%d addr=0x%lx expected=0x%lx\n",
                      _nodeId, msg->m_addr, pending.expectedMask);
-        std::fflush(stderr);
 
         DPRINTF(RubyCHIGeneric,
                 "EP_SNF node_id=%d: WriteNoSnp pending, "
@@ -240,7 +239,7 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
     _backend->checkDsmAddr(msg->m_addr);
 
     if (msg->m_ep_proxy_op == EpProxyOp_RecallUnique) {
-        std::fprintf(stderr,
+        inform(
                      "[RECALL-PROXY-EPSNF] node=%d localPA=0x%lx type=%d "
                      "proxy=RecallUnique neededPerm=%d writeIntent=%d tick=%lu\n",
                      _nodeId, msg->m_addr, static_cast<int>(msg->m_type),
@@ -275,7 +274,7 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
     // Map sideband to outer request and dispatch
     int homeNode = -1;
     if (msg->m_ep_proxy_op == EpProxyOp_RecallUnique) {
-        std::fprintf(stderr,
+        inform(
                      "[RECALL-PROXY-OUTER-ENTER] node=%d localPA=0x%lx "
                      "tick=%lu\n",
                      _nodeId, msg->m_addr, curTick());
@@ -520,11 +519,10 @@ EPSNFController::recvDataMsg(const CHIDataMsg *msg)
     DPRINTF(RubyCHIGeneric, "EP_SNF node_id=%d recvDataMsg type=%d addr=0x%lx\n",
             _nodeId, msg->m_type, msg->m_addr);
     auto pendingIt = _pendingWrites.find(msg->m_addr);
-    std::fprintf(stderr,
+    DPRINTF(RubyEP,
                  "[EPSNF-DATA-RECV] node=%d type=%d addr=0x%lx pendingWrite=%d\n",
                  _nodeId, msg->m_type, msg->m_addr,
                  pendingIt != _pendingWrites.end() ? 1 : 0);
-    std::fflush(stderr);
 
     // Q2: Write NCBWrData to DDR4 (SimpleMemory) via functionalAccess
     if (msg->m_type == CHIDataType_NCBWrData ||
@@ -580,12 +578,11 @@ EPSNFController::recvDataMsg(const CHIDataMsg *msg)
                     bool full = true;
                     for (int i = 0; i < 64; i++)
                         if (!msg->m_bitMask.test(i)) { full = false; break; }
-                    std::fprintf(stderr,
+                    inform(
                         "[C4-EPSNF-BEAT] node=%d pa=0x%lx writePa=0x%lx "
                         "off=0x%lx fullMask=%d w0=0x%016lx pending=%d\n",
                         _nodeId, msg->m_addr, writePa, absOff, full ? 1 : 0, w0,
                         pendingIt != _pendingWrites.end() ? 1 : 0);
-                    std::fflush(stderr);
                 }
             }
 
@@ -617,7 +614,7 @@ EPSNFController::recvDataMsg(const CHIDataMsg *msg)
                     // it would send an untracked QLM whose reqId is lost.
                     // Instead, enqueue directly and let processPendingWritebacks
                     // handle both QLM query and WriteBackReq with stable reqId.
-                    std::fprintf(stderr,
+                    inform(
                                  "[EPSNF-WB-PENDING] node=%d pa=0x%lx\n",
                                  _nodeId, writePa);
                     // Phase 2 async item 5: Deduplicate pending writebacks
@@ -644,7 +641,7 @@ EPSNFController::recvDataMsg(const CHIDataMsg *msg)
                             pwb.retryCount = 0;
                             pwb.nextRetryTick = 0;
                             replaced = true;
-                            std::fprintf(stderr,
+                            inform(
                                 "[EPSNF-WB-DEDUP] node=%d pa=0x%lx "
                                 "(replaced existing entry)\n",
                                 _nodeId, writePa);
@@ -660,17 +657,15 @@ EPSNFController::recvDataMsg(const CHIDataMsg *msg)
                         _pendingWritebacks.push_back(pwb);
                     }
                 }
-                std::fprintf(stderr,
+                inform(
                              "[EPSNF-WRITE-DONE] node=%d addr=0x%lx received=0x%lx\n",
                              _nodeId, msg->m_addr, pendingIt->second.receivedMask);
-                std::fflush(stderr);
                 _pendingWrites.erase(pendingIt);
             }
         } else {
-            std::fprintf(stderr,
+            warn(
                          "[EPSNF-DATA-NO-PENDING-WRITE] node=%d type=%d addr=0x%lx\n",
                          _nodeId, msg->m_type, msg->m_addr);
-            std::fflush(stderr);
         }
         return true;
     }
@@ -712,19 +707,18 @@ EPSNFController::processPendingWritebacks()
                     it->cachedEpoch = resolvedEpoch;
                     it->cachedOwnerNode = resolvedOwner;
                     it->cachedFound = resolvedFound;
-                    std::fprintf(stderr,
+                    inform(
                         "[EPSNF-QLM-READY] node=%d pa=0x%lx reqId=%lu "
                         "found=%d epoch=%lu owner=%d\n",
                         _nodeId, it->linePa, it->queryReqId,
                         resolvedFound, resolvedEpoch, resolvedOwner);
                     if (!resolvedFound || resolvedOwner < 0) {
-                        std::fprintf(stderr,
+                        warn(
                             "[EPSNF-WB-QLM-FAIL] node=%d pa=0x%lx reqId=%lu "
                             "found=%d owner=%d epoch=%lu — terminal\n",
                             _nodeId, it->linePa, it->queryReqId,
                             resolvedFound ? 1 : 0, resolvedOwner,
                             resolvedEpoch);
-                        std::fflush(stderr);
                         it = _pendingWritebacks.erase(it);
                         continue;
                     }
@@ -771,7 +765,7 @@ EPSNFController::processPendingWritebacks()
             if (wbRet == -2 && qlmReqId > 0) {
                 it->queryReqId = qlmReqId;
                 it->queryInFlight = true;
-                std::fprintf(stderr,
+                inform(
                     "[EPSNF-WB-QLM-ENQ] node=%d pa=0x%lx reqId=%lu\n",
                     _nodeId, it->linePa, qlmReqId);
             }
@@ -781,10 +775,8 @@ EPSNFController::processPendingWritebacks()
             // Writeback (or QLM) still pending — keep in queue with backoff
             it->retryCount++;
             if (it->retryCount > MAX_RETRIES) {
-                std::fprintf(stderr,
-                    "[EPSNF-WB-FATAL] node=%d pa=0x%lx max retries exceeded\n",
-                    _nodeId, it->linePa);
-                std::fflush(stderr);
+                warn("[EPSNF-WB-FATAL] node=%d pa=0x%lx max retries exceeded\n",
+                     _nodeId, it->linePa);
                 it = _pendingWritebacks.erase(it);
                 continue;
             }
@@ -796,7 +788,7 @@ EPSNFController::processPendingWritebacks()
                 if (delay > MAX_BACKOFF_TICKS) delay = MAX_BACKOFF_TICKS;
             }
             it->nextRetryTick = now + delay;
-            std::fprintf(stderr,
+            DPRINTF(RubyEP,
                 "[EPSNF-WB-RETRY] node=%d pa=0x%lx retry=%d delay=%lu\n",
                 _nodeId, it->linePa, it->retryCount, delay);
             ++it;
@@ -805,16 +797,15 @@ EPSNFController::processPendingWritebacks()
             // ── Phase 2 corrective: terminal QLM failure ──
             // found=false, owner<0, epoch=0 — do NOT silently discard.
             // Retire the entry with explicit diagnostic data.
-            std::fprintf(stderr,
+            warn(
                 "[EPSNF-WB-TERMINAL] node=%d pa=0x%lx queryReqId=%lu "
                 "retries=%d — QLM metadata resolution FAILED\n",
                 _nodeId, it->linePa, it->queryReqId, it->retryCount);
-            std::fflush(stderr);
             it = _pendingWritebacks.erase(it);
 
         } else {
             // Writeback completed (or rejected) — remove from queue
-            std::fprintf(stderr,
+            inform(
                 "[EPSNF-WB-DONE] node=%d pa=0x%lx ret=%d retries=%d\n",
                 _nodeId, it->linePa, wbRet, it->retryCount);
             it = _pendingWritebacks.erase(it);

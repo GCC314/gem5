@@ -1,13 +1,12 @@
 #include "mem/ruby/protocol/chi/ep/UBAdapter.hh"
 
-#include <cstdio>
 #include <limits>
 #include <thread>
 
 #include "base/logging.hh"
 #include "debug/RubyEP.hh"
-#include "framework/MemMessage.hh"
-#include "framework/Port.hh"
+#include "framework/iface/Message.hh"
+#include "framework/iface/Port.hh"
 #include "protocol/TracePerfPolicy.hh"
 #include "mem/ruby/protocol/chi/ep/EPBackend.hh"
 #include "mem/ruby/protocol/chi/ep/MetaRNFController.hh"
@@ -20,6 +19,50 @@ namespace gem5
 {
 namespace ruby
 {
+
+namespace
+{
+
+const CoherenceMessage *
+coherencePayload(const framework::Message *message)
+{
+    if (!message || framework::GetMessagePayloadSize(message) !=
+            sizeof(CoherenceMessage)) {
+        return nullptr;
+    }
+    const void *payload = framework::GetMessagePayloadData(message);
+    return payload ? reinterpret_cast<const CoherenceMessage *>(payload) :
+                     nullptr;
+}
+
+bool
+sendCoherenceMessage(framework::Port *port, const CoherenceMessage &coherence,
+                     uint64_t timestamp, uint64_t requestId,
+                     uint32_t sourceId = std::numeric_limits<uint32_t>::max(),
+                     uint32_t targetId = std::numeric_limits<uint32_t>::max(),
+                     uint64_t *wireTimestamp = nullptr)
+{
+    if (!port)
+        return false;
+
+    framework::Message *message =
+        framework::AllocateSendMessage(port, timestamp);
+    if (!message)
+        return false;
+
+    framework::SetMessageType(message, framework::MessageType::Payload);
+    framework::SetMessageRequestId(message, requestId);
+    if (sourceId != std::numeric_limits<uint32_t>::max())
+        framework::SetMessageSourceId(message, sourceId);
+    if (targetId != std::numeric_limits<uint32_t>::max())
+        framework::SetMessageTargetId(message, targetId);
+    framework::SetMessagePayload(message, &coherence, sizeof(coherence));
+    if (wireTimestamp)
+        *wireTimestamp = framework::GetMessageTimestamp(message);
+    return framework::SendMessage(port, message);
+}
+
+} // anonymous namespace
 
 // Phase 1: SimObject param → static local (set by UBAdapter::init).
 static uint64_t s_wait_cap = 0;
@@ -38,14 +81,24 @@ UBAdapter::UBAdapter(const Params &p)
       _addrMap(p.num_nodes, p.num_sockets, 128ULL * 1024 * 1024),
       _responseCheckEvent([this]{ wakeup(); }, name() + ".responseCheck")
 {
-    fatal_if(sizeof(CoherenceMessage) > framework::kMaxPayloadSize,
-             "UBAdapter: CoherenceMessage size (%zu) exceeds MemMessage payload (%u)",
-             sizeof(CoherenceMessage), framework::kMaxPayloadSize);
+    fatal_if(sizeof(CoherenceMessage) > framework::GetMaxPayloadSize(),
+              "UBAdapter: CoherenceMessage size (%zu) exceeds framework payload (%zu)",
+              sizeof(CoherenceMessage), framework::GetMaxPayloadSize());
     DPRINTF(RubyEP, "UBAdapter node=%d socket=%d created\n", _nodeId, _socketId);
 }
 
 UBAdapter::~UBAdapter()
 {
+    if (_port) {
+        if (_portExitState && !_portExitState->terminated) {
+            framework::TerminatePort(_port);
+            _portExitState->terminated = true;
+        }
+        if (_portExitState)
+            _portExitState->port = nullptr;
+        framework::DestroyPort(_port);
+        _port = nullptr;
+    }
 }
 
 void
@@ -67,37 +120,41 @@ UBAdapter::init()
             // ubio process, identified by the global module id gid=node*K+socket.
             // Previously all sockets of a node used gem5UbioPort(node), so only
             // socket 0 bound (duplicate endpoint) and socket-1 traffic deadlocked.
-            int numSockets = _numSockets;
-            int gid = _nodeId * numSockets + _socketId;
-            framework::PortParams pp = framework::PortEnvLoader::gem5UbioPort(gid);
-            _port = new framework::Port();
-            if (!_port->init(pp)) {
-                std::fprintf(stderr, "[UBAdapter] node=%d socket=%d Port init failed\n",
-                             _nodeId, _socketId);
-                delete _port; _port = nullptr;
+            int gid = _nodeId * _numSockets + _socketId;
+            framework::PortConfig config;
+            config.selfRole = "gem5";
+            config.peerRole = "ubio";
+            config.channelName = "coherence";
+            config.nodeId = _nodeId;
+            config.socketId = _socketId;
+            config.numNodes = _numNodes;
+            config.numSockets = _numSockets;
+            _port = framework::CreatePort(config);
+            if (!_port) {
+                warn("[UBAdapter] node=%d socket=%d Port init failed",
+                     _nodeId, _socketId);
             } else {
-                std::printf("[Port gem5_ubio] n=%d s=%d gid=%d rx=%s tx->%s\n",
-                            _nodeId, _socketId, gid,
-                            pp.localRxEndpoint.c_str(), pp.peerRxEndpoint.c_str());
-                std::printf("STEP5 Port enabled node=%d socket=%d gid=%d\n",
-                            _nodeId, _socketId, gid);
-                // Flush: this C++ stdio buffer is separate from Python's stdout;
-                // the launcher greps the log for STEP5 to detect Port binding, so
-                // it must reach the file immediately (not wait for buffer fill).
-                std::fflush(stdout);
+                inform("[Port gem5_ubio] n=%d s=%d gid=%d channel=coherence",
+                       _nodeId, _socketId, gid);
+                inform("STEP5 Port enabled node=%d socket=%d gid=%d",
+                       _nodeId, _socketId, gid);
                 // Multi-process split: when this gem5 node's simulation ends
                 // (process exit), notify ubio with a best-effort TERMINATE so
                 // the distributed clock treats this node as "done" (+inf) rather
                 // than a frozen peer. Otherwise a node that finishes early (e.g.
                 // an idle node) would cap min(safeTs) forever and freeze the
                 // still-running nodes. See Port::safeTs PEER_LOST handling.
-                framework::Port *portToClose = _port;
+                _portExitState = std::make_shared<PortExitState>();
+                _portExitState->port = _port;
+                auto exitState = _portExitState;
                 int nodeForLog = _nodeId;
-                registerExitCallback([portToClose, nodeForLog]() {
-                    std::fprintf(stderr,
-                        "[UBADAPTER-EXIT] node=%d sending TERMINATE to ubio\n",
-                        nodeForLog);
-                    portToClose->terminate();
+                registerExitCallback([exitState, nodeForLog]() {
+                    if (!exitState->port || exitState->terminated)
+                        return;
+                    inform("[UBADAPTER-EXIT] node=%d sending TERMINATE to ubio",
+                           nodeForLog);
+                    framework::TerminatePort(exitState->port);
+                    exitState->terminated = true;
                 });
 
                 // Multi-process split: register cross-node barrier callback
@@ -134,32 +191,17 @@ void
 UBAdapter::sendBarrierReached(uint32_t mask, uint32_t nodeId, uint32_t seq)
 {
     if (!_port) return;
-    framework::MemMessage *buf = _port->allocateSendBuffer(curTick());
-    if (!buf) {
-        std::fprintf(stderr,
-            "[UBADAPTER-BARRIER] node=%d sendBarrierReached FAILED (no tx buf) "
-            "mask=0x%x seq=%u\n", _nodeId, mask, seq);
-        return;
-    }
     // Barrier is carried as a PAYLOAD CoherenceMessage (BarrierReached); the
     // transport layer no longer has a dedicated BARRIER_REACHED type.
-    buf->hdr.type = static_cast<uint32_t>(framework::MemMessageType::PAYLOAD);
-    buf->hdr.req_id = mask;
-    buf->hdr.sourceId = nodeId;
-    buf->hdr.targetId = 0;
     CoherenceMessage bmsg;
     bmsg.h.type = CoherenceMessageType::BarrierReached;
     bmsg.h.srcNode = static_cast<uint16_t>(nodeId);
     bmsg.b.barrier.mask = mask;
     bmsg.b.barrier.seq = seq;   // TC90 fix: barrier generation
-    if (!buf->setPayload(bmsg)) {
-        delete buf;
-        std::fprintf(stderr,
-            "[UBADAPTER-BARRIER] node=%d sendBarrierReached setPayload failed "
-            "mask=0x%x seq=%u\n", _nodeId, mask, seq);
-        return;
-    }
-    bool ok = _port->send(buf);
+    bool ok = sendCoherenceMessage(_port, bmsg, curTick(), mask, nodeId);
+    if (!ok)
+        warn("[UBADAPTER-BARRIER] node=%d sendBarrierReached failed mask=0x%x seq=%u",
+             _nodeId, mask, seq);
     DPRINTF(RubyEP,
         "[DEBUG-UBADAPTER-BARRIER-SEND] node=%d mask=0x%x seq=%u ok=%d\n",
         _nodeId, mask, seq, ok);
@@ -179,17 +221,12 @@ UBAdapter::startup()
         // Startup diagnostic: confirm this socket-plane adapter is alive and
         // its Port is bound. Paired with STEP5 log from init() so the launcher
         // can verify every (node,socket) plane before starting ubio peers.
-        std::fprintf(stderr,
-            "[UBADAPTER-STARTUP] node=%d socket=%d port=%s armed=%d curTick=%lu\n",
-            _nodeId, _socketId, _port ? "bound" : "MISSING",
-            _eventArmed ? 1 : 0, curTick());
-        std::fflush(stdout);
-        std::fflush(stderr);
+        inform("[UBADAPTER-STARTUP] node=%d socket=%d port=%s armed=%d curTick=%lu",
+               _nodeId, _socketId, _port ? "bound" : "MISSING",
+               _eventArmed ? 1 : 0, curTick());
     } else if (!_port) {
-        std::fprintf(stderr,
-            "[UBADAPTER-STARTUP] node=%d socket=%d NO PORT — adapter will not poll for messages\n",
-            _nodeId, _socketId);
-        std::fflush(stderr);
+        warn("[UBADAPTER-STARTUP] node=%d socket=%d NO PORT — adapter will not poll for messages",
+             _nodeId, _socketId);
     }
 }
 
@@ -197,24 +234,14 @@ bool
 UBAdapter::transportSend(const CoherenceMessage &msg)
 {
     if (_port) {
-        framework::MemMessage *buf = _port->allocateSendBuffer(curTick());
-        if (!buf) {
-            warn("UBAdapter node=%d socket=%d: transportSend no tx buffer (reqId=%lu type=%s)",
-                 _nodeId, _socketId, msg.h.reqId, coherenceMsgTypeName(msg.h.type));
-            return false;
-        }
-
-        buf->hdr.type = static_cast<uint32_t>(framework::MemMessageType::PAYLOAD);
-        buf->hdr.req_id = msg.h.reqId;
-        if (!buf->setPayload(msg)) {
-            warn("UBAdapter node=%d socket=%d: transportSend payload encode failed (reqId=%lu)",
-                 _nodeId, _socketId, msg.h.reqId);
-            delete buf;
-            return false;
-        }
-
-        uint64_t sendTs = buf->hdr.timestamp;
-        if (!_port->send(buf)) {
+        uint64_t sendTs = 0;
+        if (!sendCoherenceMessage(_port, msg, curTick(), msg.h.reqId,
+                                  static_cast<uint32_t>(
+                                      _nodeId * _numSockets + _socketId),
+                                  static_cast<uint32_t>(
+                                      msg.h.dstNode * _numSockets +
+                                      msg.h.dstSocket),
+                                  &sendTs)) {
             warn("UBAdapter node=%d socket=%d: transportSend port send failed (reqId=%lu)",
                  _nodeId, _socketId, msg.h.reqId);
             return false;
@@ -222,12 +249,12 @@ UBAdapter::transportSend(const CoherenceMessage &msg)
 
         static int _tscount = 0;
         if (msg.h.type == CoherenceMessageType::ReadReq && ++_tscount <= 3)
-            std::fprintf(stderr, "[GEM5-SEND] node=%d type=ReadReq reqId=%lu gem5_tick=%lu buf_ts=%lu\n",
-                          _nodeId, msg.h.reqId, curTick(), sendTs);
+            inform("[GEM5-SEND] node=%d type=ReadReq reqId=%lu gem5_tick=%lu buf_ts=%lu",
+                   _nodeId, msg.h.reqId, curTick(), sendTs);
         if (TracePerfPolicy::get().shouldEmit("gem5")) {
-            std::fprintf(stderr, "[TRACE-PERF] %lu|%d|gem5|%lu|0x%lx|SEND|%s|dst=%d\n",
-                         sendTs, _nodeId, msg.h.reqId, msg.h.homeLinePa,
-                         coherenceMsgTypeName(msg.h.type), msg.h.dstNode);
+            inform("[TRACE-PERF] %lu|%d|gem5|%lu|0x%lx|SEND|%s|dst=%d",
+                   sendTs, _nodeId, msg.h.reqId, msg.h.homeLinePa,
+                   coherenceMsgTypeName(msg.h.type), msg.h.dstNode);
         }
         return true;
     }
@@ -257,25 +284,28 @@ UBAdapter::transportRecv(CoherenceMessageType expectedType, uint64_t expectedReq
     const uint64_t visible = std::numeric_limits<uint64_t>::max();
 
     for (int i = 0; i < kMaxPollIters; ++i) {
-        framework::MemMessage *m = _port->recv(visible);
-        if (!m) {
+        framework::ReceiveStatus status;
+        const framework::Message *m =
+            framework::ReceiveMessage(_port, visible, &status);
+        if (!m || status != framework::ReceiveStatus::Message) {
             continue;
         }
 
-        const auto msgType = static_cast<framework::MemMessageType>(m->hdr.type);
-        if (msgType == framework::MemMessageType::CONTROL_SYNC) {
+        const auto msgType = framework::GetMessageType(m);
+        if (msgType == framework::MessageType::ControlSync) {
             continue;
         }
-        if (msgType != framework::MemMessageType::PAYLOAD) {
-            warn("UBAdapter node=%d socket=%d: transportRecv unexpected MemMessage type=%u",
-                 _nodeId, _socketId, m->hdr.type);
+        if (msgType != framework::MessageType::Payload) {
+            warn("UBAdapter node=%d socket=%d: transportRecv unexpected Message type=%u",
+                 _nodeId, _socketId, static_cast<unsigned>(msgType));
             continue;
         }
 
-        const CoherenceMessage *coh = m->getPayload<CoherenceMessage>();
+        const CoherenceMessage *coh = coherencePayload(m);
         if (!coh) {
             warn("UBAdapter node=%d socket=%d: transportRecv bad payload size=%u",
-                 _nodeId, _socketId, m->payloadLen());
+                 _nodeId, _socketId,
+                 static_cast<unsigned>(framework::GetMessagePayloadSize(m)));
             continue;
         }
 
@@ -450,10 +480,8 @@ UBAdapter::sendWritebackReq(uint64_t homePa, int requesterNode,
         if (ckOff < 0x80000ULL && (off % 64 == 0)) {
             uint64_t w0;
             std::memcpy(&w0, dirtyData ? dirtyData : req.b.writebackReq.data, 8);
-            std::fprintf(stderr,
-                "[C4-WBREQ-SEND] node=%d pa=0x%lx off=0x%lx hasData=%d w0=0x%016lx\n",
-                _nodeId, homePa, off, dirtyData ? 1 : 0, w0);
-            std::fflush(stderr);
+            inform("[C4-WBREQ-SEND] node=%d pa=0x%lx off=0x%lx hasData=%d w0=0x%016lx",
+                   _nodeId, homePa, off, dirtyData ? 1 : 0, w0);
         }
     }
 
@@ -753,8 +781,8 @@ UBAdapter::sendClearReq(uint64_t linePa, int srcNode,
         PendingKey rkey{CoherenceMessageType::ClearResp, reqId};
         auto rit = _readyResponses.find(rkey);
         if (rit != _readyResponses.end()) {
-            std::fprintf(stderr, "[CLR-CACHE-HIT] node=%d reqId=%lu accepted=%d\n",
-                         _nodeId, reqId, rit->second.b.clearResp.accepted ? 1 : 0);
+            inform("[CLR-CACHE-HIT] node=%d reqId=%lu accepted=%d",
+                   _nodeId, reqId, rit->second.b.clearResp.accepted ? 1 : 0);
             bool a = rit->second.b.clearResp.accepted;
             _inflightClearReqs.erase(reqId);
             _clearRetryTick.erase(reqId);
@@ -770,8 +798,8 @@ UBAdapter::sendClearReq(uint64_t linePa, int srcNode,
             // can deduplicate it without allocating a new grant transaction.
             _inflightClearReqs.erase(reqId);
         }
-        std::fprintf(stderr, "[CLR-CACHE-MISS] node=%d reqId=%lu sending new ClearReq\n",
-                     _nodeId, reqId);
+        inform("[CLR-CACHE-MISS] node=%d reqId=%lu sending new ClearReq",
+               _nodeId, reqId);
     }
 
     CoherenceMessage req;
@@ -797,8 +825,7 @@ UBAdapter::sendClearReq(uint64_t linePa, int srcNode,
         return -1;
     }
 
-    std::fprintf(stderr, "[CLR-TX] n=%d reqId=%lu curT=%lu\n",
-                 _nodeId, reqId, curTick());
+    inform("[CLR-TX] n=%d reqId=%lu curT=%lu", _nodeId, reqId, curTick());
 
     // Port async path: schedule check, return pending
     if (_port) {
@@ -1034,16 +1061,16 @@ UBAdapter::sendQueryLineMetaReq(uint64_t homePa, int homeNode, int homeSocket,
             outEpoch = it->second.b.queryLineMetaResp.epoch;
             outOwnerNode = it->second.b.queryLineMetaResp.ownerNode;
             _readyResponses.erase(it);   // consume
-            std::fprintf(stderr,
-                "[QLM-CACHED-REQID] node=%d reqId=%lu pa=0x%lx found=%d epoch=%lu owner=%d\n",
-                _nodeId, cachedReqId, homePa, outFound, outEpoch, outOwnerNode);
+            inform("[QLM-CACHED-REQID] node=%d reqId=%lu pa=0x%lx found=%d epoch=%lu owner=%d",
+                   _nodeId, cachedReqId, homePa, outFound, outEpoch,
+                   outOwnerNode);
             return outFound ? 0 : -1;
         }
         // Response not yet arrived — the original request is still in-flight.
         // Do NOT send a duplicate; the caller will poll again.
-        std::fprintf(stderr,
-            "[QLM-WAIT-REQID] node=%d reqId=%lu pa=0x%lx — not yet cached\n",
-            _nodeId, cachedReqId, homePa);
+        DPRINTF(RubyEP,
+                "[QLM-WAIT-REQID] node=%d reqId=%lu pa=0x%lx — not yet cached\n",
+                _nodeId, cachedReqId, homePa);
         return -2;
     }
 
@@ -1074,9 +1101,8 @@ UBAdapter::sendQueryLineMetaReq(uint64_t homePa, int homeNode, int homeSocket,
     // Port async path: schedule check, return pending
     if (_port) {
         scheduleResponseCheck();
-        std::fprintf(stderr,
-            "[QLM-SENT] node=%d pa=0x%lx reqId=%lu\n",
-            _nodeId, homePa, reqId);
+        inform("[QLM-SENT] node=%d pa=0x%lx reqId=%lu",
+               _nodeId, homePa, reqId);
         return -2;
     }
 
@@ -1114,9 +1140,9 @@ UBAdapter::tryGetQueryLineMetaResp(uint64_t reqId,
         outOwnerNode = it->second.b.queryLineMetaResp.ownerNode;
         // Consume the response so it's not reused for the wrong PA
         _readyResponses.erase(it);
-        std::fprintf(stderr,
-            "[QLM-FOUND] node=%d reqId=%lu pa=0x%lx found=%d epoch=%lu owner=%d\n",
-            _nodeId, reqId, outFound ? 0UL : 0UL, outFound, outEpoch, outOwnerNode);
+        inform("[QLM-FOUND] node=%d reqId=%lu pa=0x%lx found=%d epoch=%lu owner=%d",
+               _nodeId, reqId, outFound ? 0UL : 0UL, outFound, outEpoch,
+               outOwnerNode);
         return true;
     }
     return false;
@@ -1182,19 +1208,7 @@ sendMetaRNFLineErrorResponse(framework::Port *port,
         resp.b.metaRNFLineWriteResp.bucketOffset = bucketOffset;
     }
 
-    framework::MemMessage *buf = nullptr;
-        if (port)
-        buf = port->allocateSendBuffer(curTick());
-    if (buf) {
-        buf->hdr.type = static_cast<uint32_t>(framework::MemMessageType::PAYLOAD);
-        buf->hdr.req_id = reqId;
-        buf->hdr.targetId = 0;
-        if (!buf->setPayload(resp)) {
-            delete buf;
-        } else {
-            port->send(buf); // port deletes buf on both success/failure
-        }
-    } else {
+    if (!sendCoherenceMessage(port, resp, curTick(), reqId)) {
         // Port unavailable — log DEBUG-only, not stderr.
         DPRINTF(RubyEP,
                 "[DEBUG-PHASE2] node=%d: cannot send %s for reqId=%lu bucketOffset=0x%lx (no port/buffer)\n",
@@ -1212,16 +1226,10 @@ UBAdapter::recvFromRouter(const CoherenceMessage &msg)
 
     switch (msg.h.type) {
         case CoherenceMessageType::ReadResp:
-            std::fprintf(stderr,
-                         "[ADAPTER-GOT-RESP] node=%d type=ReadResp pa=0x%lx src=%d grant=%d epoch=%lu reqId=%lu\n",
-                         _nodeId, msg.h.homeLinePa, msg.h.srcNode,
-                         static_cast<int>(msg.b.readResp.grantType),
-                         msg.h.epoch, msg.h.reqId);
-            printf("[ADAPTER-GOT-RESP] node=%d type=ReadResp pa=0x%lx src=%d "
-                   "grant=%d epoch=%lu reqId=%lu\n",
+            inform("[ADAPTER-GOT-RESP] node=%d type=ReadResp pa=0x%lx src=%d grant=%d epoch=%lu reqId=%lu",
                    _nodeId, msg.h.homeLinePa, msg.h.srcNode,
-                   static_cast<int>(msg.b.readResp.grantType),
-                   msg.h.epoch, msg.h.reqId);
+                   static_cast<int>(msg.b.readResp.grantType), msg.h.epoch,
+                   msg.h.reqId);
             _lastResponse = msg;
             _lastResponseValid = true;
             break;
@@ -1229,13 +1237,17 @@ UBAdapter::recvFromRouter(const CoherenceMessage &msg)
         case CoherenceMessageType::EvictResp:
         case CoherenceMessageType::UpgradeResp:
         case CoherenceMessageType::UpgradeDoneResp:
-        case CoherenceMessageType::ClearResp:
-            std::fprintf(stderr,
-                         "[CLEAR-RESP] node=%d via=recvFromRouter pa=0x%lx src=%d accepted=%d epoch=%lu reqId=%lu\n",
-                         _nodeId, msg.h.homeLinePa, msg.h.srcNode,
-                         msg.b.clearResp.accepted ? 1 : 0,
-                         msg.h.epoch, msg.h.reqId);
-            [[fallthrough]];
+        case CoherenceMessageType::ClearResp: {
+            inform("[CLEAR-RESP] node=%d via=recvFromRouter pa=0x%lx src=%d accepted=%d epoch=%lu reqId=%lu",
+                   _nodeId, msg.h.homeLinePa, msg.h.srcNode,
+                   msg.b.clearResp.accepted ? 1 : 0, msg.h.epoch,
+                   msg.h.reqId);
+            _lastResponse = msg;
+            _lastResponseValid = true;
+            PendingKey key{msg.h.type, msg.h.reqId};
+            _readyResponses[key] = msg;
+            break;
+        }
         case CoherenceMessageType::QueryLineMetaResp:
             // Store for caller AND in _readyResponses keyed by reqId (Phase 2 async)
             _lastResponse = msg;
@@ -1334,17 +1346,9 @@ UBAdapter::recvFromRouter(const CoherenceMessage &msg)
                         resp.h.homeLinePa = pageId;
                         resp.b.metaRNF.pagePa = pageId;
                         memcpy(resp.b.metaRNF.data, state->buf, 256);
-                        framework::MemMessage *buf = tport->allocateSendBuffer(curTick());
-                        if (buf) {
-                            buf->hdr.type = static_cast<uint32_t>(framework::MemMessageType::PAYLOAD);
-                            buf->hdr.req_id = reqId;
-                            buf->hdr.targetId = 0;
-                            if (!buf->setPayload(resp)) {
-                                delete buf;
-                            } else {
-                                tport->send(buf); // port deletes buf on both success/failure
-                            }
-                        }
+                        if (!sendCoherenceMessage(tport, resp, curTick(), reqId))
+                            warn("UBAdapter: failed to send MetaRNFReadResp reqId=%lu",
+                                 reqId);
                         delete state;
                     }
                 });
@@ -1365,10 +1369,8 @@ UBAdapter::recvFromRouter(const CoherenceMessage &msg)
             }
             // Phase D2: track completion of all 4 sub-writes, then send
             // MetaRNFWriteResp back to UBIO with aggregate success/failure.
-            std::fprintf(stderr,
-                "[D2-MRNFRECV] node=%d pageId=0x%lx pagePa=0x%lx\n",
-                _nodeId, pageId, pagePa);
-            std::fflush(stderr);
+            inform("[D2-MRNFRECV] node=%d pageId=0x%lx pagePa=0x%lx",
+                   _nodeId, pageId, pagePa);
             struct WriteState {
                 int pending = 4;
                 bool anyFailed = false;
@@ -1390,11 +1392,9 @@ UBAdapter::recvFromRouter(const CoherenceMessage &msg)
                         if (!ok) ws->anyFailed = true;
                         if (--ws->pending > 0) return;
                         // All 4 sub-writes done — send ack to UBIO
-                        std::fprintf(stderr,
-                            "[D2-WRITE-CB] node=%d pagePa=0x%lx anyFailed=%d port=%p\n",
-                            ws->nodeId, ws->pagePa, ws->anyFailed ? 1 : 0,
-                            (void*)ws->port);
-                        std::fflush(stderr);
+                        inform("[D2-WRITE-CB] node=%d pagePa=0x%lx anyFailed=%d port=%p",
+                               ws->nodeId, ws->pagePa,
+                               ws->anyFailed ? 1 : 0, (void*)ws->port);
                         CoherenceMessage resp;
                         resp.h.type = CoherenceMessageType::MetaRNFWriteResp;
                         resp.h.srcNode = ws->nodeId;
@@ -1407,19 +1407,10 @@ UBAdapter::recvFromRouter(const CoherenceMessage &msg)
                             resp.h.flags = 0;
                         else
                             resp.h.flags = 1;  // D2: bit 0 = durable
-                        framework::MemMessage *buf = ws->port
-                            ? ws->port->allocateSendBuffer(curTick()) : nullptr;
-                        if (buf) {
-                            buf->hdr.type = static_cast<uint32_t>(
-                                framework::MemMessageType::PAYLOAD);
-                            buf->hdr.req_id = ws->reqId;
-                            buf->hdr.targetId = 0;
-                            if (!buf->setPayload(resp)) {
-                                delete buf;
-                            } else {
-                                ws->port->send(buf); // port deletes buf on both success/failure
-                            }
-                        }
+                        if (!sendCoherenceMessage(ws->port, resp, curTick(),
+                                                  ws->reqId))
+                            warn("UBAdapter: failed to send MetaRNFWriteResp reqId=%lu",
+                                 ws->reqId);
                         delete ws;
                     });
             }
@@ -1467,19 +1458,9 @@ UBAdapter::recvFromRouter(const CoherenceMessage &msg)
                     resp.b.metaRNFLineReadResp.bucketOffset = bucketOffset;
                     if (st == MetaRNFLineStatus::Ok)
                         memcpy(resp.b.metaRNFLineReadResp.data, data.data(), 64);
-                    framework::MemMessage *buf =
-                        tport ? tport->allocateSendBuffer(curTick()) : nullptr;
-                    if (buf) {
-                        buf->hdr.type = static_cast<uint32_t>(
-                            framework::MemMessageType::PAYLOAD);
-                        buf->hdr.req_id = reqId;
-                        buf->hdr.targetId = 0;
-                        if (!buf->setPayload(resp)) {
-                            delete buf;
-                        } else {
-                            tport->send(buf); // port deletes buf on both success/failure
-                        }
-                    }
+                    if (!sendCoherenceMessage(tport, resp, curTick(), reqId))
+                        warn("UBAdapter: failed to send MetaRNFLineReadResp reqId=%lu",
+                             reqId);
                 });
             break;
         }
@@ -1522,19 +1503,9 @@ UBAdapter::recvFromRouter(const CoherenceMessage &msg)
                     resp.h.reqId = reqId;
                     resp.b.metaRNFLineWriteResp.status = st;
                     resp.b.metaRNFLineWriteResp.bucketOffset = bucketOffset;
-                    framework::MemMessage *buf =
-                        tport ? tport->allocateSendBuffer(curTick()) : nullptr;
-                    if (buf) {
-                        buf->hdr.type = static_cast<uint32_t>(
-                            framework::MemMessageType::PAYLOAD);
-                        buf->hdr.req_id = reqId;
-                        buf->hdr.targetId = 0;
-                        if (!buf->setPayload(resp)) {
-                            delete buf;
-                        } else {
-                            tport->send(buf); // port deletes buf on both success/failure
-                        }
-                    }
+                    if (!sendCoherenceMessage(tport, resp, curTick(), reqId))
+                        warn("UBAdapter: failed to send MetaRNFLineWriteResp reqId=%lu",
+                             reqId);
                 });
             break;
         }
@@ -1554,66 +1525,75 @@ UBAdapter::wakeup()
     if (!_port) return;
 
     // 1. Emit sync (heartbeat) to let peer advance its boundary
-    _port->emitSync(curTick());
+    framework::EmitSync(_port, curTick());
 
     // 2. Drain all ready messages. CONTROL_SYNC now arrives as an ordinary
     //    kMessage and is skipped by hdr.type below (2.1.2 alignment).
     framework::ReceiveStatus st;
-    framework::MemMessage *m = _port->recv(curTick(), &st);
-    while (m && st == framework::ReceiveStatus::kMessage) {
-        if (m->hdr.type == static_cast<uint32_t>(framework::MemMessageType::TERMINATE)) {
-            m = _port->recv(curTick(), &st);
+    const framework::Message *m =
+        framework::ReceiveMessage(_port, curTick(), &st);
+    while (m && st == framework::ReceiveStatus::Message) {
+        if (framework::GetMessageType(m) == framework::MessageType::Terminate) {
+            m = framework::ReceiveMessage(_port, curTick(), &st);
             continue;
         }
-        if (m->hdr.type == static_cast<uint32_t>(framework::MemMessageType::CONTROL_SYNC)) {
-            m = _port->recv(curTick(), &st);
+        if (framework::GetMessageType(m) ==
+            framework::MessageType::ControlSync) {
+            m = framework::ReceiveMessage(_port, curTick(), &st);
             continue;
         }
-        if (m->hdr.type != static_cast<uint32_t>(framework::MemMessageType::PAYLOAD)) {
+        if (framework::GetMessageType(m) != framework::MessageType::Payload) {
             static int noncoh = 0;
             if (++noncoh <= 5)
-                std::fprintf(stderr, "[WAKEUP-NONCOH] node=%d type=%u sz=%u\n",
-                             _nodeId, m->hdr.type, m->hdr.size);
-            m = _port->recv(curTick(), &st);
+                DPRINTF(RubyEP,
+                        "[WAKEUP-NONCOH] node=%d type=%u payload_sz=%zu\n",
+                        _nodeId,
+                        static_cast<unsigned>(framework::GetMessageType(m)),
+                        framework::GetMessagePayloadSize(m));
+            m = framework::ReceiveMessage(_port, curTick(), &st);
             continue;
         }
         // Barrier control now travels as a PAYLOAD CoherenceMessage. Peek its
         // coherence type: BarrierRelease releases the local sync_wait mask;
         // BarrierReached is handled by ubio/barrier_manager, not gem5, so skip.
-        if (const CoherenceMessage *bc = m->getPayload<CoherenceMessage>()) {
+        if (const CoherenceMessage *bc = coherencePayload(m)) {
             if (bc->h.type == CoherenceMessageType::BarrierRelease) {
                 uint32_t mask = bc->b.barrier.mask;
-                std::fprintf(stderr,
-                    "[UBADAPTER-BARRIER-RELEASE] node=%d mask=0x%x seq=%u\n",
-                    _nodeId, mask, bc->b.barrier.seq);
+                inform("[UBADAPTER-BARRIER-RELEASE] node=%d mask=0x%x seq=%u",
+                       _nodeId, mask, bc->b.barrier.seq);
                 if (!System::systemList.empty())
                     System::systemList[0]->syncWait.releaseBarrier(
                         mask, bc->b.barrier.seq);
-                m = _port->recv(curTick(), &st);
+                m = framework::ReceiveMessage(_port, curTick(), &st);
                 continue;
             }
             if (bc->h.type == CoherenceMessageType::BarrierReached) {
-                m = _port->recv(curTick(), &st);
+                m = framework::ReceiveMessage(_port, curTick(), &st);
                 continue;
             }
             if (TracePerfPolicy::get().shouldEmit("gem5")) {
-                std::fprintf(stderr, "[TRACE-PERF] %lu|%d|gem5|%lu|0x%lx|RECV|%s|src=%d\n",
-                             m->hdr.timestamp, _nodeId, bc->h.reqId, bc->h.homeLinePa,
-                             coherenceMsgTypeName(bc->h.type), bc->h.srcNode);
+                inform("[TRACE-PERF] %lu|%d|gem5|%lu|0x%lx|RECV|%s|src=%d",
+                       framework::GetMessageTimestamp(m), _nodeId, bc->h.reqId,
+                       bc->h.homeLinePa, coherenceMsgTypeName(bc->h.type),
+                       bc->h.srcNode);
             }
         }
         // PortAsync: dispatch to handleResponse (pendingByReqId map)
         static int cohcnt = 0;
         if (++cohcnt <= 5)
-            std::fprintf(stderr, "[WAKEUP-COH] node=%d type=%u sz=%u req_id=%lu\n",
-                         _nodeId, m->hdr.type, m->hdr.size, m->hdr.req_id);
+            DPRINTF(RubyEP,
+                    "[WAKEUP-COH] node=%d type=%u payload_sz=%zu req_id=%lu\n",
+                    _nodeId,
+                    static_cast<unsigned>(framework::GetMessageType(m)),
+                    framework::GetMessagePayloadSize(m),
+                    framework::GetMessageRequestId(m));
         if (_port) {
             handleResponse(m);
         } else {
-            const CoherenceMessage *coh = m->getPayload<CoherenceMessage>();
+            const CoherenceMessage *coh = coherencePayload(m);
             if (coh) recvFromRouter(*coh);
         }
-        m = _port->recv(curTick(), &st);
+        m = framework::ReceiveMessage(_port, curTick(), &st);
     }
 
     // 3. Drain deferred async control messages before checking responses
@@ -1645,7 +1625,7 @@ UBAdapter::wakeup()
     //      wait terminates promptly.
     ++_responseCheckCount;
     const uint64_t curT = curTick();
-    uint64_t safeT = _port->safeTs(curT);
+    uint64_t safeT = framework::SafeTimestamp(_port, curT);
     bool stalled = !(safeT > curT);
 
     if (stalled) {
@@ -1659,18 +1639,19 @@ UBAdapter::wakeup()
             // Drain whatever the peer has sent so receiveTimestamp() can rise
             // and any in-flight coherence responses keep flowing.
             framework::ReceiveStatus wst;
-            framework::MemMessage *wm = _port->recv(curT, &wst);
+            const framework::Message *wm =
+                framework::ReceiveMessage(_port, curT, &wst);
             // CONTROL_SYNC arrives as kMessage and is ignored (no branch below).
-            while (wm && wst == framework::ReceiveStatus::kMessage) {
-                if (wm->hdr.type ==
-                    static_cast<uint32_t>(framework::MemMessageType::TERMINATE)) {
-                    wm = _port->recv(curT, &wst);
+            while (wm && wst == framework::ReceiveStatus::Message) {
+                if (framework::GetMessageType(wm) ==
+                    framework::MessageType::Terminate) {
+                    wm = framework::ReceiveMessage(_port, curT, &wst);
                     continue;
                 }
-                if (wm->hdr.type ==
-                    static_cast<uint32_t>(framework::MemMessageType::PAYLOAD)) {
+                if (framework::GetMessageType(wm) ==
+                    framework::MessageType::Payload) {
                     // Peek for barrier control (now a PAYLOAD CoherenceMessage).
-                    const CoherenceMessage *bc = wm->getPayload<CoherenceMessage>();
+                    const CoherenceMessage *bc = coherencePayload(wm);
                     if (bc && bc->h.type == CoherenceMessageType::BarrierRelease) {
                         DPRINTF(RubyEP,
                             "[DEBUG-UBADAPTER-BARRIER-RELEASE] node=%d mask=0x%x "
@@ -1683,9 +1664,9 @@ UBAdapter::wakeup()
                         handleResponse(wm);
                     }
                 }
-                wm = _port->recv(curT, &wst);
+                wm = framework::ReceiveMessage(_port, curT, &wst);
             }
-            safeT = _port->safeTs(curT);
+            safeT = framework::SafeTimestamp(_port, curT);
             ++waitIters;
         }
         drainDeferredControls();
@@ -1702,7 +1683,7 @@ UBAdapter::wakeup()
     // curT when stalled, so pendingT > curT && pendingT < curT was always
     // false, making this block dead code).
     if (stalled) {
-        uint64_t pendingT = _port->receiveTimestamp();
+        uint64_t pendingT = framework::ReceiveTimestamp(_port);
         if (pendingT > curT &&
             pendingT != ~static_cast<uint64_t>(0))
             nextT = pendingT;
@@ -1714,7 +1695,7 @@ UBAdapter::wakeup()
     _eventArmed = true;
 
     if (_responseCheckCount % 2000 == 0) {
-        uint64_t rxt = _port->receiveTimestamp();
+        uint64_t rxt = framework::ReceiveTimestamp(_port);
         DPRINTF(RubyEP,
                 "[DEBUG-CLK-SYNC] node=%d curT=%lu rxt=%lu safeT=%lu %s cnt=%lu\n",
                 _nodeId, curT, rxt, safeT,
@@ -1742,30 +1723,30 @@ UBAdapter::checkResponseCallbacks()
         }
     }
     if (delivered && _onResponseWired) {
-        std::fprintf(stderr, "[RSP-WIRED] node=%d firing wakeup\n", _nodeId);
+        DPRINTF(RubyEP, "[RSP-WIRED] node=%d firing wakeup\n", _nodeId);
     }
 }
 
 void
-UBAdapter::handleResponse(framework::MemMessage *m)
+UBAdapter::handleResponse(const framework::Message *m)
 {
     if (!_port) return;
 
-    const CoherenceMessage *coh = m->getPayload<CoherenceMessage>();
+    const CoherenceMessage *coh = coherencePayload(m);
     DPRINTF(RubyEP,
-            "[DEBUG-UBADAPTER-RECV] node=%d msg_type=%u msg_sz=%u payload=%s coh_type=%d reqId=%lu\n",
-            _nodeId, m->hdr.type, m->hdr.size,
+            "[DEBUG-UBADAPTER-RECV] node=%d msg_type=%u payload_sz=%zu payload=%s coh_type=%d reqId=%lu\n",
+            _nodeId, static_cast<unsigned>(framework::GetMessageType(m)),
+            framework::GetMessagePayloadSize(m),
             coh ? "OK" : "NULL",
             coh ? static_cast<int>(coh->h.type) : -1,
             coh ? coh->h.reqId : 0UL);
     if (!coh) return;
 
     if (coh->h.type == CoherenceMessageType::ClearResp) {
-        std::fprintf(stderr,
-                     "[CLEAR-RESP] node=%d via=handleResponse pa=0x%lx src=%d accepted=%d epoch=%lu reqId=%lu\n",
-                     _nodeId, coh->h.homeLinePa, coh->h.srcNode,
-                     coh->b.clearResp.accepted ? 1 : 0,
-                     coh->h.epoch, coh->h.reqId);
+        inform("[CLEAR-RESP] node=%d via=handleResponse pa=0x%lx src=%d accepted=%d epoch=%lu reqId=%lu",
+               _nodeId, coh->h.homeLinePa, coh->h.srcNode,
+               coh->b.clearResp.accepted ? 1 : 0, coh->h.epoch,
+               coh->h.reqId);
     }
 
     // Async control messages: enqueue FIFO, process later via drainDeferredControls
@@ -1773,11 +1754,10 @@ UBAdapter::handleResponse(framework::MemMessage *m)
       case CoherenceMessageType::InvalidateReq:
       case CoherenceMessageType::RecallReq:
       case CoherenceMessageType::UpgradeAckNotify:
-        std::fprintf(stderr,
-                     "[ASYNC-CTRL-ENQ] node=%d type=%s reqId=%lu pa=0x%lx src=%d dst=%d curT=%lu depth=%zu\n",
-                     _nodeId, coherenceMsgTypeName(coh->h.type), coh->h.reqId,
-                     coh->h.homeLinePa, coh->h.srcNode, coh->h.dstNode,
-                     curTick(), _deferredControls.size() + 1);
+        inform("[ASYNC-CTRL-ENQ] node=%d type=%s reqId=%lu pa=0x%lx src=%d dst=%d curT=%lu depth=%zu",
+               _nodeId, coherenceMsgTypeName(coh->h.type), coh->h.reqId,
+               coh->h.homeLinePa, coh->h.srcNode, coh->h.dstNode,
+               curTick(), _deferredControls.size() + 1);
         _deferredControls.push_back(*coh);
         return;
       default:
@@ -1804,9 +1784,9 @@ UBAdapter::handleResponse(framework::MemMessage *m)
     // idling for the 20k-cycle fallback backoff.
     if (coh->h.type == CoherenceMessageType::RecallResp) {
         if (_onResponseWired) {
-            std::fprintf(stderr,
-                         "[RSP-WIRED] node=%d socket=%d firing recall-done wakeup reqId=%lu\n",
-                         _nodeId, _socketId, coh->h.reqId);
+            DPRINTF(RubyEP,
+                    "[RSP-WIRED] node=%d socket=%d firing recall-done wakeup reqId=%lu\n",
+                    _nodeId, _socketId, coh->h.reqId);
             _onResponseWired();
         }
         return;
@@ -1843,8 +1823,10 @@ UBAdapter::handleResponse(framework::MemMessage *m)
                               coh->h.type == CoherenceMessageType::WritebackResp ||
                               coh->h.type == CoherenceMessageType::EvictResp ||
                               coh->h.type == CoherenceMessageType::QueryLineMetaResp)) {
-        std::fprintf(stderr, "[RSP-WIRED] node=%d socket=%d firing immediate wakeup for type=%d reqId=%lu\n",
-                     _nodeId, _socketId, static_cast<int>(coh->h.type), coh->h.reqId);
+        DPRINTF(RubyEP,
+                "[RSP-WIRED] node=%d socket=%d firing immediate wakeup for type=%d reqId=%lu\n",
+                _nodeId, _socketId, static_cast<int>(coh->h.type),
+                coh->h.reqId);
         _onResponseWired();
     }
 
@@ -1904,10 +1886,9 @@ UBAdapter::drainDeferredControls()
     while (!_deferredControls.empty()) {
         CoherenceMessage msg = _deferredControls.front();
         _deferredControls.pop_front();
-        std::fprintf(stderr,
-                     "[ASYNC-CTRL-DRAIN] node=%d type=%s reqId=%lu pa=0x%lx curT=%lu remaining=%zu\n",
-                     _nodeId, coherenceMsgTypeName(msg.h.type), msg.h.reqId,
-                     msg.h.homeLinePa, curTick(), _deferredControls.size());
+        inform("[ASYNC-CTRL-DRAIN] node=%d type=%s reqId=%lu pa=0x%lx curT=%lu remaining=%zu",
+               _nodeId, coherenceMsgTypeName(msg.h.type), msg.h.reqId,
+               msg.h.homeLinePa, curTick(), _deferredControls.size());
         recvFromRouter(msg);
     }
     _drainingDeferredControls = false;
