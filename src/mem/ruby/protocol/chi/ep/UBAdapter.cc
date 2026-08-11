@@ -50,7 +50,6 @@ sendCoherenceMessage(framework::Port *port, const CoherenceMessage &coherence,
     if (!message)
         return false;
 
-    framework::SetMessageType(message, framework::MessageType::Payload);
     framework::SetMessageRequestId(message, requestId);
     if (sourceId != std::numeric_limits<uint32_t>::max())
         framework::SetMessageSourceId(message, sourceId);
@@ -63,13 +62,6 @@ sendCoherenceMessage(framework::Port *port, const CoherenceMessage &coherence,
 }
 
 } // anonymous namespace
-
-// Phase 1: SimObject param → static local (set by UBAdapter::init).
-static uint64_t s_wait_cap = 0;
-
-static uint64_t ub_wait_cap() {
-    return s_wait_cap;
-}
 
 UBAdapter::UBAdapter(const Params &p)
     : SimObject(p),
@@ -108,7 +100,6 @@ UBAdapter::init()
 
     // Phase 1: Store SimObject param into file-local static.
     // Param always takes effect (no env fallback).
-    s_wait_cap = params().wait_cap;
 
     // Create Port directly (guarantees all nodes get one regardless of init order).
     // _localNode selects which node this process owns (-1 = all nodes bind, legacy
@@ -1525,7 +1516,15 @@ UBAdapter::wakeup()
     if (!_port) return;
 
     // 1. Emit sync (heartbeat) to let peer advance its boundary
-    framework::EmitSync(_port, curTick());
+    if (!framework::EmitSync(_port, curTick())) {
+        std::this_thread::yield();
+        if (_responseCheckEvent.scheduled())
+            reschedule(_responseCheckEvent, curTick());
+        else
+            schedule(_responseCheckEvent, curTick());
+        _eventArmed = true;
+        return;
+    }
 
     // 2. Drain all ready messages. CONTROL_SYNC now arrives as an ordinary
     //    kMessage and is skipped by hdr.type below (2.1.2 alignment).
@@ -1629,65 +1628,44 @@ UBAdapter::wakeup()
     bool stalled = !(safeT > curT);
 
     if (stalled) {
-        uint64_t waitIters = 0;
-        // Safety net only: in normal operation the peer lifts safeT within a
-        // few microseconds. If something is genuinely wedged, fall back to a
-        // same-tick re-arm so the event queue can run other nodes' events.
-        const uint64_t kWaitCap = ub_wait_cap();
-        while (safeT <= curT && waitIters < kWaitCap) {
-            std::this_thread::yield();
-            // Drain whatever the peer has sent so receiveTimestamp() can rise
-            // and any in-flight coherence responses keep flowing.
-            framework::ReceiveStatus wst;
-            const framework::Message *wm =
-                framework::ReceiveMessage(_port, curT, &wst);
-            // CONTROL_SYNC arrives as kMessage and is ignored (no branch below).
-            while (wm && wst == framework::ReceiveStatus::Message) {
-                if (framework::GetMessageType(wm) ==
-                    framework::MessageType::Terminate) {
-                    wm = framework::ReceiveMessage(_port, curT, &wst);
-                    continue;
-                }
-                if (framework::GetMessageType(wm) ==
-                    framework::MessageType::Payload) {
-                    // Peek for barrier control (now a PAYLOAD CoherenceMessage).
-                    const CoherenceMessage *bc = coherencePayload(wm);
-                    if (bc && bc->h.type == CoherenceMessageType::BarrierRelease) {
-                        DPRINTF(RubyEP,
-                            "[DEBUG-UBADAPTER-BARRIER-RELEASE] node=%d mask=0x%x "
-                            "seq=%u (busy-wait)\n",
-                            _nodeId, bc->b.barrier.mask, bc->b.barrier.seq);
-                        if (!System::systemList.empty())
-                            System::systemList[0]->syncWait.releaseBarrier(
-                                bc->b.barrier.mask, bc->b.barrier.seq);
-                    } else {
-                        handleResponse(wm);
-                    }
-                }
+        // One poll per callback preserves docs/all.cpp's poll-safeTs-yield
+        // behavior without monopolizing gem5's single event thread. This is
+        // required when one process owns multiple UBAdapter ports.
+        framework::ReceiveStatus wst;
+        const framework::Message *wm =
+            framework::ReceiveMessage(_port, curT, &wst);
+        while (wm && wst == framework::ReceiveStatus::Message) {
+            if (framework::GetMessageType(wm) ==
+                framework::MessageType::Terminate) {
                 wm = framework::ReceiveMessage(_port, curT, &wst);
+                continue;
             }
-            safeT = framework::SafeTimestamp(_port, curT);
-            ++waitIters;
+            if (framework::GetMessageType(wm) ==
+                framework::MessageType::Payload) {
+                const CoherenceMessage *bc = coherencePayload(wm);
+                if (bc && bc->h.type == CoherenceMessageType::BarrierRelease) {
+                    DPRINTF(RubyEP,
+                        "[DEBUG-UBADAPTER-BARRIER-RELEASE] node=%d mask=0x%x "
+                        "seq=%u (stalled poll)\n",
+                        _nodeId, bc->b.barrier.mask, bc->b.barrier.seq);
+                    if (!System::systemList.empty())
+                        System::systemList[0]->syncWait.releaseBarrier(
+                            bc->b.barrier.mask, bc->b.barrier.seq);
+                } else {
+                    handleResponse(wm);
+                }
+            }
+            wm = framework::ReceiveMessage(_port, curT, &wst);
         }
+        safeT = framework::SafeTimestamp(_port, curT);
+        if (safeT <= curT)
+            std::this_thread::yield();
         drainDeferredControls();
         checkResponseCallbacks();
         stalled = !(safeT > curT);
     }
 
-    uint64_t nextT = stalled ? curT : safeT;
-    // If stalled but there is a pending message (timestamp > curT), advance
-    // to the pending timestamp so the message can be delivered next wakeup.
-    // This is critical for BARRIER_RELEASE from ubio: without it the release
-    // stays in Port recv's _pending queue forever and the barrier never fires.
-    // TC90 fix: removed the impossible `pendingT < nextT` condition (nextT ==
-    // curT when stalled, so pendingT > curT && pendingT < curT was always
-    // false, making this block dead code).
-    if (stalled) {
-        uint64_t pendingT = framework::ReceiveTimestamp(_port);
-        if (pendingT > curT &&
-            pendingT != ~static_cast<uint64_t>(0))
-            nextT = pendingT;
-    }
+    const uint64_t nextT = stalled ? curT : safeT;
     if (_responseCheckEvent.scheduled())
         reschedule(_responseCheckEvent, nextT);
     else
@@ -1695,10 +1673,9 @@ UBAdapter::wakeup()
     _eventArmed = true;
 
     if (_responseCheckCount % 2000 == 0) {
-        uint64_t rxt = framework::ReceiveTimestamp(_port);
         DPRINTF(RubyEP,
-                "[DEBUG-CLK-SYNC] node=%d curT=%lu rxt=%lu safeT=%lu %s cnt=%lu\n",
-                _nodeId, curT, rxt, safeT,
+                "[DEBUG-CLK-SYNC] node=%d curT=%lu safeT=%lu %s cnt=%lu\n",
+                _nodeId, curT, safeT,
                 stalled ? "WAIT" : "advance",
                 (unsigned long)_responseCheckCount);
     }
