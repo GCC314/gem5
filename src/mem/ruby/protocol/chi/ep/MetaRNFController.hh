@@ -146,8 +146,31 @@ class MetaRNFController : public EPController
 
     bool sendReadOnce(uint64_t pa);
     bool sendWriteUnique(uint64_t pa);
-    bool sendWriteData(uint64_t pa, MachineID dst, uint64_t dbid);
-    bool sendCompAck(uint64_t pa, MachineID dst);
+    void sendWriteData(uint64_t pa, MachineID dst, uint64_t dbid,
+                       std::function<void()> onSent);
+    void sendCompAck(uint64_t pa, MachineID dst,
+                     std::function<void()> onSent);
+    struct PendingResponseSend {
+        CHIResponseMsgPtr msg;
+        std::function<void()> onSent;
+    };
+    struct PendingRequestSend {
+        CHIRequestMsgPtr msg;
+        uint64_t pa;
+    };
+    struct PendingDataSend {
+        CHIDataMsgPtr msg;
+        std::function<void()> onSent;
+    };
+    std::deque<PendingRequestSend> _pendingRequestSends;
+    std::deque<PendingResponseSend> _pendingResponseSends;
+    std::deque<PendingDataSend> _pendingDataSends;
+    bool sendRequestReliable(CHIRequestMsgPtr msg, uint64_t pa);
+    void sendResponseReliable(CHIResponseMsgPtr msg,
+                               std::function<void()> onSent);
+    void sendDataReliable(CHIDataMsgPtr msg,
+                          std::function<void()> onSent = nullptr);
+    void processPendingOutputs();
     bool inMetadataRange(uint64_t pa) const;
 
     // Legacy completion (unchanged)

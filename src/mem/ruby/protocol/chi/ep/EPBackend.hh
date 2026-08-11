@@ -416,7 +416,7 @@ class EPBackend : public SimObject
      * @return          True if Clear accepted (ClearAck.accepted==true)
      */
     int sendClear(uint64_t line_pa, int homeNode,
-                   uint64_t epoch, uint64_t reqId);
+                  uint64_t epoch, uint64_t reqId, int sourceAdapter);
     /**
      * Handle an incoming recall request from a home UBCC.
      * This is called on the owner node's EPBackend when the home
@@ -695,6 +695,10 @@ class EPBackend : public SimObject
      */
     GrantDataSource lastGrantDataSource() const { return _lastGrantDataSource; }
 
+    /** Consume per-line grant data: 1=data, 0=explicit NoData, -1=missing. */
+    int takeGrantData(uint64_t linePa, DataBlock &data,
+                      GrantDataSource &source);
+
     bool isDsmAddr(uint64_t pa) const;
 
     /** EP_RNF snoop counter for test verification */
@@ -806,6 +810,12 @@ class EPBackend : public SimObject
     DataBlock _lastGrantDataBlock;
     bool _lastGrantDataValid = false;
     GrantDataSource _lastGrantDataSource = GrantDataSource::NoData;
+    struct PendingGrantData {
+        DataBlock data{64};
+        GrantDataSource source = GrantDataSource::NoData;
+        bool valid = false;
+    };
+    std::map<uint64_t, PendingGrantData> _pendingGrantData;
 
     // ---- F2: Recall Capture Data Buffer ----
     // Data captured from CHI completion during recall, transferred from
@@ -886,11 +896,12 @@ class EPBackend : public SimObject
         int homeNode;
         uint64_t baseEpoch;   // home-approved GRANT_HANDSHAKE baseEpoch
         uint64_t reqId;
+        int sourceAdapter;
         OuterGrantType grantType;
         Tick outerStartTick;
 
         PendingGrantTxn() : valid(false), linePa(0), homeNode(-1),
-                            baseEpoch(0), reqId(0),
+                            baseEpoch(0), reqId(0), sourceAdapter(0),
                             grantType(OuterGrantType::GlobalGrantShared),
                             outerStartTick(0) {}
     };

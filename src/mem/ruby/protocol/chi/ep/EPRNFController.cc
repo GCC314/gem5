@@ -350,8 +350,8 @@ EPRNFController::wakeup()
 {
     EPController::wakeup();
 
-    // Retry any pending CompAck sends
-    retryPendingCompAcks();
+    processPendingResponseSends();
+    processPendingDataSends();
 
     // Q3: Process deferred CHI requests (cleanup + safety net)
     processDeferredChiReqs();
@@ -361,6 +361,7 @@ EPRNFController::wakeup()
 
     // Process delayed upgrade retries (rejected upgrades waiting for home to drain).
     processUpgradeRetries();
+    processUpgradeDoneRetries();
 }
 
 void
@@ -515,7 +516,8 @@ EPRNFController::recvResponseMsg(const CHIResponseMsg *msg)
     // Comp_UC is the completion token for both CleanUnique and ReadUnique.
     // For CleanUnique: no data, just the token.
     // For ReadUnique: data arrives via CompData first, then Comp_UC finalizes.
-    if (msg->m_type == CHIResponseType_Comp_UC) {
+    if (msg->m_type == CHIResponseType_Comp_UC ||
+        msg->m_type == CHIResponseType_Comp_UC_NoData) {
         auto it = _pendingChiTxns.find(msg->m_addr);
         if (it != _pendingChiTxns.end() &&
             it->second.proxyOp == EpProxyOp_RecallUnique) {
@@ -533,17 +535,12 @@ EPRNFController::recvResponseMsg(const CHIResponseMsg *msg)
             (it->second.op == PendingChiOp::CleanUnique ||
              it->second.op == PendingChiOp::ReadUnique)) {
 
-            // For ReadUnique: data beats drive completion, not Comp_UC.
-            // The last data beat already sent CompAck + finishChiTxn.
-            // A RecallUnique miss is different: HN-F reports that this node
-            // has no local copy with Comp_UC, allowing a clean no-data recall
-            // to complete without entering EP-SNF or the outer protocol.
             if (it->second.op == PendingChiOp::ReadUnique) {
-                if (it->second.proxyOp == EpProxyOp_RecallUnique &&
-                    it->second.beatsReceived == 0) {
-                    it->second.hnfDest = msg->m_responder;
-                    finishChiTxn(msg->m_addr, true);
-                }
+                it->second.hnfDest = msg->m_responder;
+                it->second.readUniqueCompUCSeen = true;
+                if (msg->m_type == CHIResponseType_Comp_UC_NoData)
+                    it->second.readUniqueDataComplete = true;
+                tryCompleteReadUnique(msg->m_addr);
                 return true;
             }
 
@@ -559,29 +556,14 @@ EPRNFController::recvResponseMsg(const CHIResponseMsg *msg)
                 m_machineID, destNet,
                 false, false, 0, 0, MessageSizeType_Control);
 
-            if (sendResponseMsg(ack)) {
-                // CompAck sent successfully
-                DPRINTF(RubyCHIGeneric,
-                        "EP_RNF node_id=%d: %s complete for "
-                        "PA=0x%lx -- invoking callback\n",
-                        _nodeId,
-                        (it->second.op == PendingChiOp::CleanUnique)
-                            ? "CleanUnique" : "ReadUnique",
-                        msg->m_addr);
-
-                finishChiTxn(msg->m_addr, true);
-            } else {
-                // CompAck failed — will retry
-                it->second.needsCompAck = true;
-                scheduleEvent(Cycles(1));
-                warn(
-                        "EP_RNF node_id=%d: %s complete for "
-                        "PA=0x%lx but CompAck failed, will retry\n",
-                        _nodeId,
-                        (it->second.op == PendingChiOp::CleanUnique)
-                            ? "CleanUnique" : "ReadUnique",
-                        msg->m_addr);
-            }
+            it->second.needsCompAck = true;
+            sendResponseReliable(ack, [this, linePa = msg->m_addr]() {
+                auto pending = _pendingChiTxns.find(linePa);
+                if (pending == _pendingChiTxns.end())
+                    return;
+                pending->second.needsCompAck = false;
+                finishChiTxn(linePa, true);
+            });
 
             return true;
         }
@@ -627,8 +609,13 @@ EPRNFController::recvDataMsg(const CHIDataMsg *msg)
     if (it->second.op == PendingChiOp::ReadShared) {
         it->second.hnfDest = msg->m_responder;
         it->second.beatsReceived++;
-        it->second.recallDataBlk = msg->getdataBlk();
-        it->second.recallDataValid = true;
+        fatal_if(it->second.recallDataMask.isOverlap(msg->m_bitMask),
+                 "EP_RNF node_id=%d: duplicate ReadShared data bytes for %#x",
+                 _nodeId, msg->m_addr);
+        it->second.recallDataBlk.copyPartial(msg->getdataBlk(),
+                                             msg->m_bitMask);
+        it->second.recallDataMask.orMask(msg->m_bitMask);
+        it->second.recallDataValid = it->second.recallDataMask.isFull();
 
         // Send CompAck only on last beat (HN-F expects exactly 1 per txn)
         if (it->second.beatsReceived >= it->second.beatsExpected) {
@@ -639,22 +626,21 @@ EPRNFController::recvDataMsg(const CHIDataMsg *msg)
                 msg->m_addr, CHIResponseType_CompAck,
                 m_machineID, destNet,
                 false, false, 0, 0, MessageSizeType_Control);
-            if (!sendResponseMsg(ack)) {
-                it->second.needsCompAck = true;
-                scheduleEvent(Cycles(1));
-                return true;
-            }
-            finishChiTxn(msg->m_addr, true);
+            it->second.needsCompAck = true;
+            sendResponseReliable(ack, [this, linePa = msg->m_addr]() {
+                auto pending = _pendingChiTxns.find(linePa);
+                if (pending == _pendingChiTxns.end())
+                    return;
+                pending->second.needsCompAck = false;
+                finishChiTxn(linePa, true);
+            });
         }
         return true;
     }
 
     // ---- v4: ReadUnique data beat handling (§4.3.2, §5.3) ----
-    // ReadUnique: HN-F returns CompData (dirty/clean data from old owner)
-    // followed by Comp_UC (completion token).  Data beats arrive first;
-    // completion is finalized when Comp_UC arrives and all beats counted.
-    // FV risk P1-R5: ReadUnique completes on last data beat (relaxed completion).
-    // TODO strict: wait for Comp_UC+CompAck before callback
+    // ReadUnique completion requires both all data beats and Comp_UC. The two
+    // channels may arrive in either order under O3/network pressure.
     if (it->second.op == PendingChiOp::ReadUnique) {
         if (it->second.proxyOp == EpProxyOp_RecallUnique) {
             inform(
@@ -666,25 +652,21 @@ EPRNFController::recvDataMsg(const CHIDataMsg *msg)
         }
         it->second.hnfDest = msg->m_responder;
         it->second.beatsReceived++;
-        it->second.recallDataBlk = msg->getdataBlk();
-        it->second.recallDataValid = true;
+        fatal_if(it->second.recallDataMask.isOverlap(msg->m_bitMask),
+                 "EP_RNF node_id=%d: duplicate ReadUnique data bytes for %#x",
+                 _nodeId, msg->m_addr);
+        it->second.recallDataBlk.copyPartial(msg->getdataBlk(),
+                                             msg->m_bitMask);
+        it->second.recallDataMask.orMask(msg->m_bitMask);
+        it->second.recallDataValid = it->second.recallDataMask.isFull();
 
-        // Only send CompAck on last beat. HN-F expects exactly 1 per txn.
         if (it->second.beatsReceived >= it->second.beatsExpected) {
-            NetDest destNet(m_ruby_system);
-            destNet.add(msg->m_responder);
-            auto ack = std::make_shared<CHIResponseMsg>(
-                curTick(), cacheLineSize, m_ruby_system,
-                msg->m_addr, CHIResponseType_CompAck,
-                m_machineID, destNet,
-                false, false, 0, 0, MessageSizeType_Control);
-            if (!sendResponseMsg(ack)) {
-                it->second.needsCompAck = true;
-                scheduleEvent(Cycles(1));
-                return true;
-            }
-            finishChiTxn(msg->m_addr, true);
+            fatal_if(!it->second.recallDataValid,
+                     "EP_RNF node_id=%d: incomplete ReadUnique data for %#x",
+                     _nodeId, msg->m_addr);
+            it->second.readUniqueDataComplete = true;
         }
+        tryCompleteReadUnique(msg->m_addr);
         return true;
     }
 
@@ -734,14 +716,13 @@ EPRNFController::signalOuterTxnComplete(uint64_t linePa)
         linePa, it->second.respType,
         m_machineID, dest,
         false, false, 0, 0, MessageSizeType_Control);
-    sendResponseMsg(rsp);
-
-    _delayedResolvedCount++;
-
-    DPRINTF(RubyCHIGeneric,
-            "EP_RNF node_id=%d: M6 delayed HN response sent "
-            "PA=0x%lx (resolved=%d)\n",
-            _nodeId, linePa, _delayedResolvedCount);
+    sendResponseReliable(rsp, [this, linePa]() {
+        _delayedResolvedCount++;
+        DPRINTF(RubyCHIGeneric,
+                "EP_RNF node_id=%d: M6 delayed HN response sent "
+                "PA=0x%lx (resolved=%d)\n",
+                _nodeId, linePa, _delayedResolvedCount);
+    });
 }
 
 bool
@@ -951,7 +932,7 @@ EPRNFController::handleSnpUnique(const CHIRequestMsg *msg)
             msg->m_addr, CHIResponseType_SnpResp_I,
             m_machineID, dest,
             false, false, 0, 0, MessageSizeType_Control);
-        sendResponseMsg(rsp);
+        sendResponseReliable(rsp);
     } else {
         sendSnpRespI(msg);
     }
@@ -979,7 +960,7 @@ EPRNFController::sendSnpRespI(const CHIRequestMsg *msg)
         msg->m_addr, CHIResponseType_SnpResp_I,
         m_machineID, dest,
         false, false, 0, 0, MessageSizeType_Control);
-    sendResponseMsg(rsp);
+    sendResponseReliable(rsp);
     return true;
 }
 
@@ -996,7 +977,7 @@ EPRNFController::sendSnpRespSC(const CHIRequestMsg *msg)
         msg->m_addr, CHIResponseType_SnpResp_SC,
         m_machineID, dest,
         false, false, 0, 0, MessageSizeType_Control);
-    sendResponseMsg(rsp);
+    sendResponseReliable(rsp);
     return true;
 }
 
@@ -1021,7 +1002,7 @@ EPRNFController::sendSnpRespDataSC(const CHIRequestMsg *msg)
             msg->m_addr, CHIDataType_SnpRespData_SC,
             m_machineID, dest, db, wm,
             false, 0, false, MessageSizeType_Data);
-        sendDataMsg(dat);
+        sendDataReliable(dat);
     }
     return true;
 }
@@ -1119,6 +1100,90 @@ EPRNFController::finishChiTxn(uint64_t linePa, bool success)
     processDeferredChiReqs();
 }
 
+void
+EPRNFController::sendResponseReliable(CHIResponseMsgPtr msg,
+                                      std::function<void()> onSent)
+{
+    if (_pendingResponseSends.empty() && sendResponseMsg(msg)) {
+        if (onSent)
+            onSent();
+        return;
+    }
+
+    _pendingResponseSends.push_back({std::move(msg), std::move(onSent)});
+    scheduleEvent(Cycles(1));
+}
+
+void
+EPRNFController::processPendingResponseSends()
+{
+    while (!_pendingResponseSends.empty()) {
+        auto &pending = _pendingResponseSends.front();
+        if (!sendResponseMsg(pending.msg))
+            break;
+
+        auto onSent = std::move(pending.onSent);
+        _pendingResponseSends.pop_front();
+        if (onSent)
+            onSent();
+    }
+
+    if (!_pendingResponseSends.empty())
+        scheduleEvent(Cycles(1));
+}
+
+void
+EPRNFController::sendDataReliable(CHIDataMsgPtr msg)
+{
+    if (_pendingDataSends.empty() && sendDataMsg(msg))
+        return;
+
+    _pendingDataSends.push_back(std::move(msg));
+    scheduleEvent(Cycles(1));
+}
+
+void
+EPRNFController::processPendingDataSends()
+{
+    while (!_pendingDataSends.empty()) {
+        if (!sendDataMsg(_pendingDataSends.front()))
+            break;
+        _pendingDataSends.pop_front();
+    }
+
+    if (!_pendingDataSends.empty())
+        scheduleEvent(Cycles(1));
+}
+
+void
+EPRNFController::tryCompleteReadUnique(uint64_t linePa)
+{
+    auto it = _pendingChiTxns.find(linePa);
+    if (it == _pendingChiTxns.end() ||
+        it->second.op != PendingChiOp::ReadUnique ||
+        !it->second.readUniqueDataComplete ||
+        !it->second.readUniqueCompUCSeen || it->second.needsCompAck) {
+        return;
+    }
+
+    NetDest destNet(m_ruby_system);
+    destNet.add(it->second.hnfDest);
+    auto ack = std::make_shared<CHIResponseMsg>(
+        curTick(), cacheLineSize, m_ruby_system,
+        linePa, CHIResponseType_CompAck,
+        m_machineID, destNet,
+        false, false, 0, 0, MessageSizeType_Control);
+
+    it->second.needsCompAck = true;
+    sendResponseReliable(ack, [this, linePa]() {
+        auto pending = _pendingChiTxns.find(linePa);
+        if (pending == _pendingChiTxns.end())
+            return;
+        pending->second.needsCompAck = false;
+        finishChiTxn(linePa, true);
+    });
+}
+
 // ---- Q3: CHI Request to HN-F ----
 bool
 EPRNFController::sendChiRequest(uint64_t linePa, CHIRequestType reqType,
@@ -1139,6 +1204,19 @@ EPRNFController::sendChiRequest(uint64_t linePa, CHIRequestType reqType,
         d.startTick = curTick();
         _deferredChiReqs.push_back(d);
         return true;  // Report success to caller (will be sent later)
+    }
+
+    // A prior request may be waiting for reqOut capacity even though no CHI
+    // transaction has reached HN-F yet. Preserve FIFO ordering in that case.
+    if (!_deferredChiReqs.empty()) {
+        DeferredChiRequest d;
+        d.linePa = linePa;
+        d.reqType = reqType;
+        d.proxyOp = proxyOp;
+        d.startTick = curTick();
+        _deferredChiReqs.push_back(d);
+        scheduleEvent(Cycles(1));
+        return true;
     }
 
     DPRINTF(RubyCHIGeneric,
@@ -1171,6 +1249,14 @@ EPRNFController::sendChiRequest(uint64_t linePa, CHIRequestType reqType,
     } else {
         warn("EP_RNF node_id=%d: sendChiRequest failed for addr=0x%lx "
              "(reqOut full)\n", _nodeId, linePa);
+        DeferredChiRequest d;
+        d.linePa = linePa;
+        d.reqType = reqType;
+        d.proxyOp = proxyOp;
+        d.startTick = curTick();
+        _deferredChiReqs.push_back(d);
+        scheduleEvent(Cycles(1));
+        return true;
     }
 
     DPRINTF(RubyCHIGeneric,
@@ -1182,90 +1268,36 @@ EPRNFController::sendChiRequest(uint64_t linePa, CHIRequestType reqType,
     return sent;
 }
 
-void
-EPRNFController::sendCompAck(uint64_t linePa, MachineID dest)
-{
-    DPRINTF(RubyCHIGeneric,
-            "EP_RNF node_id=%d: sendCompAck addr=0x%lx\n",
-            _nodeId, linePa);
-
-    NetDest destNet(m_ruby_system);
-    destNet.add(dest);
-    auto ack = std::make_shared<CHIResponseMsg>(
-        curTick(), cacheLineSize, m_ruby_system,
-        linePa, CHIResponseType_CompAck,
-        m_machineID, destNet,
-        false, false, 0, 0, MessageSizeType_Control);
-
-    if (!sendResponseMsg(ack)) {
-        warn("EP_RNF node_id=%d: sendCompAck failed for addr=0x%lx "
-             "(rspOut full)\n", _nodeId, linePa);
-    }
-}
-
-void
-EPRNFController::retryPendingCompAcks()
-{
-    bool needRetry = false;
-    for (auto it = _pendingChiTxns.begin();
-         it != _pendingChiTxns.end(); ) {
-        if (!it->second.needsCompAck) {
-            ++it;
-            continue;
-        }
-
-        // Guard: hnfDest may be uninitialized (MachineType_NUM) for
-        // CleanUnique transactions started with needsCompAck=true before
-        // Comp_UC arrives to set hnfDest=msg->m_responder.
-        if (it->second.hnfDest.type == MachineType_NUM) {
-            ++it;
-            continue;
-        }
-
-        // Try to send pending CompAck
-        NetDest destNet(m_ruby_system);
-        destNet.add(it->second.hnfDest);
-        auto ack = std::make_shared<CHIResponseMsg>(
-            curTick(), cacheLineSize, m_ruby_system,
-            it->second.linePa, CHIResponseType_CompAck,
-            m_machineID, destNet,
-            false, false, 0, 0, MessageSizeType_Control);
-
-        if (sendResponseMsg(ack)) {
-            // CompAck sent — invoke callback
-            DPRINTF(RubyCHIGeneric,
-                    "EP_RNF node_id=%d: retryPendingCompAcks "
-                    "succeeded for PA=0x%lx -- invoking callback\n",
-                    _nodeId, it->second.linePa);
-
-            uint64_t linePa = it->second.linePa;
-            ++it;
-            finishChiTxn(linePa, true);
-        } else {
-            needRetry = true;
-            ++it;
-        }
-    }
-
-    if (needRetry) {
-        scheduleEvent(Cycles(1));
-    }
-}
-
 // ---- Q3: Process deferred CHI requests ----
 void
 EPRNFController::processDeferredChiReqs()
 {
     while (!_deferredChiReqs.empty() && !_chiRequestInFlight) {
-        DeferredChiRequest d = _deferredChiReqs.front();
-        _deferredChiReqs.pop_front();
+        const DeferredChiRequest &d = _deferredChiReqs.front();
         DPRINTF(RubyCHIGeneric,
                 "EP_RNF node_id=%d: processing deferred CHI request "
                 "addr=0x%lx type=%d proxyOp=%d (queued at tick=%lu)\n",
                 _nodeId, d.linePa,
                 static_cast<int>(d.reqType),
                 static_cast<int>(d.proxyOp), d.startTick);
-        sendChiRequest(d.linePa, d.reqType, d.proxyOp);
+        auto req = std::make_shared<CHIRequestMsg>(
+            curTick(), cacheLineSize, m_ruby_system);
+        req->m_addr = d.linePa;
+        req->m_type = d.reqType;
+        req->m_requestor = m_machineID;
+        req->m_allowRetry = true;
+        req->m_MessageSize = MessageSizeType_Control;
+        req->m_ep_proxy_op = d.proxyOp;
+        req->m_Destination.clear();
+        req->m_Destination.add(selectHnfDestination(d.linePa));
+
+        if (!sendRequestMsg(req)) {
+            scheduleEvent(Cycles(1));
+            break;
+        }
+
+        _deferredChiReqs.pop_front();
+        _chiRequestInFlight = true;
     }
 }
 
@@ -1547,7 +1579,7 @@ EPRNFController::sendSnpRespI(uint64_t linePa, MachineID hnfDest, bool staleMark
         linePa, CHIResponseType_SnpResp_I,
         m_machineID, dest,
         staleMark, false, 0, 0, MessageSizeType_Control);
-    sendResponseMsg(rsp);
+    sendResponseReliable(rsp);
 }
 
 void
@@ -1909,38 +1941,75 @@ EPRNFController::receiveUpgradeAck(uint64_t linePa)
         linePa, CHIResponseType_SnpResp_I,
         m_machineID, dest,
         false, false, 0, 0, MessageSizeType_Control);
-    sendResponseMsg(rsp);
+    const int homeNode = upIt->second.homeNode;
+    const uint64_t epoch = upIt->second.epoch;
+    const uint64_t reqId = upIt->second.reqId;
+    sendResponseReliable(rsp, [this, linePa, homeNode, epoch, reqId]() {
+        auto pending = _upgradePending.find(linePa);
+        if (pending == _upgradePending.end())
+            return;
+        pending->second.snpRespSent = true;
+
+        EPBackend *backend = EPBackend::getBackendInstance(_nodeId);
+        if (!backend) {
+            warn("EP_RNF node_id=%d: cannot send UpgradeDone for PA=0x%lx "
+                 "because backend is missing\n", _nodeId, linePa);
+            return;
+        }
+
+        bool doneOk = trySendUpgradeDone(linePa);
+        DPRINTF(RubyEP,
+                "[UPGRADE-DIAG] node=%d UpgradeDone PA=0x%lx ok=%d "
+                "home=%d epoch=%lu reqId=%lu\n",
+                _nodeId, linePa, doneOk, homeNode, epoch, reqId);
+        if (!doneOk) {
+            warn("EP_RNF node_id=%d: sendUpgradeDone failed for PA=0x%lx "
+                 "home=%d epoch=%lu reqId=%lu\n",
+                 _nodeId, linePa, homeNode, epoch, reqId);
+            scheduleEvent(Cycles(1));
+        }
+    });
+}
+
+bool
+EPRNFController::trySendUpgradeDone(uint64_t linePa)
+{
+    auto it = _upgradePending.find(linePa);
+    if (it == _upgradePending.end() || !it->second.ackReceived ||
+        !it->second.snpRespSent) {
+        return false;
+    }
 
     EPBackend *backend = EPBackend::getBackendInstance(_nodeId);
-    if (!backend) {
-        warn("EP_RNF node_id=%d: cannot send UpgradeDone for PA=0x%lx "
-             "because backend is missing\n",
-             _nodeId, linePa);
-        _upgradePending.erase(upIt);
-        return;
+    if (!backend)
+        return false;
+
+    if (!backend->sendUpgradeDone(linePa, it->second.homeNode,
+                                  it->second.epoch, it->second.reqId)) {
+        return false;
     }
 
-    bool doneOk = backend->sendUpgradeDone(
-        linePa, upIt->second.homeNode, upIt->second.epoch,
-        upIt->second.reqId);
-    DPRINTF(RubyEP, "[UPGRADE-DIAG] node=%d UpgradeDone PA=0x%lx ok=%d home=%d epoch=%lu reqId=%lu\n",
-            _nodeId, linePa, doneOk, upIt->second.homeNode,
-            upIt->second.epoch, upIt->second.reqId);
-    if (!doneOk) {
-        warn("EP_RNF node_id=%d: sendUpgradeDone failed for PA=0x%lx "
-             "home=%d epoch=%lu reqId=%lu\n",
-             _nodeId, linePa, upIt->second.homeNode,
-             upIt->second.epoch, upIt->second.reqId);
+    _upgradePending.erase(it);
+    backend->flushDeferredInvalidation(linePa);
+    return true;
+}
+
+void
+EPRNFController::processUpgradeDoneRetries()
+{
+    std::vector<uint64_t> retryLines;
+    for (const auto &[linePa, pending] : _upgradePending) {
+        if (pending.valid && pending.ackReceived && pending.snpRespSent)
+            retryLines.push_back(linePa);
     }
 
-    // Clear upgrade pending state
-    _upgradePending.erase(upIt);
-
-    // Process any InvalidateReq deferred while the snoop was held. In the
-    // accepted path the upgrade has completed and SnpResp_I was already sent
-    // above, so the local copy state is consistent.
-    if (backend)
-        backend->flushDeferredInvalidation(linePa);
+    bool needRetry = false;
+    for (uint64_t linePa : retryLines) {
+        if (!trySendUpgradeDone(linePa))
+            needRetry = true;
+    }
+    if (needRetry)
+        scheduleEvent(Cycles(1));
 }
 
 } // namespace ruby

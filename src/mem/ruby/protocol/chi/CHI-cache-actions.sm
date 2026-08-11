@@ -501,6 +501,9 @@ action(Initiate_ReadShared_Miss, desc="") {
   } else if (is_HN) {
     tbe.actions.push(Event:SendReadNoSnp);
     tbe.actions.push(Event:WaitCompAck);
+    if (tbe.epProxyOp == EpProxyOp:RecallUnique) {
+      tbe.actions.pushNB(Event:SendCompUCResp);
+    }
     tbe.actions.pushNB(Event:SendCompData);
   } else {
     tbe.actions.push(Event:SendReadShared);
@@ -515,6 +518,9 @@ action(Initiate_ReadShared_Hit, desc="") {
   tbe.actions.push(Event:ReadHitPipe);
   tbe.actions.push(Event:DataArrayRead);
   tbe.actions.push(Event:WaitCompAck);
+  if (tbe.epProxyOp == EpProxyOp:RecallUnique) {
+    tbe.actions.pushNB(Event:SendCompUCResp);
+  }
   tbe.actions.pushNB(Event:SendCompData);
   tbe.actions.pushNB(Event:TagArrayWrite);
 }
@@ -618,6 +624,9 @@ action(Initiate_ReadNoSnp_Hit, desc="") {
   tbe.actions.push(Event:ReadHitPipe);
   tbe.actions.push(Event:DataArrayRead);
   tbe.actions.push(Event:WaitCompAck);
+  if (tbe.epProxyOp == EpProxyOp:RecallUnique) {
+    tbe.actions.pushNB(Event:SendCompUCResp);
+  }
   tbe.actions.pushNB(Event:SendCompData);
   tbe.updateDirOnCompAck := false;
 }
@@ -702,6 +711,7 @@ action(Initiate_ReadUnique_Miss, desc="") {
   // miss. A home-side miss means this node has no tracked local copy: return
   // a no-data Comp_UC to EP-RNF rather than re-entering EP-SNF/Outer.
   if (is_HN && tbe.epProxyOp == EpProxyOp:RecallUnique) {
+    tbe.actions.push(Event:WaitCompAck);
     tbe.actions.push(Event:SendCompUCResp);
   } else if (is_HN && tbe.use_DMT) {
     tbe.requestorToBeExclusiveOwner := true;
@@ -791,11 +801,17 @@ action(Initiate_ReadUnique_HitUpstream, desc="") {
   } else if (tbe.dataMaybeDirtyUpstream) {
     tbe.actions.push(Event:SendSnpUnique);
     tbe.actions.push(Event:WaitCompAck);
+    if (tbe.epProxyOp == EpProxyOp:RecallUnique) {
+      tbe.actions.pushNB(Event:SendCompUCResp);
+    }
     tbe.actions.pushNB(Event:SendCompData);
   } else {
     // no one will send us data unless we explicitly ask
     tbe.actions.push(Event:SendSnpUniqueRetToSrc);
     tbe.actions.push(Event:WaitCompAck);
+    if (tbe.epProxyOp == EpProxyOp:RecallUnique) {
+      tbe.actions.pushNB(Event:SendCompUCResp);
+    }
     tbe.actions.pushNB(Event:SendCompData);
   }
   // just tag update since data any data would become stale
@@ -807,6 +823,9 @@ action(Initiate_ReadUnique_Hit_InvUpstream, desc="") {
   tbe.actions.push(Event:SendSnpCleanInvalid);
   tbe.actions.pushNB(Event:DataArrayRead);
   tbe.actions.push(Event:WaitCompAck);
+  if (tbe.epProxyOp == EpProxyOp:RecallUnique) {
+    tbe.actions.pushNB(Event:SendCompUCResp);
+  }
   tbe.actions.pushNB(Event:SendCompData);
   tbe.actions.pushNB(Event:TagArrayWrite);
 }
@@ -3476,7 +3495,12 @@ action(Send_CompUC, desc="") {
   DPRINTF(RubyGenerated, "[HNF-CU-COMPUC] addr=%#x stale=0\n", address);
   enqueue(rspOutPort, CHIResponseMsg, response_latency) {
     out_msg.addr := address;
-    out_msg.type := CHIResponseType:Comp_UC;
+    if (tbe.epProxyOp == EpProxyOp:RecallUnique &&
+        !tbe.dataValid && tbe.dir_sharers.isEmpty()) {
+      out_msg.type := CHIResponseType:Comp_UC_NoData;
+    } else {
+      out_msg.type := CHIResponseType:Comp_UC;
+    }
     out_msg.responder := machineID;
     out_msg.Destination.add(tbe.requestor);
     out_msg.txnId := tbe.txnId;

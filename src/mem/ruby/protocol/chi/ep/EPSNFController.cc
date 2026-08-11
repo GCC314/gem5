@@ -87,6 +87,8 @@ EPSNFController::wakeup()
 {
     EPController::wakeup();
 
+    processPendingOutputs();
+
     // Q3: Send deferred CompData (1-tick delay for TBE race fix)
     processDeferredData();
 
@@ -126,7 +128,17 @@ EPSNFController::wakeup()
                     : CHIDataType_CompData_UC;
                 bool sharedHint = (it->neededPerm == 0);
 
-                const uint8_t *gdata = _backend->lastGrantData();
+                DataBlock grantData(cacheLineSize);
+                GrantDataSource grantSource = GrantDataSource::NoData;
+                int grantDataState = _backend->takeGrantData(
+                    it->linePa, grantData, grantSource);
+                fatal_if(grantDataState < 0,
+                         "EP_SNF node_id=%d: missing grant data state PA=0x%lx",
+                         _nodeId, it->linePa);
+                fatal_if(grantDataState == 0 &&
+                             grantSource != GrantDataSource::NoData,
+                         "EP_SNF node_id=%d: unavailable grant data PA=0x%lx source=%d",
+                         _nodeId, it->linePa, static_cast<int>(grantSource));
                 for (int i = 0; i < dataMsgsPerLine; i++) {
                     int offset = i * dataChannelSize;
                     int chunkSize = (i == dataMsgsPerLine - 1) ?
@@ -134,8 +146,10 @@ EPSNFController::wakeup()
                     WriteMask wm(cacheLineSize);
                     wm.setMask(offset, chunkSize);
                     DataBlock db(cacheLineSize);
-                    if (gdata != nullptr)
-                        db.setData(gdata + offset, offset, chunkSize);
+                    if (grantDataState > 0) {
+                        const uint8_t *chunk = grantData.getData(offset, chunkSize);
+                        db.setData(chunk, offset, chunkSize);
+                    }
                     auto dat = std::make_shared<CHIDataMsg>(
                         curTick(), cacheLineSize, m_ruby_system,
                         it->linePa, dataType,
@@ -143,7 +157,7 @@ EPSNFController::wakeup()
                         false, 0, false, MessageSizeType_Data);
                     // v4: Set shared_hint for shared grants
                     dat->m_m_shared_hint = sharedHint;
-                    sendDataMsg(dat);
+                    sendDataReliable(dat);
                 }
                 it = _retryQueue.erase(it);
             } else {
@@ -210,7 +224,7 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
             msg->m_addr, CHIResponseType_CompDBIDResp,
             m_machineID, hnDest,
             false, false, 0, 0, MessageSizeType_Control);
-        sendResponseMsg(rsp);
+        sendResponseReliable(rsp);
         inform(
                      "[EPSNF-WRITE-DBID] node=%d addr=0x%lx expected=0x%lx\n",
                      _nodeId, msg->m_addr, pending.expectedMask);
@@ -326,23 +340,28 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
             msg->m_addr, CHIResponseType_ReadReceipt,
             m_machineID, hnDest,
             false, false, 0, 0, MessageSizeType_Control);
-        sendResponseMsg(rsp);
+        sendResponseReliable(rsp);
     }
 
-    const uint8_t *gdata = _backend->lastGrantData();
-    if (gdata && _backend->lastGrantDataSize() >= cacheLineSize) {
+    DataBlock grantData(cacheLineSize);
+    GrantDataSource grantSource = GrantDataSource::NoData;
+    int grantDataState = _backend->takeGrantData(
+        msg->m_addr, grantData, grantSource);
+    fatal_if(grantDataState < 0,
+             "EP_SNF node_id=%d: missing grant data state PA=0x%lx",
+             _nodeId, msg->m_addr);
+    if (grantDataState > 0) {
         DPRINTF(RubyCHIGeneric,
                 "EP_SNF node_id=%d: CompData populated with grant data "
-                "first_byte=0x%02x\n", _nodeId, gdata[0]);
+                "first_byte=0x%02x\n", _nodeId, grantData.getByte(0));
     } else {
         // F3: Data not ready — defer/retry instead of silent zero-fill.
         // Only NoData (explicit zero-fill) is allowed through without data.
-        GrantDataSource ds = _backend->lastGrantDataSource();
-        if (ds != GrantDataSource::NoData) {
+        if (grantSource != GrantDataSource::NoData) {
             DPRINTF(RubyCHIGeneric,
                     "EP_SNF node_id=%d: grant data not ready (dataSource=%d), "
                     "deferring to retry queue\n",
-                    _nodeId, static_cast<int>(ds));
+                    _nodeId, static_cast<int>(grantSource));
             EPSNFController::RetryEntry entry;
             entry.linePa = msg->m_addr;
             entry.neededPerm = neededPerm;
@@ -388,8 +407,9 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
         DataBlock db(cacheLineSize);
         // P0-1: Guard against nullptr to avoid memcpy crash.
         // P0-2: Use correct destination offset (offset, not 0).
-        if (gdata != nullptr) {
-            db.setData(gdata + offset, offset, chunkSize);
+        if (grantDataState > 0) {
+            const uint8_t *chunk = grantData.getData(offset, chunkSize);
+            db.setData(chunk, offset, chunkSize);
         }
         // else db keeps default zeros
 
@@ -403,7 +423,9 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
         dat->m_m_shared_hint = sharedHint;
         // Q3: Defer send by 1 tick to prevent same-tick TBE race
         // at HN-F (see docs/tbe-race-condition.svg for details).
-        _deferredCompData.push_back(dat);
+        PendingDataOutput pending;
+        pending.msg = dat;
+        _deferredCompData.push_back(std::move(pending));
     }
 
     // Schedule deferred sends.
@@ -425,10 +447,52 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
 void
 EPSNFController::processDeferredData()
 {
-    for (auto &dat : _deferredCompData) {
-        sendDataMsg(dat);
+    for (auto &pending : _deferredCompData) {
+        sendDataReliable(pending.msg);
     }
     _deferredCompData.clear();
+}
+
+void
+EPSNFController::sendResponseReliable(std::shared_ptr<CHIResponseMsg> msg)
+{
+    if (_pendingResponses.empty() && sendResponseMsg(msg))
+        return;
+
+    _pendingResponses.push_back(std::move(msg));
+    scheduleEvent(Cycles(1));
+}
+
+void
+EPSNFController::sendDataReliable(std::shared_ptr<CHIDataMsg> msg)
+{
+    if (_pendingData.empty() && sendDataMsg(msg))
+        return;
+
+    PendingDataOutput pending;
+    pending.msg = std::move(msg);
+    _pendingData.push_back(std::move(pending));
+    scheduleEvent(Cycles(1));
+}
+
+void
+EPSNFController::processPendingOutputs()
+{
+    while (!_pendingResponses.empty()) {
+        if (!sendResponseMsg(_pendingResponses.front()))
+            break;
+        _pendingResponses.pop_front();
+    }
+
+    while (!_pendingData.empty()) {
+        auto &pending = _pendingData.front();
+        if (!sendDataMsg(pending.msg))
+            break;
+        _pendingData.pop_front();
+    }
+
+    if (!_pendingResponses.empty() || !_pendingData.empty())
+        scheduleEvent(Cycles(1));
 }
 
 // ---- v4: Deferred Grant Processing (§4.4.2, §7.6) ----
@@ -485,7 +549,9 @@ EPSNFController::processDeferredGrants()
             dat->m_m_shared_hint = entry.sharedHint;
 
             // Defer by 1 tick for timing invariant (§4.4.2 item 2, I10)
-            _deferredCompData.push_back(dat);
+            PendingDataOutput pending;
+            pending.msg = dat;
+            _deferredCompData.push_back(std::move(pending));
         }
 
         DPRINTF(RubyCHIGeneric,

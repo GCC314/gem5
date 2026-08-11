@@ -329,6 +329,7 @@ class EPRNFController : public EPController
         std::function<void(bool)> onComplete;
         // F2: Recall data capture from CHI data beats
         DataBlock recallDataBlk;
+        WriteMask recallDataMask;
         bool recallDataValid;
 
         PendingChiTxn()
@@ -341,7 +342,7 @@ class EPRNFController : public EPController
               snoopSlotValid(false),
               queuedSnoopType(CHI::CHIRequestType_null),
               queuedRetToSrc(false), startTick(0),
-              recallDataBlk(64), recallDataValid(false) {}
+              recallDataBlk(64), recallDataMask(64), recallDataValid(false) {}
     };
 
     // ---- v4: Retry queue entry (§4.3.4, §7.5) ----
@@ -424,15 +425,24 @@ class EPRNFController : public EPController
         return _downstreamBySocket[decodeHomeSocket(linePa)];
     }
 
-    /** Send CompAck to HN-F via rspOut after receiving a response. */
-    void sendCompAck(uint64_t linePa, MachineID dest);
-
     /** Per-cacheline pending CHI transaction tracking. */
     std::map<uint64_t, PendingChiTxn> _pendingChiTxns;
 
-    /** Retry sending CompAck for pending CHI transactions
-     *  whose CompAck couldn't be sent due to rspOut full. */
-    void retryPendingCompAcks();
+    struct PendingResponseSend {
+        CHIResponseMsgPtr msg;
+        std::function<void()> onSent;
+    };
+    std::deque<PendingResponseSend> _pendingResponseSends;
+    void sendResponseReliable(CHIResponseMsgPtr msg,
+                              std::function<void()> onSent = nullptr);
+    void processPendingResponseSends();
+
+    std::deque<CHIDataMsgPtr> _pendingDataSends;
+    void sendDataReliable(CHIDataMsgPtr msg);
+    void processPendingDataSends();
+
+    /** Complete ReadUnique only after data/no-data completion and Comp_UC. */
+    void tryCompleteReadUnique(uint64_t linePa);
 
     // ---- v4: Snoop Dispatch & Queue (§4.3.3) ----
     /** Process a snoop message immediately (no in-flight CHI txn). */
@@ -494,6 +504,7 @@ class EPRNFController : public EPController
         uint64_t reqId;
         MachineID hnfDest;      // HN-F that sent SnpCleanInvalid
         bool ackReceived;       // true when OuterUpgradeAck(true) arrived
+        bool snpRespSent;       // deferred SnpResp_I reached rspOut
         bool homeAccepted;      // monotonic once any accepted UpgradeResp lands
         bool rejected;          // true when home rejected: give up upgrade, but
                                 // keep snoop held until the line is invalidated
@@ -510,7 +521,8 @@ class EPRNFController : public EPController
                                 // (bounded to avoid infinite resend storms)
 
         UpgradePending() : valid(false), linePa(0), homeNode(-1), epoch(0),
-                           reqId(0), ackReceived(false), homeAccepted(false),
+                           reqId(0), ackReceived(false), snpRespSent(false),
+                           homeAccepted(false),
                            rejected(false),
                            needsRetry(false), retryCount(0),
                            dropWatchdogArmed(false), retryReadyTick(0),
@@ -524,6 +536,8 @@ class EPRNFController : public EPController
     std::set<uint64_t> _upgradeRetryLines;
     void scheduleUpgradeRetry(uint64_t linePa);
     void processUpgradeRetries();
+    void processUpgradeDoneRetries();
+    bool trySendUpgradeDone(uint64_t linePa);
 
     /** Count of Cache-type controllers (for reference). */
     int _numCacheControllers;

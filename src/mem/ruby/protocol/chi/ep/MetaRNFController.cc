@@ -73,6 +73,7 @@ void
 MetaRNFController::wakeup()
 {
     EPController::wakeup();
+    processPendingOutputs();
     completeDeferredReads();
     completeDeferredWrites();
 }
@@ -525,16 +526,11 @@ MetaRNFController::sendReadOnce(uint64_t pa)
     req->m_Destination.clear();
     req->m_Destination.add(hnfId);
 
-    bool sent = sendRequestMsg(req);
+    bool sent = sendRequestReliable(req, pa);
     if (tracePageOne(pa)) {
         inform(
                      "[META-TRACE] node=%d op=read-send pa=0x%lx sent=%d\n",
                      _nodeId, pa, sent ? 1 : 0);
-    }
-    if (sent) {
-        auto sbIt = _scoreboard.find(pa);
-        if (sbIt != _scoreboard.end())
-            _flightSlots[sbIt->second].state = SlotState::Sent;
     }
     return sent;
 }
@@ -557,31 +553,41 @@ MetaRNFController::sendWriteUnique(uint64_t pa)
     req->m_Destination.clear();
     req->m_Destination.add(hnfId);
 
-    bool sent = sendRequestMsg(req);
+    bool sent = sendRequestReliable(req, pa);
     if (tracePageOne(pa)) {
         inform(
                      "[META-TRACE] node=%d op=write-send pa=0x%lx sent=%d\n",
                      _nodeId, pa, sent ? 1 : 0);
     }
-    if (sent) {
-        auto sbIt = _scoreboard.find(pa);
-        if (sbIt != _scoreboard.end())
-            _flightSlots[sbIt->second].state = SlotState::Sent;
-    }
     return sent;
 }
 
 bool
-MetaRNFController::sendWriteData(uint64_t pa, MachineID dst, uint64_t dbid)
+MetaRNFController::sendRequestReliable(CHIRequestMsgPtr msg, uint64_t pa)
+{
+    if (_pendingRequestSends.empty() && sendRequestMsg(msg)) {
+        auto sbIt = _scoreboard.find(pa);
+        if (sbIt != _scoreboard.end())
+            _flightSlots[sbIt->second].state = SlotState::Sent;
+        return true;
+    }
+
+    _pendingRequestSends.push_back({std::move(msg), pa});
+    scheduleEvent(Cycles(1));
+    return true;
+}
+
+void
+MetaRNFController::sendWriteData(uint64_t pa, MachineID dst, uint64_t dbid,
+                                 std::function<void()> onSent)
 {
     auto sbIt = _scoreboard.find(pa);
     if (sbIt == _scoreboard.end())
-        return false;
+        return;
 
     int slot = sbIt->second;
     FlightSlot &fs = _flightSlots[slot];
 
-    bool sent = true;
     for (int offset = 0; offset < cacheLineSize; offset += dataChannelSize) {
         const int bytes = std::min(dataChannelSize, cacheLineSize - offset);
         auto dat = std::make_shared<CHIDataMsg>(curTick(), cacheLineSize,
@@ -597,18 +603,19 @@ MetaRNFController::sendWriteData(uint64_t pa, MachineID dst, uint64_t dbid)
         dat->m_bitMask = wm;
         dat->m_txnId = dbid;
         dat->m_MessageSize = MessageSizeType_Data;
-        sent = sendDataMsg(dat) && sent;
+        const bool lastBeat = offset + bytes >= cacheLineSize;
+        sendDataReliable(dat, lastBeat ? onSent : nullptr);
     }
     if (tracePageOne(pa)) {
         inform(
-                     "[META-TRACE] node=%d op=write-data pa=0x%lx dbid=%lu dst=%d sent=%d\n",
-                     _nodeId, pa, dbid, dst.num, sent ? 1 : 0);
+                     "[META-TRACE] node=%d op=write-data pa=0x%lx dbid=%lu dst=%d queued=1\n",
+                     _nodeId, pa, dbid, dst.num);
     }
-    return sent;
 }
 
-bool
-MetaRNFController::sendCompAck(uint64_t pa, MachineID dst)
+void
+MetaRNFController::sendCompAck(uint64_t pa, MachineID dst,
+                               std::function<void()> onSent)
 {
     NetDest dest(m_ruby_system);
     dest.add(dst);
@@ -617,7 +624,73 @@ MetaRNFController::sendCompAck(uint64_t pa, MachineID dst)
         pa, CHIResponseType_CompAck,
         m_machineID, dest,
         false, false, 0, 0, MessageSizeType_Control);
-    return sendResponseMsg(rsp);
+    sendResponseReliable(rsp, std::move(onSent));
+}
+
+void
+MetaRNFController::sendResponseReliable(CHIResponseMsgPtr msg,
+                                        std::function<void()> onSent)
+{
+    if (_pendingResponseSends.empty() && sendResponseMsg(msg)) {
+        if (onSent)
+            onSent();
+        return;
+    }
+
+    _pendingResponseSends.push_back({std::move(msg), std::move(onSent)});
+    scheduleEvent(Cycles(1));
+}
+
+void
+MetaRNFController::sendDataReliable(CHIDataMsgPtr msg,
+                                    std::function<void()> onSent)
+{
+    if (_pendingDataSends.empty() && sendDataMsg(msg)) {
+        if (onSent)
+            onSent();
+        return;
+    }
+
+    _pendingDataSends.push_back({std::move(msg), std::move(onSent)});
+    scheduleEvent(Cycles(1));
+}
+
+void
+MetaRNFController::processPendingOutputs()
+{
+    while (!_pendingRequestSends.empty()) {
+        auto &pending = _pendingRequestSends.front();
+        if (!sendRequestMsg(pending.msg))
+            break;
+        auto sbIt = _scoreboard.find(pending.pa);
+        if (sbIt != _scoreboard.end())
+            _flightSlots[sbIt->second].state = SlotState::Sent;
+        _pendingRequestSends.pop_front();
+    }
+
+    while (!_pendingResponseSends.empty()) {
+        auto &pending = _pendingResponseSends.front();
+        if (!sendResponseMsg(pending.msg))
+            break;
+        auto onSent = std::move(pending.onSent);
+        _pendingResponseSends.pop_front();
+        if (onSent)
+            onSent();
+    }
+
+    while (!_pendingDataSends.empty()) {
+        auto &pending = _pendingDataSends.front();
+        if (!sendDataMsg(pending.msg))
+            break;
+        auto onSent = std::move(pending.onSent);
+        _pendingDataSends.pop_front();
+        if (onSent)
+            onSent();
+    }
+
+    if (!_pendingRequestSends.empty() || !_pendingResponseSends.empty() ||
+        !_pendingDataSends.empty())
+        scheduleEvent(Cycles(1));
 }
 
 void
@@ -881,20 +954,16 @@ MetaRNFController::recvResponseMsg(const CHIResponseMsg *msg)
     if (fs.op == OpType::Write || fs.op == OpType::Delete) {
         if (msg->m_type == CHIResponseType_CompDBIDResp ||
             msg->m_type == CHIResponseType_DBIDResp) {
-            if (!sendWriteData(msg->m_addr, msg->m_responder, msg->m_dbid)) {
-                completeWrite(slot, false);
-                return true;
-            }
-
             if (msg->m_type == CHIResponseType_CompDBIDResp) {
-                // This is the completion response for WriteUniqueFull. Keep
-                // the slot until its data flits have reached the HN-F so a
-                // same-address request cannot overtake them.
-                _deferredWriteCompletions.emplace_back(
-                    slot, curTick() + cyclesToTicks(Cycles(16)));
-                scheduleEvent(Cycles(16));
+                sendWriteData(msg->m_addr, msg->m_responder, msg->m_dbid,
+                    [this, slot]() {
+                        if (_flightSlots[slot].state != SlotState::Free)
+                            completeWrite(slot, true);
+                    });
             } else {
                 fs.waitingCompAfterDbid = true;
+                sendWriteData(msg->m_addr, msg->m_responder, msg->m_dbid,
+                              nullptr);
             }
             return true;
         }
@@ -948,13 +1017,12 @@ MetaRNFController::recvDataMsg(const CHIDataMsg *msg)
 
     // One 64B CHI transaction completes only after every data-channel flit
     // has arrived. The HN-F expects exactly one CompAck for that transaction.
-    sendCompAck(msg->m_addr, msg->m_responder);
     DataBlock db = fs.readData;
-    // Keep the scoreboard entry until the acknowledgement reaches the HN-F,
-    // so a queued same-address write cannot overtake it.
-    _deferredReadCompletions.push_back(
-        {slot, curTick() + cyclesToTicks(Cycles(16)), db});
-    scheduleEvent(Cycles(16));
+    sendCompAck(msg->m_addr, msg->m_responder,
+        [this, slot, db]() {
+            if (_flightSlots[slot].state != SlotState::Free)
+                completeRead(slot, true, &db);
+        });
     return true;
 }
 

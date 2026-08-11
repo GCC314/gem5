@@ -459,8 +459,8 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
     auto existing = _requesterLines.find(line_pa);
 
     // ---- Async grant/clear: pending-Clear fast path ----
-    // If we already obtained the outer grant for this line and are only waiting
-    // for the ClearResp to confirm it, do NOT retry the whole miss. Re-issuing a
+    // If we already obtained the outer grant and only Clear remains, do NOT
+    // retry the whole miss. Re-issuing a
     // fresh ReadReq here would (a) allocate a brand-new reqId (handleGrant has
     // already moved the line out of R_WAIT_GRANT, so isRetry would be false) and
     // (b) make the already-cached ClearResp{original reqId} unmatchable — an
@@ -471,10 +471,13 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
         auto pgt = _pendingGrantTxns.find(homePa);
         if (pgt != _pendingGrantTxns.end() && pgt->second.valid) {
             int clearRet = sendClear(homePa, pgt->second.homeNode,
-                                     pgt->second.baseEpoch, pgt->second.reqId);
+                                     pgt->second.baseEpoch, pgt->second.reqId,
+                                     pgt->second.sourceAdapter);
             if (clearRet == -2)
                 return -2;   // ClearResp not here yet; keep waiting (same reqId)
-            // ClearResp accepted: sendClear() has consumed the txn. Finish up.
+            if (clearRet <= 0)
+                return -1;   // send/reject is retryable; retain txn and guard
+            // Clear accepted: sendClear() has consumed the txn. Finish up.
             OuterGrantType g = pgt->second.grantType;
             const Tick start = pgt->second.outerStartTick;
             const uint64_t completedReqId = pgt->second.reqId;
@@ -768,6 +771,7 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
         txn.homeNode = homeNode;
         txn.baseEpoch = grantBaseEpoch;
         txn.reqId = reqIdVal;
+        txn.sourceAdapter = adapterIdx;
         txn.grantType = grantEnv.grantType;
         txn.outerStartTick = entry.outerStartTick;
         _pendingGrantTxns[homePa] = txn;
@@ -796,6 +800,10 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
         _lastGrantDataBlock = routedGrantData;
         _lastGrantDataValid = true;
         _lastGrantDataSource = GrantDataSource::RecallBuffer;
+        PendingGrantData &pendingData = _pendingGrantData[line_pa];
+        pendingData.data = routedGrantData;
+        pendingData.source = GrantDataSource::RecallBuffer;
+        pendingData.valid = true;
         DPRINTF(RubyEP,
                      "[C1-GRANT-DATA-DIRECT] node=%d pa=0x%lx "
                      "grant data routed directly (bypass recall capture)\n",
@@ -816,10 +824,19 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
     } else {
         // No payload — uninitialised line, zero-fill is correct
         populateGrantData(homePa, GrantDataSource::NoData);
+        PendingGrantData &pendingData = _pendingGrantData[line_pa];
+        pendingData.data = _lastGrantDataBlock;
+        pendingData.source = _lastGrantDataSource;
+        // Presence is separate from explicit NoData; only the latter may zero-fill.
+        pendingData.valid = _lastGrantDataValid &&
+            _lastGrantDataSource != GrantDataSource::NoData;
     }
 
-    int clearRet = sendClear(homePa, homeNode, grantEnv.epoch, grantEnv.reqId);
+    int clearRet = sendClear(homePa, homeNode, grantEnv.epoch, grantEnv.reqId,
+                             adapterIdx);
     if (clearRet == -2) return -2;
+    if (clearRet <= 0)
+        return -1;
 
     // ---- M6: Clear outer txn pending and signal completion (after Clear) ----
     if (_epRnfCtrl) {
@@ -1008,6 +1025,23 @@ int
 EPBackend::lastGrantDataSize() const
 {
     return _lastGrantDataValid ? 64 : 0;
+}
+
+int
+EPBackend::takeGrantData(uint64_t linePa, DataBlock &data,
+                         GrantDataSource &source)
+{
+    auto it = _pendingGrantData.find(linePa);
+    if (it == _pendingGrantData.end()) {
+        return -1;
+    }
+
+    source = it->second.source;
+    if (it->second.valid)
+        data = it->second.data;
+    const bool valid = it->second.valid;
+    _pendingGrantData.erase(it);
+    return valid ? 1 : 0;
 }
 
 // ---- M5 Inspection API ----
@@ -2211,7 +2245,7 @@ EPBackend::sendUpgradeDone(uint64_t line_pa, int homeNode,
 
     int
 EPBackend::sendClear(uint64_t line_pa, int homeNode,
-                      uint64_t epoch, uint64_t reqId)
+                     uint64_t epoch, uint64_t reqId, int sourceAdapter)
 {
     inform(
                  "[CLEAR-SEND] node=%d pa=0x%lx homeNode=%d epoch=%lu reqId=%lu\n",
@@ -2249,10 +2283,11 @@ EPBackend::sendClear(uint64_t line_pa, int homeNode,
     clearMsg.reason = ClearReason::GrantHandshake;
     _lastClearMsg = clearMsg;
 
-    if (!getUBAdapter(0)) {
+    UBAdapter *adapter = getUBAdapter(sourceAdapter);
+    if (!adapter) {
         fatal("EPBackend node_id=%d: UBAdapter required for clear "
-              "PA=0x%lx homeNode=%d\n",
-              _nodeId, line_pa, homeNode);
+              "PA=0x%lx homeNode=%d sourceAdapter=%d\n",
+              _nodeId, line_pa, homeNode, sourceAdapter);
     }
     // line_pa here is the home PA (socket-encoded); derive its home socket so
     // the ClearReq routes to the home plane's ubio (matching the original
@@ -2260,7 +2295,7 @@ EPBackend::sendClear(uint64_t line_pa, int homeNode,
     // grant handshake never completed and the requester deadlocked.
     int clearHomeSocket = _addrMap.homeSocket(homeNode, line_pa);
     if (clearHomeSocket < 0) clearHomeSocket = 0;
-    int clearRet = getUBAdapter(0)->sendClearReq(
+    int clearRet = adapter->sendClearReq(
         line_pa, _nodeId, clearEpoch, reqId, homeNode, clearHomeSocket);
     bool accepted = (clearRet > 0);  // -2=pending, -1=error, 0=rejected, 1=accepted
 
@@ -2283,7 +2318,7 @@ EPBackend::sendClear(uint64_t line_pa, int homeNode,
     ack.accepted = accepted;
     _lastClearAckMsg = ack;
 
-    return (clearRet == -2) ? -2 : (accepted ? 1 : 0);
+    return clearRet;
 }
 
 // ---- upgrade_invalidate_fix: upgrade ack callback ----

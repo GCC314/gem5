@@ -60,8 +60,19 @@ class EPSNFController : public EPController
     std::deque<RetryEntry> _retryQueue;
 
     // Q3: Deferred CompData sends (1-tick delay for TBE race fix)
-    std::vector<std::shared_ptr<CHIDataMsg>> _deferredCompData;
+    struct PendingDataOutput {
+        std::shared_ptr<CHIDataMsg> msg;
+    };
+    std::vector<PendingDataOutput> _deferredCompData;
     void processDeferredData();
+
+    // Output backpressure must not drop CHI responses. Keep messages in FIFO
+    // order until the corresponding MessageBuffer accepts them.
+    std::deque<std::shared_ptr<CHIResponseMsg>> _pendingResponses;
+    std::deque<PendingDataOutput> _pendingData;
+    void sendResponseReliable(std::shared_ptr<CHIResponseMsg> msg);
+    void sendDataReliable(std::shared_ptr<CHIDataMsg> msg);
+    void processPendingOutputs();
 
     // ---- v4: Deferred Grant Entry (§4.4.2, §7.6) ----
     /**

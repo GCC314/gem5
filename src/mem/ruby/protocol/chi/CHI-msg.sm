@@ -158,6 +158,7 @@ enumeration(CHIResponseType, desc="...") {
   // CHI response types
   Comp_I;
   Comp_UC;
+  Comp_UC_NoData;
   Comp_UD_PD;
   Comp_SC;
   CompAck;
