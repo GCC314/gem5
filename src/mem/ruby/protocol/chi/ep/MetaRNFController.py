@@ -9,7 +9,7 @@ class MetaRNFController(EPController):
 
     socket_id = Param.Int(0, "Socket ID for this controller")
     metadata_private_range = Param.AddrRange(
-        AddrRange(0, size="16MB"),
+        AddrRange(0, size="16MiB"),
         "private metadata DRAM range"
     )
     flight_slots = Param.Int(8, "Maximum concurrent metadata page requests")
