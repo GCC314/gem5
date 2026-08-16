@@ -105,6 +105,11 @@ class RubySequencer(RubyPort):
     # id used by protocols that support multiple sequencers per controller
     # 99 is the dummy default value
     coreid = Param.Int(99, "CorePair core id")
+    # Optional CHI HA requester facade.  SimObject (rather than EPBackend) is
+    # intentional so non-CHI Ruby builds do not acquire a generated type
+    # dependency on the endpoint extension.
+    ha_ep_backend = Param.SimObject(NULL, "EPBackend used by CHI HA stores")
+    ha_source_socket = Param.Int(0, "source socket for CHI HA permission traffic")
 
     def connectCpuPorts(self, cpu):
         """

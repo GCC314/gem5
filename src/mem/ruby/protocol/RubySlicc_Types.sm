@@ -138,6 +138,11 @@ structure (Sequencer, external = "yes") {
   void writeCallback(Addr, DataBlock, bool, MachineType,
                      Cycles, Cycles, Cycles);
   void writeUniqueCallback(Addr, DataBlock);
+  bool needsHAPermission(Addr);
+  int requestHAReadPermission(Addr, DataBlock, bool);
+  int requestHAStorePermission(Addr, DataBlock);
+  void completeHAStore(Addr, DataBlock, bool);
+  void acknowledgeHAPermission(Addr);
 
   void atomicCallback(Addr, DataBlock);
   void atomicCallback(Addr, DataBlock, bool);

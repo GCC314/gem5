@@ -304,6 +304,8 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
 
         _silent_env = os.environ.get("EP_SILENT_UPGRADE")
         _direct_env = os.environ.get("EP_DIRECT_FWD")
+        _ha_profile = os.environ.get("EP_HA_PROFILE", "ubcc")
+        _clear_profile = os.environ.get("OURCC_CLEAR_PROFILE", "ack")
         ep_backend = EPBackend(node_id=node_id, ruby_system=ruby_system,
                                  meta_rnf=NULL,
                                  ub_adapter=nd['ub_adapter'],
@@ -321,8 +323,10 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
                                  metadata_private_size=f"{metadata_private_size}B",
                                   silent_upgrade=bool(int(_silent_env))
                                        if _silent_env is not None else False,
-                                  direct_fwd=bool(int(_direct_env))
-                                       if _direct_env is not None else False)
+                                   direct_fwd=bool(int(_direct_env))
+                                        if _direct_env is not None else False,
+                                   ha_endpoint_profile=_ha_profile,
+                                   clear_profile=_clear_profile)
 
         # v4-dual-socket: Create per-socket EP-SNF controllers (§3.2 change 2)
         nd['ep_snf_cntrls'] = []
@@ -447,6 +451,9 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
                 l1i_assoc=2, l1d_assoc=2, l1i_size="32kB", l1d_size="32kB",
                 l2_assoc=8, l2_size="256kB",
                 socket_id=cluster_socket)
+            for cpu in cluster_cpus:
+                cpu.data_sequencer.ha_ep_backend = ep_backend
+                cpu.data_sequencer.ha_source_socket = cluster_socket
             cluster.addPrivL2Cache()
             setattr(ruby_system,
                     f"cluster_n{node_id}_c{cluster_i}", cluster)

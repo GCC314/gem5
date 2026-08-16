@@ -282,6 +282,7 @@ class CHI_L1Controller(Base_CHI_Cache_Controller):
     def __init__(self, ruby_system, sequencer, cache, prefetcher):
         super().__init__(ruby_system)
         self.sequencer = sequencer
+        self.accepts_cpu_requests = True
         self.cache = cache
         self.prefetcher = prefetcher
         self.use_prefetcher = prefetcher != NULL
@@ -428,6 +429,7 @@ class CHI_DMAController(Base_CHI_Cache_Controller):
     def __init__(self, ruby_system, sequencer):
         super().__init__(ruby_system)
         self.sequencer = sequencer
+        self.accepts_cpu_requests = True
 
         class DummyCache(RubyCache):
             dataAccessLatency = 0

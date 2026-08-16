@@ -1,6 +1,7 @@
 #include "mem/ruby/protocol/chi/ep/EPBackend.hh"
 
 #include <cstring>
+#include <algorithm>
 #include <array>
 #include <sstream>
 
@@ -16,6 +17,7 @@
 #include "mem/ruby/protocol/chi/ep/EPSNFController.hh"
 #include "mem/ruby/protocol/CHI/CHIRequestType.hh"
 #include "mem/ruby/system/RubySystem.hh"
+#include "mem/ruby/structures/CacheMemory.hh"
 #include "params/EPBackend.hh"
 #include "sim/cur_tick.hh"
 
@@ -92,8 +94,25 @@ EPBackend::EPBackend(const Params &p)
     _writebackCount(0),
     _evictCount(0),
     _invalidationReceivedCount(0),
-    _invalidationAckSentCount(0)
+    _invalidationAckSentCount(0),
+    _haEndpointEnabled(p.ha_endpoint_profile == "ha-vi" ||
+                       p.ha_endpoint_profile == "ha"),
+    _losslessOneWayClearEnabled(p.clear_profile == "lossless-oneway")
 {
+    fatal_if(p.ha_endpoint_profile != "ubcc" &&
+             p.ha_endpoint_profile != "ha-vi" &&
+             p.ha_endpoint_profile != "ha",
+             "EPBackend node_id=%d: unknown ha_endpoint_profile='%s' "
+              "(expected 'ubcc' or 'ha-vi')", _nodeId,
+               p.ha_endpoint_profile.c_str());
+    fatal_if(p.clear_profile != "ack" &&
+             p.clear_profile != "lossless-oneway",
+             "EPBackend node_id=%d: unknown clear_profile='%s' "
+             "(expected 'ack' or 'lossless-oneway')", _nodeId,
+             p.clear_profile.c_str());
+    fatal_if(_haEndpointEnabled && _losslessOneWayClearEnabled,
+             "EPBackend node_id=%d: clear_profile='lossless-oneway' is only "
+             "valid with ha_endpoint_profile='ubcc'", _nodeId);
     if (_numSockets < 1) {
         fatal("EPBackend node_id=%d: num_sockets=%d must be >= 1\n",
               _nodeId, _numSockets);
@@ -129,6 +148,10 @@ EPBackend::EPBackend(const Params &p)
         _metadataPrivateBase,
         _metadataPrivateSize / (1024 * 1024),
         (_metadataPrivateSize / _numSockets) / (1024 * 1024));
+    inform("[EPBACKEND-PROFILE] node=%d ha_endpoint_profile=%s "
+           "clear_profile=%s reliability=%s\n", _nodeId,
+           p.ha_endpoint_profile.c_str(), p.clear_profile.c_str(),
+           _losslessOneWayClearEnabled ? "eventual-delivery" : "clear-ack");
 }
 
 // v4-dual-socket: per-socket EP-SNF registration (§3.6)
@@ -256,6 +279,255 @@ EPBackend::wakeup()
         if (adapter && adapter->port())
             adapter->wakeup();
     }
+}
+
+int
+EPBackend::requestHAPermission(uint64_t linePa, HAOperation operation,
+                                uint64_t permissionEpoch,
+                                const uint8_t *writeData, int dstNode,
+                                int dstSocket, uint64_t &ioReqId,
+                                UBHAPermissionRespBody &outResp,
+                                int sourceSocket)
+{
+    UBAdapter *adapter = getUBAdapter(sourceSocket);
+    if (!adapter)
+        return -1;
+    return adapter->sendHAPermissionReq(
+        linePa, operation, permissionEpoch, writeData, dstNode, dstSocket,
+        ioReqId, outResp);
+}
+
+bool
+EPBackend::resolveHAStoreTarget(uint64_t localLinePa, int sourceSocket,
+                                 uint64_t &homeLinePa, int &homeNode,
+                                 int &homeSocket,
+                                 uint64_t &permissionEpoch) const
+{
+    if (!_haEndpointEnabled || sourceSocket < 0 ||
+        sourceSocket >= _numSockets) {
+        return false;
+    }
+
+    // EP-SNF can receive either the requester's DSM PA view or an already
+    // translated peer/home view. Route from the PA's actual encoded source so
+    // the HAPermissionReq reaches the matching HomeVI node/socket controller.
+    int paViewNode = _nodeId;
+    if (!_addrMap.isDsm(paViewNode, localLinePa)) {
+        paViewNode = _addrMap.srcNodeId(localLinePa);
+        if (paViewNode < 0 || paViewNode >= _addrMap.numNodes() ||
+            !_addrMap.isDsm(paViewNode, localLinePa)) {
+            return false;
+        }
+    }
+    homeNode = _addrMap.homeNode(paViewNode, localLinePa);
+    homeSocket = _addrMap.homeSocket(paViewNode, localLinePa);
+    if (homeNode < 0 || homeSocket < 0)
+        return false;
+    homeLinePa = _addrMap.buildDsmPA(
+        homeNode, homeNode, _addrMap.dsmOffset(localLinePa), homeSocket);
+    permissionEpoch = 0;
+    auto it = _haRequesterLines.find({sourceSocket, localLinePa});
+    if (it != _haRequesterLines.end())
+        permissionEpoch = it->second.epoch;
+    return true;
+}
+
+bool
+EPBackend::acknowledgeHAPermission(uint64_t linePa, HAOperation operation,
+                                   HAStatus status, uint64_t permissionEpoch,
+                                   int dstNode, int dstSocket, uint64_t reqId,
+                                   int sourceSocket)
+{
+    UBAdapter *adapter = getUBAdapter(sourceSocket);
+    return adapter && adapter->sendHAPermissionAck(
+        linePa, operation, status, permissionEpoch, dstNode, dstSocket, reqId);
+}
+
+void
+EPBackend::recordHAInstall(uint64_t localLinePa, HAOperation operation,
+                           uint64_t permissionEpoch, int homeNode,
+                           uint64_t reqId, int sourceSocket)
+{
+    fatal_if(sourceSocket < 0 || sourceSocket >= _numSockets,
+             "EPBackend node_id=%d: invalid HA install socket=%d PA=0x%lx",
+             _nodeId, sourceSocket, localLinePa);
+    RequesterLineEntry entry{};
+    entry.lineAddr = localLinePa;
+    entry.state = operation == HAOperation::Write
+        ? RequesterLineState::R_M : RequesterLineState::R_S;
+    entry.pendingReq = operation == HAOperation::Write
+        ? OuterReqType::GlobalReadUnique : OuterReqType::GlobalReadShared;
+    entry.epoch = permissionEpoch;
+    entry.reqId = reqId;
+    entry.writeIntent = operation == HAOperation::Write;
+    entry.homeNode = homeNode;
+    entry.outerStartTick = 0;
+    _haRequesterLines[{sourceSocket, localLinePa}] = entry;
+}
+
+void
+EPBackend::registerHADataCache(int sourceSocket, CacheMemory *cache)
+{
+    fatal_if(sourceSocket < 0 || sourceSocket >= _numSockets,
+             "EPBackend node_id=%d: invalid HA cache socket=%d",
+             _nodeId, sourceSocket);
+    if (!cache)
+        return;
+    if (_haDataCachesBySocket.size() < static_cast<size_t>(_numSockets))
+        _haDataCachesBySocket.resize(_numSockets);
+    auto &caches = _haDataCachesBySocket[sourceSocket];
+    if (std::find(caches.begin(), caches.end(), cache) == caches.end())
+        caches.push_back(cache);
+}
+
+void
+EPBackend::invalidateHADataCaches(int sourceSocket, uint64_t localLinePa)
+{
+    fatal_if(sourceSocket < 0 ||
+                 sourceSocket >= static_cast<int>(_haDataCachesBySocket.size()),
+             "EPBackend node_id=%d: invalid HA invalidate socket=%d PA=0x%lx",
+             _nodeId, sourceSocket, localLinePa);
+    for (CacheMemory *cache : _haDataCachesBySocket[sourceSocket]) {
+        if (cache->isTagPresent(localLinePa))
+            cache->deallocate(localLinePa);
+    }
+}
+
+bool
+EPBackend::hasHADataCacheLine(int sourceSocket, uint64_t localLinePa) const
+{
+    if (sourceSocket < 0 ||
+        sourceSocket >= static_cast<int>(_haDataCachesBySocket.size())) {
+        return false;
+    }
+    for (const CacheMemory *cache : _haDataCachesBySocket[sourceSocket]) {
+        if (cache->isTagPresent(localLinePa))
+            return true;
+    }
+    return false;
+}
+
+int
+EPBackend::requestHAPresenceProbe(uint64_t linePa, HAProbeAction action,
+                                   uint64_t expectedEpoch, int dstNode,
+                                   int dstSocket, uint64_t &ioReqId,
+                                   UBHAPresenceProbeRespBody &outResp,
+                                   int sourceSocket)
+{
+    UBAdapter *adapter = getUBAdapter(sourceSocket);
+    if (!adapter)
+        return -1;
+    return adapter->sendHAPresenceProbeReq(
+        linePa, action, expectedEpoch, dstNode, dstSocket, ioReqId, outResp);
+}
+
+void
+EPBackend::handleHAPresenceProbeRequest(const CoherenceMessage &request,
+                                         UBAdapter *sourceAdapter)
+{
+    if (!_haEndpointEnabled || !_epRnfCtrl || !sourceAdapter) {
+        UBHAPresenceProbeRespBody body;
+        body.action = request.b.haPresenceProbeReq.action;
+        body.status = _haEndpointEnabled ? HAStatus::RetryableBusy
+                                         : HAStatus::Denied;
+        sourceAdapter->sendHAPresenceProbeResp(request, body);
+        return;
+    }
+
+    const HAProbeKey key{
+        request.h.srcNode, request.h.srcSocket, request.h.reqId,
+        request.h.seqNum, request.h.homeLinePa,
+        static_cast<uint8_t>(request.b.haPresenceProbeReq.action),
+        request.b.haPresenceProbeReq.expectedEpoch};
+    auto done = _haCompletedProbeResponses.find(key);
+    if (done != _haCompletedProbeResponses.end()) {
+        sourceAdapter->sendHAPresenceProbeResp(
+            request, done->second.b.haPresenceProbeResp);
+        return;
+    }
+    if (_haPendingProbes.count(key))
+        return;
+
+    const uint64_t localPa = request.h.localLinePa != 0
+                                 ? request.h.localLinePa
+                                 : request.h.homeLinePa;
+    const int targetSocket = sourceAdapter->socketId();
+    HAPendingProbe pending;
+    pending.request = request;
+    pending.adapter = sourceAdapter;
+    _haPendingProbes.emplace(key, pending);
+
+    const auto requester = _haRequesterLines.find({targetSocket, localPa});
+    const uint64_t observedEpoch = requester == _haRequesterLines.end()
+        ? 0 : requester->second.epoch;
+    const bool present = hasHADataCacheLine(targetSocket, localPa);
+
+    auto complete = [this, key, reqId = request.h.reqId, localPa,
+                      targetSocket, observedEpoch, present](bool ok) {
+        auto it = _haPendingProbes.find(key);
+        if (it == _haPendingProbes.end())
+            return;
+        UBHAPresenceProbeRespBody body;
+        body.action = it->second.request.b.haPresenceProbeReq.action;
+        body.status = ok ? HAStatus::Ok : HAStatus::RetryableBusy;
+        body.present = ok && present ? 1 : 0;
+        body.observedEpoch = observedEpoch;
+
+        CoherenceMessage saved;
+        saved.b.haPresenceProbeResp = body;
+        _haCompletedProbeResponses[key] = saved;
+        // Keep duplicate-request replay bounded. Entries are only an at-most-
+        // once response cache, not protocol state.
+        if (_haCompletedProbeResponses.size() > 1024)
+            _haCompletedProbeResponses.erase(_haCompletedProbeResponses.begin());
+        const uint64_t expectedEpoch =
+            it->second.request.b.haPresenceProbeReq.expectedEpoch;
+        it->second.adapter->sendHAPresenceProbeResp(it->second.request, body);
+        inform("[HA-PROBE-COMPLETE] node=%d socket=%d reqId=%lu PA=0x%lx action=%s "
+               "status=%s present=%d observedEpoch=%lu expectedEpoch=%lu\n",
+               _nodeId, targetSocket, reqId, localPa,
+               haProbeActionName(body.action),
+               haStatusName(body.status), body.present ? 1 : 0,
+               body.observedEpoch, expectedEpoch);
+        _haPendingProbes.erase(it);
+    };
+
+    // Query reports pre-existing cache presence and must not fetch an absent
+    // line. Validate invalidates only a matching observed epoch.
+    if (request.b.haPresenceProbeReq.action == HAProbeAction::Query) {
+        complete(true);
+    } else if (request.b.haPresenceProbeReq.action == HAProbeAction::Validate) {
+        if (!present || observedEpoch !=
+                request.b.haPresenceProbeReq.expectedEpoch) {
+            complete(true);
+        } else {
+            _epRnfCtrl->startCleanUnique(
+                localPa, [this, targetSocket, localPa,
+                          complete = std::move(complete)](bool ok) mutable {
+                    if (ok)
+                        invalidateHADataCaches(targetSocket, localPa);
+                    complete(ok);
+                });
+        }
+    } else {
+        complete(false);
+    }
+}
+
+void
+EPBackend::handleHAPermissionRequest(const CoherenceMessage &request,
+                                      UBAdapter *sourceAdapter)
+{
+    // Permission policy intentionally remains outside generic CHI/SLICC in
+    // this change.  Until the later per-store hook consumes requestHAPermission,
+    // an unsolicited peer request receives a typed terminal response rather
+    // than being dropped or accidentally granted from requester bookkeeping.
+    UBHAPermissionRespBody body;
+    body.operation = request.b.haPermissionReq.operation;
+    body.permissionEpoch = request.b.haPermissionReq.permissionEpoch;
+    body.status = _haEndpointEnabled ? HAStatus::Denied
+                                     : HAStatus::InvalidArgument;
+    sourceAdapter->sendHAPermissionResp(request, body);
 }
 
 bool
@@ -444,6 +716,105 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
             "homeNode=%d homeSocket=%d ingressSocket=%d offset=0x%lx\n",
             _nodeId, line_pa, homePa, homeNode, homeSocket, ingressSocket, offset);
 
+    // HA endpoint path.  EP-SNF ReadNoSnp traffic bypasses the CPU Sequencer,
+    // so it must perform the HA transaction here, before touching any legacy
+    // requester-line, ReadReq, grant-handshake, or Clear state.
+    //
+    // Even when CHI asks for a Unique fill, this transaction only obtains the
+    // 64-byte base line.  It is intentionally a HA Read: EP-SNF does not have
+    // the architectural store bytes, and manufacturing a HA Write here would
+    // both persist incorrect data and let a reusable CHI Unique fill stand in
+    // for the mandatory per-store HA Write gate in Sequencer.  The later store
+    // therefore still performs its own HA Write with the final line contents.
+    if (_haEndpointEnabled) {
+        const HARemoteMissKey key{line_pa, adapterIdx, neededPerm, writeIntent};
+        auto [ctxIt, inserted] = _haRemoteMisses.try_emplace(key);
+        HARemoteMissContext &ctx = ctxIt->second;
+        if (inserted) {
+            ctx.homePa = homePa;
+            ctx.homeNode = homeNode;
+            ctx.homeSocket = homeSocket;
+            ctx.sourceSocket = adapterIdx;
+            ctx.operation = HAOperation::Read;
+
+            // There is deliberately no requester-line allocation in HA mode.
+            // If older non-HA state exists, its epoch is only an echoed wire
+            // field and conveys no reusable HA write authorization.
+            auto requester = _haRequesterLines.find({adapterIdx, line_pa});
+            if (requester != _haRequesterLines.end())
+                ctx.permissionEpoch = requester->second.epoch;
+        } else {
+            fatal_if(ctx.homePa != homePa || ctx.homeNode != homeNode ||
+                         ctx.homeSocket != homeSocket ||
+                         ctx.sourceSocket != adapterIdx,
+                     "EPBackend node_id=%d: HA remote-miss context changed "
+                     "PA=0x%lx", _nodeId, line_pa);
+        }
+
+        // A successful result is returned exactly once to EPSNF, which then
+        // consumes _pendingGrantData and eventually calls the completion hook.
+        // A duplicate CHI request with identical semantics waits behind that
+        // installation instead of polling an already-consumed response or
+        // receiving the first request's data without its own HA transaction.
+        if (ctx.awaitingInstall)
+            return -2;
+
+        UBHAPermissionRespBody response;
+        const int status = requestHAPermission(
+            ctx.homePa, ctx.operation, ctx.permissionEpoch, nullptr,
+            ctx.homeNode, ctx.homeSocket, ctx.reqId, response,
+            ctx.sourceSocket);
+        if (status == -2)
+            return -2;
+        if (status < 0)
+            return -1;
+
+        fatal_if(status != 1,
+                 "EPBackend node_id=%d: invalid HA permission result %d "
+                 "PA=0x%lx", _nodeId, status, line_pa);
+        fatal_if(response.operation != ctx.operation,
+                 "EPBackend node_id=%d: HA permission operation mismatch "
+                 "PA=0x%lx got=%s expected=%s", _nodeId, line_pa,
+                 haOperationName(response.operation),
+                 haOperationName(ctx.operation));
+        fatal_if(response.permissionEpoch != ctx.permissionEpoch,
+                 "EPBackend node_id=%d: HA permission epoch mismatch "
+                 "PA=0x%lx got=%lu expected=%lu", _nodeId, line_pa,
+                 response.permissionEpoch, ctx.permissionEpoch);
+
+        if (response.status == HAStatus::RetryableBusy) {
+            // UBAdapter consumed the terminal busy response.  Reset only the
+            // wire ID; retaining the keyed context makes the next retry a safe
+            // fresh request with unchanged address/socket/semantics.
+            ctx.reqId = 0;
+            return -2;
+        }
+        fatal_if(response.status != HAStatus::Ok,
+                 "EPBackend node_id=%d: HA permission denied PA=0x%lx "
+                 "status=%s", _nodeId, line_pa,
+                 haStatusName(response.status));
+        fatal_if(!response.hasData,
+                 "EPBackend node_id=%d: successful HA Read lacks 64-byte "
+                 "data PA=0x%lx", _nodeId, line_pa);
+
+        DataBlock block(64);
+        block.setData(response.data, 0, 64);
+        _lastGrantDataBlock = block;
+        _lastGrantDataValid = true;
+        _lastGrantDataSource = GrantDataSource::HomeMemory;
+        PendingGrantData &pending = _pendingGrantData[line_pa];
+        pending.data = block;
+        pending.source = GrantDataSource::HomeMemory;
+        pending.valid = true;
+        ctx.awaitingInstall = true;
+
+        // This is CHI fill privilege only.  In particular, Unique maps to UC
+        // CompData but does not create R_E/R_M or reusable Home write authority.
+        return static_cast<int>(neededPerm == 0
+            ? OuterGrantType::GlobalGrantShared
+            : OuterGrantType::GlobalGrantExclusive);
+    }
+
     // Map sideband to outer request type
     OuterReqType reqType;
     if (neededPerm == 0) {
@@ -468,7 +839,7 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
     // sendClear() with the ORIGINAL reqId/epoch saved in the pending grant txn,
     // and complete the transaction once the ClearResp is accepted.
     {
-        auto pgt = _pendingGrantTxns.find(homePa);
+        auto pgt = _pendingGrantTxns.find({adapterIdx, homePa});
         if (pgt != _pendingGrantTxns.end() && pgt->second.valid) {
             int clearRet = sendClear(homePa, pgt->second.homeNode,
                                      pgt->second.baseEpoch, pgt->second.reqId,
@@ -774,7 +1145,7 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
         txn.sourceAdapter = adapterIdx;
         txn.grantType = grantEnv.grantType;
         txn.outerStartTick = entry.outerStartTick;
-        _pendingGrantTxns[homePa] = txn;
+        _pendingGrantTxns[{adapterIdx, homePa}] = txn;
         DPRINTF(RubyEP, "[DEBUG-TC5-CLEAR-TRACE] savePendingGrantTxn node=%d keyPA=0x%lx homePA=0x%lx "
                 "baseEpoch=%lu reqId=%lu grantType=%d\n",
                 _nodeId, homePa, homePa, txn.baseEpoch, txn.reqId,
@@ -832,6 +1203,19 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
             _lastGrantDataSource != GrantDataSource::NoData;
     }
 
+    // Experimental lossless one-way profile: the grant may now flow into the
+    // local CHI hierarchy, but Clear is deliberately NOT sent here. The real
+    // publication point is the existing HA SLICC Final action in Sequencer,
+    // after cache/data and directory publication and just before TBE retirement.
+    // Home retains WAITING_CLEAR in the meantime, so same-line conflicts remain
+    // blocked.
+    if (_losslessOneWayClearEnabled) {
+        inform("[CLEAR-ONEWAY] phase=grant_received node=%d localPa=0x%lx "
+               "homePa=0x%lx reqId=%lu tick=%lu\n", _nodeId, line_pa,
+               homePa, grantEnv.reqId, curTick());
+        return static_cast<int>(result);
+    }
+
     int clearRet = sendClear(homePa, homeNode, grantEnv.epoch, grantEnv.reqId,
                              adapterIdx);
     if (clearRet == -2) return -2;
@@ -851,22 +1235,118 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
     return -1;
 }
 
+void
+EPBackend::notifyLocalLinePublished(uint64_t localLinePa, int sourceSocket)
+{
+    if (!_losslessOneWayClearEnabled)
+        return;
+
+    const uint64_t offset = _addrMap.dsmOffset(localLinePa);
+    int homeNode = _addrMap.homeNode(_nodeId, localLinePa);
+    int homeSocket = _addrMap.homeSocket(_nodeId, localLinePa);
+    if (homeNode < 0 || homeSocket < 0)
+        return;
+    const uint64_t homePa = _addrMap.buildDsmPA(
+        homeNode, homeNode, offset, homeSocket);
+    auto txnIt = _pendingGrantTxns.find({sourceSocket, homePa});
+    if (txnIt == _pendingGrantTxns.end() || !txnIt->second.valid)
+        return;
+
+    PendingGrantTxn txn = txnIt->second;
+    fatal_if(txn.sourceAdapter != sourceSocket,
+             "EPBackend node_id=%d: publication socket mismatch PA=0x%lx "
+             "grantSocket=%d ackSocket=%d", _nodeId, localLinePa,
+             txn.sourceAdapter, sourceSocket);
+    UBAdapter *adapter = getUBAdapter(txn.sourceAdapter);
+    fatal_if(!adapter,
+             "EPBackend node_id=%d: no adapter for one-way Clear socket=%d",
+             _nodeId, txn.sourceAdapter);
+
+    inform("[CLEAR-ONEWAY] phase=local_publication node=%d sourceSocket=%d "
+           "homeNode=%d homeSocket=%d localPa=0x%lx homePa=0x%lx "
+           "reqId=%lu tick=%lu\n", _nodeId, txn.sourceAdapter, txn.homeNode,
+           homeSocket, localLinePa, homePa, txn.reqId, curTick());
+    fatal_if(!adapter->sendClearReqOneWay(
+                 homePa, _nodeId, txn.baseEpoch, txn.reqId, txn.homeNode,
+                 homeSocket),
+             "EPBackend node_id=%d: failed to queue lossless one-way Clear "
+             "PA=0x%lx reqId=%lu", _nodeId, homePa, txn.reqId);
+
+    OuterClearMsg clearMsg;
+    clearMsg.linePa = homePa;
+    clearMsg.srcNode = _nodeId;
+    clearMsg.homeNode = txn.homeNode;
+    clearMsg.epoch = txn.baseEpoch;
+    clearMsg.reqId = txn.reqId;
+    clearMsg.reason = ClearReason::GrantHandshake;
+    _lastClearMsg = clearMsg;
+    inform("[CLEAR-ONEWAY] phase=clear_queued node=%d sourceSocket=%d "
+           "homeNode=%d homeSocket=%d localPa=0x%lx homePa=0x%lx "
+           "reqId=%lu tick=%lu\n", _nodeId, txn.sourceAdapter, txn.homeNode,
+           homeSocket, localLinePa, homePa, txn.reqId, curTick());
+
+    _pendingGrantTxns.erase(txnIt);
+    if (txn.outerStartTick) {
+        inform("[EP-PERF] kind=outer_oneway_root node=%d pa=0x%lx reqId=%lu "
+               "start=%lu end=%lu latency_ps=%lu\n", _nodeId, homePa,
+               txn.reqId, txn.outerStartTick, curTick(),
+               curTick() - txn.outerStartTick);
+    }
+    if (_epRnfCtrl) {
+        _epRnfCtrl->setOuterTxnPending(localLinePa, false);
+        _epRnfCtrl->signalOuterTxnComplete(localLinePa);
+    }
+}
+
 int
 EPBackend::handleRemoteDemandMiss(uint64_t line_pa, int neededPerm,
                                   bool writeIntent, int ingressSocket,
                                   int& outHomeNode)
 {
-    auto existing = _requesterLines.find(line_pa);
-    if (existing != _requesterLines.end() &&
-        existing->second.state != RequesterLineState::R_WAIT_GRANT) {
-        DPRINTF(RubyEP,
-                "EPBackend node_id=%d: HN-F confirmed local miss PA=0x%lx "
-                "invalidating stale requester state=%d\n",
-                _nodeId, line_pa, static_cast<int>(existing->second.state));
-        existing->second.state = RequesterLineState::R_I;
+    // HA mode must enter handleRemoteMiss without mutating legacy requester
+    // state; that function branches to HAPermissionReq before all legacy work.
+    if (!_haEndpointEnabled) {
+        auto existing = _requesterLines.find(line_pa);
+        if (existing != _requesterLines.end() &&
+            existing->second.state != RequesterLineState::R_WAIT_GRANT) {
+            DPRINTF(RubyEP,
+                    "EPBackend node_id=%d: HN-F confirmed local miss PA=0x%lx "
+                    "invalidating stale requester state=%d\n",
+                    _nodeId, line_pa, static_cast<int>(existing->second.state));
+            existing->second.state = RequesterLineState::R_I;
+        }
     }
     return handleRemoteMiss(line_pa, neededPerm, writeIntent,
                             ingressSocket, outHomeNode);
+}
+
+void
+EPBackend::completeHARemoteGrant(uint64_t linePa, int neededPerm,
+                                 bool writeIntent, int ingressSocket)
+{
+    if (!_haEndpointEnabled)
+        return;
+
+    const int sourceSocket =
+        (ingressSocket >= 0 && ingressSocket < _numSockets) ? ingressSocket : 0;
+    const HARemoteMissKey key{linePa, sourceSocket, neededPerm, writeIntent};
+    auto it = _haRemoteMisses.find(key);
+    fatal_if(it == _haRemoteMisses.end() || !it->second.awaitingInstall ||
+                 it->second.reqId == 0,
+             "EPBackend node_id=%d: invalid HA remote-grant completion "
+             "PA=0x%lx perm=%d writeIntent=%d socket=%d", _nodeId, linePa,
+             neededPerm, writeIntent, sourceSocket);
+
+    const HARemoteMissContext &ctx = it->second;
+    recordHAInstall(linePa, HAOperation::Read, ctx.permissionEpoch,
+                    ctx.homeNode, ctx.reqId, ctx.sourceSocket);
+    fatal_if(!acknowledgeHAPermission(
+                 ctx.homePa, ctx.operation, HAStatus::Ok,
+                 ctx.permissionEpoch, ctx.homeNode, ctx.homeSocket, ctx.reqId,
+                 ctx.sourceSocket),
+             "EPBackend node_id=%d: failed to queue HA permission Ack "
+             "PA=0x%lx reqId=%lu", _nodeId, linePa, ctx.reqId);
+    _haRemoteMisses.erase(it);
 }
 
 OuterGrantType
@@ -1214,6 +1694,19 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
 
     // Capture recallMsg fields for the async callback
     OuterRecallMsg capturedMsg = recallMsg;
+    DataBlock ownerSnapshot(64);
+    bool ownerSnapshotValid = false;
+    if (recallMsg.dataNeeded && _ruby_system) {
+        uint8_t bytes[64]{};
+        RequestPtr req = std::make_shared<Request>(
+            ownerLocalPa, 64, 0, _epRnfCtrl->getRequestorId());
+        req->setFlags(Request::PHYSICAL);
+        Packet pkt(req, MemCmd::ReadReq);
+        pkt.dataStatic(bytes);
+        ownerSnapshotValid = _ruby_system->functionalRead(&pkt);
+        if (ownerSnapshotValid)
+            ownerSnapshot.setData(bytes, 0, 64);
+    }
 
     if (recallMsg.isReadRequest) {
         // Read recall: ReadShared to downgrade owner to R_S
@@ -1228,7 +1721,8 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
         // R2: Clear stale recall capture data before initiating new recall
         setRecallCaptureData(DataBlock(64), false);
         _epRnfCtrl->startReadShared(ownerLocalPa,
-            [this, capturedMsg](bool success) {
+            [this, capturedMsg, ownerSnapshot,
+             ownerSnapshotValid](bool success) {
                 if (_verboseLog) {
                 DPRINTF(RubyEP, "[RECALL-DIAG] node=%d ReadShared callback success=%d valid=%d\n",
                         _nodeId, success, _recallCaptureDataValid);
@@ -1244,12 +1738,14 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
                 resp.homeNode = capturedMsg.homeNode;
                 resp.epoch = capturedMsg.epoch;
                 resp.reqId = capturedMsg.reqId;
+                resp.sourceSocket = capturedMsg.sourceSocket;
                 resp.ackReceived = success;
                 resp.dataReturned = capturedMsg.dataNeeded && success &&
-                                    _recallCaptureDataValid;
+                    (ownerSnapshotValid || _recallCaptureDataValid);
                 // R2: Gate data payload on dataReturned (not raw _recallCaptureDataValid)
                 if (resp.dataReturned) {
-                    resp.dataPayload = _recallCaptureDataBlock;
+                    resp.dataPayload = ownerSnapshotValid
+                        ? ownerSnapshot : _recallCaptureDataBlock;
                     resp.hasDataPayload = true;
                 }
                 // C4: Direct-forward data to requester (requester ≠ owner ≠ home)
@@ -1305,7 +1801,8 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
         // R2: Clear stale recall capture data before initiating new recall
         setRecallCaptureData(DataBlock(64), false);
         _epRnfCtrl->startReadUnique(ownerLocalPa,
-            [this, capturedMsg](bool success) {
+            [this, capturedMsg, ownerSnapshot,
+             ownerSnapshotValid](bool success) {
                 inform(
                              "[RECALL-PROXY-CALLBACK] node=%d homePA=0x%lx "
                              "reqId=%lu success=%d dataValid=%d tick=%lu\n",
@@ -1327,12 +1824,14 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
                 resp.homeNode = capturedMsg.homeNode;
                 resp.epoch = capturedMsg.epoch;
                 resp.reqId = capturedMsg.reqId;
+                resp.sourceSocket = capturedMsg.sourceSocket;
                 resp.ackReceived = success;
                 resp.dataReturned = capturedMsg.dataNeeded && success &&
-                                    _recallCaptureDataValid;
+                    (ownerSnapshotValid || _recallCaptureDataValid);
                 // R2: Gate data payload on dataReturned (not raw _recallCaptureDataValid)
                 if (resp.dataReturned) {
-                    resp.dataPayload = _recallCaptureDataBlock;
+                    resp.dataPayload = ownerSnapshotValid
+                        ? ownerSnapshot : _recallCaptureDataBlock;
                     resp.hasDataPayload = true;
                 }
                 // C4: Direct-forward data to requester (requester ≠ owner ≠ home)
@@ -1434,17 +1933,18 @@ EPBackend::sendRecallResponse(const OuterRecallResponse &response)
         }
     }
 
-    if (!getUBAdapter(0)) {
+    if (!getUBAdapter(response.sourceSocket)) {
         fatal("EPBackend node_id=%d: UBAdapter required for recall response "
-              "PA=0x%lx homeNode=%d\n",
-              _nodeId, response.linePa, response.homeNode);
+              "PA=0x%lx homeNode=%d sourceSocket=%d\n",
+              _nodeId, response.linePa, response.homeNode,
+              response.sourceSocket);
     }
     // RecallResp returns to the home directory plane; derive its socket from the
     // home line PA so it routes to ubio(homeNode, homeSocket) and matches the
     // outstanding RECALL there (hardcoding 0 stranded cross-socket recalls).
     int rrHomeSocket = _addrMap.homeSocket(response.homeNode, response.linePa);
     if (rrHomeSocket < 0) rrHomeSocket = 0;
-    bool ok = getUBAdapter(0)->sendRecallResp(
+    bool ok = getUBAdapter(response.sourceSocket)->sendRecallResp(
         response.linePa, response.ownerNode, response.dataReturned,
         response.epoch, response.reqId,
         response.hasDataPayload ? &response.dataPayload : nullptr,
@@ -1791,15 +2291,27 @@ EPBackend::handleInvalidationRequest(const OuterInvalidateMsg &invMsg)
                            : invMsg.linePa;
     bool hadLocalCopy = false;
     {
-        auto it = _requesterLines.find(lookupPa);
-        if (it != _requesterLines.end()) {
-            // A copy is held only in R_S/R_E/R_M. R_I means already invalid and
-            // R_WAIT_GRANT means a request is in flight but no copy is held yet.
+        const HALineKey haKey{invMsg.sourceSocket, lookupPa};
+        auto it = _haEndpointEnabled ? _haRequesterLines.find(haKey)
+                                     : _haRequesterLines.end();
+        if (_haEndpointEnabled && it != _haRequesterLines.end()) {
             RequesterLineState st = it->second.state;
             hadLocalCopy = (st == RequesterLineState::R_S ||
                             st == RequesterLineState::R_E ||
-                            st == RequesterLineState::R_M);
+                            st == RequesterLineState::R_M) &&
+                           hasHADataCacheLine(invMsg.sourceSocket, lookupPa);
             it->second.state = RequesterLineState::R_I;
+        } else if (!_haEndpointEnabled) {
+            auto legacy = _requesterLines.find(lookupPa);
+            if (legacy != _requesterLines.end()) {
+                // A copy is held only in R_S/R_E/R_M. R_I means already invalid
+                // and R_WAIT_GRANT means no copy has been installed yet.
+                RequesterLineState st = legacy->second.state;
+                hadLocalCopy = (st == RequesterLineState::R_S ||
+                                st == RequesterLineState::R_E ||
+                                st == RequesterLineState::R_M);
+                legacy->second.state = RequesterLineState::R_I;
+            }
         }
     }
 
@@ -1845,6 +2357,7 @@ EPBackend::handleInvalidationRequest(const OuterInvalidateMsg &invMsg)
             ack.linePa = invMsg.linePa;
             ack.ackNode = _nodeId;
             ack.homeNode = invMsg.homeNode;
+            ack.sourceSocket = invMsg.sourceSocket;
             ack.epoch = invMsg.epoch;
             ack.reqId = invMsg.reqId;
             sendInvalidationAck(ack);
@@ -1885,6 +2398,7 @@ EPBackend::handleInvalidationRequest(const OuterInvalidateMsg &invMsg)
         ack.linePa = invMsg.linePa;
         ack.ackNode = _nodeId;
         ack.homeNode = invMsg.homeNode;
+        ack.sourceSocket = invMsg.sourceSocket;
         ack.epoch = invMsg.epoch;
         ack.reqId = invMsg.reqId;
         sendInvalidationAck(ack);
@@ -1908,10 +2422,14 @@ EPBackend::handleInvalidationRequest(const OuterInvalidateMsg &invMsg)
                 DPRINTF(RubyEP, "[INVAL-DIAG] node=%d startCleanUnique callback PA=0x%lx ok=%d\n",
                         _nodeId, capturedMsg.linePa, ok);
                 }
+                if (ok && _haEndpointEnabled)
+                    invalidateHADataCaches(capturedMsg.sourceSocket,
+                                           capturedMsg.sharerLocalPa);
                 OuterInvalidationAck ack;
                 ack.linePa = capturedMsg.linePa;
                 ack.ackNode = _nodeId;
                 ack.homeNode = capturedMsg.homeNode;
+                ack.sourceSocket = capturedMsg.sourceSocket;
                 ack.epoch = capturedMsg.epoch;
                 ack.reqId = capturedMsg.reqId;
                 sendInvalidationAck(ack);
@@ -1938,14 +2456,14 @@ EPBackend::sendInvalidationAck(const OuterInvalidationAck &ack)
     _lastInvalidationAck = ack;
     _invalidationAckSentCount++;
 
-    if (!getUBAdapter(0)) {
+    if (!getUBAdapter(ack.sourceSocket)) {
         fatal("EPBackend node_id=%d: UBAdapter required for invalidation ack "
-              "PA=0x%lx homeNode=%d\n",
-              _nodeId, ack.linePa, ack.homeNode);
+              "PA=0x%lx homeNode=%d sourceSocket=%d\n",
+              _nodeId, ack.linePa, ack.homeNode, ack.sourceSocket);
     }
     int ackHomeSocket = _addrMap.homeSocket(ack.homeNode, ack.linePa);
     if (ackHomeSocket < 0) ackHomeSocket = 0;
-    bool ok = getUBAdapter(0)->sendInvalidateAck(
+    bool ok = getUBAdapter(ack.sourceSocket)->sendInvalidateAck(
         ack.linePa, ack.ackNode, ack.epoch, ack.reqId,
         ack.homeNode, ackHomeSocket);
 
@@ -2274,7 +2792,7 @@ EPBackend::sendClear(uint64_t line_pa, int homeNode,
 
     // upgrade_invalidate_fix D5: prefer PendingGrantTxn.baseEpoch
     uint64_t clearEpoch = epoch;
-    auto txnIt = _pendingGrantTxns.find(line_pa);
+    auto txnIt = _pendingGrantTxns.find({sourceAdapter, line_pa});
     bool foundPendingGrantTxn =
         (txnIt != _pendingGrantTxns.end() && txnIt->second.valid);
     if (txnIt != _pendingGrantTxns.end() && txnIt->second.valid) {
@@ -2440,6 +2958,7 @@ EPBackend::flushDeferredInvalidation(uint64_t linePa)
         ackR.linePa = invMsg.linePa;
         ackR.ackNode = _nodeId;
         ackR.homeNode = invMsg.homeNode;
+        ackR.sourceSocket = invMsg.sourceSocket;
         ackR.epoch = invMsg.epoch;
         ackR.reqId = invMsg.reqId;
         sendInvalidationAck(ackR);
@@ -2455,6 +2974,7 @@ EPBackend::flushDeferredInvalidation(uint64_t linePa)
     ack.linePa = invMsg.linePa;
     ack.ackNode = _nodeId;
     ack.homeNode = invMsg.homeNode;
+    ack.sourceSocket = invMsg.sourceSocket;
     ack.epoch = invMsg.epoch;
     ack.reqId = invMsg.reqId;
     sendInvalidationAck(ack);

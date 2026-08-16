@@ -55,6 +55,11 @@
 #include "mem/ruby/slicc_interface/RubyRequest.hh"
 #include "mem/ruby/slicc_interface/RubySlicc_Util.hh"
 #include "mem/ruby/system/RubySystem.hh"
+#include "config/ruby_protocol_chi.hh"
+
+#if RUBY_PROTOCOL_CHI
+#include "mem/ruby/protocol/chi/ep/EPBackend.hh"
+#endif
 
 namespace gem5
 {
@@ -81,6 +86,19 @@ Sequencer::Sequencer(const Params &p)
     m_unaddressedTransactionCnt = 0;
 
     m_runningGarnetStandalone = p.garnet_standalone;
+
+#if RUBY_PROTOCOL_CHI
+    m_haEpBackend = dynamic_cast<EPBackend *>(p.ha_ep_backend);
+    fatal_if(p.ha_ep_backend && !m_haEpBackend,
+             "%s: ha_ep_backend is not an EPBackend", name());
+    if (m_haEpBackend && m_haEpBackend->haEndpointEnabled()) {
+        m_haEpBackend->registerHADataCache(
+            p.ha_source_socket, m_dataCache_ptr);
+        inform("[HA-SEQ-ATTACH] seq=%s socket=%d backend=%s\n",
+               name(), p.ha_source_socket, m_haEpBackend->name());
+    }
+#endif
+    m_haSourceSocket = p.ha_source_socket;
 
     m_num_pending_invs = 0;
     m_cache_inv_pkt = nullptr;
@@ -146,6 +164,232 @@ Sequencer::Sequencer(const Params &p)
 
 Sequencer::~Sequencer()
 {
+}
+
+bool
+Sequencer::needsHAPermission(Addr address) const
+{
+#if RUBY_PROTOCOL_CHI
+    if (!m_haEpBackend || !m_haEpBackend->haEndpointEnabled())
+        return false;
+
+    uint64_t homePa = 0;
+    uint64_t epoch = 0;
+    int homeNode = -1;
+    int homeSocket = 0;
+    return m_haEpBackend->resolveHAStoreTarget(
+        makeLineAddress(address), m_haSourceSocket, homePa, homeNode,
+        homeSocket, epoch);
+#else
+    return false;
+#endif
+}
+
+int
+Sequencer::requestHAReadPermission(Addr address, DataBlock& data,
+                                   bool storeMiss)
+{
+#if RUBY_PROTOCOL_CHI
+    if (!needsHAPermission(address))
+        return 0;
+
+    const Addr lineAddr = makeLineAddress(address);
+    auto requests = m_RequestTable.find(lineAddr);
+    fatal_if(requests == m_RequestTable.end() || requests->second.empty(),
+             "%s: HA load gate without a sequencer request for line %#x",
+             name(), lineAddr);
+    const RubyRequestType expected = storeMiss ? RubyRequestType_ST
+                                               : RubyRequestType_LD;
+    fatal_if(requests->second.front().m_type != expected,
+             "%s: wrong request type entered HA read gate for line %#x",
+             name(), lineAddr);
+
+    auto [it, inserted] = m_haPermissions.try_emplace(lineAddr);
+    HAPermissionState &state = it->second;
+    if (inserted) {
+        state.isWrite = false;
+        if (!m_haEpBackend->resolveHAStoreTarget(
+                lineAddr, m_haSourceSocket, state.homePa, state.homeNode,
+                state.homeSocket, state.epoch)) {
+            m_haPermissions.erase(it);
+            return 0;
+        }
+        inform("[HA-SLICC-GATE] seq=%s phase=READ_ENTER pa=%#x homePa=%#lx "
+               "homeNode=%d homeSocket=%d storeMiss=%d\n",
+               name(), lineAddr, state.homePa, state.homeNode,
+               state.homeSocket, storeMiss);
+    }
+    fatal_if(state.isWrite,
+             "%s: HA read/write overlap for line %#x", name(), lineAddr);
+
+    if (state.granted)
+        return 2;
+
+    UBHAPermissionRespBody response;
+    const int status = m_haEpBackend->requestHAPermission(
+        state.homePa, HAOperation::Read, state.epoch, nullptr, state.homeNode,
+        state.homeSocket, state.reqId, response, m_haSourceSocket);
+    if (status == -2)
+        return 1;
+    fatal_if(status != 1,
+             "%s: HA read permission transport failed for line %#x", name(),
+             lineAddr);
+    fatal_if(response.operation != HAOperation::Read,
+             "%s: HA read permission operation mismatch for line %#x", name(),
+             lineAddr);
+    fatal_if(response.permissionEpoch != state.epoch,
+             "%s: HA read permission epoch mismatch for line %#x: got %lu expected %lu",
+             name(), lineAddr, response.permissionEpoch, state.epoch);
+    if (response.status == HAStatus::RetryableBusy) {
+        state.reqId = 0;
+        return 1;
+    }
+    fatal_if(response.status != HAStatus::Ok,
+             "%s: HA read permission denied for line %#x status=%s", name(),
+             lineAddr, haStatusName(response.status));
+    fatal_if(!response.hasData,
+             "%s: successful HA read response lacks 64-byte data for line %#x",
+             name(), lineAddr);
+    data.setData(response.data, 0, 64);
+    state.granted = true;
+    inform("[HA-SLICC-GATE] seq=%s phase=READ_GRANTED pa=%#x reqId=%lu "
+           "epoch=%lu\n", name(), lineAddr, state.reqId, state.epoch);
+    return 2;
+#else
+    return 0;
+#endif
+}
+
+int
+Sequencer::requestHAStorePermission(Addr address, DataBlock& data)
+{
+#if RUBY_PROTOCOL_CHI
+    if (!needsHAPermission(address))
+        return 0;
+
+    const Addr lineAddr = makeLineAddress(address);
+    auto requests = m_RequestTable.find(lineAddr);
+    fatal_if(requests == m_RequestTable.end() || requests->second.empty(),
+             "%s: HA store gate without a sequencer request for line %#x",
+             name(), lineAddr);
+    if (requests->second.front().m_type != RubyRequestType_ST)
+        return 0;
+
+    auto [it, inserted] = m_haPermissions.try_emplace(lineAddr);
+    HAPermissionState &state = it->second;
+    if (inserted) {
+        state.isWrite = true;
+        if (!m_haEpBackend->resolveHAStoreTarget(
+                lineAddr, m_haSourceSocket, state.homePa, state.homeNode,
+                state.homeSocket, state.epoch)) {
+            m_haPermissions.erase(it);
+            return 0;
+        }
+        inform("[HA-SLICC-GATE] seq=%s phase=WRITE_ENTER pa=%#x homePa=%#lx "
+               "homeNode=%d homeSocket=%d\n", name(), lineAddr,
+               state.homePa, state.homeNode, state.homeSocket);
+    }
+    fatal_if(!state.isWrite,
+             "%s: HA read/write overlap for line %#x", name(), lineAddr);
+
+    if (state.granted)
+        return 2;
+
+    // The home controller persists the request payload. Construct the final
+    // value in a temporary block so permission is requested with the eventual
+    // store contents while the live CHI TBE remains unmodified until grant.
+    DataBlock proposed(data);
+    proposed.setData(requests->second.front().pkt);
+    UBHAPermissionRespBody response;
+    const int status = m_haEpBackend->requestHAPermission(
+        state.homePa, HAOperation::Write, state.epoch,
+        proposed.getData(0, 64), state.homeNode, state.homeSocket, state.reqId,
+        response, m_haSourceSocket);
+    if (status == -2)
+        return 1;
+    fatal_if(status != 1,
+             "%s: HA permission transport failed for line %#x", name(),
+             lineAddr);
+    fatal_if(response.operation != HAOperation::Write,
+             "%s: HA permission operation mismatch for line %#x", name(),
+             lineAddr);
+    fatal_if(response.permissionEpoch != state.epoch,
+             "%s: HA permission epoch mismatch for line %#x: got %lu expected %lu",
+             name(), lineAddr, response.permissionEpoch, state.epoch);
+
+    if (response.status == HAStatus::RetryableBusy) {
+        // sendHAPermissionReq consumed the response and retired the old wire
+        // request.  A zero ID causes the next poll to allocate a fresh request.
+        state.reqId = 0;
+        return 1;
+    }
+    fatal_if(response.status != HAStatus::Ok,
+             "%s: HA write permission denied for line %#x status=%s", name(),
+             lineAddr, haStatusName(response.status));
+    if (response.hasData)
+        data.setData(response.data, 0, 64);
+    state.granted = true;
+    inform("[HA-SLICC-GATE] seq=%s phase=WRITE_GRANTED pa=%#x reqId=%lu "
+           "epoch=%lu\n", name(), lineAddr, state.reqId, state.epoch);
+    return 2;
+#else
+    return 0;
+#endif
+}
+
+void
+Sequencer::completeHAStore(Addr address, DataBlock& data, bool externalHit)
+{
+    inform("[HA-SLICC-GATE] seq=%s phase=STORE_MUTATE pa=%#x externalHit=%d\n",
+           name(), makeLineAddress(address), externalHit);
+    // noCoales=true is the ownership boundary: exactly the first ordinary
+    // store completes under this permission; any aliases are reissued.
+    writeCallback(address, data, externalHit, MachineType_NUM, Cycles(0),
+                  Cycles(0), Cycles(0), true);
+}
+
+void
+Sequencer::acknowledgeHAPermission(Addr address)
+{
+#if RUBY_PROTOCOL_CHI
+    // Finalize invokes this action for every transaction. Avoid RubyPort's
+    // controller-dependent address helper until we know this line actually
+    // owns an HA permission context.
+    const Addr lineAddr = address & ~Addr(63);
+    auto it = m_haPermissions.find(lineAddr);
+    if (it == m_haPermissions.end()) {
+        // Legacy UBCC lossless-oneway reuses the same SLICC Final action as
+        // HA. This action runs after cache/data and directory publication and
+        // immediately before TBE retirement, making it the minimum real local
+        // publication hook. The backend ignores unrelated/non-pending lines.
+        if (m_haEpBackend &&
+            m_haEpBackend->losslessOneWayClearEnabled()) {
+            m_haEpBackend->notifyLocalLinePublished(
+                lineAddr, m_haSourceSocket);
+        }
+        return;
+    }
+    HAPermissionState &state = it->second;
+    fatal_if(!state.granted || state.reqId == 0,
+             "%s: invalid HA permission completion for line %#x", name(),
+             lineAddr);
+    const bool isWrite = state.isWrite;
+    const uint64_t reqId = state.reqId;
+    m_haEpBackend->recordHAInstall(
+        lineAddr, state.isWrite ? HAOperation::Write : HAOperation::Read,
+        state.epoch, state.homeNode, state.reqId, m_haSourceSocket);
+    fatal_if(!m_haEpBackend->acknowledgeHAPermission(
+                 state.homePa,
+                 state.isWrite ? HAOperation::Write : HAOperation::Read,
+                 HAStatus::Ok, state.epoch,
+                 state.homeNode, state.homeSocket, state.reqId,
+                 m_haSourceSocket),
+              "%s: failed to queue HA permission ack for line %#x", name(),
+              lineAddr);
+    inform("[HA-SLICC-GATE] seq=%s phase=%s_ACK pa=%#x reqId=%lu\n",
+           name(), isWrite ? "WRITE" : "READ", lineAddr, reqId);
+    m_haPermissions.erase(it);
+#endif
 }
 
 void
@@ -1009,7 +1253,7 @@ Sequencer::makeRequest(PacketPtr pkt)
     } else if (pkt->req->isTlbiCmd()) {
         primary_type = secondary_type = tlbiCmdToRubyRequestType(pkt);
         DPRINTF(RubySequencer, "Issuing TLBI\n");
-#if defined (PROTOCOL_CHI)
+#if RUBY_PROTOCOL_CHI
     } else if (pkt->isAtomicOp()) {
         if (pkt->req->isAtomicReturn()){
             DPRINTF(RubySequencer, "Issuing ATOMIC RETURN \n");
@@ -1225,6 +1469,13 @@ Sequencer::recordRequestType(SequencerRequestType requestType) {
 void
 Sequencer::evictionCallback(Addr address)
 {
+    if (needsHAPermission(address)) {
+        fatal_if(!m_haEpBackend->handleEvict(makeLineAddress(address)),
+                 "%s: failed to notify HA home of local eviction for line %#x",
+                 name(), makeLineAddress(address));
+        inform("[HA-SLICC-GATE] seq=%s phase=EVICT pa=%#x\n",
+               name(), makeLineAddress(address));
+    }
     llscClearMonitor(address);
     ruby_eviction_callback(address);
 }

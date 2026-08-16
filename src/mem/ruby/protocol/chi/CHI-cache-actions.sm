@@ -982,7 +982,9 @@ action(Initiate_LoadHit, desc="") {
 }
 
 action(Initiate_LoadMiss, desc="") {
-  if (tbe.doCacheFill) {
+  if (tbe.is_local_pf == false && sequencer.needsHAPermission(tbe.addr)) {
+    tbe.actions.push(Event:HALoadPermission);
+  } else if (tbe.doCacheFill) {
     tbe.actions.push(Event:SendReadShared);
     tbe.actions.push(Event:CheckCacheFill);
     tbe.actions.push(Event:TagArrayWrite);
@@ -1002,7 +1004,16 @@ action(Initiate_StoreHit, desc="") {
 }
 
 action(Initiate_StoreMiss, desc="") {
-  if (tbe.doCacheFill) {
+  if (sequencer.needsHAPermission(tbe.addr)) {
+    // HA Home permission/data is the outer transaction. Do not emit a legacy
+    // ReadUnique before it. First publish an authoritative Home read locally;
+    // only then form the full-line HA write payload from that base value.
+    tbe.doCacheFill := true;
+    tbe.dataToBeInvalid := false;
+    tbe.haStoreMissFill := true;
+    tbe.haStoreExternalHit := true;
+    tbe.actions.push(Event:HAStoreReadPermission);
+  } else if (tbe.doCacheFill) {
     tbe.actions.push(Event:SendReadUnique);
     tbe.actions.push(Event:CheckCacheFill);
     tbe.actions.push(Event:TagArrayWrite);
@@ -1166,8 +1177,15 @@ action(Initiate_AtomicNoReturn_SC, desc="") {
 action(Initiate_StoreUpgrade, desc="") {
   assert(tbe.dataValid);
   assert(is_valid(cache_entry));
-  tbe.actions.push(Event:SendCleanUnique);
-  tbe.actions.push(Event:CheckUpgrade_FromStore);
+  if (sequencer.needsHAPermission(tbe.addr)) {
+    // The typed HA write replaces the legacy CleanUnique/UpgradeReq for a
+    // shared line. The current data block supplies the full-line base value.
+    tbe.haStoreExternalHit := true;
+    tbe.actions.push(Event:HAStorePermission);
+  } else {
+    tbe.actions.push(Event:SendCleanUnique);
+    tbe.actions.push(Event:CheckUpgrade_FromStore);
+  }
   tbe.actions.push(Event:CheckCacheFill);
   tbe.actions.push(Event:TagArrayWrite);
 }
@@ -2945,17 +2963,17 @@ action(Receive_ReqResp, desc="") {
     }
     DPRINTF(RubyGenerated, "[STALE-MISMATCH] addr=%#x type=%d stale=%d tbe_stale=%d\n",
             address, in_msg.type, in_msg.stale, tbe.is_stale);
-    // EP-RNF upgrade-abandon (TC16 dual-upgrade race loser): a CleanUnique that
-    // completes with Comp_UC marked stale means our shared copy was invalidated
-    // by the race winner and is no longer valid. Record that so the follow-up
-    // CheckUpgrade_FromCU downgrades to a fresh ReadUnique (I->M) to recall the
-    // winner's data. We must also drop dataValid *before* UpdateDataState_
-    // FromCUResp recomputes dataUnique, otherwise the requestor would wrongly
-    // treat the stale completion as a successful upgrade (silent split-brain).
-    // Strictly gated on (Comp_UC && stale) so ordinary responses are unchanged.
-    if ((in_msg.type == CHIResponseType:Comp_UC) && in_msg.stale) {
+    // A stale response means downstream no longer accepts the requester's
+    // advertised ownership. This covers EP-RNF upgrade-abandon (Comp_UC) and
+    // stale copyback (CompDBIDResp); both must stop publishing valid old data.
+    if (in_msg.stale) {
       tbe.is_stale := true;
       tbe.dataValid := false;
+      if (in_msg.type == CHIResponseType:CompDBIDResp) {
+        // A stale copyback must use CBWrData_I/SC, not publish an old dirty
+        // unique payload that the downstream no longer recognizes as owner.
+        tbe.dataUnique := false;
+      }
     }
   }
 }
@@ -4044,10 +4062,21 @@ action(Callback_StoreHit, desc="") {
          (tbe.reqType == CHIRequestType:Store));
   if (tbe.is_local_pf == false) {
     assert(tbe.dataValid);
-    DPRINTF(RubyGenerated, "Write before %s\n", tbe.dataBlk);
-    sequencer.writeCallback(tbe.addr, tbe.dataBlk, false);
-    DPRINTF(RubyGenerated, "Write after %s\n", tbe.dataBlk);
-    tbe.dataDirty := true;
+    int ha_gate := sequencer.requestHAStorePermission(tbe.addr, tbe.dataBlk);
+    if (ha_gate == 1) {
+      tbe.haStoreExternalHit := false;
+      tbe.actions.pushFront(Event:HAStorePermission);
+      tbe.delayNextAction := curTick() + cyclesToTicks(intToCycles(1));
+    } else {
+      DPRINTF(RubyGenerated, "Write before %s\n", tbe.dataBlk);
+      if (ha_gate == 2) {
+        sequencer.completeHAStore(tbe.addr, tbe.dataBlk, false);
+      } else {
+        sequencer.writeCallback(tbe.addr, tbe.dataBlk, false);
+      }
+      DPRINTF(RubyGenerated, "Write after %s\n", tbe.dataBlk);
+      tbe.dataDirty := true;
+    }
   }
 }
 
@@ -4097,10 +4126,21 @@ action(Callback_Miss, desc="") {
 
   } else if (tbe.dataValid && ((tbe.reqType == CHIRequestType:Store) ||
                                (tbe.reqType == CHIRequestType:StoreLine))) {
-    DPRINTF(RubyGenerated, "Write before %s\n", tbe.dataBlk);
-    sequencer.writeCallback(tbe.addr, tbe.dataBlk, true);
-    DPRINTF(RubyGenerated, "Write after %s\n", tbe.dataBlk);
-    tbe.dataDirty := true;
+    int ha_gate := sequencer.requestHAStorePermission(tbe.addr, tbe.dataBlk);
+    if (ha_gate == 1) {
+      tbe.haStoreExternalHit := true;
+      tbe.actions.pushFront(Event:HAStorePermission);
+      tbe.delayNextAction := curTick() + cyclesToTicks(intToCycles(1));
+    } else {
+      DPRINTF(RubyGenerated, "Write before %s\n", tbe.dataBlk);
+      if (ha_gate == 2) {
+        sequencer.completeHAStore(tbe.addr, tbe.dataBlk, true);
+      } else {
+        sequencer.writeCallback(tbe.addr, tbe.dataBlk, true);
+      }
+      DPRINTF(RubyGenerated, "Write after %s\n", tbe.dataBlk);
+      tbe.dataDirty := true;
+    }
 
     // sets a use time out for store misses to prevent LL/SC livelocks
     int use_timeout_latency := scLockLatency();
@@ -4173,11 +4213,129 @@ action(Callback_WriteUnique, desc="") {
   assert((tbe.reqType == CHIRequestType:StoreLine) ||
          (tbe.reqType == CHIRequestType:Store));
   assert(tbe.dataValid == false);
-  sequencer.writeUniqueCallback(tbe.addr, tbe.dataBlk);
-  DPRINTF(RubyGenerated, "WriteUnique data %s\n", tbe.dataBlk);
-  // set mask; note data is never considered valid
-  assert(tbe.dataBlkValid.isEmpty());
-  tbe.dataBlkValid.setMask(addressOffset(tbe.accAddr, tbe.addr), tbe.accSize);
+  int ha_gate := sequencer.requestHAStorePermission(tbe.addr, tbe.dataBlk);
+  if (ha_gate == 1) {
+    tbe.haStoreExternalHit := true;
+    tbe.actions.pushFront(Event:HAStorePermission);
+    tbe.delayNextAction := curTick() + cyclesToTicks(intToCycles(1));
+  } else {
+    sequencer.writeUniqueCallback(tbe.addr, tbe.dataBlk);
+    DPRINTF(RubyGenerated, "WriteUnique data %s\n", tbe.dataBlk);
+    // set mask; note data is never considered valid
+    assert(tbe.dataBlkValid.isEmpty());
+    tbe.dataBlkValid.setMask(addressOffset(tbe.accAddr, tbe.addr), tbe.accSize);
+  }
+}
+
+action(Callback_HAStorePermission, desc="") {
+  assert(is_valid(tbe));
+  assert((tbe.reqType == CHIRequestType:StoreLine) ||
+         (tbe.reqType == CHIRequestType:Store));
+  int ha_gate := sequencer.requestHAStorePermission(tbe.addr, tbe.dataBlk);
+  assert(ha_gate != 0);
+  if (ha_gate == 1) {
+    tbe.actions.pushFront(Event:HAStorePermission);
+    tbe.delayNextAction := curTick() + cyclesToTicks(intToCycles(1));
+  } else if (tbe.haStoreMissFill) {
+    // The preceding HA read supplied the authoritative 64-byte base. Apply
+    // this permitted write and publish it through ordinary local plumbing.
+    tbe.dataBlkValid.fillMask();
+    tbe.dataValid := true;
+    tbe.dataUnique := true;
+    tbe.dataDirty := false;
+    sequencer.completeHAStore(tbe.addr, tbe.dataBlk, true);
+    tbe.dataDirty := true;
+    tbe.actions.push(Event:CheckCacheFill);
+    tbe.actions.push(Event:TagArrayWrite);
+  } else if (tbe.dataValid) {
+    // Publish unique ownership only after the typed HA write grant.
+    tbe.dataUnique := true;
+    sequencer.completeHAStore(tbe.addr, tbe.dataBlk,
+                              tbe.haStoreExternalHit);
+    tbe.dataDirty := true;
+  } else {
+    // Non-allocating StoreLine/WriteUnique: the full-line CPU payload is
+    // applied only after permission, while returned HA data has already been
+    // installed in dataBlk by the Sequencer facade.
+    sequencer.writeUniqueCallback(tbe.addr, tbe.dataBlk);
+    assert(tbe.dataBlkValid.isEmpty());
+    tbe.dataBlkValid.setMask(addressOffset(tbe.accAddr, tbe.addr), tbe.accSize);
+  }
+}
+
+action(Callback_HALoadPermission, desc="") {
+  assert(is_valid(tbe));
+  assert(tbe.reqType == CHIRequestType:Load);
+  int ha_gate := sequencer.requestHAReadPermission(tbe.addr, tbe.dataBlk,
+                                                    false);
+  assert(ha_gate != 0);
+  if (ha_gate == 1) {
+    tbe.actions.pushFront(Event:HALoadPermission);
+    tbe.delayNextAction := curTick() + cyclesToTicks(intToCycles(1));
+  } else {
+    // Install and publish the successful permission response before exposing
+    // it to CPU; the final ack remains after final cache/directory publication.
+    tbe.dataBlkValid.fillMask();
+    tbe.dataValid := true;
+    tbe.dataDirty := false;
+    tbe.dataUnique := false;
+    if (tbe.doCacheFill) {
+      tbe.actions.push(Event:CheckCacheFill);
+      tbe.actions.push(Event:TagArrayWrite);
+    } else {
+      tbe.dataToBeInvalid := true;
+    }
+    tbe.actions.push(Event:HACompleteLoad);
+  }
+}
+
+action(Complete_HALoad, desc="") {
+  assert(is_valid(tbe));
+  assert(tbe.reqType == CHIRequestType:Load);
+  assert(tbe.dataValid);
+  sequencer.readCallback(tbe.addr, tbe.dataBlk, true);
+}
+
+action(Callback_HAStoreReadPermission, desc="") {
+  assert(is_valid(tbe));
+  assert((tbe.reqType == CHIRequestType:StoreLine) ||
+         (tbe.reqType == CHIRequestType:Store));
+  assert(tbe.haStoreMissFill);
+  int ha_gate := sequencer.requestHAReadPermission(tbe.addr, tbe.dataBlk,
+                                                    true);
+  assert(ha_gate != 0);
+  if (ha_gate == 1) {
+    tbe.actions.pushFront(Event:HAStoreReadPermission);
+    tbe.delayNextAction := curTick() + cyclesToTicks(intToCycles(1));
+  } else {
+    tbe.dataBlkValid.fillMask();
+    tbe.dataValid := true;
+    tbe.dataDirty := false;
+    tbe.dataUnique := false;
+    // The read ack may only follow publication. HAAckReadThenStore is queued
+    // after both fill/data-array and tag-array actions complete.
+    tbe.actions.push(Event:CheckCacheFill);
+    tbe.actions.push(Event:TagArrayWrite);
+    tbe.actions.push(Event:HAAckReadThenStore);
+  }
+}
+
+action(AckHAReadThenStartStore, desc="") {
+  assert(is_valid(tbe));
+  assert(tbe.haStoreMissFill);
+  sequencer.acknowledgeHAPermission(tbe.addr);
+  tbe.actions.pushFront(Event:HAStorePermission);
+}
+
+action(Finalize_AckHAPermission, desc="") {
+  assert(is_valid(tbe));
+  // No-op when this TBE did not use HA. Otherwise this is deliberately after
+  // cache/directory publication and immediately before request deallocation.
+  // Internal HN-F/EP transactions have no Sequencer pointer and must not call
+  // through the SLICC sequencer interface.
+  if (accepts_cpu_requests && tbe.isSeqReqValid) {
+    sequencer.acknowledgeHAPermission(tbe.addr);
+  }
 }
 
 action(Profile_Miss, desc="") {

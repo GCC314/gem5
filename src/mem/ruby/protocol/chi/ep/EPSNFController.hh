@@ -3,6 +3,7 @@
 
 #include <cstring>
 #include <deque>
+#include <functional>
 #include <map>
 #include <set>
 #include <vector>
@@ -39,15 +40,28 @@ class EPSNFController : public EPController
     EPBackend *_backend = nullptr;
     int _socketId = 0;  // v4-dual-socket
 
-    // A WriteNoSnp grants the DBID before its data beats arrive.  Keep the
-    // transaction until every expected byte has reached home memory, then
-    // publish the completed writeback to UBCC exactly once.
+    // A WriteNoSnp grants the DBID before its data beats arrive.  In HA mode
+    // this is also the store's permission context: the final line is assembled
+    // here and is not published to memory until its own HA Write is granted.
     struct PendingWrite {
         uint64_t expectedMask = 0;
         uint64_t receivedMask = 0;
         int sourceSocket = 0;
+        uint8_t data[64]{};
+        MachineID requestor;
+        bool haWrite = false;
+        bool dataComplete = false;
+        bool granted = false;
+        bool completionQueued = false;
+        uint64_t homePa = 0;
+        int homeNode = -1;
+        int homeSocket = -1;
+        uint64_t permissionEpoch = 0;
+        uint64_t permissionReqId = 0;
     };
     std::map<Addr, PendingWrite> _pendingWrites;
+    void processPendingHAWrites();
+    void publishHAWrite(Addr linePa, PendingWrite &pending);
 
     // Q3: Retry queue for blocked grants
     struct RetryEntry {
@@ -64,16 +78,23 @@ class EPSNFController : public EPController
     // Q3: Deferred CompData sends (1-tick delay for TBE race fix)
     struct PendingDataOutput {
         std::shared_ptr<CHIDataMsg> msg;
+        std::function<void()> onSent;
     };
     std::vector<PendingDataOutput> _deferredCompData;
     void processDeferredData();
 
     // Output backpressure must not drop CHI responses. Keep messages in FIFO
     // order until the corresponding MessageBuffer accepts them.
-    std::deque<std::shared_ptr<CHIResponseMsg>> _pendingResponses;
+    struct PendingResponseOutput {
+        std::shared_ptr<CHIResponseMsg> msg;
+        std::function<void()> onSent;
+    };
+    std::deque<PendingResponseOutput> _pendingResponses;
     std::deque<PendingDataOutput> _pendingData;
-    void sendResponseReliable(std::shared_ptr<CHIResponseMsg> msg);
-    void sendDataReliable(std::shared_ptr<CHIDataMsg> msg);
+    void sendResponseReliable(std::shared_ptr<CHIResponseMsg> msg,
+                              std::function<void()> onSent = nullptr);
+    void sendDataReliable(std::shared_ptr<CHIDataMsg> msg,
+                          std::function<void()> onSent = nullptr);
     void processPendingOutputs();
 
     // ---- v4: Deferred Grant Entry (§4.4.2, §7.6) ----
@@ -128,6 +149,14 @@ class EPSNFController : public EPController
 
     // Phase 4: verbose diagnostic logging gate (I14)
     bool _verboseLog = false;
+
+    // Bounded, cumulative proof markers for HA Write request/response/ack.
+    uint64_t _haWriteReqCount = 0;
+    uint64_t _haWriteRespCount = 0;
+    uint64_t _haWriteAckCount = 0;
+    uint64_t _haWriteAssembledCount = 0;
+    uint64_t _haWritePublishCount = 0;
+    static constexpr uint64_t kHAWriteTraceLimit = 256;
 };
 
 } // namespace ruby

@@ -1,5 +1,6 @@
 #include "mem/ruby/protocol/chi/ep/UBAdapter.hh"
 
+#include <chrono>
 #include <limits>
 #include <thread>
 
@@ -256,6 +257,156 @@ UBAdapter::transportSend(const CoherenceMessage &msg)
     }
     fatal("transportSend: no port (router removed)");
     return true;
+}
+
+bool
+UBAdapter::transportSendReliable(const CoherenceMessage &msg)
+{
+    if (!_reliableOutputs.empty()) {
+        _reliableOutputs.push_back(msg);
+        scheduleResponseCheck();
+        return true;
+    }
+    if (transportSend(msg))
+        return true;
+    _reliableOutputs.push_back(msg);
+    scheduleResponseCheck();
+    return true;
+}
+
+void
+UBAdapter::drainReliableOutputs()
+{
+    while (!_reliableOutputs.empty()) {
+        if (!transportSend(_reliableOutputs.front()))
+            break;
+        _reliableOutputs.pop_front();
+    }
+}
+
+int
+UBAdapter::sendHAPermissionReq(uint64_t linePa, HAOperation operation,
+                                uint64_t permissionEpoch,
+                                const uint8_t *writeData, int dstNode,
+                                int dstSocket, uint64_t &ioReqId,
+                                UBHAPermissionRespBody &outResp)
+{
+    if (!_port)
+        return -1;
+    if (ioReqId != 0) {
+        PendingKey key{CoherenceMessageType::HAPermissionResp, ioReqId};
+        auto ready = _readyResponses.find(key);
+        if (ready != _readyResponses.end()) {
+            outResp = ready->second.b.haPermissionResp;
+            _readyResponses.erase(ready);
+            _inflightHAPermissionReqs.erase(ioReqId);
+            return 1;
+        }
+        return -2;
+    }
+
+    ioReqId = allocLocalReqId();
+    CoherenceMessage req;
+    req.h.type = CoherenceMessageType::HAPermissionReq;
+    req.h.srcNode = _nodeId; req.h.srcSocket = _socketId;
+    req.h.dstNode = dstNode; req.h.dstSocket = dstSocket;
+    req.h.homeLinePa = linePa; req.h.localLinePa = linePa;
+    req.h.reqId = ioReqId; req.h.seqNum = _nextSeq++;
+    req.h.enqueueTick = req.h.readyTick = curTick();
+    req.b.haPermissionReq.operation = operation;
+    req.b.haPermissionReq.permissionEpoch = permissionEpoch;
+    if (operation == HAOperation::Write && writeData)
+        memcpy(req.b.haPermissionReq.data, writeData, 64);
+    _inflightHAPermissionReqs.insert(ioReqId);
+    transportSendReliable(req);
+    return -2;
+}
+
+bool
+UBAdapter::sendHAPermissionAck(uint64_t linePa, HAOperation operation,
+                               HAStatus status, uint64_t permissionEpoch,
+                               int dstNode, int dstSocket, uint64_t reqId)
+{
+    CoherenceMessage ack;
+    ack.h.type = CoherenceMessageType::HAPermissionAck;
+    ack.h.srcNode = _nodeId; ack.h.srcSocket = _socketId;
+    ack.h.dstNode = dstNode; ack.h.dstSocket = dstSocket;
+    ack.h.homeLinePa = linePa; ack.h.localLinePa = linePa;
+    ack.h.reqId = reqId; ack.h.seqNum = _nextSeq++;
+    ack.h.enqueueTick = ack.h.readyTick = curTick();
+    ack.b.haPermissionAck.operation = operation;
+    ack.b.haPermissionAck.status = status;
+    ack.b.haPermissionAck.permissionEpoch = permissionEpoch;
+    return transportSendReliable(ack);
+}
+
+int
+UBAdapter::sendHAPresenceProbeReq(uint64_t linePa, HAProbeAction action,
+                                   uint64_t expectedEpoch, int dstNode,
+                                   int dstSocket, uint64_t &ioReqId,
+                                   UBHAPresenceProbeRespBody &outResp)
+{
+    if (!_port)
+        return -1;
+    if (ioReqId != 0) {
+        PendingKey key{CoherenceMessageType::HAPresenceProbeResp, ioReqId};
+        auto ready = _readyResponses.find(key);
+        if (ready != _readyResponses.end()) {
+            outResp = ready->second.b.haPresenceProbeResp;
+            _readyResponses.erase(ready);
+            _inflightHAPresenceProbeReqs.erase(ioReqId);
+            return 1;
+        }
+        return -2;
+    }
+
+    ioReqId = allocLocalReqId();
+    CoherenceMessage req;
+    req.h.type = CoherenceMessageType::HAPresenceProbeReq;
+    req.h.srcNode = _nodeId; req.h.srcSocket = _socketId;
+    req.h.dstNode = dstNode; req.h.dstSocket = dstSocket;
+    req.h.homeLinePa = linePa; req.h.localLinePa = linePa;
+    req.h.reqId = ioReqId; req.h.seqNum = _nextSeq++;
+    req.h.enqueueTick = req.h.readyTick = curTick();
+    req.b.haPresenceProbeReq.action = action;
+    req.b.haPresenceProbeReq.expectedEpoch = expectedEpoch;
+    _inflightHAPresenceProbeReqs.insert(ioReqId);
+    transportSendReliable(req);
+    return -2;
+}
+
+bool
+UBAdapter::sendHAPermissionResp(const CoherenceMessage &request,
+                                 const UBHAPermissionRespBody &body)
+{
+    CoherenceMessage resp;
+    resp.h.type = CoherenceMessageType::HAPermissionResp;
+    resp.h.srcNode = _nodeId; resp.h.srcSocket = _socketId;
+    resp.h.dstNode = request.h.srcNode; resp.h.dstSocket = request.h.srcSocket;
+    resp.h.homeLinePa = request.h.homeLinePa;
+    resp.h.localLinePa = request.h.localLinePa;
+    resp.h.reqId = request.h.reqId; resp.h.epoch = request.h.epoch;
+    resp.h.seqNum = _nextSeq++;
+    resp.h.enqueueTick = resp.h.readyTick = curTick();
+    resp.b.haPermissionResp = body;
+    return transportSendReliable(resp);
+}
+
+bool
+UBAdapter::sendHAPresenceProbeResp(const CoherenceMessage &request,
+                                    const UBHAPresenceProbeRespBody &body)
+{
+    CoherenceMessage resp;
+    resp.h.type = CoherenceMessageType::HAPresenceProbeResp;
+    resp.h.srcNode = _nodeId; resp.h.srcSocket = _socketId;
+    resp.h.dstNode = request.h.srcNode; resp.h.dstSocket = request.h.srcSocket;
+    resp.h.homeLinePa = request.h.homeLinePa;
+    resp.h.localLinePa = request.h.localLinePa;
+    resp.h.reqId = request.h.reqId; resp.h.epoch = request.h.epoch;
+    resp.h.seqNum = _nextSeq++;
+    resp.h.enqueueTick = resp.h.readyTick = curTick();
+    resp.b.haPresenceProbeResp = body;
+    return transportSendReliable(resp);
 }
 
 bool
@@ -757,6 +908,35 @@ UBAdapter::sendUpgradeDoneReq(uint64_t homePa, int requesterNode,
 
 // ---- Clear Request ----
 
+bool
+UBAdapter::sendClearReqOneWay(uint64_t linePa, int srcNode,
+                               uint64_t epoch, uint64_t reqId,
+                               int homeNode, int homeSocket)
+{
+    fatal_if(!_port,
+             "UBAdapter node=%d socket=%d: one-way Clear has no transport",
+             _nodeId, _socketId);
+    CoherenceMessage req;
+    req.h.type = CoherenceMessageType::ClearReq;
+    req.h.srcNode = _nodeId;
+    req.h.srcSocket = _socketId;
+    req.h.dstNode = homeNode;
+    req.h.dstSocket = homeSocket;
+    req.h.homeNode = homeNode;
+    req.h.homeSocket = homeSocket;
+    req.h.ingressSocket = _socketId;
+    req.h.requesterNode = srcNode;
+    req.h.homeLinePa = linePa;
+    req.h.epoch = epoch;
+    req.h.reqId = reqId;
+    req.h.seqNum = _nextSeq++;
+    req.h.enqueueTick = req.h.readyTick = curTick();
+    // Wire marker: Home commits normally but suppresses ClearResp; fault
+    // injection also recognizes this as an explicitly lossless Clear.
+    req.b.clearReq.reason = 1;
+    return transportSendReliable(req);
+}
+
 int
 UBAdapter::sendClearReq(uint64_t linePa, int srcNode,
                          uint64_t epoch, uint64_t reqId,
@@ -889,8 +1069,9 @@ UBAdapter::sendRecallResp(uint64_t linePa, int ownerNode,
         memcpy(req.b.recallResp.data, dataBlk->getData(0, 64), 64);
     }
 
-    // Fire-and-forget: no response expected
-    return transportSend(req);
+    // No response is expected, but loss under local port backpressure would
+    // strand the Home transaction. Queue until the transport accepts it.
+    return transportSendReliable(req);
 }
 
 // ---- Invalidation Ack (fire-and-forget → home UBCC) ----
@@ -929,7 +1110,7 @@ UBAdapter::sendInvalidateAck(uint64_t linePa, int ackNode,
     req.h.readyTick = curTick();
 
     // Fire-and-forget
-    return transportSend(req);
+    return transportSendReliable(req);
 }
 
 // ---- C4: Direct data forward from owner to requester (bypasses home) ----
@@ -1248,6 +1429,31 @@ UBAdapter::recvFromRouter(const CoherenceMessage &msg)
                 _readyResponses[qk] = msg;
             }
             break;
+        case CoherenceMessageType::HAPermissionResp:
+        case CoherenceMessageType::HAPresenceProbeResp: {
+            _lastResponse = msg;
+            _lastResponseValid = true;
+            PendingKey key{msg.h.type, msg.h.reqId};
+            _readyResponses[key] = msg;
+            break;
+        }
+        case CoherenceMessageType::HAPresenceProbeReq:
+            if (_backend)
+                _backend->handleHAPresenceProbeRequest(msg, this);
+            else
+                warn("UBAdapter node=%d: HA probe received without backend", _nodeId);
+            break;
+        case CoherenceMessageType::HAPermissionReq:
+            if (_backend)
+                _backend->handleHAPermissionRequest(msg, this);
+            else
+                warn("UBAdapter node=%d: HA permission request without backend",
+                     _nodeId);
+            break;
+        case CoherenceMessageType::HAPermissionAck:
+            // Ack is terminal at the endpoint.  The HA controller owns any
+            // permission transaction state; gem5 intentionally has none here.
+            break;
 
         case CoherenceMessageType::UpgradeAckNotify: {
             // Async notification from UBCC: all invalidation acks received
@@ -1277,7 +1483,8 @@ UBAdapter::recvFromRouter(const CoherenceMessage &msg)
 
             // C4: Extract direct-forward target from requesterNode header field
             recallMsg.requesterNode = msg.h.requesterNode;
-            recallMsg.requesterSocket = 0;  // simplified for v1
+            recallMsg.requesterSocket = msg.h.ingressSocket;
+            recallMsg.sourceSocket = _socketId;
 
             if (_backend) {
                 _backend->handleRecallRequest(recallMsg);
@@ -1295,6 +1502,7 @@ UBAdapter::recvFromRouter(const CoherenceMessage &msg)
             invMsg.sharerLocalPa = msg.h.localLinePa;
             invMsg.sharerNode = msg.h.targetNode;
             invMsg.homeNode = msg.h.homeNode;
+            invMsg.sourceSocket = _socketId;
             invMsg.epoch = msg.h.epoch;
             invMsg.reqId = msg.h.reqId;
 
@@ -1515,9 +1723,13 @@ UBAdapter::wakeup()
 {
     if (!_port) return;
 
+    drainReliableOutputs();
+
     // 1. Emit sync (heartbeat) to let peer advance its boundary
     if (!framework::EmitSync(_port, curTick())) {
-        std::this_thread::yield();
+        // The peer may still be binding. Keep virtual time fixed without
+        // spinning hard enough to starve the launcher or peer processes.
+        std::this_thread::sleep_for(std::chrono::microseconds(50));
         if (_responseCheckEvent.scheduled())
             reschedule(_responseCheckEvent, curTick());
         else
@@ -1731,6 +1943,8 @@ UBAdapter::handleResponse(const framework::Message *m)
       case CoherenceMessageType::InvalidateReq:
       case CoherenceMessageType::RecallReq:
       case CoherenceMessageType::UpgradeAckNotify:
+      case CoherenceMessageType::HAPresenceProbeReq:
+      case CoherenceMessageType::HAPermissionReq:
         inform("[ASYNC-CTRL-ENQ] node=%d type=%s reqId=%lu pa=0x%lx src=%d dst=%d curT=%lu depth=%zu",
                _nodeId, coherenceMsgTypeName(coh->h.type), coh->h.reqId,
                coh->h.homeLinePa, coh->h.srcNode, coh->h.dstNode,
@@ -1749,6 +1963,7 @@ UBAdapter::handleResponse(const framework::Message *m)
       case CoherenceMessageType::MetaRNFWriteReq:
       case CoherenceMessageType::MetaRNFLineReadReq:
       case CoherenceMessageType::MetaRNFLineWriteReq:
+      case CoherenceMessageType::HAPermissionAck:
         recvFromRouter(*coh);
         return;
       default:
@@ -1798,8 +2013,10 @@ UBAdapter::handleResponse(const framework::Message *m)
                               coh->h.type == CoherenceMessageType::ClearResp ||
                               coh->h.type == CoherenceMessageType::UpgradeResp ||
                               coh->h.type == CoherenceMessageType::WritebackResp ||
-                              coh->h.type == CoherenceMessageType::EvictResp ||
-                              coh->h.type == CoherenceMessageType::QueryLineMetaResp)) {
+                               coh->h.type == CoherenceMessageType::EvictResp ||
+                               coh->h.type == CoherenceMessageType::QueryLineMetaResp ||
+                               coh->h.type == CoherenceMessageType::HAPermissionResp ||
+                               coh->h.type == CoherenceMessageType::HAPresenceProbeResp)) {
         DPRINTF(RubyEP,
                 "[RSP-WIRED] node=%d socket=%d firing immediate wakeup for type=%d reqId=%lu\n",
                 _nodeId, _socketId, static_cast<int>(coh->h.type),

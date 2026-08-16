@@ -5,6 +5,7 @@
 #include <array>
 #include <map>
 #include <string>
+#include <tuple>
 #include <vector>
 
 #include "mem/simple_mem.hh"
@@ -27,6 +28,7 @@ class EPSNFController;
 class UBAdapter;
 class RubySystem;
 class MetaRNFController;
+class CacheMemory;
 struct UBMsg;       // v4-dual-socket: forward decl for handleQueryLineMetaResp
 
 // ---- M5 Outer Protocol Types ----
@@ -87,11 +89,12 @@ struct OuterInvalidateMsg {
     uint64_t sharerLocalPa;    // PA in sharer node's local view
     int sharerNode;            // Node being invalidated
     int homeNode;              // Home node that sent the invalidation
+    int sourceSocket;          // Local socket that received InvalidateReq
     uint64_t epoch;            // Per-transaction epoch
     uint64_t reqId;            // v4: transaction ID
 
     OuterInvalidateMsg() : linePa(0), sharerLocalPa(0),
-        sharerNode(-1), homeNode(-1), epoch(0), reqId(0) {}
+        sharerNode(-1), homeNode(-1), sourceSocket(0), epoch(0), reqId(0) {}
 };
 
 // Invalidation acknowledgment sent from sharer node back to home UBCC.
@@ -99,11 +102,12 @@ struct OuterInvalidationAck {
     uint64_t linePa;         // Physical address (home node's view)
     int ackNode;             // Node that completed invalidation
     int homeNode;            // Home node that initiated the invalidation
+    int sourceSocket;        // Local socket that must source InvalidateAck
     uint64_t epoch;          // Per-transaction epoch
     uint64_t reqId;          // v4: transaction ID
 
     OuterInvalidationAck() : linePa(0), ackNode(-1), homeNode(-1),
-                              epoch(0), reqId(0) {}
+                              sourceSocket(0), epoch(0), reqId(0) {}
 };
 
 // ---- M6: Outer Recall Message Types ----
@@ -119,10 +123,11 @@ struct OuterRecallMsg {
     bool dataNeeded;         // True if dirty data must be returned
     int requesterNode;       // C4: direct-forward target node (data goes here)
     int requesterSocket;     // C4: direct-forward target socket
+    int sourceSocket;        // Local socket that received RecallReq
 
     OuterRecallMsg() : linePa(0), ownerLocalPa(0), ownerNode(-1), homeNode(-1),
                        epoch(0), reqId(0), isReadRequest(false), dataNeeded(false),
-                       requesterNode(-1), requesterSocket(-1) {}
+                       requesterNode(-1), requesterSocket(-1), sourceSocket(0) {}
 };
 
 // Recall response sent from owner node's EPBackend back to home UBCC.
@@ -138,11 +143,12 @@ struct OuterRecallResponse {
     bool hasDataPayload;     // F2: true if dataPayload is valid
     bool dataForwarded;      // C4: true if data was sent directly to requester
     int  dataForwardedTo;    // C4: requester node that received direct data
+    int sourceSocket;        // Local socket that must source RecallResp
 
     OuterRecallResponse() : linePa(0), ownerNode(-1), homeNode(-1),
                             epoch(0), reqId(0), dataReturned(false), ackReceived(false),
                             dataPayload(64), hasDataPayload(false),
-                            dataForwarded(false), dataForwardedTo(-1) {}
+                            dataForwarded(false), dataForwardedTo(-1), sourceSocket(0) {}
 };
 
 // ---- M5 Phase 2: Outer Message Envelope ----
@@ -331,6 +337,10 @@ class EPBackend : public SimObject
     // SimObject-param getters (replaces env-var reads)
     bool silentUpgradeEnabled() const { return params().silent_upgrade; }
     bool directFwdEnabled() const { return params().direct_fwd; }
+    bool haEndpointEnabled() const { return _haEndpointEnabled; }
+    bool losslessOneWayClearEnabled() const {
+        return _losslessOneWayClearEnabled;
+    }
 
     bool checkAddr(uint64_t pa) const;
     bool checkDsmAddr(uint64_t pa) const;
@@ -353,6 +363,15 @@ class EPBackend : public SimObject
     int handleRemoteDemandMiss(uint64_t line_pa, int neededPerm,
                                bool writeIntent, int ingressSocket,
                                int& outHomeNode);
+
+    /**
+     * Complete the HA permission install handshake for an EP-SNF fill.
+     * EPSNF calls this only after the final reliable CompData beat has been
+     * accepted by its outgoing MessageBuffer.  Receiving HAPermissionResp is
+     * deliberately not sufficient to acknowledge installation.
+     */
+    void completeHARemoteGrant(uint64_t linePa, int neededPerm,
+                               bool writeIntent, int ingressSocket);
 
     // Called after home UBCC makes a grant decision.
     // Returns the OuterGrantType that was granted.
@@ -418,6 +437,14 @@ class EPBackend : public SimObject
      */
     int sendClear(uint64_t line_pa, int homeNode,
                   uint64_t epoch, uint64_t reqId, int sourceAdapter);
+
+    /**
+     * Publication hook for legacy UBCC grants. The Sequencer invokes this from
+     * the existing HA SLICC Final action, after cache/data and directory
+     * publication and immediately before TBE retirement. In lossless-oneway
+     * mode it queues the matching Clear without waiting for ClearResp.
+     */
+    void notifyLocalLinePublished(uint64_t localLinePa, int sourceSocket);
     /**
      * Handle an incoming recall request from a home UBCC.
      * This is called on the owner node's EPBackend when the home
@@ -779,6 +806,44 @@ class EPBackend : public SimObject
      */
     EPRNFController* getEpRnfController() const { return _epRnfCtrl; }
 
+    // ---- HA endpoint API for a later per-store SLICC hook ----
+    // The caller owns ioReqId.  Initialize it to zero for a new operation and
+    // retain the returned value across retries.  Return values are identical to
+    // UBAdapter: 1 completed, -2 pending, -1 transport/setup failure.
+    int requestHAPermission(uint64_t linePa, HAOperation operation,
+                            uint64_t permissionEpoch, const uint8_t *writeData,
+                            int dstNode, int dstSocket, uint64_t &ioReqId,
+                            UBHAPermissionRespBody &outResp,
+                             int sourceSocket = 0);
+    // Convert a requester-local DSM line into the home-plane address and
+    // capture the latest requester epoch used by the permission transaction.
+    bool resolveHAStoreTarget(uint64_t localLinePa, int sourceSocket,
+                              uint64_t &homeLinePa, int &homeNode,
+                              int &homeSocket, uint64_t &permissionEpoch) const;
+    bool acknowledgeHAPermission(uint64_t linePa, HAOperation operation,
+                                 HAStatus status, uint64_t permissionEpoch,
+                                 int dstNode, int dstSocket, uint64_t reqId,
+                                 int sourceSocket = 0);
+    void recordHAInstall(uint64_t localLinePa, HAOperation operation,
+                         uint64_t permissionEpoch, int homeNode,
+                         uint64_t reqId, int sourceSocket);
+    void registerHADataCache(int sourceSocket, CacheMemory *cache);
+    void invalidateHADataCaches(int sourceSocket, uint64_t localLinePa);
+    bool hasHADataCacheLine(int sourceSocket, uint64_t localLinePa) const;
+    int requestHAPresenceProbe(uint64_t linePa, HAProbeAction action,
+                               uint64_t expectedEpoch, int dstNode,
+                               int dstSocket, uint64_t &ioReqId,
+                               UBHAPresenceProbeRespBody &outResp,
+                               int sourceSocket = 0);
+
+    // UBAdapter entry point for peer-initiated probes.  Completion is based on
+    // an actual EPRNF→HN-F CHI transaction; requester bookkeeping is not used
+    // as the presence decision.
+    void handleHAPresenceProbeRequest(const CoherenceMessage &request,
+                                      UBAdapter *sourceAdapter);
+    void handleHAPermissionRequest(const CoherenceMessage &request,
+                                   UBAdapter *sourceAdapter);
+
     /**
      * Get the RubySystem pointer for cross-node phys_mem access.
      * Used by recall handlers to write owner data to the home node's
@@ -842,6 +907,9 @@ class EPBackend : public SimObject
     // ---- M5: Requester-Side Bookkeeping ----
     // Per-line entries tracking global permissions for remote DSM lines.
     std::map<uint64_t, RequesterLineEntry> _requesterLines;
+    using HALineKey = std::pair<int, uint64_t>;
+    std::map<HALineKey, RequesterLineEntry> _haRequesterLines;
+    std::vector<std::vector<CacheMemory *>> _haDataCachesBySocket;
     uint64_t _epochCounter = 0;
 
     // ---- M5: Sideband Inspection ----
@@ -878,6 +946,8 @@ class EPBackend : public SimObject
     // ---- M8: Invalidation counters and envelopes ----
     uint64_t _invalidationReceivedCount;
     uint64_t _invalidationAckSentCount;
+    bool _haEndpointEnabled = false;
+    bool _losslessOneWayClearEnabled = false;
     OuterInvalidateMsg _lastInvalidateMsg;
     OuterInvalidationAck _lastInvalidationAck;
 
@@ -908,7 +978,8 @@ class EPBackend : public SimObject
                             grantType(OuterGrantType::GlobalGrantShared),
                             outerStartTick(0) {}
     };
-    std::map<uint64_t, PendingGrantTxn> _pendingGrantTxns;
+    using PendingGrantKey = std::pair<int, uint64_t>;
+    std::map<PendingGrantKey, PendingGrantTxn> _pendingGrantTxns;
 
     // ---- Async upgrade pending txn (mirrors PendingGrantTxn for clear) ----
     // When sendUpgradeReq returns -2 (UpgradeResp not yet arrived), we save the
@@ -937,6 +1008,32 @@ class EPBackend : public SimObject
     // SnpCleanInvalid TBE. Once SnpResp_I has invalidated the local copy,
     // the deferred InvalidateReq can be ack'd directly (no CleanUnique needed).
     std::map<uint64_t, OuterInvalidateMsg> _deferredInvalidationReqs;
+
+    struct HAPendingProbe {
+        CoherenceMessage request;
+        UBAdapter *adapter = nullptr;
+    };
+    using HAProbeKey = std::tuple<uint16_t, uint16_t, uint64_t, uint64_t,
+                                  uint64_t, uint8_t, uint64_t>;
+    std::map<HAProbeKey, HAPendingProbe> _haPendingProbes;
+    std::map<HAProbeKey, CoherenceMessage> _haCompletedProbeResponses;
+
+    // EP-SNF bypasses the CPU Sequencer, so HA ReadNoSnp fills need their own
+    // stable asynchronous permission transaction.  Request semantics are part
+    // of the key: retries must poll the exact wire reqId, while a later request
+    // with different intent must not inherit an earlier authorization.
+    using HARemoteMissKey = std::tuple<uint64_t, int, int, bool>;
+    struct HARemoteMissContext {
+        uint64_t homePa = 0;
+        int homeNode = -1;
+        int homeSocket = 0;
+        int sourceSocket = 0;
+        uint64_t permissionEpoch = 0;
+        uint64_t reqId = 0;
+        HAOperation operation = HAOperation::Read;
+        bool awaitingInstall = false;
+    };
+    std::map<HARemoteMissKey, HARemoteMissContext> _haRemoteMisses;
 
     // ---- M6: Cross-Node EPBackend Routing Registry ----
     static std::map<int, EPBackend*> _backendInstances;

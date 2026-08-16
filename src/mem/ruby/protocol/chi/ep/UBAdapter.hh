@@ -109,7 +109,10 @@ class UBAdapter : public SimObject
 
     int sendClearReq(uint64_t linePa, int srcNode,
                      uint64_t epoch, uint64_t reqId,
-                     int homeNode, int homeSocket);
+                             int homeNode, int homeSocket);
+    bool sendClearReqOneWay(uint64_t linePa, int srcNode,
+                            uint64_t epoch, uint64_t reqId,
+                            int homeNode, int homeSocket);
 
     // Cross-node EPBackend→EPBackend (fire-and-forget via router)
     void sendRecallReqToOwner(int targetNode,
@@ -167,8 +170,31 @@ class UBAdapter : public SimObject
      * writeback metadata without a blocking transportRecv.
      */
     bool tryGetQueryLineMetaResp(uint64_t reqId,
-                                 uint64_t &outEpoch, int &outOwnerNode,
-                                 bool &outFound);
+                                  uint64_t &outEpoch, int &outOwnerNode,
+                                  bool &outFound);
+
+    // ---- HA endpoint wire API ----
+    // ioReqId == 0 allocates a transaction ID.  A retry must pass the returned
+    // non-zero ID; the adapter then polls the exact response and never emits a
+    // second request.  Return: 1=response consumed, -2=pending, -1=send error.
+    int sendHAPermissionReq(uint64_t linePa, HAOperation operation,
+                            uint64_t permissionEpoch, const uint8_t *writeData,
+                            int dstNode, int dstSocket, uint64_t &ioReqId,
+                            UBHAPermissionRespBody &outResp);
+    bool sendHAPermissionAck(uint64_t linePa, HAOperation operation,
+                             HAStatus status, uint64_t permissionEpoch,
+                             int dstNode, int dstSocket, uint64_t reqId);
+    int sendHAPresenceProbeReq(uint64_t linePa, HAProbeAction action,
+                               uint64_t expectedEpoch, int dstNode,
+                               int dstSocket, uint64_t &ioReqId,
+                               UBHAPresenceProbeRespBody &outResp);
+
+    // Responses to requests initiated by the HA peer.  These use the reliable
+    // output queue because they are produced from asynchronous CHI callbacks.
+    bool sendHAPermissionResp(const CoherenceMessage &request,
+                              const UBHAPermissionRespBody &body);
+    bool sendHAPresenceProbeResp(const CoherenceMessage &request,
+                                 const UBHAPresenceProbeRespBody &body);
 
     /** Clear cached ready-responses for a given line PA (e.g. a rejected
      *  UpgradeResp) so a retry sends a fresh request. */
@@ -212,6 +238,8 @@ class UBAdapter : public SimObject
 
     /** Send through the owned opaque framework port. */
     bool transportSend(const CoherenceMessage &msg);
+    bool transportSendReliable(const CoherenceMessage &msg);
+    void drainReliableOutputs();
 
     /** Multi-process split: send a BarrierReached CoherenceMessage (PAYLOAD)
      *  to ubio via Port.  @p seq is the barrier generation (TC90 fix). */
@@ -252,6 +280,8 @@ class UBAdapter : public SimObject
 
     std::set<uint64_t> _inflightReadReqs;
     std::set<uint64_t> _inflightClearReqs;
+    std::set<uint64_t> _inflightHAPermissionReqs;
+    std::set<uint64_t> _inflightHAPresenceProbeReqs;
     std::map<uint64_t, Tick> _clearRetryTick;
 
     std::map<PendingKey, PendingTxn> _pendingByReqId;
@@ -276,6 +306,10 @@ class UBAdapter : public SimObject
     // Deferred async control messages (InvalidateReq/RecallReq/UpgradeAckNotify)
     std::deque<CoherenceMessage> _deferredControls;
     bool _drainingDeferredControls = false;
+
+    // Ordered, lossless-at-the-adapter-boundary output queue.  A full opaque
+    // transport is retried by wakeup() without changing reqId or wire fields.
+    std::deque<CoherenceMessage> _reliableOutputs;
 };
 
 } // namespace ruby

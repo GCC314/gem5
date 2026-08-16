@@ -416,6 +416,8 @@ void initializeTBE(TBE tbe, Addr addr, int storSlot) {
   tbe.delayNextAction := intToTick(0);
 
   tbe.is_stale := false;
+  tbe.haStoreExternalHit := false;
+  tbe.haStoreMissFill := false;
   tbe.ubccIngressSocket := 0;
 
    // v4: Derive epRnfMachineID from epRnfMachineVersion

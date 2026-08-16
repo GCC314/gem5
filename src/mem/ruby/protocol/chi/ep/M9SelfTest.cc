@@ -77,6 +77,40 @@ static_assert(
 static_assert(sizeof(cc::glob::CoherenceMessageHeader) == 80,
               "CoherenceMessageHeader size must be 80 bytes (wire format)");
 
+// ---- HA additions: append-only enum values and fixed wire layouts ----
+static_assert(static_cast<uint16_t>(cc::glob::CoherenceMessageType::PeerExit) == 30,
+              "existing CoherenceMessageType values must remain stable");
+static_assert(static_cast<uint16_t>(cc::glob::CoherenceMessageType::HAPermissionReq) == 31,
+              "HA message types must be appended after PeerExit");
+static_assert(static_cast<uint16_t>(cc::glob::CoherenceMessageType::HAPresenceProbeResp) == 35,
+              "HA message type range changed");
+static_assert(sizeof(cc::glob::HAOperation) == 1 &&
+              sizeof(cc::glob::HAProbeAction) == 1 &&
+              sizeof(cc::glob::HAStatus) == 1,
+              "HA wire enums must remain one byte");
+static_assert(sizeof(cc::glob::UBHAPermissionReqBody) == 80,
+              "HA permission request wire body must remain 80 bytes");
+static_assert(sizeof(cc::glob::UBHAPermissionRespBody) == 80,
+              "HA permission response wire body must remain 80 bytes");
+static_assert(sizeof(cc::glob::UBHAPermissionAckBody) == 16,
+              "HA permission ack wire body must remain 16 bytes");
+static_assert(sizeof(cc::glob::UBHAPresenceProbeReqBody) == 16,
+              "HA presence probe request wire body must remain 16 bytes");
+static_assert(sizeof(cc::glob::UBHAPresenceProbeRespBody) == 16,
+              "HA presence probe response wire body must remain 16 bytes");
+static_assert(offsetof(cc::glob::UBHAPermissionReqBody, data) == 16,
+              "HA permission request data wire offset changed");
+static_assert(offsetof(cc::glob::UBHAPermissionRespBody, data) == 16,
+              "HA permission response data wire offset changed");
+static_assert(sizeof(cc::glob::CoherenceMessageBody) == 264,
+              "HA additions must not grow the message body ABI");
+static_assert(sizeof(cc::glob::CoherenceMessage) == 344,
+              "HA additions must not grow the message wire ABI");
+static_assert(std::is_copy_assignable<cc::glob::UBHAPermissionRespBody>::value,
+              "HA permission responses must be cacheable for async polling");
+static_assert(std::is_copy_assignable<cc::glob::UBHAPresenceProbeRespBody>::value,
+              "HA probe responses must be cacheable for async polling");
+
 void m9SelfTest_run(EPBackend *) { /* all checks are compile-time static_assert */ }
 
 } // namespace ruby

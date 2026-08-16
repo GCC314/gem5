@@ -60,6 +60,8 @@ namespace gem5
 namespace ruby
 {
 
+class EPBackend;
+
 struct SequencerRequest
 {
     PacketPtr pkt;
@@ -159,6 +161,15 @@ class Sequencer : public RubyPort
     void markRemoved();
     void evictionCallback(Addr address);
     int coreId() const { return m_coreId; }
+
+    // CHI HA permission facade. Return 0 outside the HA DSM path, 1 while the
+    // asynchronous transaction is pending, and 2 after a validated grant.
+    bool needsHAPermission(Addr address) const;
+    int requestHAReadPermission(Addr address, DataBlock& data,
+                                bool storeMiss = false);
+    int requestHAStorePermission(Addr address, DataBlock& data);
+    void completeHAStore(Addr address, DataBlock& data, bool externalHit);
+    void acknowledgeHAPermission(Addr address);
 
     virtual int functionalWrite(Packet *func_pkt) override;
 
@@ -279,6 +290,20 @@ class Sequencer : public RubyPort
     uint64_t m_unaddressedTransactionCnt;
 
     bool m_runningGarnetStandalone;
+
+    EPBackend *m_haEpBackend = nullptr;
+    int m_haSourceSocket = 0;
+    struct HAPermissionState
+    {
+        uint64_t reqId = 0;
+        uint64_t epoch = 0;
+        uint64_t homePa = 0;
+        int homeNode = -1;
+        int homeSocket = 0;
+        bool isWrite = false;
+        bool granted = false;
+    };
+    std::unordered_map<Addr, HAPermissionState> m_haPermissions;
 
     //! Histogram for number of outstanding requests per cycle.
     statistics::Histogram m_outstandReqHist;

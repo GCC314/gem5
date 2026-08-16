@@ -27,3 +27,14 @@ class EPBackend(SimObject):
     metadata_private_size = Param.MemorySize("128MiB", "metadata private DRAM size")
     silent_upgrade = Param.Bool(False, "silent upgrade: complete write upgrade locally when requester holds E/M")
     direct_fwd = Param.Bool(False, "enable direct-forward (owner->requester data bypass)")
+    ha_endpoint_profile = Param.String(
+        "ubcc",
+        "endpoint profile: 'ubcc' preserves legacy behavior; 'ha' enables "
+        "incoming HA presence probes",
+    )
+    clear_profile = Param.String(
+        "ack",
+        "UBCC grant completion profile: 'ack' waits for ClearResp; "
+        "'lossless-oneway' sends Clear only after the requester-side CHI "
+        "publication acknowledgement and never waits for ClearResp",
+    )

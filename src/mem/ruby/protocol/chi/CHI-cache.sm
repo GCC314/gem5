@@ -40,6 +40,7 @@ machine(MachineType:Cache, "Cache coherency protocol") :
   // Sequencer to insert Load/Store requests.
   // May be null if this is not a L1 cache
   Sequencer * sequencer;
+  bool accepts_cpu_requests := "False";
 
   // Cache for storing local lines.
   // NOTE: it is assumed that a cache tag and directory lookups and updates
@@ -560,6 +561,11 @@ machine(MachineType:Cache, "Cache coherency protocol") :
     // Misc triggers
     LoadHit,  desc="Complete a load hit";
     StoreHit, desc="Complete a store hit";
+    HALoadPermission, desc="Poll requester-side HA read permission";
+    HACompleteLoad, desc="Expose published HA read data to CPU";
+    HAStoreReadPermission, desc="Fetch authoritative HA data for store miss";
+    HAAckReadThenStore, desc="Ack published HA read before HA write";
+    HAStorePermission, desc="Poll requester-side HA write permission";
     AtomicHit, desc="Complete an atomic hit";
     UseTimeout, desc="Transition from UD_T -> UD";
     RestoreFromHazard, desc="Restore from a snoop hazard";
@@ -714,6 +720,8 @@ machine(MachineType:Cache, "Cache coherency protocol") :
     bool dataValid,               desc="Local copy is valid";
     bool dataAMOValid,            desc="Local copy is valid for AMO";
     bool dataDirty,               desc="Local copy is dirtry";
+    bool haStoreExternalHit, default="false", desc="HA-delayed store was a miss";
+    bool haStoreMissFill, default="false", desc="HA write response supplies miss fill";
     bool dataMaybeDirtyUpstream,  desc="Line maybe dirty upstream";
     bool dataUnique,              desc="Line is unique either locally or upsatream";
     bool dataToBeInvalid,         desc="Local copy will be invalidated at the end of transaction";

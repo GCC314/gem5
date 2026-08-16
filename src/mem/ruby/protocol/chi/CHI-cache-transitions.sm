@@ -656,6 +656,36 @@ transition(BUSY_BLKD, StoreHit) {
   ProcessNextState_ClearPending;
 }
 
+transition({BUSY_BLKD,BUSY_INTR}, HAStorePermission) {
+  Pop_TriggerQueue;
+  Callback_HAStorePermission;
+  ProcessNextState_ClearPending;
+}
+
+transition({BUSY_BLKD,BUSY_INTR}, HALoadPermission) {
+  Pop_TriggerQueue;
+  Callback_HALoadPermission;
+  ProcessNextState_ClearPending;
+}
+
+transition({BUSY_BLKD,BUSY_INTR}, HACompleteLoad) {
+  Pop_TriggerQueue;
+  Complete_HALoad;
+  ProcessNextState_ClearPending;
+}
+
+transition({BUSY_BLKD,BUSY_INTR}, HAStoreReadPermission) {
+  Pop_TriggerQueue;
+  Callback_HAStoreReadPermission;
+  ProcessNextState_ClearPending;
+}
+
+transition({BUSY_BLKD,BUSY_INTR}, HAAckReadThenStore) {
+  Pop_TriggerQueue;
+  AckHAReadThenStartStore;
+  ProcessNextState_ClearPending;
+}
+
 transition(UC, {AtomicLoad,AtomicStore}, BUSY_BLKD) {
   Initiate_Request;
   Initiate_Atomic_UC;
@@ -1401,8 +1431,11 @@ transition(BUSY_BLKD, FinishCopyBack_Stale) {
 
 transition(BUSY_BLKD, CheckUpgrade_FromStore) {
   Pop_TriggerQueue;
-  Callback_Miss; // note: Callback happens only if tbe.dataValid
   CheckUpgrade_FromStoreOrRU;
+  // Gate only after the upgrade result has resolved.  A stale upgrade clears
+  // dataValid and queues a fresh ReadUnique, so Callback_Miss becomes a no-op
+  // here and runs for real when that latest full line arrives.
+  Callback_Miss; // note: Callback happens only if tbe.dataValid
   ProcessNextState_ClearPending;
 }
 
@@ -1634,6 +1667,7 @@ transition(BUSY_INTR, WriteZero) {
    ScrubEPRNF_ToI;
    Finalize_UpdateCacheFromTBE;
    Finalize_UpdateDirectoryFromTBE;
+   Finalize_AckHAPermission;
    Finalize_DeallocateRequest;
  }
 
