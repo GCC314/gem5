@@ -166,6 +166,7 @@ machine(MachineType:Cache, "Cache coherency protocol") :
 
   // EP-RNF MachineID version (-1 if none, overridden by config if EP-RNF exists)
   int epRnfMachineVersion := -1;
+  int ubccRequesterSocket := 0;
 
   // MetaRNF issues non-allocating ReadOnce transactions for the private
   // metadata range. The HN-F still caches these lines, but never records the
@@ -667,6 +668,7 @@ machine(MachineType:Cache, "Cache coherency protocol") :
     bool ns,                desc="Secure State of the transaction. NS=NonSecure", default="true";
     MachineID requestor,    desc="Requestor ID";
     MachineID fwdRequestor, desc="Requestor to receive data on fwding snoops";
+    int ubccIngressSocket, desc="Original requester socket for UBCC source routing", default="0";
     bool use_DMT,           desc="Use DMT for this transaction";
     bool use_DCT,           desc="Use DCT for this transaction";
 

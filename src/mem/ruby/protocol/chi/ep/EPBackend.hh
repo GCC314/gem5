@@ -387,6 +387,7 @@ class EPBackend : public SimObject
     // retry the upgrade. A temporary reject (outNotSharer stays false) should
     // be retried once the home drains.
     bool notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
+                                  int sourceSocket,
                                   int desiredPerm, UpgradeCause cause,
                                   uint64_t &outEpoch, uint64_t &outReqId,
                                   bool *outRejected = nullptr,
@@ -402,7 +403,7 @@ class EPBackend : public SimObject
      * @param reqId     Original upgrade reqId
      * @return          True if accepted by home
      */
-    bool sendUpgradeDone(uint64_t line_pa, int homeNode,
+    bool sendUpgradeDone(uint64_t line_pa, int homeNode, int sourceSocket,
                          uint64_t epoch, uint64_t reqId);
 
     // ---- v4: Clear / ClearAck (§3.5, §4.2.3) ----
@@ -529,7 +530,8 @@ class EPBackend : public SimObject
                         const uint8_t *dirtyData = nullptr,
                         const WritebackQueryMeta *queryMeta = nullptr,
                         uint64_t *outQueryReqId = nullptr,
-                        uint64_t cachedQlmReqId = 0);
+                        uint64_t cachedQlmReqId = 0,
+                        int sourceSocket = 0);
 
     /**
      * Phase 2 async: fire a WritebackReq with previously-resolved metadata
@@ -540,7 +542,8 @@ class EPBackend : public SimObject
      */
     int handleWritebackWithMeta(uint64_t line_pa, bool keepAsClean,
                                  const uint8_t *dirtyData,
-                                 uint64_t epochVal, int requesterNode);
+                                 uint64_t epochVal, int requesterNode,
+                                 int sourceSocket = 0);
 
     /**
      * Called by EPSNFController when HN-F completes a WriteNoSnp write
@@ -644,7 +647,7 @@ class EPBackend : public SimObject
 
     /** Clear any rejected UpgradeResp cached in the UBAdapter for this line,
      *  so a retry sends a fresh UpgradeReq. */
-    void clearCachedUpgradeResp(uint64_t linePa);
+    void clearCachedUpgradeResp(uint64_t linePa, int sourceSocket);
 
     /** Process a deferred InvalidateReq after the held snoop that blocked it
      *  has been resolved (SnpResp_I sent). Acks directly since the local copy
@@ -916,11 +919,13 @@ class EPBackend : public SimObject
         bool valid;
         uint64_t linePa;
         int homeNode;
+        int sourceSocket;
         uint64_t epoch;
         uint64_t reqId;
         Tick startTick;
         bool acceptedPending;
         PendingUpgradeTxn() : valid(false), linePa(0), homeNode(-1),
+                               sourceSocket(0),
                                epoch(0), reqId(0), startTick(0),
                                acceptedPending(false) {}
     };

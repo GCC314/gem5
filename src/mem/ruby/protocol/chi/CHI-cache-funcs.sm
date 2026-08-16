@@ -416,6 +416,7 @@ void initializeTBE(TBE tbe, Addr addr, int storSlot) {
   tbe.delayNextAction := intToTick(0);
 
   tbe.is_stale := false;
+  tbe.ubccIngressSocket := 0;
 
    // v4: Derive epRnfMachineID from epRnfMachineVersion
   if (epRnfMachineVersion >= 0) {
@@ -459,6 +460,7 @@ TBE allocateRequestTBE(Addr addr, CHIRequestMsg in_msg), return_by_pointer="yes"
   tbe.accSize := in_msg.accSize;
   tbe.requestor := in_msg.requestor;
   tbe.reqType := in_msg.type;
+  tbe.ubccIngressSocket := in_msg.ubcc_ingress_socket;
 
   tbe.isSeqReqValid := in_msg.isSeqReqValid;
   tbe.seqReq := in_msg.seqReq;
@@ -692,6 +694,7 @@ void prepareRequest(TBE tbe, CHIRequestType type, CHIRequestMsg & out_msg) {
   // Default UBCC sideband: Shared, no write intent
   out_msg.ubcc_needed_perm := 0;
   out_msg.ubcc_write_intent := false;
+  out_msg.ubcc_ingress_socket := tbe.ubccIngressSocket;
 
   // v4: propagate epProxyOp so the snoop recipient (EP-RNF) can distinguish
   // a self-initiated upgrade snoop (NoProxyOp, from CPU store) from a passive
@@ -776,6 +779,7 @@ void prepareRequestRetry(TBE tbe, CHIRequestMsg & out_msg) {
   // Sideband is derived from tbe.reqType (the original CPU request type),
   // which does not change across retries.
   setUbccSideband(tbe, out_msg);
+  out_msg.ubcc_ingress_socket := tbe.ubccIngressSocket;
 }
 
 void prepareRequestRetryDVM(TBE tbe, CHIRequestMsg & out_msg) {

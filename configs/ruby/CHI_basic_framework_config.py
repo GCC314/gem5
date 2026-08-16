@@ -226,6 +226,8 @@ class ClusterCHI_RNF(CHI_Node):
                 ruby_system, cpu.inst_sequencer, l1i_cache, NULL)
             cpu.l1d = CHI_L1Controller(
                 ruby_system, cpu.data_sequencer, l1d_cache, NULL)
+            cpu.l1i.ubccRequesterSocket = socket_id
+            cpu.l1d.ubccRequesterSocket = socket_id
             cpu.inst_sequencer.dcache = NULL
             cpu.data_sequencer.dcache = cpu.l1d.cache
             cpu.l1d.sc_lock_enabled = True

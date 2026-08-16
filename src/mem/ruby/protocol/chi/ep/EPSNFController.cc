@@ -111,7 +111,8 @@ EPSNFController::wakeup()
         for (auto it = _retryQueue.begin(); it != _retryQueue.end(); ) {
             int homeNode = -1;
             int grantResult = _backend->handleRemoteMiss(
-                it->linePa, it->neededPerm, it->writeIntent, _socketId, homeNode);
+                it->linePa, it->neededPerm, it->writeIntent,
+                it->ingressSocket, homeNode);
             if (grantResult >= 0) {
                 // Grant succeeded — send CompData (same as normal flow)
                 NetDest hnDest(m_ruby_system);
@@ -197,6 +198,11 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
         _backend->checkDsmAddr(msg->m_addr);
 
         PendingWrite pending;
+        pending.sourceSocket = msg->m_ubcc_ingress_socket;
+        fatal_if(pending.sourceSocket < 0 ||
+                     !_backend->getUBAdapter(pending.sourceSocket),
+                 "EP_SNF node_id=%d: invalid WriteNoSnp requester socket %d",
+                 _nodeId, pending.sourceSocket);
         if (msg->m_type == CHIRequestType_WriteNoSnpPtl) {
             const int offset = msg->m_accAddr - msg->m_addr;
             pending.expectedMask = ((1ULL << msg->m_accSize) - 1) << offset;
@@ -264,6 +270,7 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
     // ---- M5: Read UBCC Sideband Fields ----
     int neededPerm = msg->m_ubcc_needed_perm;  // 0=Shared, 1=Unique
     bool writeIntent = msg->m_ubcc_write_intent;
+    int ingressSocket = msg->m_ubcc_ingress_socket;
 
     DPRINTF(RubyCHIGeneric,
         "[DEBUG-EP-SNF] node=%d type=%d addr=0x%lx neededPerm=%d writeIntent=%d\n",
@@ -294,7 +301,7 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
                      _nodeId, msg->m_addr, curTick());
     }
     int grantResult = _backend->handleRemoteDemandMiss(
-        msg->m_addr, neededPerm, writeIntent, _socketId, homeNode);
+        msg->m_addr, neededPerm, writeIntent, ingressSocket, homeNode);
 
     // Q3: If grant blocked, queue for retry instead of sending stale data
     if (grantResult < 0) {
@@ -305,6 +312,7 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
         entry.linePa = msg->m_addr;
         entry.neededPerm = neededPerm;
         entry.writeIntent = writeIntent;
+        entry.ingressSocket = ingressSocket;
         entry.hnReq = msg->m_requestor;
         entry.fwdReq = msg->m_fwdRequestor;
         entry.dataToFwdReq = msg->m_dataToFwdRequestor;
@@ -366,6 +374,7 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
             entry.linePa = msg->m_addr;
             entry.neededPerm = neededPerm;
             entry.writeIntent = writeIntent;
+            entry.ingressSocket = ingressSocket;
             entry.hnReq = msg->m_requestor;
             entry.fwdReq = msg->m_fwdRequestor;
             entry.dataToFwdReq = msg->m_dataToFwdRequestor;
@@ -609,7 +618,10 @@ EPSNFController::recvDataMsg(const CHIDataMsg *msg)
                 auto &addrMap = _backend->addrMap();
                 int homeNode = addrMap.homeNode(_nodeId, msg->m_addr);
                 uint64_t offset = addrMap.dsmOffset(msg->m_addr);
-                writePa = addrMap.buildDsmPA(homeNode, homeNode, offset);
+                int homeSocket = addrMap.homeSocket(_nodeId, msg->m_addr);
+                if (homeSocket < 0) homeSocket = 0;
+                writePa = addrMap.buildDsmPA(
+                    homeNode, homeNode, offset, homeSocket);
                 DPRINTF(RubyCHIGeneric,
                         "EP_SNF node_id=%d: NCBWrData PA translation: "
                         "local=0x%lx → home=0x%lx (homeNode=%d)\n",
@@ -687,10 +699,12 @@ EPSNFController::recvDataMsg(const CHIDataMsg *msg)
                     // per line — retain newest dirty payload.
                     bool replaced = false;
                     for (auto &pwb : _pendingWritebacks) {
-                        if (pwb.linePa == writePa) {
+                        if (pwb.linePa == writePa &&
+                            pwb.sourceSocket == pendingIt->second.sourceSocket) {
                             // Phase 2 corrective item 3: consume stale QLM
                             if (pwb.queryInFlight && _backend) {
-                                UBAdapter *wa = _backend->getUBAdapter(0);
+                                UBAdapter *wa = _backend->getUBAdapter(
+                                    pwb.sourceSocket);
                                 if (wa) {
                                     uint64_t _dE; int _dO; bool _dF;
                                     wa->tryGetQueryLineMetaResp(
@@ -718,6 +732,7 @@ EPSNFController::recvDataMsg(const CHIDataMsg *msg)
                         PendingWriteback pwb;
                         pwb.linePa = writePa;
                         pwb.keepAsClean = false;
+                        pwb.sourceSocket = pendingIt->second.sourceSocket;
                         pwb.hasData = true;
                         std::memcpy(pwb.data, buf, 64);
                         _pendingWritebacks.push_back(pwb);
@@ -760,7 +775,7 @@ EPSNFController::processPendingWritebacks()
 
         // ── Poll for QLM response if one is in-flight ──
         if (it->queryInFlight && _backend) {
-            UBAdapter *wa = _backend->getUBAdapter(0);
+            UBAdapter *wa = _backend->getUBAdapter(it->sourceSocket);
             if (wa) {
                 uint64_t resolvedEpoch = 0;
                 int resolvedOwner = -1;
@@ -803,7 +818,8 @@ EPSNFController::processPendingWritebacks()
                                  ? it->cachedOwnerNode : _nodeId;
             wbRet = _backend->handleWriteback(it->linePa, it->keepAsClean,
                                                it->hasData ? it->data : nullptr,
-                                               &meta);
+                                               &meta, nullptr, 0,
+                                               it->sourceSocket);
 
         } else if (it->queryReqId > 0) {
             // ── Phase 2 item 4: retry with stable queryReqId ──
@@ -815,7 +831,8 @@ EPSNFController::processPendingWritebacks()
                 it->hasData ? it->data : nullptr,
                 nullptr,           // no pre-resolved meta
                 nullptr,           // no new outQueryReqId (reusing existing)
-                it->queryReqId);   // stable cached reqId
+                it->queryReqId,    // stable cached reqId
+                it->sourceSocket);
             // If handleWriteback consumed a cached QLM response,
             // wbRet will be the writeback result (not -2).
             // If still pending, wbRet == -2 and we back off.
@@ -827,7 +844,8 @@ EPSNFController::processPendingWritebacks()
                                                it->hasData ? it->data : nullptr,
                                                nullptr,  // no cached meta
                                                &qlmReqId, // get the new reqId
-                                               0);        // no cached reqId
+                                               0,         // no cached reqId
+                                               it->sourceSocket);
             if (wbRet == -2 && qlmReqId > 0) {
                 it->queryReqId = qlmReqId;
                 it->queryInFlight = true;

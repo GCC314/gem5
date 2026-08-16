@@ -141,6 +141,7 @@ action(AllocateTBE_SeqRequest, desc="") {
       out_msg.accSize := in_msg.Size;
       out_msg.requestor := machineID;
       out_msg.fwdRequestor := machineID;
+      out_msg.ubcc_ingress_socket := ubccRequesterSocket;
       out_msg.seqReq := in_msg.getRequestPtr();
       out_msg.isSeqReqValid := true;
       assert(in_msg.Prefetch == PrefetchBit:No);
@@ -232,6 +233,7 @@ action(AllocateTBE_PfRequest, desc="Allocate TBE for prefetch request") {
       out_msg.accSize := in_msg.Size;
       out_msg.requestor := machineID;
       out_msg.fwdRequestor := machineID;
+      out_msg.ubcc_ingress_socket := ubccRequesterSocket;
       out_msg.seqReq := in_msg.getRequestPtr();
       out_msg.isSeqReqValid := true;
       assert(in_msg.Prefetch != PrefetchBit:No);

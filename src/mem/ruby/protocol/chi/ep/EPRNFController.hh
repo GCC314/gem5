@@ -500,6 +500,7 @@ class EPRNFController : public EPController
         bool valid;
         uint64_t linePa;
         int homeNode;
+        int sourceSocket;
         uint64_t epoch;
         uint64_t reqId;
         MachineID hnfDest;      // HN-F that sent SnpCleanInvalid
@@ -520,7 +521,8 @@ class EPRNFController : public EPController
         int dropResendCount;    // number of DROP-recovery resends issued so far
                                 // (bounded to avoid infinite resend storms)
 
-        UpgradePending() : valid(false), linePa(0), homeNode(-1), epoch(0),
+        UpgradePending() : valid(false), linePa(0), homeNode(-1),
+                           sourceSocket(0), epoch(0),
                            reqId(0), ackReceived(false), snpRespSent(false),
                            homeAccepted(false),
                            rejected(false),

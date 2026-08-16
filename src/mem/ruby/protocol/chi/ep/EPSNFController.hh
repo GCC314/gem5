@@ -45,6 +45,7 @@ class EPSNFController : public EPController
     struct PendingWrite {
         uint64_t expectedMask = 0;
         uint64_t receivedMask = 0;
+        int sourceSocket = 0;
     };
     std::map<Addr, PendingWrite> _pendingWrites;
 
@@ -53,6 +54,7 @@ class EPSNFController : public EPController
         uint64_t linePa;
         int neededPerm;
         bool writeIntent;
+        int ingressSocket;
         MachineID hnReq;      // HN-F requestor (for CompData routing)
         MachineID fwdReq;     // fwdRequestor (if dataToFwdReq)
         bool dataToFwdReq;
@@ -97,6 +99,7 @@ class EPSNFController : public EPController
     struct PendingWriteback {
         uint64_t linePa;
         bool keepAsClean;
+        int sourceSocket;
         uint8_t data[64];
         bool hasData;
 
@@ -112,7 +115,7 @@ class EPSNFController : public EPController
         Tick nextRetryTick;
 
         PendingWriteback()
-            : linePa(0), keepAsClean(false), hasData(false),
+            : linePa(0), keepAsClean(false), sourceSocket(0), hasData(false),
               queryReqId(0), queryInFlight(false),
               cachedEpoch(0), cachedOwnerNode(-1), cachedFound(false),
               retryCount(0), nextRetryTick(0)

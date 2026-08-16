@@ -1518,7 +1518,8 @@ EPBackend::handleWriteback(uint64_t line_pa, bool keepAsClean,
                            const uint8_t *dirtyData,
                            const WritebackQueryMeta *queryMeta,
                            uint64_t *outQueryReqId,
-                           uint64_t cachedQlmReqId)
+                           uint64_t cachedQlmReqId,
+                           int sourceSocket)
 {
     DPRINTF(RubyEP,
             "EPBackend node_id=%d: handleWriteback PA=0x%lx "
@@ -1560,7 +1561,7 @@ EPBackend::handleWriteback(uint64_t line_pa, bool keepAsClean,
         uint64_t qEpoch = 0;
         int qOwnerNode = -1;
         bool qFound = false;
-        UBAdapter *wa = getUBAdapter(0);
+        UBAdapter *wa = getUBAdapter(sourceSocket);
         if (wa) {
             int qRet = wa->sendQueryLineMetaReq(line_pa, homeNode, homeSocket,
                                                 qEpoch, qOwnerNode, qFound,
@@ -1594,13 +1595,14 @@ EPBackend::handleWriteback(uint64_t line_pa, bool keepAsClean,
     }
 
     return handleWritebackWithMeta(line_pa, keepAsClean, dirtyData,
-                                    epochVal, requesterNode);
+                                    epochVal, requesterNode, sourceSocket);
 }
 
 int
 EPBackend::handleWritebackWithMeta(uint64_t line_pa, bool keepAsClean,
                                     const uint8_t *dirtyData,
-                                    uint64_t epochVal, int requesterNode)
+                                    uint64_t epochVal, int requesterNode,
+                                    int sourceSocket)
 {
     DPRINTF(RubyEP,
             "EPBackend node_id=%d: handleWritebackWithMeta PA=0x%lx "
@@ -1629,12 +1631,13 @@ EPBackend::handleWritebackWithMeta(uint64_t line_pa, bool keepAsClean,
     _lastWritebackMsg.epoch = epochVal;
     _lastWritebackMsg.keepAsClean = keepAsClean;
 
-    if (!getUBAdapter(0)) {
+    UBAdapter *adapter = getUBAdapter(sourceSocket);
+    if (!adapter) {
         fatal("EPBackend node_id=%d: UBAdapter required for writeback "
-              "PA=0x%lx homeNode=%d\n",
-              _nodeId, line_pa, homeNode);
+              "PA=0x%lx homeNode=%d sourceSocket=%d\n",
+              _nodeId, line_pa, homeNode, sourceSocket);
     }
-    int wbRet = getUBAdapter(0)->sendWritebackReq(
+    int wbRet = adapter->sendWritebackReq(
         homePa, requesterNode, epochVal, keepAsClean, homeNode, homeSocket,
         dirtyData);
     bool wbPending = (wbRet == -2);
@@ -1958,6 +1961,7 @@ EPBackend::sendInvalidationAck(const OuterInvalidationAck &ack)
 
 bool
 EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
+                                    int sourceSocket,
                                     int desiredPerm, UpgradeCause cause,
                                     uint64_t &outEpoch, uint64_t &outReqId,
                                     bool *outRejected, bool *outNotSharer,
@@ -1968,7 +1972,11 @@ EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
     DPRINTF(RubyEP,
             "EPBackend node_id=%d: notifyLocalWriteUpgrade "
             "PA=0x%lx homeNode=%d desiredPerm=%d\n",
-            _nodeId, line_pa, homeNode, desiredPerm);
+             _nodeId, line_pa, homeNode, desiredPerm);
+
+    fatal_if(sourceSocket < 0 || sourceSocket >= _numSockets,
+             "EPBackend node_id=%d: invalid upgrade source socket %d PA=0x%lx",
+             _nodeId, sourceSocket, line_pa);
 
     // Translate local PA to home PA
     uint64_t offset = _addrMap.dsmOffset(line_pa);
@@ -1982,6 +1990,10 @@ EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
     // loop forever (TC3/8/10/11).
     auto put = _pendingUpgradeTxns.find(line_pa);
     const bool hadPending = (put != _pendingUpgradeTxns.end() && put->second.valid);
+    fatal_if(hadPending && put->second.sourceSocket != sourceSocket,
+             "EPBackend node_id=%d: pending upgrade socket changed PA=0x%lx "
+             "old=%d new=%d", _nodeId, line_pa, put->second.sourceSocket,
+             sourceSocket);
 
     uint64_t epochVal;
     uint64_t reqIdVal;
@@ -1995,10 +2007,11 @@ EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
     }
     const Tick upgradeStartTick = hadPending ? put->second.startTick : curTick();
 
-    if (!getUBAdapter(0)) {
+    UBAdapter *adapter = getUBAdapter(sourceSocket);
+    if (!adapter) {
         fatal("EPBackend node_id=%d: UBAdapter required for upgrade "
-              "PA=0x%lx homeNode=%d\n",
-              _nodeId, line_pa, homeNode);
+              "PA=0x%lx homeNode=%d sourceSocket=%d\n",
+              _nodeId, line_pa, homeNode, sourceSocket);
     }
 
     // Send OuterUpgradeReq to home UBCC via message passing
@@ -2022,6 +2035,7 @@ EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
         txn.valid = true;
         txn.linePa = line_pa;
         txn.homeNode = homeNode;
+        txn.sourceSocket = sourceSocket;
         txn.epoch = epochVal;
         txn.reqId = reqIdVal;
         txn.startTick = upgradeStartTick;
@@ -2046,9 +2060,9 @@ EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
         // target mask while its later UpgradeAckNotify is the message that was
         // lost. A recovery resend must bypass that stale stage and actually
         // reach the home with the same tuple so it can replay current progress.
-        getUBAdapter(0)->clearReadyResponsesForLine(homePa);
+        adapter->clearReadyResponsesForLine(homePa);
     }
-    int upgradeRet = getUBAdapter(0)->sendUpgradeReq(
+    int upgradeRet = adapter->sendUpgradeReq(
         homePa, _nodeId, epochVal, reqIdVal,
         desiredPerm, static_cast<int>(cause),
         &upgradeTargetMask, &committedEpoch, homeNode, homeSocket,
@@ -2065,6 +2079,7 @@ EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
         txn.valid = true;
         txn.linePa = line_pa;
         txn.homeNode = homeNode;
+        txn.sourceSocket = sourceSocket;
         txn.epoch = epochVal;
         txn.reqId = reqIdVal;
         txn.startTick = upgradeStartTick;
@@ -2153,6 +2168,7 @@ EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
             txn.valid = true;
             txn.linePa = line_pa;
             txn.homeNode = homeNode;
+            txn.sourceSocket = sourceSocket;
             txn.epoch = epochVal;
             txn.reqId = reqIdVal;
             txn.startTick = upgradeStartTick;
@@ -2192,7 +2208,7 @@ EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
 }
 
 bool
-EPBackend::sendUpgradeDone(uint64_t line_pa, int homeNode,
+EPBackend::sendUpgradeDone(uint64_t line_pa, int homeNode, int sourceSocket,
                             uint64_t epoch, uint64_t reqId)
 {
     DPRINTF(RubyEP,
@@ -2205,10 +2221,11 @@ EPBackend::sendUpgradeDone(uint64_t line_pa, int homeNode,
     if (homeSocket < 0) homeSocket = 0;
     uint64_t homePa = _addrMap.buildDsmPA(homeNode, homeNode, offset, homeSocket);
 
-    if (!getUBAdapter(0)) {
+    UBAdapter *adapter = getUBAdapter(sourceSocket);
+    if (!adapter) {
         fatal("EPBackend node_id=%d: UBAdapter required for upgrade done "
-              "PA=0x%lx homeNode=%d\n",
-              _nodeId, line_pa, homeNode);
+              "PA=0x%lx homeNode=%d sourceSocket=%d\n",
+              _nodeId, line_pa, homeNode, sourceSocket);
     }
 
     OuterUpgradeDone doneMsg;
@@ -2219,7 +2236,7 @@ EPBackend::sendUpgradeDone(uint64_t line_pa, int homeNode,
     doneMsg.reqId = reqId;
     _lastUpgradeDone = doneMsg;
 
-    int doneRet = getUBAdapter(0)->sendUpgradeDoneReq(
+    int doneRet = adapter->sendUpgradeDoneReq(
         homePa, _nodeId, epoch, reqId, homeNode, homeSocket);
     bool donePending = (doneRet == -2);
     bool accepted = (doneRet > 0);
@@ -2379,13 +2396,16 @@ EPBackend::sendSnpRespIForRejected(uint64_t linePa, uint64_t hnfDestRaw)
 }
 
 void
-EPBackend::clearCachedUpgradeResp(uint64_t linePa)
+EPBackend::clearCachedUpgradeResp(uint64_t linePa, int sourceSocket)
 {
     // Clear any rejected UpgradeResp from the UBAdapter's ready-response cache
     // so the next upgrade attempt sends a fresh UpgradeReq instead of hitting
     // the stale rejected response.
-    if (getUBAdapter(0))
-        getUBAdapter(0)->clearReadyResponsesForLine(linePa);
+    UBAdapter *adapter = getUBAdapter(sourceSocket);
+    fatal_if(!adapter,
+             "EPBackend node_id=%d: missing upgrade response adapter socket=%d "
+             "PA=0x%lx", _nodeId, sourceSocket, linePa);
+    adapter->clearReadyResponsesForLine(linePa);
 }
 
 void

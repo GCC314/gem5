@@ -783,10 +783,18 @@ EPRNFController::handleSnpCleanInvalid(const CHIRequestMsg *msg)
 
     EPBackend *backend = EPBackend::getBackendInstance(_nodeId);
     bool isDsmLine = backend && backend->isDsmAddrCrossNode(msg->m_addr);
+    const int sourceSocket = msg->m_ubcc_ingress_socket;
+    fatal_if(sourceSocket < 0 || sourceSocket >= _numSockets,
+             "EP_RNF node_id=%d: invalid requester socket %d for PA=0x%lx",
+             _nodeId, sourceSocket, msg->m_addr);
 
     // Check if upgrade is pending for this PA (set by the first snoop arrival)
     auto upIt = _upgradePending.find(msg->m_addr);
     if (upIt != _upgradePending.end() && upIt->second.valid) {
+        fatal_if(upIt->second.sourceSocket != sourceSocket,
+                 "EP_RNF node_id=%d: held upgrade socket changed for PA=0x%lx "
+                 "old=%d new=%d", _nodeId, msg->m_addr,
+                 upIt->second.sourceSocket, sourceSocket);
         // ---- Upgrade path (§5.5 t2-t5) ----
         DPRINTF(RubyCHIGeneric,
                 "EP_RNF node_id=%d: SnpCleanInvalid upgrade path for "
@@ -871,6 +879,7 @@ EPRNFController::handleSnpCleanInvalid(const CHIRequestMsg *msg)
         pending.valid = true;
         pending.linePa = msg->m_addr;
         pending.homeNode = homeNode;
+        pending.sourceSocket = sourceSocket;
         pending.epoch = 0;
         pending.reqId = 0;
         pending.hnfDest = msg->m_requestor;
@@ -1606,7 +1615,7 @@ EPRNFController::scheduleUpgradeRetryAfterRejection(uint64_t linePa)
     EPBackend *backend = EPBackend::getBackendInstance(_nodeId);
     if (backend) {
         backend->clearPendingUpgradeTxn(linePa);
-        backend->clearCachedUpgradeResp(linePa);
+        backend->clearCachedUpgradeResp(linePa, upIt->second.sourceSocket);
     }
     }
     // Schedule the retry using exponential backoff (§11).
@@ -1739,7 +1748,7 @@ EPRNFController::completeHeldUpgrade(uint64_t linePa, bool dropRecoveryResend)
     // `notSharer` distinguishes a PERMANENT reject (we lost a dual-upgrade race
     // and were invalidated) from a TEMPORARY reject (another op is outstanding).
     bool accepted = backend->notifyLocalWriteUpgrade(
-        linePa, homeNode, 1,
+        linePa, homeNode, upIt->second.sourceSocket, 1,
         UpgradeCause::LocalCleanUnique,
         epoch, reqId, &rejected, &notSharer,
         dropRecoveryResend /*forceResend: retransmit same reqId on DROP*/);
@@ -1801,7 +1810,7 @@ EPRNFController::completeHeldUpgrade(uint64_t linePa, bool dropRecoveryResend)
                 backend->hasDeferredInvalidation(linePa));
 
         backend->clearPendingUpgradeTxn(linePa);
-        backend->clearCachedUpgradeResp(linePa);
+        backend->clearCachedUpgradeResp(linePa, upIt->second.sourceSocket);
         upIt->second.rejected = true;
 
         // Drive the stale-SnpResp_I abandon. There are two orderings:
@@ -1985,6 +1994,7 @@ EPRNFController::trySendUpgradeDone(uint64_t linePa)
         return false;
 
     if (!backend->sendUpgradeDone(linePa, it->second.homeNode,
+                                  it->second.sourceSocket,
                                   it->second.epoch, it->second.reqId)) {
         return false;
     }
