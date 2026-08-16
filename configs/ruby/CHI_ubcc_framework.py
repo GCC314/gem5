@@ -7,6 +7,7 @@ Q1: DSM VA Mapping helper — call setup_dsm_va_mapping() from test scripts
     after Process creation to map DSM_VA_BASE + k*SEG to PA for each node.
 """
 import math
+import os
 
 import m5
 from m5.objects import *
@@ -188,6 +189,15 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
     ubcc_meta_read_ticks = int(_opt("ubcc_meta_read_ticks", 8000))
     ubcc_meta_write_ticks = int(_opt("ubcc_meta_write_ticks", 7500))
     ubcc_meta_delete_ticks = int(_opt("ubcc_meta_delete_ticks", 7500))
+    ep_upgrade_retry_min_cycles = int(_opt(
+        "ep_upgrade_retry_min_cycles",
+        os.environ.get("EP_UPGRADE_RETRY_MIN_CYCLES", 10000)))
+    ep_upgrade_retry_max_cycles = int(_opt(
+        "ep_upgrade_retry_max_cycles",
+        os.environ.get("EP_UPGRADE_RETRY_MAX_CYCLES", 400000)))
+    ep_upgrade_retry_max_resends = int(_opt(
+        "ep_upgrade_retry_max_resends",
+        os.environ.get("EP_UPGRADE_RETRY_MAX_RESENDS", 8)))
     cache_line = system.cache_line_size.value
     # node_list: which nodes this process builds. In split mode, exactly one.
     if local_node < 0:
@@ -292,7 +302,6 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
         nd['ub_adapter'] = nd['ub_adapters'][0] if nd['ub_adapters'] else None
         nd['meta_rnf'] = None
 
-        import os
         _silent_env = os.environ.get("EP_SILENT_UPGRADE")
         _direct_env = os.environ.get("EP_DIRECT_FWD")
         ep_backend = EPBackend(node_id=node_id, ruby_system=ruby_system,
@@ -403,6 +412,9 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
             ruby_system=ruby_system, node_id=node_id, num_nodes=num_nodes,
             data_channel_size=params.data_width,
             ep_backend=ep_backend,
+            upgrade_retry_min_cycles=ep_upgrade_retry_min_cycles,
+            upgrade_retry_max_cycles=ep_upgrade_retry_max_cycles,
+            upgrade_retry_max_resends=ep_upgrade_retry_max_resends,
             addr_ranges=[NodeConfig.dsm_range_for(
                 node_id, seg_size, cfg.phy_base, num_sockets, sid)
                 for sid in range(num_sockets)],

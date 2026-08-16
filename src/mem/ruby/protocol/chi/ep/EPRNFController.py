@@ -16,3 +16,5 @@ class EPRNFController(EPController):
     wakeup_retry_cycles = Param.UInt64(1000000, "Wakeup retry interval in cycles")
     upgrade_retry_min_cycles = Param.UInt64(10000, "Held-upgrade retry backoff min cycles")
     upgrade_retry_max_cycles = Param.UInt64(400000, "Held-upgrade retry backoff max cycles")
+    upgrade_retry_max_resends = Param.UInt32(
+        8, "Maximum same-tuple UpgradeReq recovery resends")

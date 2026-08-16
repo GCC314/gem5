@@ -2006,6 +2006,10 @@ EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
         reqIdVal = makeRequesterReqId(_nodeId, _epochCounter);
     }
     const Tick upgradeStartTick = hadPending ? put->second.startTick : curTick();
+    // The caller needs the exact stable tuple even while the request is still
+    // pending, so a no-response terminal can identify the wire transaction.
+    outEpoch = epochVal;
+    outReqId = reqIdVal;
 
     UBAdapter *adapter = getUBAdapter(sourceSocket);
     if (!adapter) {
@@ -2130,10 +2134,6 @@ EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
         *outNotSharer = true;
 
     if (accepted) {
-        // Store returned values (reservedEpoch, echoed reqId)
-        outEpoch = epochVal;
-        outReqId = reqIdVal;
-
         if (upgradeTargetMask != 0) {
             // Other sharers exist — must invalidate them before Ack(true).
             //

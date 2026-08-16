@@ -409,6 +409,8 @@ class EPRNFController : public EPController
     EPBackend *_backend = nullptr;
 
   private:
+    const uint32_t _upgradeRetryMaxResends;
+
     // ---- Q3: CHI Request to HN-F ----
     /** Send a CHI request (ReadShared/CleanUnique/ReadUnique) to HN-F via reqOut.
      *  @return true if the message was enqueued successfully. */
@@ -518,8 +520,9 @@ class EPRNFController : public EPController
         bool dropWatchdogArmed; // true once a DROP/NO-RESP watchdog timer has
                                 // been scheduled for this held (pending) upgrade
         Tick retryReadyTick;    // do not consume retry work on unrelated wakeups
-        int dropResendCount;    // number of DROP-recovery resends issued so far
+        uint32_t dropResendCount; // DROP-recovery resends issued so far
                                 // (bounded to avoid infinite resend storms)
+        bool retryExhausted;    // terminal: never poll or re-arm this request
 
         UpgradePending() : valid(false), linePa(0), homeNode(-1),
                            sourceSocket(0), epoch(0),
@@ -528,7 +531,7 @@ class EPRNFController : public EPController
                            rejected(false),
                            needsRetry(false), retryCount(0),
                            dropWatchdogArmed(false), retryReadyTick(0),
-                           dropResendCount(0) {}
+                           dropResendCount(0), retryExhausted(false) {}
     };
     std::map<uint64_t, UpgradePending> _upgradePending;
 

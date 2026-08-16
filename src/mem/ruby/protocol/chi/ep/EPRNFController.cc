@@ -28,7 +28,6 @@ static uint64_t s_upgrade_retry_max = 0;   // from _params.upgrade_retry_max_cyc
 // DROP/NO-RESP recovery: cap the number of watchdog-driven OuterUpgradeReq
 // resends for a single held upgrade. Bounds a livelock storm on a persistently
 // faulty link while still tolerating several transient drops (TC111 drops one).
-static const int s_upgrade_drop_max_resends = 8;
 
 static uint64_t eprn_compack_retry() {
     return s_compack_retry;
@@ -258,6 +257,7 @@ EPController::functionalReadBuffers(PacketPtr& pkt, WriteMask &mask)
 
 EPRNFController::EPRNFController(const Params &p)
   : EPController(p), _backend(p.ep_backend),
+    _upgradeRetryMaxResends(p.upgrade_retry_max_resends),
     _numCacheControllers(0),
     _numSockets(p.downstream_destinations.size()),
     _addrMap(p.num_nodes, _numSockets, 128ULL * 1024 * 1024),
@@ -315,6 +315,9 @@ EPRNFController::init()
     s_wakeup_retry = params().wakeup_retry_cycles;
     s_upgrade_retry_min = params().upgrade_retry_min_cycles;
     s_upgrade_retry_max = params().upgrade_retry_max_cycles;
+    fatal_if(_upgradeRetryMaxResends == 0,
+             "EP_RNF node_id=%d: upgrade_retry_max_resends must be positive",
+             _nodeId);
 
     // v4-dual-socket: strict completeness check (§3.4 change 2)
     // num_sockets > 1 且 downstream_destinations.size() != num_sockets -> fatal
@@ -1607,8 +1610,13 @@ EPRNFController::scheduleUpgradeRetryAfterRejection(uint64_t linePa)
     auto upIt = _upgradePending.find(linePa);
     if (upIt != _upgradePending.end() && upIt->second.valid) {
         upIt->second.rejected = false;
-    upIt->second.needsRetry = true;
-    upIt->second.retryCount++;        // exponential backoff (§11)
+        upIt->second.needsRetry = true;
+        upIt->second.retryCount++;        // exponential backoff (§11)
+        // TEMP-REJECT starts a fresh tuple. Its no-response watchdog and
+        // same-tuple resend budget must not inherit state from the old reqId.
+        upIt->second.dropWatchdogArmed = false;
+        upIt->second.dropResendCount = 0;
+        upIt->second.retryExhausted = false;
 
     // Clear pending txn in EPBackend so notifyLocalWriteUpgrade allocates
     // a fresh reqId instead of reusing the rejected one (checkOnly).
@@ -1674,22 +1682,29 @@ EPRNFController::processUpgradeRetries()
         if (dropRecovery) {
             // Disarm so the next pending-hold re-arms with a wider backoff
             // window if this retransmit is also dropped. Bound the number of
-            // retransmits to avoid storming a persistently faulty link; once
-            // exhausted we keep re-polling (forceResend=false) without churning.
+            // retransmits to avoid storming a persistently faulty link. Once
+            // exhausted, fail-stop without polling, resending, or re-arming.
             bool doResend = (upIt->second.dropResendCount
-                             < s_upgrade_drop_max_resends);
+                             < _upgradeRetryMaxResends);
             if (doResend) {
                 upIt->second.dropWatchdogArmed = false;
                 upIt->second.dropResendCount++;
                 upIt->second.retryCount++;   // widen next watchdog window
-                warn("[UPGRADE-DIAG] node=%d DROP-recovery resend #%d "
+                warn("[UPGRADE-DIAG] node=%d DROP-recovery resend #%u "
                        "PA=0x%lx (same reqId)\n",
                        _nodeId, upIt->second.dropResendCount, linePa);
             } else {
                 upIt->second.dropWatchdogArmed = false;
-                warn("EP_RNF node_id=%d: upgrade DROP-recovery exhausted "
-                     "(%d resends) PA=0x%lx — re-polling only\n",
-                     _nodeId, upIt->second.dropResendCount, linePa);
+                upIt->second.retryExhausted = true;
+                fatal("[EPRNF-UPGRADE-TERMINAL] node=%d pa=0x%lx "
+                      "sourceSocket=%d homeNode=%d epoch=%lu reqId=%lu "
+                      "reason=EXHAUSTED_NO_RESPONSE resends=%u "
+                      "homeAccepted=%d\n",
+                      _nodeId, linePa, upIt->second.sourceSocket,
+                      upIt->second.homeNode,
+                      upIt->second.epoch, upIt->second.reqId,
+                      upIt->second.dropResendCount,
+                      upIt->second.homeAccepted ? 1 : 0);
             }
             DPRINTF(RubyCHIGeneric,
                     "EP_RNF node_id=%d: DROP-recovery retry held upgrade "
@@ -1727,6 +1742,8 @@ EPRNFController::completeHeldUpgrade(uint64_t linePa, bool dropRecoveryResend)
         // Already completed; nothing to do.
         return;
     }
+    if (upIt->second.retryExhausted)
+        return;
 
     EPBackend *backend = EPBackend::getBackendInstance(_nodeId);
     if (!backend) {
@@ -1752,6 +1769,12 @@ EPRNFController::completeHeldUpgrade(uint64_t linePa, bool dropRecoveryResend)
         UpgradeCause::LocalCleanUnique,
         epoch, reqId, &rejected, &notSharer,
         dropRecoveryResend /*forceResend: retransmit same reqId on DROP*/);
+    fatal_if(epoch == 0 || reqId == 0,
+             "EP_RNF node_id=%d: upgrade lacks stable tuple PA=0x%lx "
+             "sourceSocket=%d epoch=%lu reqId=%lu", _nodeId, linePa,
+             upIt->second.sourceSocket, epoch, reqId);
+    upIt->second.epoch = epoch;
+    upIt->second.reqId = reqId;
 
     if (accepted) {
         upIt->second.homeAccepted = true;
@@ -1856,7 +1879,8 @@ EPRNFController::completeHeldUpgrade(uint64_t linePa, bool dropRecoveryResend)
         // the cached grant. We do NOT set needsRetry here (that marks a
         // TEMP-REJECT fresh-reqId retry) and we do NOT give up the snoop (that is
         // only correct for an explicit reject).
-        if (!upIt->second.dropWatchdogArmed) {
+        if (!upIt->second.dropWatchdogArmed &&
+            !upIt->second.retryExhausted) {
             upIt->second.dropWatchdogArmed = true;
             _upgradeRetryLines.insert(linePa);
             const Cycles delay(
@@ -1876,11 +1900,6 @@ EPRNFController::completeHeldUpgrade(uint64_t linePa, bool dropRecoveryResend)
         return;
     }
 
-    // Accepted: record the real epoch/reqId for the deferred SnpResp_I /
-    // UpgradeDone path.
-    upIt->second.epoch = epoch;
-    upIt->second.reqId = reqId;
-
     // upgrade_invalidate_fix D2: only call receiveUpgradeAck() immediately if
     // the ack is ready (targetMask==0). Otherwise it is triggered later via
     // EPBackend::notifyUpgradeAckReady() when all invalidation acks arrive.
@@ -1891,7 +1910,8 @@ EPRNFController::completeHeldUpgrade(uint64_t linePa, bool dropRecoveryResend)
         // Deferred: wait for all invalidation acks to arrive. Keep a watchdog
         // armed even after an accepted-pending UpgradeResp: AckNotify is a
         // separate asynchronous message and may be the message that was lost.
-        if (!upIt->second.dropWatchdogArmed) {
+        if (!upIt->second.dropWatchdogArmed &&
+            !upIt->second.retryExhausted) {
             upIt->second.dropWatchdogArmed = true;
             _upgradeRetryLines.insert(linePa);
             const Cycles delay(
