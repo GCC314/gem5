@@ -775,6 +775,9 @@ action(Initiate_ReadUnique_Hit, desc="") {
   tbe.actions.push(Event:ReadHitPipe);
   tbe.actions.push(Event:DataArrayRead);
   tbe.actions.push(Event:WaitCompAck);
+  if (tbe.epProxyOp == EpProxyOp:RecallUnique) {
+    tbe.actions.pushNB(Event:SendCompUCResp);
+  }
   tbe.actions.pushNB(Event:SendCompData);
   tbe.actions.pushNB(Event:TagArrayWrite);
 }

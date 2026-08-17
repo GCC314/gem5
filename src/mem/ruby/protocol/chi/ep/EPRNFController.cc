@@ -1369,7 +1369,17 @@ EPRNFController::startReadUnique(uint64_t linePa,
             "(write recall path)\n",
             _nodeId, linePa);
 
-    if (_pendingChiTxns.find(linePa) != _pendingChiTxns.end()) {
+    auto pending = _pendingChiTxns.find(linePa);
+    if (pending != _pendingChiTxns.end()) {
+        if (pending->second.op == PendingChiOp::ReadUnique &&
+            pending->second.proxyOp == EpProxyOp_RecallUnique) {
+            // The original proxy owns the authoritative recall response.
+            inform(
+                "[RECALL-PROXY-COALESCE] node=%d localPA=0x%lx "
+                "proxy=RecallUnique\n",
+                _nodeId, linePa);
+            return;
+        }
         warn(
                 "EP_RNF node_id=%d: startReadUnique addr=0x%lx "
                 "already has pending txn\n",
