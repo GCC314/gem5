@@ -839,19 +839,21 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
     // sendClear() with the ORIGINAL reqId/epoch saved in the pending grant txn,
     // and complete the transaction once the ClearResp is accepted.
     {
-        auto pgt = _pendingGrantTxns.find({adapterIdx, homePa});
+        auto pgt = _pendingGrantTxns.find(homePa);
         if (pgt != _pendingGrantTxns.end() && pgt->second.valid) {
-            int clearRet = sendClear(homePa, pgt->second.homeNode,
-                                     pgt->second.baseEpoch, pgt->second.reqId,
-                                     pgt->second.sourceAdapter);
+            PendingGrantTxn &txn = pgt->second;
+            const bool sameSource = txn.sourceAdapter == adapterIdx;
+            int clearRet = sendClear(homePa, txn.homeNode,
+                                     txn.baseEpoch, txn.reqId,
+                                     txn.sourceAdapter);
             if (clearRet == -2)
                 return -2;   // ClearResp not here yet; keep waiting (same reqId)
             if (clearRet <= 0)
                 return -1;   // send/reject is retryable; retain txn and guard
             // Clear accepted: sendClear() has consumed the txn. Finish up.
-            OuterGrantType g = pgt->second.grantType;
-            const Tick start = pgt->second.outerStartTick;
-            const uint64_t completedReqId = pgt->second.reqId;
+            OuterGrantType g = txn.grantType;
+            const Tick start = txn.outerStartTick;
+            const uint64_t completedReqId = txn.reqId;
             _pendingGrantTxns.erase(pgt);
             if (start) {
                 inform(
@@ -864,7 +866,9 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
                 _epRnfCtrl->setOuterTxnPending(line_pa, false);
                 _epRnfCtrl->signalOuterTxnComplete(line_pa);
             }
-            return static_cast<int>(g);
+            // Only the original socket may consume this grant. A sibling
+            // socket may help complete Clear but must retry its own CHI miss.
+            return sameSource ? static_cast<int>(g) : -1;
         }
     }
 
@@ -1145,7 +1149,7 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
         txn.sourceAdapter = adapterIdx;
         txn.grantType = grantEnv.grantType;
         txn.outerStartTick = entry.outerStartTick;
-        _pendingGrantTxns[{adapterIdx, homePa}] = txn;
+        _pendingGrantTxns[homePa] = txn;
         DPRINTF(RubyEP, "[DEBUG-TC5-CLEAR-TRACE] savePendingGrantTxn node=%d keyPA=0x%lx homePA=0x%lx "
                 "baseEpoch=%lu reqId=%lu grantType=%d\n",
                 _nodeId, homePa, homePa, txn.baseEpoch, txn.reqId,
@@ -1248,8 +1252,9 @@ EPBackend::notifyLocalLinePublished(uint64_t localLinePa, int sourceSocket)
         return;
     const uint64_t homePa = _addrMap.buildDsmPA(
         homeNode, homeNode, offset, homeSocket);
-    auto txnIt = _pendingGrantTxns.find({sourceSocket, homePa});
-    if (txnIt == _pendingGrantTxns.end() || !txnIt->second.valid)
+    auto txnIt = _pendingGrantTxns.find(homePa);
+    if (txnIt == _pendingGrantTxns.end() || !txnIt->second.valid ||
+        txnIt->second.sourceAdapter != sourceSocket)
         return;
 
     PendingGrantTxn txn = txnIt->second;
@@ -1306,9 +1311,21 @@ EPBackend::handleRemoteDemandMiss(uint64_t line_pa, int neededPerm,
     // HA mode must enter handleRemoteMiss without mutating legacy requester
     // state; that function branches to HAPermissionReq before all legacy work.
     if (!_haEndpointEnabled) {
+        int homeNode = homeNodeCrossNode(line_pa);
+        int homeSocket = _addrMap.homeSocket(_nodeId, line_pa);
+        if (homeSocket < 0)
+            homeSocket = 0;
+        const uint64_t offset = _addrMap.dsmOffset(line_pa);
+        const uint64_t homePa = _addrMap.buildDsmPA(
+            homeNode, homeNode, offset, homeSocket);
+        bool pendingClear = false;
+        auto pending = _pendingGrantTxns.find(homePa);
+        pendingClear = pending != _pendingGrantTxns.end() &&
+            pending->second.valid;
         auto existing = _requesterLines.find(line_pa);
         if (existing != _requesterLines.end() &&
-            existing->second.state != RequesterLineState::R_WAIT_GRANT) {
+            existing->second.state != RequesterLineState::R_WAIT_GRANT &&
+            !pendingClear) {
             DPRINTF(RubyEP,
                     "EPBackend node_id=%d: HN-F confirmed local miss PA=0x%lx "
                     "invalidating stale requester state=%d\n",
@@ -2792,7 +2809,7 @@ EPBackend::sendClear(uint64_t line_pa, int homeNode,
 
     // upgrade_invalidate_fix D5: prefer PendingGrantTxn.baseEpoch
     uint64_t clearEpoch = epoch;
-    auto txnIt = _pendingGrantTxns.find({sourceAdapter, line_pa});
+    auto txnIt = _pendingGrantTxns.find(line_pa);
     bool foundPendingGrantTxn =
         (txnIt != _pendingGrantTxns.end() && txnIt->second.valid);
     if (txnIt != _pendingGrantTxns.end() && txnIt->second.valid) {

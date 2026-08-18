@@ -978,8 +978,10 @@ class EPBackend : public SimObject
                             grantType(OuterGrantType::GlobalGrantShared),
                             outerStartTick(0) {}
     };
-    using PendingGrantKey = std::pair<int, uint64_t>;
-    std::map<PendingGrantKey, PendingGrantTxn> _pendingGrantTxns;
+    // One Home PA has one node-level Grant/Clear transaction. The originating
+    // socket is routing context inside the tuple, not part of transaction
+    // identity; keying by socket would allow two reqIds for the same Home line.
+    std::map<uint64_t, PendingGrantTxn> _pendingGrantTxns;
 
     // ---- Async upgrade pending txn (mirrors PendingGrantTxn for clear) ----
     // When sendUpgradeReq returns -2 (UpgradeResp not yet arrived), we save the
