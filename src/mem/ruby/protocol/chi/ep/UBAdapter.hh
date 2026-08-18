@@ -278,7 +278,9 @@ class UBAdapter : public SimObject
               homeNode(-1), epoch(0) {}
     };
 
-    std::set<uint64_t> _inflightReadReqs;
+    static constexpr size_t MaxInflightReadReqs = 64;
+    static constexpr Tick ReadReqRetryTicks = 1000000;
+    std::map<uint64_t, Tick> _inflightReadReqs;
     std::set<uint64_t> _inflightClearReqs;
     std::set<uint64_t> _inflightHAPermissionReqs;
     std::set<uint64_t> _inflightHAPresenceProbeReqs;

@@ -545,12 +545,21 @@ UBAdapter::sendReadReq(
             _readyResponses.erase(rit);
             return static_cast<int>(resp.b.readResp.grantType);
         }
-        if (_inflightReadReqs.count(reqId)) {
-            return -2;
+        auto inflight = _inflightReadReqs.find(reqId);
+        if (inflight != _inflightReadReqs.end()) {
+            if (curTick() < inflight->second)
+                return -2;
+            _inflightReadReqs.erase(inflight);
         }
     }
 
     _lastResponseValid = false;
+    if (_port && _inflightReadReqs.size() >= MaxInflightReadReqs) {
+        warn("UBAdapter node=%d: bounded ReadReq table full (%zu), "
+             "reqId=%lu stays BUSY\n",
+             _nodeId, _inflightReadReqs.size(), reqId);
+        return -1;
+    }
     if (!transportSend(req)) {
         return -1;
     }
@@ -566,7 +575,7 @@ UBAdapter::sendReadReq(
         // insert the guard was dead (only erase/count, never insert), causing
         // the TC98 retry storm: one line-hot reqId sent ~100k times, home
         // BUSY-rejecting each and flooding a 300MB+ log.
-        _inflightReadReqs.insert(reqId);
+        _inflightReadReqs[reqId] = curTick() + ReadReqRetryTicks;
         scheduleResponseCheck();
         return -2;
     }

@@ -557,9 +557,10 @@ class EPRNFController : public EPController
     // Prevents multiple CHI requests being sent to HN-F in the same
     // event-processing cycle, which can cause TBE reservation exhaustion
     // and trigger `decrementReserved(): m_reserved > 0` assertion.
-    // v4-dual-socket: _chiRequestInFlight remains GLOBAL — no per-socket parallelism.
-    bool _chiRequestInFlight;
-    // Queue of deferred CHI requests waiting for the current one to complete
+    // Different lines may remain in flight concurrently; only same-tick sends
+    // are serialized to avoid the HN-F reservation race described above.
+    Tick _lastChiRequestSendTick;
+    // Queue of CHI requests deferred to a later event-processing cycle.
     struct DeferredChiRequest {
         uint64_t linePa;
         CHI::CHIRequestType reqType;
