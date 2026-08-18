@@ -180,17 +180,30 @@ UBAdapter::init()
 }
 
 void
-UBAdapter::sendBarrierReached(uint32_t mask, uint32_t nodeId, uint32_t seq)
+UBAdapter::sendBarrierReached(uint32_t mask, uint32_t srcBit, uint32_t seq)
 {
     if (!_port) return;
     // Barrier is carried as a PAYLOAD CoherenceMessage (BarrierReached); the
     // transport layer no longer has a dedicated BARRIER_REACHED type.
     CoherenceMessage bmsg;
     bmsg.h.type = CoherenceMessageType::BarrierReached;
-    bmsg.h.srcNode = static_cast<uint16_t>(nodeId);
+    bmsg.h.srcNode = static_cast<uint16_t>(_nodeId);
+    bmsg.h.srcSocket = static_cast<uint16_t>(_socketId);
+    bmsg.h.dstNode = static_cast<uint16_t>(_nodeId);
+    bmsg.h.dstSocket = static_cast<uint16_t>(_socketId);
     bmsg.b.barrier.mask = mask;
     bmsg.b.barrier.seq = seq;   // TC90 fix: barrier generation
-    bool ok = sendCoherenceMessage(_port, bmsg, curTick(), mask, nodeId);
+    const uint32_t sourceGid =
+        static_cast<uint32_t>(_nodeId * _numSockets + _socketId);
+    if (srcBit != sourceGid) {
+        warn("[UBADAPTER-BARRIER] node=%d socket=%d registeredBit=%u "
+             "sourceGid=%u; using adapter GID for transport envelope",
+             _nodeId, _socketId, srcBit, sourceGid);
+    }
+    // First hop is always gem5 -> its local UBIO plane. A non-leader UBIO
+    // rewrites both envelope endpoints before forwarding through networksim.
+    bool ok = sendCoherenceMessage(
+        _port, bmsg, curTick(), mask, sourceGid, sourceGid);
     if (!ok)
         warn("[UBADAPTER-BARRIER] node=%d sendBarrierReached failed mask=0x%x seq=%u",
              _nodeId, mask, seq);
