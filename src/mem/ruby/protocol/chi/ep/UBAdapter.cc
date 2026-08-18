@@ -2069,11 +2069,17 @@ UBAdapter::allocLocalReqId()
 }
 
 void
-UBAdapter::clearReadyResponsesForLine(uint64_t linePa)
+UBAdapter::clearReadyResponsesForLine(
+    uint64_t linePa, CoherenceMessageType responseType)
 {
     for (auto it = _readyResponses.begin(); it != _readyResponses.end(); ) {
-        if (it->second.h.homeLinePa == linePa ||
-            it->second.h.localLinePa == linePa) {
+        if (it->first.respType == responseType &&
+            (it->second.h.homeLinePa == linePa ||
+             it->second.h.localLinePa == linePa)) {
+            inform("[RSP-CACHE-CLEAR] node=%d socket=%d type=%s reqId=%lu "
+                   "pa=0x%lx",
+                   _nodeId, _socketId, coherenceMsgTypeName(responseType),
+                   it->second.h.reqId, linePa);
             it = _readyResponses.erase(it);
         } else {
             ++it;
