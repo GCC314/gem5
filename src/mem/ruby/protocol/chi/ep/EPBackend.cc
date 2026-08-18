@@ -2599,7 +2599,8 @@ EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
         // target mask while its later UpgradeAckNotify is the message that was
         // lost. A recovery resend must bypass that stale stage and actually
         // reach the home with the same tuple so it can replay current progress.
-        adapter->clearReadyResponsesForLine(homePa);
+        adapter->clearReadyResponsesForLine(
+            homePa, CoherenceMessageType::UpgradeResp);
     }
     int upgradeRet = adapter->sendUpgradeReq(
         homePa, _nodeId, epochVal, reqIdVal,
@@ -2940,7 +2941,8 @@ EPBackend::clearCachedUpgradeResp(uint64_t linePa, int sourceSocket)
     fatal_if(!adapter,
              "EPBackend node_id=%d: missing upgrade response adapter socket=%d "
              "PA=0x%lx", _nodeId, sourceSocket, linePa);
-    adapter->clearReadyResponsesForLine(linePa);
+    adapter->clearReadyResponsesForLine(
+        linePa, CoherenceMessageType::UpgradeResp);
 }
 
 void

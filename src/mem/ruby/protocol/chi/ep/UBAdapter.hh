@@ -198,7 +198,8 @@ class UBAdapter : public SimObject
 
     /** Clear cached ready-responses for a given line PA (e.g. a rejected
      *  UpgradeResp) so a retry sends a fresh request. */
-    void clearReadyResponsesForLine(uint64_t linePa);
+    void clearReadyResponsesForLine(
+        uint64_t linePa, CoherenceMessageType responseType);
 
     /**
      * Receive a message from the local UBIOModule *.
