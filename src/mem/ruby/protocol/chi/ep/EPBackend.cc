@@ -470,17 +470,19 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
     {
         auto pgt = _pendingGrantTxns.find(homePa);
         if (pgt != _pendingGrantTxns.end() && pgt->second.valid) {
-            int clearRet = sendClear(homePa, pgt->second.homeNode,
-                                     pgt->second.baseEpoch, pgt->second.reqId,
-                                     pgt->second.sourceAdapter);
+            PendingGrantTxn &txn = pgt->second;
+            const bool sameSource = txn.sourceAdapter == adapterIdx;
+            int clearRet = sendClear(homePa, txn.homeNode,
+                                     txn.baseEpoch, txn.reqId,
+                                     txn.sourceAdapter);
             if (clearRet == -2)
                 return -2;   // ClearResp not here yet; keep waiting (same reqId)
             if (clearRet <= 0)
                 return -1;   // send/reject is retryable; retain txn and guard
             // Clear accepted: sendClear() has consumed the txn. Finish up.
-            OuterGrantType g = pgt->second.grantType;
-            const Tick start = pgt->second.outerStartTick;
-            const uint64_t completedReqId = pgt->second.reqId;
+            OuterGrantType g = txn.grantType;
+            const Tick start = txn.outerStartTick;
+            const uint64_t completedReqId = txn.reqId;
             _pendingGrantTxns.erase(pgt);
             if (start) {
                 inform(
@@ -493,7 +495,7 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
                 _epRnfCtrl->setOuterTxnPending(line_pa, false);
                 _epRnfCtrl->signalOuterTxnComplete(line_pa);
             }
-            return static_cast<int>(g);
+            return sameSource ? static_cast<int>(g) : -1;
         }
     }
 
@@ -856,9 +858,20 @@ EPBackend::handleRemoteDemandMiss(uint64_t line_pa, int neededPerm,
                                   bool writeIntent, int ingressSocket,
                                   int& outHomeNode)
 {
+    int homeNode = homeNodeCrossNode(line_pa);
+    int homeSocket = _addrMap.homeSocket(_nodeId, line_pa);
+    if (homeSocket < 0)
+        homeSocket = 0;
+    const uint64_t offset = _addrMap.dsmOffset(line_pa);
+    const uint64_t homePa = _addrMap.buildDsmPA(
+        homeNode, homeNode, offset, homeSocket);
+    auto pending = _pendingGrantTxns.find(homePa);
+    const bool pendingClear = pending != _pendingGrantTxns.end() &&
+        pending->second.valid;
     auto existing = _requesterLines.find(line_pa);
     if (existing != _requesterLines.end() &&
-        existing->second.state != RequesterLineState::R_WAIT_GRANT) {
+        existing->second.state != RequesterLineState::R_WAIT_GRANT &&
+        !pendingClear) {
         DPRINTF(RubyEP,
                 "EPBackend node_id=%d: HN-F confirmed local miss PA=0x%lx "
                 "invalidating stale requester state=%d\n",

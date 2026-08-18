@@ -261,7 +261,7 @@ EPRNFController::EPRNFController(const Params &p)
     _numCacheControllers(0),
     _numSockets(p.downstream_destinations.size()),
     _addrMap(p.num_nodes, _numSockets, 128ULL * 1024 * 1024),
-    _chiRequestInFlight(false),
+    _lastChiRequestSendTick(MaxTick),
     _pendingHnResponseCount(0),
     _delayedResolvedCount(0)
 {
@@ -501,10 +501,9 @@ EPRNFController::recvResponseMsg(const CHIResponseMsg *msg)
     if (msg->m_type == CHIResponseType_RetryAck ||
         msg->m_type == CHIResponseType_PCrdGrant) {
         auto it = _pendingChiTxns.find(msg->m_addr);
-        DPRINTF(RubyEP, "[EPRNF-RETRY-DIAG] node=%d type=%s PA=0x%lx chiInFlight=%d pendingFound=%d\n",
+        DPRINTF(RubyEP, "[EPRNF-RETRY-DIAG] node=%d type=%s PA=0x%lx pendingFound=%d\n",
                _nodeId, msg->m_type == CHIResponseType_RetryAck ? "RetryAck" : "PCrdGrant",
-               msg->m_addr, _chiRequestInFlight,
-               it != _pendingChiTxns.end());
+               msg->m_addr, it != _pendingChiTxns.end());
     }
 
     // CompAck from HN-F or other agents: ignore (not tracking req responses)
@@ -1079,9 +1078,6 @@ EPRNFController::finishChiTxn(uint64_t linePa, bool success)
         cb(success);
     }
 
-    // Clear in-flight flag
-    _chiRequestInFlight = false;
-
     // §4.3.3: Queued snoop has higher priority than deferred CHI requests
     if (hadQueuedSnoop) {
         processQueuedSnoop(linePa);
@@ -1193,8 +1189,8 @@ EPRNFController::sendChiRequest(uint64_t linePa, CHIRequestType reqType,
     // in the HN-F.  When the HN-F processes multiple requests in the same
     // event-processing cycle, allocateRequestTBE can call decrementReserved
     // twice for a single incrementReserved, triggering assertion failure.
-    if (_chiRequestInFlight) {
-        // Defer: queue the request for later processing
+    if (_lastChiRequestSendTick == curTick()) {
+        // Defer additional sends from the same event-processing cycle.
         DPRINTF(RubyEP, "[EPRNF-DEFER] node=%d PA=0x%lx type=%d — queued\n",
                 _nodeId, linePa, static_cast<int>(reqType));
         DeferredChiRequest d;
@@ -1203,6 +1199,7 @@ EPRNFController::sendChiRequest(uint64_t linePa, CHIRequestType reqType,
         d.proxyOp = proxyOp;
         d.startTick = curTick();
         _deferredChiReqs.push_back(d);
+        scheduleEvent(Cycles(1));
         return true;  // Report success to caller (will be sent later)
     }
 
@@ -1245,7 +1242,7 @@ EPRNFController::sendChiRequest(uint64_t linePa, CHIRequestType reqType,
     // Send on reqOut → HN-F's reqIn
     bool sent = sendRequestMsg(req);
     if (sent) {
-        _chiRequestInFlight = true;
+        _lastChiRequestSendTick = curTick();
     } else {
         warn("EP_RNF node_id=%d: sendChiRequest failed for addr=0x%lx "
              "(reqOut full)\n", _nodeId, linePa);
@@ -1260,10 +1257,10 @@ EPRNFController::sendChiRequest(uint64_t linePa, CHIRequestType reqType,
     }
 
     DPRINTF(RubyCHIGeneric,
-            "EP_RNF node_id=%d: sendChiRequest addr=0x%lx type=%d "
-            "homeSocket=%d dest=(type=%d num=%d) sent=%d inFlight=%d\n",
-            _nodeId, linePa, static_cast<int>(reqType),
-            homeSocket, hnfId.getType(), hnfId.getNum(), sent, _chiRequestInFlight);
+             "EP_RNF node_id=%d: sendChiRequest addr=0x%lx type=%d "
+             "homeSocket=%d dest=(type=%d num=%d) sent=%d\n",
+             _nodeId, linePa, static_cast<int>(reqType),
+             homeSocket, hnfId.getType(), hnfId.getNum(), sent);
 
     return sent;
 }
@@ -1272,7 +1269,8 @@ EPRNFController::sendChiRequest(uint64_t linePa, CHIRequestType reqType,
 void
 EPRNFController::processDeferredChiReqs()
 {
-    while (!_deferredChiReqs.empty() && !_chiRequestInFlight) {
+    while (!_deferredChiReqs.empty() &&
+           _lastChiRequestSendTick != curTick()) {
         const DeferredChiRequest &d = _deferredChiReqs.front();
         DPRINTF(RubyCHIGeneric,
                 "EP_RNF node_id=%d: processing deferred CHI request "
@@ -1297,7 +1295,9 @@ EPRNFController::processDeferredChiReqs()
         }
 
         _deferredChiReqs.pop_front();
-        _chiRequestInFlight = true;
+        _lastChiRequestSendTick = curTick();
+        if (!_deferredChiReqs.empty())
+            scheduleEvent(Cycles(1));
     }
 }
 
@@ -1357,7 +1357,20 @@ EPRNFController::startReadUnique(uint64_t linePa,
             "(write recall path)\n",
             _nodeId, linePa);
 
-    if (_pendingChiTxns.find(linePa) != _pendingChiTxns.end()) {
+    auto pending = _pendingChiTxns.find(linePa);
+    if (pending != _pendingChiTxns.end()) {
+        if (pending->second.op == PendingChiOp::ReadUnique &&
+            pending->second.proxyOp == EpProxyOp_RecallUnique) {
+            // Home retries use the same recall tuple while the original CHI
+            // proxy is still pending. Its completion owns the authoritative
+            // response; reporting this duplicate as failure would fabricate a
+            // no-data RecallResp for a dirty owner.
+            inform(
+                "[RECALL-PROXY-COALESCE] node=%d localPA=0x%lx "
+                "proxy=RecallUnique\n",
+                _nodeId, linePa);
+            return;
+        }
         warn(
                 "EP_RNF node_id=%d: startReadUnique addr=0x%lx "
                 "already has pending txn\n",
