@@ -445,6 +445,8 @@ class EPBackend : public SimObject
      * mode it queues the matching Clear without waiting for ClearResp.
      */
     void notifyLocalLinePublished(uint64_t localLinePa, int sourceSocket);
+    void notifyOneWayClearHandedOff(
+        uint64_t homePa, int sourceSocket, uint64_t reqId);
     /**
      * Handle an incoming recall request from a home UBCC.
      * This is called on the owner node's EPBackend when the home
@@ -966,17 +968,19 @@ class EPBackend : public SimObject
     struct PendingGrantTxn {
         bool valid;
         uint64_t linePa;
+        uint64_t localLinePa;
         int homeNode;
         uint64_t baseEpoch;   // home-approved GRANT_HANDSHAKE baseEpoch
         uint64_t reqId;
         int sourceAdapter;
         OuterGrantType grantType;
         Tick outerStartTick;
+        bool clearQueued;
 
-        PendingGrantTxn() : valid(false), linePa(0), homeNode(-1),
+        PendingGrantTxn() : valid(false), linePa(0), localLinePa(0), homeNode(-1),
                             baseEpoch(0), reqId(0), sourceAdapter(0),
                             grantType(OuterGrantType::GlobalGrantShared),
-                            outerStartTick(0) {}
+                            outerStartTick(0), clearQueued(false) {}
     };
     // One Home PA has one node-level Grant/Clear transaction. The originating
     // socket is routing context inside the tuple, not part of transaction

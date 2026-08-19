@@ -284,8 +284,14 @@ UBAdapter::transportSendReliable(const CoherenceMessage &msg)
         scheduleResponseCheck();
         return true;
     }
-    if (transportSend(msg))
+    if (transportSend(msg)) {
+        if (_backend && msg.h.type == CoherenceMessageType::ClearReq &&
+            msg.b.clearReq.reason == 1) {
+            _backend->notifyOneWayClearHandedOff(
+                msg.h.homeLinePa, _socketId, msg.h.reqId);
+        }
         return true;
+    }
     _reliableOutputs.push_back(msg);
     scheduleResponseCheck();
     return true;
@@ -295,9 +301,15 @@ void
 UBAdapter::drainReliableOutputs()
 {
     while (!_reliableOutputs.empty()) {
-        if (!transportSend(_reliableOutputs.front()))
+        const CoherenceMessage message = _reliableOutputs.front();
+        if (!transportSend(message))
             break;
         _reliableOutputs.pop_front();
+        if (_backend && message.h.type == CoherenceMessageType::ClearReq &&
+            message.b.clearReq.reason == 1) {
+            _backend->notifyOneWayClearHandedOff(
+                message.h.homeLinePa, _socketId, message.h.reqId);
+        }
     }
 }
 

@@ -840,9 +840,26 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
     // and complete the transaction once the ClearResp is accepted.
     {
         auto pgt = _pendingGrantTxns.find(homePa);
+        if (pgt == _pendingGrantTxns.end()) {
+            for (auto it = _pendingGrantTxns.begin();
+                 it != _pendingGrantTxns.end(); ++it) {
+                if (it->second.valid && it->second.localLinePa == line_pa &&
+                    it->second.sourceAdapter == adapterIdx) {
+                    inform("[PENDING-GRANT-KEY-DRIFT] node=%d localPa=0x%lx "
+                           "computedHomePa=0x%lx storedHomePa=0x%lx reqId=%lu\n",
+                           _nodeId, line_pa, homePa, it->first,
+                           it->second.reqId);
+                    pgt = it;
+                    homePa = it->first;
+                    break;
+                }
+            }
+        }
         if (pgt != _pendingGrantTxns.end() && pgt->second.valid) {
             PendingGrantTxn &txn = pgt->second;
             const bool sameSource = txn.sourceAdapter == adapterIdx;
+            if (_losslessOneWayClearEnabled && txn.clearQueued)
+                return -2;
             int clearRet = sendClear(homePa, txn.homeNode,
                                      txn.baseEpoch, txn.reqId,
                                      txn.sourceAdapter);
@@ -1143,6 +1160,7 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
         PendingGrantTxn txn;
         txn.valid = true;
         txn.linePa = homePa;
+        txn.localLinePa = line_pa;
         txn.homeNode = homeNode;
         txn.baseEpoch = grantBaseEpoch;
         txn.reqId = reqIdVal;
@@ -1256,8 +1274,11 @@ EPBackend::notifyLocalLinePublished(uint64_t localLinePa, int sourceSocket)
     if (txnIt == _pendingGrantTxns.end() || !txnIt->second.valid ||
         txnIt->second.sourceAdapter != sourceSocket)
         return;
+    if (txnIt->second.clearQueued)
+        return;
 
     PendingGrantTxn txn = txnIt->second;
+    txnIt->second.clearQueued = true;
     fatal_if(txn.sourceAdapter != sourceSocket,
              "EPBackend node_id=%d: publication socket mismatch PA=0x%lx "
              "grantSocket=%d ackSocket=%d", _nodeId, localLinePa,
@@ -1289,17 +1310,36 @@ EPBackend::notifyLocalLinePublished(uint64_t localLinePa, int sourceSocket)
            "homeNode=%d homeSocket=%d localPa=0x%lx homePa=0x%lx "
            "reqId=%lu tick=%lu\n", _nodeId, txn.sourceAdapter, txn.homeNode,
            homeSocket, localLinePa, homePa, txn.reqId, curTick());
+}
 
+void
+EPBackend::notifyOneWayClearHandedOff(
+    uint64_t homePa, int sourceSocket, uint64_t reqId)
+{
+    auto txnIt = _pendingGrantTxns.find(homePa);
+    if (txnIt == _pendingGrantTxns.end() || !txnIt->second.valid ||
+        !txnIt->second.clearQueued ||
+        txnIt->second.sourceAdapter != sourceSocket ||
+        txnIt->second.reqId != reqId) {
+        warn("EPBackend node_id=%d: one-way Clear handoff tuple mismatch "
+             "homePa=0x%lx sourceSocket=%d reqId=%lu\n",
+             _nodeId, homePa, sourceSocket, reqId);
+        return;
+    }
+    const PendingGrantTxn txn = txnIt->second;
     _pendingGrantTxns.erase(txnIt);
+    inform("[CLEAR-ONEWAY] phase=transport_handoff node=%d sourceSocket=%d "
+           "homeNode=%d homePa=0x%lx reqId=%lu tick=%lu\n",
+           _nodeId, sourceSocket, txn.homeNode, homePa, reqId, curTick());
     if (txn.outerStartTick) {
         inform("[EP-PERF] kind=outer_oneway_root node=%d pa=0x%lx reqId=%lu "
                "start=%lu end=%lu latency_ps=%lu\n", _nodeId, homePa,
-               txn.reqId, txn.outerStartTick, curTick(),
+               reqId, txn.outerStartTick, curTick(),
                curTick() - txn.outerStartTick);
     }
     if (_epRnfCtrl) {
-        _epRnfCtrl->setOuterTxnPending(localLinePa, false);
-        _epRnfCtrl->signalOuterTxnComplete(localLinePa);
+        _epRnfCtrl->setOuterTxnPending(txn.localLinePa, false);
+        _epRnfCtrl->signalOuterTxnComplete(txn.localLinePa);
     }
 }
 
