@@ -38,10 +38,9 @@ coherencePayload(const framework::Message *message)
 
 bool
 sendCoherenceMessage(framework::Port *port, const CoherenceMessage &coherence,
-                     uint64_t timestamp, uint64_t requestId,
-                     uint32_t sourceId = std::numeric_limits<uint32_t>::max(),
-                     uint32_t targetId = std::numeric_limits<uint32_t>::max(),
-                     uint64_t *wireTimestamp = nullptr)
+                      uint64_t timestamp, uint64_t requestId,
+                      uint32_t sourceId, uint32_t targetId,
+                      uint64_t *wireTimestamp = nullptr)
 {
     if (!port)
         return false;
@@ -52,10 +51,8 @@ sendCoherenceMessage(framework::Port *port, const CoherenceMessage &coherence,
         return false;
 
     framework::SetMessageRequestId(message, requestId);
-    if (sourceId != std::numeric_limits<uint32_t>::max())
-        framework::SetMessageSourceId(message, sourceId);
-    if (targetId != std::numeric_limits<uint32_t>::max())
-        framework::SetMessageTargetId(message, targetId);
+    framework::SetMessageSourceId(message, sourceId);
+    framework::SetMessageTargetId(message, targetId);
     framework::SetMessagePayload(message, &coherence, sizeof(coherence));
     if (wireTimestamp)
         *wireTimestamp = framework::GetMessageTimestamp(message);
@@ -1386,11 +1383,14 @@ sendMetaRNFLineErrorResponse(framework::Port *port,
                                CoherenceMessageType respType,
                                MetaRNFLineStatus st,
                                uint64_t reqId, uint64_t bucketOffset,
-                               int nodeId, int dstNode, int dstSocket)
+                               int nodeId, int nodeSocket,
+                               int dstNode, int dstSocket,
+                               uint32_t sourceId, uint32_t targetId)
 {
     CoherenceMessage resp;
     resp.h.type = respType;
     resp.h.srcNode = static_cast<uint16_t>(nodeId);
+    resp.h.srcSocket = static_cast<uint16_t>(nodeSocket);
     resp.h.dstNode = static_cast<uint16_t>(dstNode);
     resp.h.dstSocket = static_cast<uint16_t>(dstSocket);
     resp.h.reqId = reqId;
@@ -1402,7 +1402,8 @@ sendMetaRNFLineErrorResponse(framework::Port *port,
         resp.b.metaRNFLineWriteResp.bucketOffset = bucketOffset;
     }
 
-    if (!sendCoherenceMessage(port, resp, curTick(), reqId)) {
+    if (!sendCoherenceMessage(port, resp, curTick(), reqId,
+                              sourceId, targetId)) {
         // Port unavailable — log DEBUG-only, not stderr.
         DPRINTF(RubyEP,
                 "[DEBUG-PHASE2] node=%d: cannot send %s for reqId=%lu bucketOffset=0x%lx (no port/buffer)\n",
@@ -1553,21 +1554,36 @@ UBAdapter::recvFromRouter(const CoherenceMessage &msg)
                 break;
             }
             auto tport = _port;
+            const int srcNode = _nodeId;
+            const int srcSocket = _socketId;
+            const int dstNode = msg.h.srcNode;
+            const int dstSocket = msg.h.srcSocket;
+            const uint32_t sourceId =
+                static_cast<uint32_t>(srcNode * _numSockets + srcSocket);
+            const uint32_t targetId =
+                static_cast<uint32_t>(dstNode * _numSockets + dstSocket);
             struct MRState { int done; uint8_t buf[256]; };
             auto *state = new MRState{0, {}};
             for (int i = 0; i < 4; i++) {
                 uint64_t blockPa = pagePa + i * 64;
-                metaRNF->issueRead(blockPa, [tport, reqId, state, i, pageId](bool ok, const MetaRNFController::MetaLine &db) {
+                metaRNF->issueRead(blockPa,
+                    [tport, reqId, state, i, pageId, srcNode, srcSocket,
+                     dstNode, dstSocket, sourceId, targetId]
+                    (bool ok, const MetaRNFController::MetaLine &db) {
                     if (ok) memcpy(&state->buf[i*64], db.data(), 64);
                     if (++state->done == 4) {
                         CoherenceMessage resp;
                         resp.h.type = CoherenceMessageType::MetaRNFReadResp;
-                        resp.h.srcNode = 0; resp.h.dstNode = 0;
+                        resp.h.srcNode = static_cast<uint16_t>(srcNode);
+                        resp.h.srcSocket = static_cast<uint16_t>(srcSocket);
+                        resp.h.dstNode = static_cast<uint16_t>(dstNode);
+                        resp.h.dstSocket = static_cast<uint16_t>(dstSocket);
                         resp.h.reqId = reqId;
                         resp.h.homeLinePa = pageId;
                         resp.b.metaRNF.pagePa = pageId;
                         memcpy(resp.b.metaRNF.data, state->buf, 256);
-                        if (!sendCoherenceMessage(tport, resp, curTick(), reqId))
+                        if (!sendCoherenceMessage(tport, resp, curTick(), reqId,
+                                                  sourceId, targetId))
                             warn("UBAdapter: failed to send MetaRNFReadResp reqId=%lu",
                                  reqId);
                         delete state;
@@ -1598,12 +1614,24 @@ UBAdapter::recvFromRouter(const CoherenceMessage &msg)
                 framework::Port *port;
                 uint64_t reqId;
                 int nodeId;
+                int socketId;
+                int dstNode;
+                int dstSocket;
+                uint32_t sourceId;
+                uint32_t targetId;
                 uint64_t pagePa;
             };
             auto *ws = new WriteState;
             ws->port = _port;
             ws->reqId = msg.h.reqId;
             ws->nodeId = _nodeId;
+            ws->socketId = _socketId;
+            ws->dstNode = msg.h.srcNode;
+            ws->dstSocket = msg.h.srcSocket;
+            ws->sourceId = static_cast<uint32_t>(
+                _nodeId * _numSockets + _socketId);
+            ws->targetId = static_cast<uint32_t>(
+                msg.h.srcNode * _numSockets + msg.h.srcSocket);
             ws->pagePa = pagePa;
             for (int i = 0; i < 4; i++) {
                 MetaRNFController::MetaLine ml;
@@ -1619,7 +1647,9 @@ UBAdapter::recvFromRouter(const CoherenceMessage &msg)
                         CoherenceMessage resp;
                         resp.h.type = CoherenceMessageType::MetaRNFWriteResp;
                         resp.h.srcNode = ws->nodeId;
-                        resp.h.dstNode = ws->nodeId;
+                        resp.h.srcSocket = ws->socketId;
+                        resp.h.dstNode = ws->dstNode;
+                        resp.h.dstSocket = ws->dstSocket;
                         resp.h.homeLinePa = ws->pagePa;
                         resp.h.reqId = ws->reqId;
                         resp.b.metaRNF.pagePa = ws->pagePa;
@@ -1629,7 +1659,8 @@ UBAdapter::recvFromRouter(const CoherenceMessage &msg)
                         else
                             resp.h.flags = 1;  // D2: bit 0 = durable
                         if (!sendCoherenceMessage(ws->port, resp, curTick(),
-                                                  ws->reqId))
+                                                  ws->reqId, ws->sourceId,
+                                                  ws->targetId))
                             warn("UBAdapter: failed to send MetaRNFWriteResp reqId=%lu",
                                  ws->reqId);
                         delete ws;
@@ -1647,8 +1678,12 @@ UBAdapter::recvFromRouter(const CoherenceMessage &msg)
                 sendMetaRNFLineErrorResponse(_port,
                     CoherenceMessageType::MetaRNFLineReadResp,
                     MetaRNFLineStatus::IoError,
-                    msg.h.reqId, bucketOffset, _nodeId,
-                    msg.h.srcNode, msg.h.srcSocket);
+                    msg.h.reqId, bucketOffset, _nodeId, _socketId,
+                    msg.h.srcNode, msg.h.srcSocket,
+                    static_cast<uint32_t>(
+                        _nodeId * _numSockets + _socketId),
+                    static_cast<uint32_t>(
+                        msg.h.srcNode * _numSockets + msg.h.srcSocket));
                 break;
             }
             uint64_t physPa = metaRNF->metadataRangeStart() +
@@ -1658,20 +1693,31 @@ UBAdapter::recvFromRouter(const CoherenceMessage &msg)
                 sendMetaRNFLineErrorResponse(_port,
                     CoherenceMessageType::MetaRNFLineReadResp,
                     MetaRNFLineStatus::RangeError,
-                    msg.h.reqId, bucketOffset, _nodeId,
-                    msg.h.srcNode, msg.h.srcSocket);
+                    msg.h.reqId, bucketOffset, _nodeId, _socketId,
+                    msg.h.srcNode, msg.h.srcSocket,
+                    static_cast<uint32_t>(
+                        _nodeId * _numSockets + _socketId),
+                    static_cast<uint32_t>(
+                        msg.h.srcNode * _numSockets + msg.h.srcSocket));
                 break;
             }
             uint64_t reqId = msg.h.reqId;
             int dstNode = msg.h.srcNode;
             int dstSocket = msg.h.srcSocket;
+            const int srcSocket = _socketId;
+            const uint32_t sourceId = static_cast<uint32_t>(
+                _nodeId * _numSockets + _socketId);
+            const uint32_t targetId = static_cast<uint32_t>(
+                dstNode * _numSockets + dstSocket);
             auto tport = _port;
             metaRNF->issueReadLine(physPa,
-                [tport, reqId, bucketOffset, nodeId = _nodeId, dstNode, dstSocket]
+                [tport, reqId, bucketOffset, nodeId = _nodeId, srcSocket,
+                 dstNode, dstSocket, sourceId, targetId]
                 (MetaRNFLineStatus st, const MetaRNFController::MetaLine &data) {
                     CoherenceMessage resp;
                     resp.h.type = CoherenceMessageType::MetaRNFLineReadResp;
                     resp.h.srcNode = static_cast<uint16_t>(nodeId);
+                    resp.h.srcSocket = static_cast<uint16_t>(srcSocket);
                     resp.h.dstNode = static_cast<uint16_t>(dstNode);
                     resp.h.dstSocket = static_cast<uint16_t>(dstSocket);
                     resp.h.reqId = reqId;
@@ -1679,7 +1725,8 @@ UBAdapter::recvFromRouter(const CoherenceMessage &msg)
                     resp.b.metaRNFLineReadResp.bucketOffset = bucketOffset;
                     if (st == MetaRNFLineStatus::Ok)
                         memcpy(resp.b.metaRNFLineReadResp.data, data.data(), 64);
-                    if (!sendCoherenceMessage(tport, resp, curTick(), reqId))
+                    if (!sendCoherenceMessage(tport, resp, curTick(), reqId,
+                                              sourceId, targetId))
                         warn("UBAdapter: failed to send MetaRNFLineReadResp reqId=%lu",
                              reqId);
                 });
@@ -1692,8 +1739,12 @@ UBAdapter::recvFromRouter(const CoherenceMessage &msg)
                 sendMetaRNFLineErrorResponse(_port,
                     CoherenceMessageType::MetaRNFLineWriteResp,
                     MetaRNFLineStatus::IoError,
-                    msg.h.reqId, bucketOffset, _nodeId,
-                    msg.h.srcNode, msg.h.srcSocket);
+                    msg.h.reqId, bucketOffset, _nodeId, _socketId,
+                    msg.h.srcNode, msg.h.srcSocket,
+                    static_cast<uint32_t>(
+                        _nodeId * _numSockets + _socketId),
+                    static_cast<uint32_t>(
+                        msg.h.srcNode * _numSockets + msg.h.srcSocket));
                 break;
             }
             uint64_t physPa = metaRNF->metadataRangeStart() +
@@ -1703,28 +1754,40 @@ UBAdapter::recvFromRouter(const CoherenceMessage &msg)
                 sendMetaRNFLineErrorResponse(_port,
                     CoherenceMessageType::MetaRNFLineWriteResp,
                     MetaRNFLineStatus::RangeError,
-                    msg.h.reqId, bucketOffset, _nodeId,
-                    msg.h.srcNode, msg.h.srcSocket);
+                    msg.h.reqId, bucketOffset, _nodeId, _socketId,
+                    msg.h.srcNode, msg.h.srcSocket,
+                    static_cast<uint32_t>(
+                        _nodeId * _numSockets + _socketId),
+                    static_cast<uint32_t>(
+                        msg.h.srcNode * _numSockets + msg.h.srcSocket));
                 break;
             }
             uint64_t reqId = msg.h.reqId;
             int dstNode = msg.h.srcNode;
             int dstSocket = msg.h.srcSocket;
+            const int srcSocket = _socketId;
+            const uint32_t sourceId = static_cast<uint32_t>(
+                _nodeId * _numSockets + _socketId);
+            const uint32_t targetId = static_cast<uint32_t>(
+                dstNode * _numSockets + dstSocket);
             auto tport = _port;
             MetaRNFController::MetaLine ml;
             memcpy(ml.data(), msg.b.metaRNFLineWriteReq.data, 64);
             metaRNF->issueWriteLine(physPa, ml,
-                [tport, reqId, bucketOffset, nodeId = _nodeId, dstNode, dstSocket]
+                [tport, reqId, bucketOffset, nodeId = _nodeId, srcSocket,
+                 dstNode, dstSocket, sourceId, targetId]
                 (MetaRNFLineStatus st) {
                     CoherenceMessage resp;
                     resp.h.type = CoherenceMessageType::MetaRNFLineWriteResp;
                     resp.h.srcNode = static_cast<uint16_t>(nodeId);
+                    resp.h.srcSocket = static_cast<uint16_t>(srcSocket);
                     resp.h.dstNode = static_cast<uint16_t>(dstNode);
                     resp.h.dstSocket = static_cast<uint16_t>(dstSocket);
                     resp.h.reqId = reqId;
                     resp.b.metaRNFLineWriteResp.status = st;
                     resp.b.metaRNFLineWriteResp.bucketOffset = bucketOffset;
-                    if (!sendCoherenceMessage(tport, resp, curTick(), reqId))
+                    if (!sendCoherenceMessage(tport, resp, curTick(), reqId,
+                                              sourceId, targetId))
                         warn("UBAdapter: failed to send MetaRNFLineWriteResp reqId=%lu",
                              reqId);
                 });
