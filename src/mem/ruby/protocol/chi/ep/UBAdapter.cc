@@ -803,10 +803,10 @@ UBAdapter::sendUpgradeReq(uint64_t homePa, int requesterNode,
                 (resp.h.flags & static_cast<uint32_t>(CFLAG_ACCEPTED)) != 0;
             bool permanent =
                 (resp.h.flags & static_cast<uint32_t>(CFLAG_BUSY)) != 0;
+            bool deferred =
+                (resp.h.flags & static_cast<uint32_t>(CFLAG_DEFERRED)) != 0;
             _readyResponses.erase(rit);
-            // 1=accepted, -3=permanent reject (not sharer → abandon),
-            // 0=temporary reject (retry).
-            return accepted ? 1 : (permanent ? -3 : 0);
+            return accepted ? 1 : (permanent ? -3 : (deferred ? -4 : 0));
         }
         // checkOnly: a previous UpgradeReq for this reqId is already in flight
         // (async pending). Do NOT re-send — a duplicate would make the home emit
@@ -862,6 +862,7 @@ UBAdapter::sendUpgradeReq(uint64_t homePa, int requesterNode,
 
     bool accepted = (resp.h.flags & static_cast<uint32_t>(CFLAG_ACCEPTED)) != 0;
     bool permanent = (resp.h.flags & static_cast<uint32_t>(CFLAG_BUSY)) != 0;
+    bool deferred = (resp.h.flags & static_cast<uint32_t>(CFLAG_DEFERRED)) != 0;
     if (outUpgradeTargetMask)
         *outUpgradeTargetMask = resp.b.upgradeResp.upgradeTargetMask;
     if (outCommittedEpoch)
@@ -872,7 +873,7 @@ UBAdapter::sendUpgradeReq(uint64_t homePa, int requesterNode,
             _nodeId, accepted, permanent, resp.b.upgradeResp.upgradeTargetMask);
 
     // 1=accepted, -3=permanent reject (not sharer → abandon), 0=temporary (retry).
-    return accepted ? 1 : (permanent ? -3 : 0);
+    return accepted ? 1 : (permanent ? -3 : (deferred ? -4 : 0));
 }
 
 // ---- Upgrade Done Request ----

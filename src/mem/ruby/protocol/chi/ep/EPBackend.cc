@@ -2613,12 +2613,14 @@ bool
 EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
                                     int sourceSocket,
                                     int desiredPerm, UpgradeCause cause,
-                                    uint64_t &outEpoch, uint64_t &outReqId,
-                                    bool *outRejected, bool *outNotSharer,
-                                    bool forceResend)
+                                     uint64_t &outEpoch, uint64_t &outReqId,
+                                     bool *outRejected, bool *outNotSharer,
+                                     bool *outDeferred,
+                                     bool forceResend)
 {
     if (outRejected) *outRejected = false;
     if (outNotSharer) *outNotSharer = false;
+    if (outDeferred) *outDeferred = false;
     DPRINTF(RubyEP,
             "EPBackend node_id=%d: notifyLocalWriteUpgrade "
             "PA=0x%lx homeNode=%d desiredPerm=%d\n",
@@ -2740,6 +2742,12 @@ EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
         txn.startTick = upgradeStartTick;
         txn.acceptedPending = hadPending && put->second.acceptedPending;
         _pendingUpgradeTxns[line_pa] = txn;
+        return false;
+    }
+    if (upgradeRet == -4) {
+        if (outDeferred) *outDeferred = true;
+        inform("[EP-UPGRADE-DEFERRED] node=%d pa=0x%lx home=%d epoch=%lu "
+               "reqId=%lu\n", _nodeId, homePa, homeNode, epochVal, reqIdVal);
         return false;
     }
     // Keep the stable tuple while an accepted upgrade is still waiting for

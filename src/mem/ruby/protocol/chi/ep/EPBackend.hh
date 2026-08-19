@@ -408,10 +408,11 @@ class EPBackend : public SimObject
     bool notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
                                   int sourceSocket,
                                   int desiredPerm, UpgradeCause cause,
-                                  uint64_t &outEpoch, uint64_t &outReqId,
-                                  bool *outRejected = nullptr,
-                                  bool *outNotSharer = nullptr,
-                                  bool forceResend = false);
+                                     uint64_t &outEpoch, uint64_t &outReqId,
+                                     bool *outRejected = nullptr,
+                                     bool *outNotSharer = nullptr,
+                                     bool *outDeferred = nullptr,
+                                     bool forceResend = false);
 
     /**
      * Send OuterUpgradeDone after local upgrade completes.

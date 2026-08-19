@@ -1770,6 +1770,7 @@ EPRNFController::completeHeldUpgrade(uint64_t linePa, bool dropRecoveryResend)
     uint64_t reqId = 0;
     bool rejected = false;
     bool notSharer = false;
+    bool homeDeferred = false;
 
     // Re-check the upgrade. With checkOnly semantics (an in-flight upgrade is
     // already pending in EPBackend::_pendingUpgradeTxns), this returns true once
@@ -1780,7 +1781,7 @@ EPRNFController::completeHeldUpgrade(uint64_t linePa, bool dropRecoveryResend)
     bool accepted = backend->notifyLocalWriteUpgrade(
         linePa, homeNode, upIt->second.sourceSocket, 1,
         UpgradeCause::LocalCleanUnique,
-        epoch, reqId, &rejected, &notSharer,
+        epoch, reqId, &rejected, &notSharer, &homeDeferred,
         dropRecoveryResend /*forceResend: retransmit same reqId on DROP*/);
     fatal_if(epoch == 0 || reqId == 0,
              "EP_RNF node_id=%d: upgrade lacks stable tuple PA=0x%lx "
@@ -1791,6 +1792,11 @@ EPRNFController::completeHeldUpgrade(uint64_t linePa, bool dropRecoveryResend)
 
     if (accepted) {
         upIt->second.homeAccepted = true;
+    } else if (homeDeferred) {
+        upIt->second.dropResendCount = 0;
+        upIt->second.dropWatchdogArmed = false;
+        inform("[UPGRADE-HOME-DEFERRED] node=%d pa=0x%lx reqId=%lu home=%d\n",
+               _nodeId, linePa, reqId, homeNode);
     } else if (rejected && upIt->second.homeAccepted && !notSharer) {
         // Accepted is monotonic for the held tuple. A later temporary reject
         // can only be a delayed response to an earlier duplicate request; the
