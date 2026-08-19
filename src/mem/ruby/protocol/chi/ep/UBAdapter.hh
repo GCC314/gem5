@@ -7,6 +7,7 @@
 #include <map>
 #include <memory>
 #include <set>
+#include <vector>
 
 #include "mem/ruby/common/DataBlock.hh"
 #include "mem/ruby/protocol/chi/ep/CoherenceMessage.hh"
@@ -241,6 +242,14 @@ class UBAdapter : public SimObject
     bool transportSend(const CoherenceMessage &msg);
     bool transportSendReliable(const CoherenceMessage &msg);
     void drainReliableOutputs();
+    size_t pollVisibleMessages(Tick curT, size_t budget);
+
+    static void registerClockAdapter(UBAdapter *adapter);
+    static void unregisterClockAdapter(UBAdapter *adapter);
+    static void armClockPump(Tick when);
+    static std::vector<UBAdapter *> _clockAdapters;
+    static UBAdapter *_clockOwner;
+    static bool _clockPumpRunning;
 
     /** Multi-process split: send a BarrierReached CoherenceMessage (PAYLOAD)
      *  to ubio via Port.  @p seq is the barrier generation (TC90 fix). */
@@ -299,7 +308,6 @@ class UBAdapter : public SimObject
 
     /** Event for periodic Port response polling. */
     EventFunctionWrapper _responseCheckEvent;
-    uint64_t _safeTick = 0;
     int _responseCheckCount = 0;
     bool _eventArmed = false;
 

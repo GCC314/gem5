@@ -134,6 +134,7 @@ enum class CoherenceMessageType : uint16_t {
     HAPermissionAck,         // requester acknowledges accepted permission result
     HAPresenceProbeReq,      // query/validate line presence at an HA participant
     HAPresenceProbeResp,     // typed presence result
+    NetworkExit,             // UBIO/networksim application-level shutdown
 };
 
 // ---- Message Flags ----
@@ -146,6 +147,7 @@ enum CoherenceMessageFlags : uint32_t {
     CFLAG_IS_READ_RECALL = 1u << 5,
     CFLAG_BUSY            = 1u << 6,
     CFLAG_DATA_FORWARDED  = 1u << 7,  // C4: data was direct-forwarded from owner to requester
+    CFLAG_NETWORK_EXIT_ACK = 1u << 9, // NetworkExit ACK; clear means Request
 };
 
 // ---- Message Header (fixed envelope) ----
@@ -479,6 +481,7 @@ coherenceMsgTypeName(CoherenceMessageType t)
         case CoherenceMessageType::HAPermissionAck:     return "HAPermissionAck";
         case CoherenceMessageType::HAPresenceProbeReq:  return "HAPresenceProbeReq";
         case CoherenceMessageType::HAPresenceProbeResp: return "HAPresenceProbeResp";
+        case CoherenceMessageType::NetworkExit:          return "NetworkExit";
         default:                           return "Unknown";
     }
 }

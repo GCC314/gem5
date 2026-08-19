@@ -1,5 +1,6 @@
 #include "mem/ruby/protocol/chi/ep/UBAdapter.hh"
 
+#include <algorithm>
 #include <chrono>
 #include <limits>
 #include <thread>
@@ -20,6 +21,10 @@ namespace gem5
 {
 namespace ruby
 {
+
+std::vector<UBAdapter *> UBAdapter::_clockAdapters;
+UBAdapter *UBAdapter::_clockOwner = nullptr;
+bool UBAdapter::_clockPumpRunning = false;
 
 namespace
 {
@@ -79,6 +84,7 @@ UBAdapter::UBAdapter(const Params &p)
 
 UBAdapter::~UBAdapter()
 {
+    unregisterClockAdapter(this);
     if (_port) {
         if (_portExitState && !_portExitState->terminated) {
             framework::TerminatePort(_port);
@@ -127,6 +133,7 @@ UBAdapter::init()
                        _nodeId, _socketId, gid);
                 inform("STEP5 Port enabled node=%d socket=%d gid=%d",
                        _nodeId, _socketId, gid);
+                registerClockAdapter(this);
                 // Multi-process split: when this gem5 node's simulation ends
                 // (process exit), notify ubio with a best-effort TERMINATE so
                 // the distributed clock treats this node as "done" (+inf) rather
@@ -214,9 +221,9 @@ UBAdapter::startup()
 {
     SimObject::startup();
 
-    if (_port && !_eventArmed) {
-        schedule(_responseCheckEvent, curTick());
-        _eventArmed = true;
+    if (_port) {
+        if (this == _clockOwner)
+            armClockPump(curTick());
         DPRINTF(RubyEP,
                 "[DEBUG-UBADAPTER-STARTUP] node=%d socket=%d schedule sync wakeup @%lu\n",
                 _nodeId, _socketId, curTick());
@@ -225,7 +232,7 @@ UBAdapter::startup()
         // can verify every (node,socket) plane before starting ubio peers.
         inform("[UBADAPTER-STARTUP] node=%d socket=%d port=%s armed=%d curTick=%lu",
                _nodeId, _socketId, _port ? "bound" : "MISSING",
-               _eventArmed ? 1 : 0, curTick());
+               _clockOwner && _clockOwner->_eventArmed ? 1 : 0, curTick());
     } else if (!_port) {
         warn("[UBADAPTER-STARTUP] node=%d socket=%d NO PORT — adapter will not poll for messages",
              _nodeId, _socketId);
@@ -1804,67 +1811,91 @@ UBAdapter::recvFromRouter(const CoherenceMessage &msg)
 // ---- Event-driven response processing (Step 1) ----
 
 void
-UBAdapter::wakeup()
+UBAdapter::registerClockAdapter(UBAdapter *adapter)
 {
-    if (!_port) return;
-
-    drainReliableOutputs();
-
-    // 1. Emit sync (heartbeat) to let peer advance its boundary
-    if (!framework::EmitSync(_port, curTick())) {
-        // The peer may still be binding. Keep virtual time fixed without
-        // spinning hard enough to starve the launcher or peer processes.
-        std::this_thread::sleep_for(std::chrono::microseconds(50));
-        if (_responseCheckEvent.scheduled())
-            reschedule(_responseCheckEvent, curTick());
-        else
-            schedule(_responseCheckEvent, curTick());
-        _eventArmed = true;
+    if (!adapter || !adapter->_port)
         return;
+    if (std::find(_clockAdapters.begin(), _clockAdapters.end(), adapter) ==
+            _clockAdapters.end()) {
+        _clockAdapters.push_back(adapter);
     }
+    if (!_clockOwner)
+        _clockOwner = adapter;
+}
 
-    // 2. Drain all ready messages. CONTROL_SYNC now arrives as an ordinary
-    //    kMessage and is skipped by hdr.type below (2.1.2 alignment).
-    framework::ReceiveStatus st;
-    const framework::Message *m =
-        framework::ReceiveMessage(_port, curTick(), &st);
-    while (m && st == framework::ReceiveStatus::Message) {
-        if (framework::GetMessageType(m) == framework::MessageType::Terminate) {
-            m = framework::ReceiveMessage(_port, curTick(), &st);
-            continue;
-        }
-        if (framework::GetMessageType(m) ==
-            framework::MessageType::ControlSync) {
-            m = framework::ReceiveMessage(_port, curTick(), &st);
+void
+UBAdapter::unregisterClockAdapter(UBAdapter *adapter)
+{
+    _clockAdapters.erase(
+        std::remove(_clockAdapters.begin(), _clockAdapters.end(), adapter),
+        _clockAdapters.end());
+    if (_clockOwner == adapter) {
+        if (adapter->_responseCheckEvent.scheduled())
+            adapter->deschedule(adapter->_responseCheckEvent);
+        adapter->_eventArmed = false;
+        _clockOwner = _clockAdapters.empty() ? nullptr : _clockAdapters.front();
+        if (_clockOwner)
+            armClockPump(curTick());
+    }
+}
+
+void
+UBAdapter::armClockPump(Tick when)
+{
+    if (!_clockOwner || !_clockOwner->_port || _clockPumpRunning)
+        return;
+    panic_if(when < curTick(),
+             "UBAdapter clock pump cannot schedule in the past: now=%lu when=%lu",
+             curTick(), when);
+    if (_clockOwner->_responseCheckEvent.scheduled()) {
+        when = std::min(when, _clockOwner->_responseCheckEvent.when());
+        if (_clockOwner->_responseCheckEvent.when() != when)
+            _clockOwner->reschedule(_clockOwner->_responseCheckEvent, when);
+    } else {
+        _clockOwner->schedule(_clockOwner->_responseCheckEvent, when);
+    }
+    _clockOwner->_eventArmed = true;
+}
+
+size_t
+UBAdapter::pollVisibleMessages(Tick curT, size_t budget)
+{
+    if (!_port)
+        return 0;
+    size_t processed = 0;
+    while (processed < budget) {
+        framework::ReceiveStatus st;
+        const framework::Message *m =
+            framework::ReceiveMessage(_port, curT, &st);
+        if (!m || st != framework::ReceiveStatus::Message)
+            break;
+        ++processed;
+        if (framework::GetMessageType(m) == framework::MessageType::Terminate ||
+            framework::GetMessageType(m) == framework::MessageType::ControlSync) {
             continue;
         }
         if (framework::GetMessageType(m) != framework::MessageType::Payload) {
             static int noncoh = 0;
-            if (++noncoh <= 5)
+            if (++noncoh <= 5) {
                 DPRINTF(RubyEP,
                         "[WAKEUP-NONCOH] node=%d type=%u payload_sz=%zu\n",
                         _nodeId,
                         static_cast<unsigned>(framework::GetMessageType(m)),
                         framework::GetMessagePayloadSize(m));
-            m = framework::ReceiveMessage(_port, curTick(), &st);
+            }
             continue;
         }
-        // Barrier control now travels as a PAYLOAD CoherenceMessage. Peek its
-        // coherence type: BarrierRelease releases the local sync_wait mask;
-        // BarrierReached is handled by ubio/barrier_manager, not gem5, so skip.
         if (const CoherenceMessage *bc = coherencePayload(m)) {
             if (bc->h.type == CoherenceMessageType::BarrierRelease) {
-                uint32_t mask = bc->b.barrier.mask;
                 inform("[UBADAPTER-BARRIER-RELEASE] node=%d mask=0x%x seq=%u",
-                       _nodeId, mask, bc->b.barrier.seq);
-                if (!System::systemList.empty())
+                       _nodeId, bc->b.barrier.mask, bc->b.barrier.seq);
+                if (!System::systemList.empty()) {
                     System::systemList[0]->syncWait.releaseBarrier(
-                        mask, bc->b.barrier.seq);
-                m = framework::ReceiveMessage(_port, curTick(), &st);
+                        bc->b.barrier.mask, bc->b.barrier.seq);
+                }
                 continue;
             }
             if (bc->h.type == CoherenceMessageType::BarrierReached) {
-                m = framework::ReceiveMessage(_port, curTick(), &st);
                 continue;
             }
             if (TracePerfPolicy::get().shouldEmit("gem5")) {
@@ -1874,108 +1905,66 @@ UBAdapter::wakeup()
                        bc->h.srcNode);
             }
         }
-        // PortAsync: dispatch to handleResponse (pendingByReqId map)
         static int cohcnt = 0;
-        if (++cohcnt <= 5)
+        if (++cohcnt <= 5) {
             DPRINTF(RubyEP,
                     "[WAKEUP-COH] node=%d type=%u payload_sz=%zu req_id=%lu\n",
                     _nodeId,
                     static_cast<unsigned>(framework::GetMessageType(m)),
                     framework::GetMessagePayloadSize(m),
                     framework::GetMessageRequestId(m));
-        if (_port) {
-            handleResponse(m);
-        } else {
-            const CoherenceMessage *coh = coherencePayload(m);
-            if (coh) recvFromRouter(*coh);
         }
-        m = framework::ReceiveMessage(_port, curTick(), &st);
+        handleResponse(m);
     }
-
-    // 3. Drain deferred async control messages before checking responses
     drainDeferredControls();
-
-    // 4. Check for matched responses (for retry-based callers)
     checkResponseCallbacks();
+    return processed;
+}
 
-    // 5. Schedule next wakeup using safeTs (conservative PDES bound).
-    //    safeT = min(peer's latest timestamp, ownLastSync + syncInterval).
-    //
-    //    - safeT > curTick  : the peer is ahead; advance our clock to safeT.
-    //    - safeT <= curTick : the peer has NOT advanced past us yet. We must
-    //      NOT advance simulated time (that races gem5 ahead of the natives and
-    //      breaks the protocol). Earlier we re-armed the event at the SAME tick
-    //      and let it re-fire — but that hot-spins the gem5 event queue at
-    //      millions of wakeups/sec, and each wakeup hammers ZMQ recv on the
-    //      peer's socket. That saturated the IPC path and made the peer's own
-    //      loop ~100x slower (the idle node's ubio peer crawled while the active
-    //      nodes' peers flew), throttling the whole simulation to ~1 leapfrog
-    //      step per 10 ms (the ZMQ send timeout).
-    //
-    //      Instead we busy-wait in WALL-CLOCK time, yielding the CPU between
-    //      polls, exactly like the reference waitForUbsimAdvance() in
-    //      docs/all.cpp. We never advance simulated time, so there is no drift;
-    //      we stop hammering, so the peer advances quickly; and we still drain
-    //      responses so the protocol keeps flowing. The syncInterval lookahead
-    //      window guarantees the peer can always advance >= linkLatency, so this
-    //      wait terminates promptly.
+void
+UBAdapter::wakeup()
+{
+    if (this != _clockOwner || !_port)
+        return;
+    _clockPumpRunning = true;
+    _eventArmed = false;
     ++_responseCheckCount;
     const uint64_t curT = curTick();
-    uint64_t safeT = framework::SafeTimestamp(_port, curT);
-    bool stalled = !(safeT > curT);
-
-    if (stalled) {
-        // One poll per callback preserves docs/all.cpp's poll-safeTs-yield
-        // behavior without monopolizing gem5's single event thread. This is
-        // required when one process owns multiple UBAdapter ports.
-        framework::ReceiveStatus wst;
-        const framework::Message *wm =
-            framework::ReceiveMessage(_port, curT, &wst);
-        while (wm && wst == framework::ReceiveStatus::Message) {
-            if (framework::GetMessageType(wm) ==
-                framework::MessageType::Terminate) {
-                wm = framework::ReceiveMessage(_port, curT, &wst);
+    uint64_t minSafe = curT;
+    uint64_t waitRounds = 0;
+    do {
+        minSafe = std::numeric_limits<uint64_t>::max();
+        bool syncFailed = false;
+        for (UBAdapter *adapter : _clockAdapters) {
+            if (!adapter || !adapter->_port)
                 continue;
-            }
-            if (framework::GetMessageType(wm) ==
-                framework::MessageType::Payload) {
-                const CoherenceMessage *bc = coherencePayload(wm);
-                if (bc && bc->h.type == CoherenceMessageType::BarrierRelease) {
-                    DPRINTF(RubyEP,
-                        "[DEBUG-UBADAPTER-BARRIER-RELEASE] node=%d mask=0x%x "
-                        "seq=%u (stalled poll)\n",
-                        _nodeId, bc->b.barrier.mask, bc->b.barrier.seq);
-                    if (!System::systemList.empty())
-                        System::systemList[0]->syncWait.releaseBarrier(
-                            bc->b.barrier.mask, bc->b.barrier.seq);
-                } else {
-                    handleResponse(wm);
-                }
-            }
-            wm = framework::ReceiveMessage(_port, curT, &wst);
+            adapter->drainReliableOutputs();
+            syncFailed |= !framework::EmitSync(adapter->_port, curT);
+            adapter->pollVisibleMessages(curT, 64);
+            minSafe = std::min(
+                minSafe, framework::SafeTimestamp(adapter->_port, curT));
         }
-        safeT = framework::SafeTimestamp(_port, curT);
-        if (safeT <= curT)
+        if (minSafe > curT)
+            break;
+        ++waitRounds;
+        if (waitRounds % 2000 == 0) {
+            DPRINTF(RubyEP,
+                    "[DEBUG-CLK-SYNC] node=%d curT=%lu safeT=%lu WAIT "
+                    "round=%lu adapters=%lu\n",
+                    _nodeId, curT, minSafe, waitRounds,
+                    static_cast<unsigned long>(_clockAdapters.size()));
+        }
+        if (syncFailed)
+            std::this_thread::sleep_for(std::chrono::microseconds(50));
+        else
             std::this_thread::yield();
-        drainDeferredControls();
-        checkResponseCallbacks();
-        stalled = !(safeT > curT);
-    }
+    } while (true);
 
-    const uint64_t nextT = stalled ? curT : safeT;
-    if (_responseCheckEvent.scheduled())
-        reschedule(_responseCheckEvent, nextT);
-    else
-        schedule(_responseCheckEvent, nextT);
-    _eventArmed = true;
-
-    if (_responseCheckCount % 2000 == 0) {
-        DPRINTF(RubyEP,
-                "[DEBUG-CLK-SYNC] node=%d curT=%lu safeT=%lu %s cnt=%lu\n",
-                _nodeId, curT, safeT,
-                stalled ? "WAIT" : "advance",
-                (unsigned long)_responseCheckCount);
-    }
+    _clockPumpRunning = false;
+    panic_if(minSafe <= curT,
+             "UBAdapter clock pump attempted same-tick scheduling: now=%lu safe=%lu",
+             curT, minSafe);
+    armClockPump(minSafe);
 }
 
 void
@@ -2130,10 +2119,8 @@ UBAdapter::handleResponse(const framework::Message *m)
 void
 UBAdapter::scheduleResponseCheck()
 {
-    if (!_eventArmed && _port) {
-        schedule(_responseCheckEvent, curTick() + 10);
-        _eventArmed = true;
-    }
+    if (_port)
+        armClockPump(curTick() + 10);
 }
 
 uint64_t
