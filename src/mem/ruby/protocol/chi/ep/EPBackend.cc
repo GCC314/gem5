@@ -711,6 +711,27 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
     uint64_t offset = _addrMap.dsmOffset(line_pa);
     uint64_t homePa = _addrMap.buildDsmPA(homeNode, homeNode, offset, homeSocket);
 
+    auto pendingRead = _pendingReadTxns.find(homePa);
+    if (pendingRead != _pendingReadTxns.end()) {
+        PendingReadTxn &txn = pendingRead->second;
+        if (txn.localLinePa != line_pa || txn.sourceAdapter != adapterIdx ||
+            txn.neededPerm != neededPerm || txn.writeIntent != writeIntent) {
+            inform("[PENDING-READ-CONFLICT] node=%d homePa=0x%lx "
+                   "activeLocalPa=0x%lx incomingLocalPa=0x%lx "
+                   "activeSocket=%d incomingSocket=%d activeReqId=%lu\n",
+                   _nodeId, homePa, txn.localLinePa, line_pa,
+                   txn.sourceAdapter, adapterIdx, txn.reqId);
+            return -2;
+        }
+        ++txn.retryCount;
+        if ((txn.retryCount & (txn.retryCount - 1)) == 0) {
+            inform("[PENDING-READ-HIT] node=%d localPa=0x%lx homePa=0x%lx "
+                   "sourceSocket=%d reqId=%lu retry=%lu\n",
+                   _nodeId, line_pa, homePa, adapterIdx, txn.reqId,
+                   txn.retryCount);
+        }
+    }
+
     DPRINTF(RubyCHIGeneric,
             "EPBackend node_id=%d: translating PA 0x%lx -> home PA 0x%lx "
             "homeNode=%d homeSocket=%d ingressSocket=%d offset=0x%lx\n",
@@ -871,6 +892,10 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
             OuterGrantType g = txn.grantType;
             const Tick start = txn.outerStartTick;
             const uint64_t completedReqId = txn.reqId;
+            inform("[PENDING-GRANT-ERASE] node=%d localPa=0x%lx homePa=0x%lx "
+                   "sourceSocket=%d reqId=%lu reason=clear_accepted\n",
+                   _nodeId, txn.localLinePa, pgt->first, txn.sourceAdapter,
+                   completedReqId);
             _pendingGrantTxns.erase(pgt);
             if (start) {
                 inform(
@@ -947,7 +972,19 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
 
     uint64_t reqIdVal;
     RequesterLineEntry entry;
-    if (isRetry) {
+    if (pendingRead != _pendingReadTxns.end()) {
+        const PendingReadTxn &txn = pendingRead->second;
+        reqIdVal = txn.reqId;
+        entry.lineAddr = txn.localLinePa;
+        entry.state = RequesterLineState::R_WAIT_GRANT;
+        entry.pendingReq = reqType;
+        entry.epoch = txn.epoch;
+        entry.reqId = txn.reqId;
+        entry.writeIntent = txn.writeIntent;
+        entry.homeNode = txn.homeNode;
+        entry.outerStartTick = txn.outerStartTick;
+        isRetry = true;
+    } else if (isRetry) {
         reqIdVal = existing->second.reqId;
         // A retry belongs to the already-issued outer transaction. Preserve its
         // first issue tick so capacity waits and transport retries remain part
@@ -970,6 +1007,25 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
     if (!isRetry)
         entry.outerStartTick = curTick();
     _requesterLines[line_pa] = entry;
+
+    if (pendingRead == _pendingReadTxns.end()) {
+        PendingReadTxn txn;
+        txn.homePa = homePa;
+        txn.localLinePa = line_pa;
+        txn.homeNode = homeNode;
+        txn.homeSocket = homeSocket;
+        txn.sourceAdapter = adapterIdx;
+        txn.epoch = entry.epoch;
+        txn.reqId = reqIdVal;
+        txn.neededPerm = neededPerm;
+        txn.writeIntent = writeIntent;
+        txn.outerStartTick = entry.outerStartTick;
+        _pendingReadTxns.emplace(homePa, txn);
+        inform("[PENDING-READ-SAVE] node=%d localPa=0x%lx homePa=0x%lx "
+               "sourceSocket=%d epoch=%lu reqId=%lu perm=%d write=%d\n",
+               _nodeId, line_pa, homePa, adapterIdx, entry.epoch, reqIdVal,
+               neededPerm, writeIntent ? 1 : 0);
+    }
 
     if (!adapter) {
         fatal("EPBackend node_id=%d: UBAdapter required for remote miss "
@@ -1167,11 +1223,27 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
         txn.sourceAdapter = adapterIdx;
         txn.grantType = grantEnv.grantType;
         txn.outerStartTick = entry.outerStartTick;
+        auto existingTxn = _pendingGrantTxns.find(homePa);
+        if (existingTxn != _pendingGrantTxns.end() && existingTxn->second.valid &&
+            (existingTxn->second.reqId != txn.reqId ||
+             existingTxn->second.sourceAdapter != txn.sourceAdapter ||
+             existingTxn->second.localLinePa != txn.localLinePa ||
+             existingTxn->second.baseEpoch != txn.baseEpoch)) {
+            inform("[PENDING-GRANT-OVERWRITE-BLOCKED] node=%d homePa=0x%lx "
+                   "oldLocalPa=0x%lx newLocalPa=0x%lx oldSocket=%d newSocket=%d "
+                   "oldEpoch=%lu newEpoch=%lu oldReqId=%lu newReqId=%lu\n",
+                   _nodeId, homePa, existingTxn->second.localLinePa,
+                   txn.localLinePa, existingTxn->second.sourceAdapter,
+                   txn.sourceAdapter, existingTxn->second.baseEpoch,
+                   txn.baseEpoch, existingTxn->second.reqId, txn.reqId);
+            return -2;
+        }
         _pendingGrantTxns[homePa] = txn;
-        DPRINTF(RubyEP, "[DEBUG-TC5-CLEAR-TRACE] savePendingGrantTxn node=%d keyPA=0x%lx homePA=0x%lx "
-                "baseEpoch=%lu reqId=%lu grantType=%d\n",
-                _nodeId, homePa, homePa, txn.baseEpoch, txn.reqId,
-                static_cast<int>(txn.grantType));
+        _pendingReadTxns.erase(homePa);
+        inform("[PENDING-GRANT-SAVE] node=%d localPa=0x%lx homePa=0x%lx "
+               "sourceSocket=%d baseEpoch=%lu reqId=%lu grantType=%d\n",
+               _nodeId, line_pa, homePa, txn.sourceAdapter, txn.baseEpoch,
+               txn.reqId, static_cast<int>(txn.grantType));
     }
 
     DPRINTF(RubyCHIGeneric,
@@ -1327,6 +1399,9 @@ EPBackend::notifyOneWayClearHandedOff(
         return;
     }
     const PendingGrantTxn txn = txnIt->second;
+    inform("[PENDING-GRANT-ERASE] node=%d localPa=0x%lx homePa=0x%lx "
+           "sourceSocket=%d reqId=%lu reason=oneway_transport_handoff\n",
+           _nodeId, txn.localLinePa, homePa, sourceSocket, reqId);
     _pendingGrantTxns.erase(txnIt);
     inform("[CLEAR-ONEWAY] phase=transport_handoff node=%d sourceSocket=%d "
            "homeNode=%d homePa=0x%lx reqId=%lu tick=%lu\n",

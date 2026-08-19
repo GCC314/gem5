@@ -987,6 +987,24 @@ class EPBackend : public SimObject
     // identity; keying by socket would allow two reqIds for the same Home line.
     std::map<uint64_t, PendingGrantTxn> _pendingGrantTxns;
 
+    struct PendingReadTxn {
+        uint64_t homePa = 0;
+        uint64_t localLinePa = 0;
+        int homeNode = -1;
+        int homeSocket = 0;
+        int sourceAdapter = 0;
+        uint64_t epoch = 0;
+        uint64_t reqId = 0;
+        int neededPerm = 0;
+        bool writeIntent = false;
+        Tick outerStartTick = 0;
+        uint64_t retryCount = 0;
+    };
+    // Created before the first ReadReq so an async response window, local PA
+    // alias, or requester-state mutation cannot allocate a second reqId for the
+    // same Home PA.
+    std::map<uint64_t, PendingReadTxn> _pendingReadTxns;
+
     // ---- Async upgrade pending txn (mirrors PendingGrantTxn for clear) ----
     // When sendUpgradeReq returns -2 (UpgradeResp not yet arrived), we save the
     // reqId/epoch so a snoop retry reuses the SAME reqId and hits the cached
