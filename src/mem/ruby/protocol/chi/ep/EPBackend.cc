@@ -2784,7 +2784,7 @@ EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
     // (Two requesters upgrading the same line otherwise deadlock: each holds
     // its SnpResp_I waiting for its own upgrade, so neither can be invalidated
     // for the other's upgrade. TC16/25/53 double-upgrade race.)
-    if (upgradeRet == 0 && outRejected)
+    if ((upgradeRet == 0 || upgradeRet == -3) && outRejected)
         *outRejected = true;
     // upgradeRet == -3: PERMANENT reject (requester no longer a committed
     // sharer — lost a dual-upgrade race). Caller must abandon + ReadUnique.
