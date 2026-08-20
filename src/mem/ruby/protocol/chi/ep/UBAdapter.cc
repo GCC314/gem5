@@ -265,6 +265,12 @@ UBAdapter::transportSend(const CoherenceMessage &msg)
                    sendTs, _nodeId, msg.h.reqId, msg.h.homeLinePa,
                    coherenceMsgTypeName(msg.h.type), msg.h.dstNode);
         }
+        if (msg.h.type == CoherenceMessageType::UpgradeReq) {
+            inform("[UPGRADE-FORENSIC] stage=GEM5_REQ_SEND node=%d socket=%d "
+                   "pa=0x%lx reqId=%lu epoch=%lu dst=%d:%d simTs=%lu",
+                   _nodeId, _socketId, msg.h.homeLinePa, msg.h.reqId,
+                   msg.h.epoch, msg.h.dstNode, msg.h.dstSocket, sendTs);
+        }
         return true;
     }
 
@@ -795,6 +801,10 @@ UBAdapter::sendUpgradeReq(uint64_t homePa, int requesterNode,
         auto rit = _readyResponses.find(rkey);
         if (!forceWire && rit != _readyResponses.end()) {
             const CoherenceMessage &resp = rit->second;
+            inform("[UPGRADE-FORENSIC] stage=GEM5_RESP_CONSUME node=%d socket=%d "
+                   "pa=0x%lx reqId=%lu epoch=%lu flags=0x%x curT=%lu",
+                   _nodeId, _socketId, resp.h.homeLinePa, resp.h.reqId,
+                   resp.h.epoch, resp.h.flags, curTick());
             if (outUpgradeTargetMask)
                 *outUpgradeTargetMask = resp.b.upgradeResp.upgradeTargetMask;
             if (outCommittedEpoch)
@@ -2023,6 +2033,13 @@ UBAdapter::handleResponse(const framework::Message *m)
                _nodeId, coh->h.homeLinePa, coh->h.srcNode,
                coh->b.clearResp.accepted ? 1 : 0, coh->h.epoch,
                coh->h.reqId);
+    }
+    if (coh->h.type == CoherenceMessageType::UpgradeResp) {
+        inform("[UPGRADE-FORENSIC] stage=GEM5_RESP_RECV node=%d socket=%d "
+               "pa=0x%lx reqId=%lu epoch=%lu flags=0x%x msgTs=%lu curT=%lu",
+               _nodeId, _socketId, coh->h.homeLinePa, coh->h.reqId,
+               coh->h.epoch, coh->h.flags,
+               framework::GetMessageTimestamp(m), curTick());
     }
 
     // Async control messages: enqueue FIFO, process later via drainDeferredControls
