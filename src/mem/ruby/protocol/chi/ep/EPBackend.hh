@@ -977,11 +977,13 @@ class EPBackend : public SimObject
         OuterGrantType grantType;
         Tick outerStartTick;
         bool clearQueued;
+        bool clearSendLogged;
 
         PendingGrantTxn() : valid(false), linePa(0), localLinePa(0), homeNode(-1),
                             baseEpoch(0), reqId(0), sourceAdapter(0),
                             grantType(OuterGrantType::GlobalGrantShared),
-                            outerStartTick(0), clearQueued(false) {}
+                            outerStartTick(0), clearQueued(false),
+                            clearSendLogged(false) {}
     };
     // One Home PA has one node-level Grant/Clear transaction. The originating
     // socket is routing context inside the tuple, not part of transaction

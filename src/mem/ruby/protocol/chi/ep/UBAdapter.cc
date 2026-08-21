@@ -666,8 +666,9 @@ UBAdapter::sendWritebackReq(uint64_t homePa, int requesterNode,
         if (ckOff < 0x80000ULL && (off % 64 == 0)) {
             uint64_t w0;
             std::memcpy(&w0, dirtyData ? dirtyData : req.b.writebackReq.data, 8);
-            inform("[C4-WBREQ-SEND] node=%d pa=0x%lx off=0x%lx hasData=%d w0=0x%016lx",
-                   _nodeId, homePa, off, dirtyData ? 1 : 0, w0);
+            DPRINTF(RubyEP,
+                    "[C4-WBREQ-SEND] node=%d pa=0x%lx off=0x%lx hasData=%d w0=0x%016lx",
+                    _nodeId, homePa, off, dirtyData ? 1 : 0, w0);
         }
     }
 

@@ -724,7 +724,14 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
             return -2;
         }
         ++txn.retryCount;
-        if ((txn.retryCount & (txn.retryCount - 1)) == 0) {
+        const bool retryPower =
+            (txn.retryCount & (txn.retryCount - 1)) == 0;
+        const bool normalSample = txn.retryCount == 1 ||
+                                  txn.retryCount == 8 ||
+                                  txn.retryCount == 64 ||
+                                  txn.retryCount == 256;
+        const bool highRetrySample = retryPower && txn.retryCount >= 1024;
+        if (normalSample || highRetrySample) {
             inform("[PENDING-READ-HIT] node=%d localPa=0x%lx homePa=0x%lx "
                    "sourceSocket=%d reqId=%lu retry=%lu\n",
                    _nodeId, line_pa, homePa, adapterIdx, txn.reqId,
@@ -1748,7 +1755,7 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
     DPRINTF(RubyEP, "[RECALL-ENTRY] EPBackend node=%d PA=0x%lx ownerNode=%d homeNode=%d\n",
             _nodeId, recallMsg.linePa, recallMsg.ownerNode, recallMsg.homeNode);
     }
-    inform(
+    DPRINTF(RubyEP,
                  "[RECALL-ENTRY-ERR] node=%d PA=0x%lx ownerNode=%d homeNode=%d reqId=%lu isRead=%d dataNeeded=%d curT=%lu\n",
                  _nodeId, recallMsg.linePa, recallMsg.ownerNode,
                  recallMsg.homeNode, recallMsg.reqId,
@@ -1846,7 +1853,7 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
         DPRINTF(RubyEP, "[RECALL-DIAG] node=%d initiating ReadShared recall PA=0x%lx\n",
                 _nodeId, recallMsg.linePa);
         }
-        inform(
+        DPRINTF(RubyEP,
                      "[RECALL-START-ERR] node=%d kind=ReadShared linePA=0x%lx localPA=0x%lx reqId=%lu curT=%lu\n",
                      _nodeId, recallMsg.linePa, ownerLocalPa,
                      recallMsg.reqId, curTick());
@@ -1859,7 +1866,7 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
                 DPRINTF(RubyEP, "[RECALL-DIAG] node=%d ReadShared callback success=%d valid=%d\n",
                         _nodeId, success, _recallCaptureDataValid);
                 }
-                inform(
+                DPRINTF(RubyEP,
                              "[RECALL-CB-ERR] node=%d kind=ReadShared linePA=0x%lx reqId=%lu success=%d valid=%d curT=%lu\n",
                              _nodeId, capturedMsg.linePa, capturedMsg.reqId,
                              success ? 1 : 0,
@@ -1925,7 +1932,7 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
         DPRINTF(RubyEP, "[RECALL-DIAG] node=%d initiating ReadUnique recall PA=0x%lx\n",
                 _nodeId, recallMsg.linePa);
         }
-        inform(
+        DPRINTF(RubyEP,
                      "[RECALL-START-ERR] node=%d kind=ReadUnique linePA=0x%lx localPA=0x%lx reqId=%lu curT=%lu\n",
                      _nodeId, recallMsg.linePa, ownerLocalPa,
                       recallMsg.reqId, curTick());
@@ -1945,7 +1952,7 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
                 DPRINTF(RubyEP, "[RECALL-DIAG] node=%d ReadUnique callback success=%d\n",
                         _nodeId, success);
                 }
-                inform(
+                DPRINTF(RubyEP,
                              "[RECALL-CB-ERR] node=%d kind=ReadUnique linePA=0x%lx reqId=%lu success=%d valid=%d curT=%lu\n",
                              _nodeId, capturedMsg.linePa, capturedMsg.reqId,
                              success ? 1 : 0,
@@ -2018,7 +2025,7 @@ EPBackend::sendRecallResponse(const OuterRecallResponse &response)
     DPRINTF(RubyEP, "[RECALL-RESP] node=%d PA=0x%lx homeNode=%d dataReturned=%d\n",
             _nodeId, response.linePa, response.homeNode, response.dataReturned);
     }
-    inform(
+    DPRINTF(RubyEP,
                  "[RECALL-RESP-ERR] node=%d PA=0x%lx homeNode=%d reqId=%lu dataReturned=%d curT=%lu\n",
                  _nodeId, response.linePa, response.homeNode,
                  response.reqId, response.dataReturned ? 1 : 0, curTick());
@@ -2923,9 +2930,16 @@ EPBackend::sendUpgradeDone(uint64_t line_pa, int homeNode, int sourceSocket,
 EPBackend::sendClear(uint64_t line_pa, int homeNode,
                      uint64_t epoch, uint64_t reqId, int sourceAdapter)
 {
-    inform(
-                 "[CLEAR-SEND] node=%d pa=0x%lx homeNode=%d epoch=%lu reqId=%lu\n",
-                 _nodeId, line_pa, homeNode, epoch, reqId);
+    auto txnIt = _pendingGrantTxns.find(line_pa);
+    const bool firstClearSend =
+        txnIt == _pendingGrantTxns.end() || !txnIt->second.valid ||
+        !txnIt->second.clearSendLogged;
+    if (firstClearSend) {
+        inform("[CLEAR-SEND] node=%d pa=0x%lx homeNode=%d epoch=%lu reqId=%lu\n",
+               _nodeId, line_pa, homeNode, epoch, reqId);
+        if (txnIt != _pendingGrantTxns.end() && txnIt->second.valid)
+            txnIt->second.clearSendLogged = true;
+    }
     DPRINTF(RubyEP,
             "EPBackend node_id=%d: sendClear "
             "PA=0x%lx homeNode=%d epoch=%lu reqId=%lu\n",
@@ -2933,7 +2947,6 @@ EPBackend::sendClear(uint64_t line_pa, int homeNode,
 
     // upgrade_invalidate_fix D5: prefer PendingGrantTxn.baseEpoch
     uint64_t clearEpoch = epoch;
-    auto txnIt = _pendingGrantTxns.find(line_pa);
     bool foundPendingGrantTxn =
         (txnIt != _pendingGrantTxns.end() && txnIt->second.valid);
     if (txnIt != _pendingGrantTxns.end() && txnIt->second.valid) {

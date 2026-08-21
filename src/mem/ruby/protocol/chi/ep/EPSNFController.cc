@@ -194,9 +194,9 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
 {
     DPRINTF(RubyCHIGeneric, "[DEBUG-EPSNF-RECV] EP_SNF node_id=%d recvRequestMsg type=%s addr=0x%lx\n",
             _nodeId, msg->m_type, msg->m_addr);
-    warn("EP_SNF node_id=%d recvRequestMsg type=%d addr=0x%lx "
-         "dataToFwdReq=%d\n",
-         _nodeId, msg->m_type, msg->m_addr, msg->m_dataToFwdRequestor);
+    DPRINTF(RubyEP, "EP_SNF node_id=%d recvRequestMsg type=%d addr=0x%lx "
+            "dataToFwdReq=%d\n", _nodeId, msg->m_type, msg->m_addr,
+            msg->m_dataToFwdRequestor);
 
     // A WriteNoSnp is a two-phase operation.  CompDBIDResp grants the
     // sender permission to transmit NCBWrData; waiting for that data before
@@ -258,7 +258,7 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
             uint64_t off = msg->m_addr & 0x1FFFULL;
             uint64_t ckOff = msg->m_addr & 0xFFFFFULL;
             if (ckOff < 0x80000ULL && (off % 64 == 0)) {
-                inform(
+                DPRINTF(RubyEP,
                     "[C4-ESNF-WNOSNP] node=%d addr=0x%lx off=0x%lx "
                     "expectedMask=0x%lx\n",
                     _nodeId, msg->m_addr, off, pending.expectedMask);
@@ -769,7 +769,7 @@ EPSNFController::recvDataMsg(const CHIDataMsg *msg)
                     bool full = true;
                     for (int i = 0; i < 64; i++)
                         if (!msg->m_bitMask.test(i)) { full = false; break; }
-                    inform(
+                    DPRINTF(RubyEP,
                         "[C4-EPSNF-BEAT] node=%d pa=0x%lx writePa=0x%lx "
                         "off=0x%lx fullMask=%d w0=0x%016lx pending=%d\n",
                         _nodeId, msg->m_addr, writePa, absOff, full ? 1 : 0, w0,
