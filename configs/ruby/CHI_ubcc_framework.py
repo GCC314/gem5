@@ -487,13 +487,39 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
             snf_dests.append(nd['ep_snf_cntrls'][sid])
             nd['hnf_wrappers'][sid].setDownstream(snf_dests)
             hnf_cntrl = nd['hnf_cntrls'][sid]
+            import faulthandler
+            import sys
+
+            print("[HNF-UNPROXY-WATCH] BEGIN node={} sid={} type={} id={}".
+                  format(node_id, sid, type(hnf_cntrl).__name__,
+                         hex(id(hnf_cntrl))), flush=True)
+
+            trace_state = {'param': object()}
+
+            def _trace_unproxy(frame, event, arg):
+                if (frame.f_code.co_name != 'unproxyParams' or
+                        frame.f_locals.get('self') is not hnf_cntrl):
+                    return None
+                if event == 'line':
+                    param = frame.f_locals.get('param', '<not-set>')
+                    if param != trace_state['param']:
+                        value = frame.f_locals.get('value')
+                        print("[HNF-UNPROXY-WATCH] ACTIVE param={!r} "
+                              "value_type={}".format(
+                                  param, type(value).__name__), flush=True)
+                        trace_state['param'] = param
+                return _trace_unproxy
+
+            previous_trace = sys.gettrace()
+            sys.settrace(_trace_unproxy)
+            faulthandler.dump_traceback_later(10, repeat=True)
+            unproxy_ok = False
             try:
                 hnf_cntrl.unproxyParams()
+                unproxy_ok = True
             except Exception as exc:
                 # Avoid path()/str(SimObject): either can recurse when the
                 # remote configuration has a parent or multidict cycle.
-                import sys
-
                 def _obj_desc(obj):
                     if obj is None:
                         return "None"
@@ -576,6 +602,12 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
                 _dump_multidict('hnf._params', hnf_cntrl._params)
                 _dump_multidict('hnf._values', hnf_cntrl._values)
                 raise
+            finally:
+                faulthandler.cancel_dump_traceback_later()
+                sys.settrace(previous_trace)
+                print("[HNF-UNPROXY-WATCH] END node={} sid={} status={}".
+                      format(node_id, sid,
+                             'ok' if unproxy_ok else 'exception'), flush=True)
 
     for cntrl in all_cntrls:
         cntrl.data_channel_size = params.data_width
