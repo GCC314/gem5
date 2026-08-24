@@ -41,6 +41,9 @@
 
 #include "mem/ruby/structures/CacheMemory.hh"
 
+#include <algorithm>
+
+#include "base/cprintf.hh"
 #include "base/intmath.hh"
 #include "base/logging.hh"
 #include "debug/HtmMem.hh"
@@ -71,6 +74,12 @@ CacheMemory::CacheMemory(const Params &p)
     dataArray(p.dataArrayBanks, p.dataAccessLatency, p.start_index_bit),
     tagArray(p.tagArrayBanks, p.tagAccessLatency, p.start_index_bit),
     atomicALUArray(p.atomicALUs, p.atomicLatency),
+    m_track_l3_occupancy(p.track_l3_occupancy),
+    m_occupancy_sample_interval(p.occupancy_sample_interval),
+    m_occupancy_node_id(p.occupancy_node_id),
+    m_occupancy_socket_id(p.occupancy_socket_id),
+    m_occupancy_dsm_ranges(p.occupancy_dsm_ranges),
+    m_occupancy_metadata_ranges(p.occupancy_metadata_ranges),
     cacheMemoryStats(this)
 {
     m_cache_size = p.size;
@@ -110,6 +119,10 @@ CacheMemory::init()
 
     m_cache.resize(m_cache_num_sets,
                     std::vector<AbstractCacheEntry*>(m_cache_assoc, nullptr));
+    if (m_track_l3_occupancy) {
+        m_pending_replacements.resize(m_cache_num_sets);
+        updateOccupancyStats();
+    }
     replacement_data.resize(m_cache_num_sets,
                                std::vector<ReplData>(m_cache_assoc, nullptr));
     // instantiate all the replacement_data here
@@ -123,6 +136,52 @@ CacheMemory::init()
 
 CacheMemory::~CacheMemory()
 {
+    if (m_track_l3_occupancy) {
+        inform("[L3-OCC-SUMMARY] cache=%s node=%d socket=%d capacity=%d "
+               "current=%llu peak=%llu "
+               "class_current={dsm:%llu,metadata:%llu,other:%llu} "
+               "class_peak={dsm:%llu,metadata:%llu,other:%llu} "
+               "alloc={total:%llu,dsm:%llu,metadata:%llu,other:%llu} "
+               "dealloc={total:%llu,dsm:%llu,metadata:%llu,other:%llu} "
+               "repl={total:%llu,dsm_to_dsm:%llu,dsm_to_metadata:%llu,"
+               "dsm_to_other:%llu,metadata_to_dsm:%llu,"
+               "metadata_to_metadata:%llu,metadata_to_other:%llu,"
+               "other_to_dsm:%llu,other_to_metadata:%llu,"
+               "other_to_other:%llu}",
+               name(), m_occupancy_node_id, m_occupancy_socket_id,
+               getNumBlocks(),
+               (unsigned long long)m_occupancy_current_total,
+               (unsigned long long)m_occupancy_peak_total,
+               (unsigned long long)m_occupancy_current[OccDsm],
+               (unsigned long long)m_occupancy_current[OccMetadata],
+               (unsigned long long)m_occupancy_current[OccOther],
+               (unsigned long long)m_occupancy_peak[OccDsm],
+               (unsigned long long)m_occupancy_peak[OccMetadata],
+               (unsigned long long)m_occupancy_peak[OccOther],
+               (unsigned long long)m_occupancy_allocation_total,
+               (unsigned long long)m_occupancy_allocations[OccDsm],
+               (unsigned long long)m_occupancy_allocations[OccMetadata],
+               (unsigned long long)m_occupancy_allocations[OccOther],
+               (unsigned long long)m_occupancy_deallocation_total,
+               (unsigned long long)m_occupancy_deallocations[OccDsm],
+               (unsigned long long)m_occupancy_deallocations[OccMetadata],
+               (unsigned long long)m_occupancy_deallocations[OccOther],
+               (unsigned long long)m_occupancy_replacement_total,
+               (unsigned long long)m_occupancy_replacements[OccDsm][OccDsm],
+               (unsigned long long)
+                   m_occupancy_replacements[OccDsm][OccMetadata],
+               (unsigned long long)m_occupancy_replacements[OccDsm][OccOther],
+               (unsigned long long)
+                   m_occupancy_replacements[OccMetadata][OccDsm],
+               (unsigned long long)
+                   m_occupancy_replacements[OccMetadata][OccMetadata],
+               (unsigned long long)
+                   m_occupancy_replacements[OccMetadata][OccOther],
+               (unsigned long long)m_occupancy_replacements[OccOther][OccDsm],
+               (unsigned long long)
+                   m_occupancy_replacements[OccOther][OccMetadata],
+               (unsigned long long)m_occupancy_replacements[OccOther][OccOther]);
+    }
     if (m_replacementPolicy_ptr)
         delete m_replacementPolicy_ptr;
     for (int i = 0; i < m_cache_num_sets; i++) {
@@ -130,6 +189,126 @@ CacheMemory::~CacheMemory()
             delete m_cache[i][j];
         }
     }
+}
+
+CacheMemory::OccupancyClass
+CacheMemory::occupancyClass(Addr address) const
+{
+    for (const auto &range : m_occupancy_dsm_ranges) {
+        if (range.contains(address))
+            return OccDsm;
+    }
+    for (const auto &range : m_occupancy_metadata_ranges) {
+        if (range.contains(address))
+            return OccMetadata;
+    }
+    return OccOther;
+}
+
+void
+CacheMemory::updateOccupancyStats()
+{
+    cacheMemoryStats.occupancyCurrentTotal = m_occupancy_current_total;
+    cacheMemoryStats.occupancyPeakTotal = m_occupancy_peak_total;
+    cacheMemoryStats.occupancyAllocationsTotal = m_occupancy_allocation_total;
+    cacheMemoryStats.occupancyDeallocationsTotal =
+        m_occupancy_deallocation_total;
+    cacheMemoryStats.occupancyReplacementsTotal =
+        m_occupancy_replacement_total;
+    for (unsigned i = 0; i < OccNumClasses; ++i) {
+        cacheMemoryStats.occupancyCurrent[i] = m_occupancy_current[i];
+        cacheMemoryStats.occupancyPeak[i] = m_occupancy_peak[i];
+        cacheMemoryStats.occupancyAllocations[i] = m_occupancy_allocations[i];
+        cacheMemoryStats.occupancyDeallocations[i] =
+            m_occupancy_deallocations[i];
+        for (unsigned j = 0; j < OccNumClasses; ++j) {
+            cacheMemoryStats.occupancyReplacementFromTo[
+                i * OccNumClasses + j] = m_occupancy_replacements[i][j];
+        }
+    }
+}
+
+void
+CacheMemory::maybeEmitOccupancySample()
+{
+    if (!m_track_l3_occupancy || m_occupancy_sample_interval == 0)
+        return;
+    ++m_occupancy_mutations;
+    if (m_occupancy_mutations % m_occupancy_sample_interval != 0)
+        return;
+    inform("[L3-OCC-SAMPLE] tick=%llu cache=%s node=%d socket=%d "
+           "capacity=%d current=%llu peak=%llu dsm=%llu metadata=%llu "
+           "other=%llu peak_dsm=%llu peak_metadata=%llu peak_other=%llu "
+           "alloc=%llu dealloc=%llu replacements=%llu "
+           "dsm_to_metadata=%llu metadata_to_dsm=%llu "
+           "other_to_metadata=%llu metadata_to_other=%llu",
+           (unsigned long long)curTick(), name(), m_occupancy_node_id,
+           m_occupancy_socket_id, getNumBlocks(),
+           (unsigned long long)m_occupancy_current_total,
+           (unsigned long long)m_occupancy_peak_total,
+           (unsigned long long)m_occupancy_current[OccDsm],
+           (unsigned long long)m_occupancy_current[OccMetadata],
+           (unsigned long long)m_occupancy_current[OccOther],
+           (unsigned long long)m_occupancy_peak[OccDsm],
+           (unsigned long long)m_occupancy_peak[OccMetadata],
+           (unsigned long long)m_occupancy_peak[OccOther],
+           (unsigned long long)m_occupancy_allocation_total,
+           (unsigned long long)m_occupancy_deallocation_total,
+           (unsigned long long)m_occupancy_replacement_total,
+           (unsigned long long)m_occupancy_replacements[OccDsm][OccMetadata],
+           (unsigned long long)m_occupancy_replacements[OccMetadata][OccDsm],
+           (unsigned long long)m_occupancy_replacements[OccOther][OccMetadata],
+           (unsigned long long)m_occupancy_replacements[OccMetadata][OccOther]);
+}
+
+void
+CacheMemory::recordOccupancyAllocate(Addr address, int64_t cache_set)
+{
+    const auto cls = occupancyClass(address);
+    ++m_occupancy_current[cls];
+    ++m_occupancy_current_total;
+    ++m_occupancy_allocations[cls];
+    ++m_occupancy_allocation_total;
+    m_occupancy_peak[cls] = std::max(m_occupancy_peak[cls],
+                                     m_occupancy_current[cls]);
+    m_occupancy_peak_total = std::max(m_occupancy_peak_total,
+                                      m_occupancy_current_total);
+
+    auto &pending = m_pending_replacements[cache_set];
+    if (pending.valid && pending.victimDeallocated &&
+        pending.incoming == address) {
+        ++m_occupancy_replacements[pending.victimClass][cls];
+        ++m_occupancy_replacement_total;
+    }
+    // An allocation is the final operation in a replacement sequence.  Any
+    // other allocation in this set makes an older probe/deallocate pair stale.
+    pending = PendingReplacement();
+    updateOccupancyStats();
+    maybeEmitOccupancySample();
+}
+
+void
+CacheMemory::recordOccupancyDeallocate(Addr address, int64_t cache_set)
+{
+    const auto cls = occupancyClass(address);
+    assert(m_occupancy_current[cls] > 0);
+    assert(m_occupancy_current_total > 0);
+    --m_occupancy_current[cls];
+    --m_occupancy_current_total;
+    ++m_occupancy_deallocations[cls];
+    ++m_occupancy_deallocation_total;
+
+    auto &pending = m_pending_replacements[cache_set];
+    if (pending.valid && !pending.victimDeallocated &&
+        pending.victim == address) {
+        pending.victimDeallocated = true;
+    } else {
+        // Do not guess: a deallocation other than the exact probed victim
+        // invalidates replacement inference for this set.
+        pending = PendingReplacement();
+    }
+    updateOccupancyStats();
+    maybeEmitOccupancySample();
 }
 
 // convert a Address to its location in the cache
@@ -325,6 +504,9 @@ CacheMemory::allocate(Addr address, AbstractCacheEntry *entry)
             // replacement policies.
             m_replacementPolicy_ptr->reset(entry->replacementData);
 
+            if (m_track_l3_occupancy)
+                recordOccupancyAllocate(address, cacheSet);
+
             return entry;
         }
     }
@@ -340,6 +522,8 @@ CacheMemory::deallocate(Addr address)
     m_replacementPolicy_ptr->invalidate(entry->replacementData);
     uint32_t cache_set = entry->getSet();
     uint32_t way = entry->getWay();
+    if (m_track_l3_occupancy)
+        recordOccupancyDeallocate(address, cache_set);
     delete entry;
     m_cache[cache_set][way] = NULL;
     m_tag_index.erase(address);
@@ -358,8 +542,17 @@ CacheMemory::cacheProbe(Addr address) const
         candidates.push_back(static_cast<ReplaceableEntry*>(
                                                        m_cache[cacheSet][i]));
     }
-    return m_cache[cacheSet][m_replacementPolicy_ptr->
+    const Addr victim = m_cache[cacheSet][m_replacementPolicy_ptr->
                         getVictim(candidates)->getWay()]->m_Address;
+    if (m_track_l3_occupancy) {
+        auto &pending = m_pending_replacements[cacheSet];
+        pending.incoming = address;
+        pending.victim = victim;
+        pending.victimClass = occupancyClass(victim);
+        pending.valid = true;
+        pending.victimDeallocated = false;
+    }
+    return victim;
 }
 
 // looks an address up in the cache
@@ -571,7 +764,18 @@ CacheMemoryStats::CacheMemoryStats(statistics::Group *parent)
       ADD_STAT(m_prefetch_misses, "Number of cache prefetch misses"),
       ADD_STAT(m_prefetch_accesses, "Number of cache prefetch accesses",
                m_prefetch_hits + m_prefetch_misses),
-      ADD_STAT(m_accessModeType, "")
+      ADD_STAT(m_accessModeType, ""),
+      ADD_STAT(occupancyCurrentTotal, "Current tracked cache lines"),
+      ADD_STAT(occupancyPeakTotal, "Peak tracked cache lines"),
+      ADD_STAT(occupancyAllocationsTotal, "Tracked line allocations"),
+      ADD_STAT(occupancyDeallocationsTotal, "Tracked line deallocations"),
+      ADD_STAT(occupancyReplacementsTotal, "Inferred tracked replacements"),
+      ADD_STAT(occupancyCurrent, "Current lines by address class"),
+      ADD_STAT(occupancyPeak, "Peak lines by address class"),
+      ADD_STAT(occupancyAllocations, "Allocations by address class"),
+      ADD_STAT(occupancyDeallocations, "Deallocations by address class"),
+      ADD_STAT(occupancyReplacementFromTo,
+               "Inferred replacements by victim and incoming address class")
 {
     numDataArrayReads
         .flags(statistics::nozero);
@@ -635,6 +839,34 @@ CacheMemoryStats::CacheMemoryStats(statistics::Group *parent)
             .subname(i, RubyAccessMode_to_string(RubyAccessMode(i)))
             .flags(statistics::nozero)
             ;
+    }
+
+    const char *classes[] = {"dsm", "metadata", "other"};
+    occupancyCurrent.init(OccNumClasses);
+    occupancyPeak.init(OccNumClasses);
+    occupancyAllocations.init(OccNumClasses);
+    occupancyDeallocations.init(OccNumClasses);
+    occupancyReplacementFromTo.init(OccNumClasses * OccNumClasses);
+    occupancyCurrent.flags(statistics::nozero);
+    occupancyPeak.flags(statistics::nozero);
+    occupancyAllocations.flags(statistics::nozero);
+    occupancyDeallocations.flags(statistics::nozero);
+    occupancyReplacementFromTo.flags(statistics::nozero);
+    occupancyCurrentTotal.flags(statistics::nozero);
+    occupancyPeakTotal.flags(statistics::nozero);
+    occupancyAllocationsTotal.flags(statistics::nozero);
+    occupancyDeallocationsTotal.flags(statistics::nozero);
+    occupancyReplacementsTotal.flags(statistics::nozero);
+    for (unsigned i = 0; i < OccNumClasses; ++i) {
+        occupancyCurrent.subname(i, classes[i]);
+        occupancyPeak.subname(i, classes[i]);
+        occupancyAllocations.subname(i, classes[i]);
+        occupancyDeallocations.subname(i, classes[i]);
+        for (unsigned j = 0; j < OccNumClasses; ++j) {
+            occupancyReplacementFromTo.subname(
+                i * OccNumClasses + j,
+                csprintf("%s_to_%s", classes[i], classes[j]));
+        }
     }
 }
 

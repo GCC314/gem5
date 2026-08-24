@@ -407,6 +407,39 @@ EPBackend::hasHADataCacheLine(int sourceSocket, uint64_t localLinePa) const
     return false;
 }
 
+bool
+EPBackend::readHADataCacheLine(int sourceSocket, uint64_t localLinePa,
+                               DataBlock &data) const
+{
+    if (sourceSocket < 0 ||
+        sourceSocket >= static_cast<int>(_haDataCachesBySocket.size())) {
+        return false;
+    }
+    bool found = false;
+    for (CacheMemory *cache : _haDataCachesBySocket[sourceSocket]) {
+        AbstractCacheEntry *entry = cache->lookup(localLinePa);
+        if (!entry)
+            continue;
+        const AccessPermission permission = entry->getPermission();
+        if (permission != AccessPermission_Read_Only &&
+            permission != AccessPermission_Read_Write) {
+            continue;
+        }
+        const DataBlock &candidate = entry->getDataBlk();
+        if (found) {
+            fatal_if(std::memcmp(data.getData(0, 64),
+                                 candidate.getData(0, 64), 64) != 0,
+                     "EPBackend node_id=%d: conflicting HA L1 copies "
+                     "socket=%d PA=0x%lx", _nodeId, sourceSocket,
+                     localLinePa);
+        } else {
+            data = candidate;
+            found = true;
+        }
+    }
+    return found;
+}
+
 int
 EPBackend::requestHAPresenceProbe(uint64_t linePa, HAProbeAction action,
                                    uint64_t expectedEpoch, int dstNode,
@@ -1834,18 +1867,9 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
     // Capture recallMsg fields for the async callback
     OuterRecallMsg capturedMsg = recallMsg;
     DataBlock ownerSnapshot(64);
-    bool ownerSnapshotValid = false;
-    if (recallMsg.dataNeeded && _ruby_system) {
-        uint8_t bytes[64]{};
-        RequestPtr req = std::make_shared<Request>(
-            ownerLocalPa, 64, 0, _epRnfCtrl->getRequestorId());
-        req->setFlags(Request::PHYSICAL);
-        Packet pkt(req, MemCmd::ReadReq);
-        pkt.dataStatic(bytes);
-        ownerSnapshotValid = _ruby_system->functionalRead(&pkt);
-        if (ownerSnapshotValid)
-            ownerSnapshot.setData(bytes, 0, 64);
-    }
+    const bool ownerSnapshotValid = recallMsg.dataNeeded &&
+        readHADataCacheLine(recallMsg.sourceSocket, ownerLocalPa,
+                            ownerSnapshot);
 
     if (recallMsg.isReadRequest) {
         // Read recall: ReadShared to downgrade owner to R_S

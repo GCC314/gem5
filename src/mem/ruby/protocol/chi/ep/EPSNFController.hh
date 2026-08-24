@@ -72,6 +72,7 @@ class EPSNFController : public EPController
         MachineID hnReq;      // HN-F requestor (for CompData routing)
         MachineID fwdReq;     // fwdRequestor (if dataToFwdReq)
         bool dataToFwdReq;
+        bool publishOnData;
     };
     std::deque<RetryEntry> _retryQueue;
 

@@ -1287,6 +1287,12 @@ transition(BUSY_BLKD, SendReadNoSnp, BUSY_INTR) {DestinationAvailable} {
   ProcessNextState_ClearPending;
 }
 
+transition(BUSY_BLKD, SendReadNoSnpSharedData, BUSY_INTR) {DestinationAvailable} {
+  Pop_TriggerQueue;
+  Send_ReadNoSnpSharedData;
+  ProcessNextState_ClearPending;
+}
+
 transition(BUSY_BLKD, SendReadNoSnpDMT, BUSY_INTR) {DestinationAvailable} {
   Pop_TriggerQueue;
   Send_ReadNoSnpDMT;
@@ -1448,6 +1454,12 @@ transition(BUSY_BLKD, CheckUpgrade_FromCU) {
 transition(BUSY_BLKD, CheckUpgrade_FromRU) {
   Pop_TriggerQueue;
   CheckUpgrade_FromStoreOrRU;
+  ProcessNextState_ClearPending;
+}
+
+transition(BUSY_BLKD, CompleteEPRNFReadUniqueUpgrade) {
+  Pop_TriggerQueue;
+  CompleteEPRNFReadUniqueUpgrade;
   ProcessNextState_ClearPending;
 }
 

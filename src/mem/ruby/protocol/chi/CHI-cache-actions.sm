@@ -714,7 +714,7 @@ action(Initiate_ReadUnique_Miss, desc="") {
   // a no-data Comp_UC to EP-RNF rather than re-entering EP-SNF/Outer.
   if (is_HN && tbe.epProxyOp == EpProxyOp:RecallUnique) {
     tbe.actions.push(Event:WaitCompAck);
-    tbe.actions.push(Event:SendCompUCResp);
+    tbe.actions.pushNB(Event:SendCompUCResp);
   } else if (is_HN && tbe.use_DMT) {
     tbe.requestorToBeExclusiveOwner := true;
     tbe.dataMaybeDirtyUpstream := true; // SNF always replies with CompData_UC
@@ -783,44 +783,80 @@ action(Initiate_ReadUnique_Hit, desc="") {
 }
 
 action(Initiate_ReadUnique_HitUpstream, desc="") {
-  tbe.actions.push(Event:ReadMissPipe);
-  // SnpUniqueFwd can be used only if the line is cached at a single
-  // requester; so force it off if that's the case
-  tbe.use_DCT := tbe.use_DCT && (tbe.dir_sharers.count() == 1) &&
-                 (tbe.dir_sharers.isElement(tbe.requestor) == false);
-  // v4: DCT fallback — if requester is EP-RNF, force non-DCT snoop path
-  if (tbe.use_DCT && epRnfMachineVersion >= 0 &&
-      tbe.requestor == tbe.epRnfMachineID) {
-    tbe.use_DCT := false;
-  }
-  // v4: DCT fallback — if sole sharer is EP-RNF, force non-DCT snoop path
-  if (tbe.use_DCT && epRnfMachineVersion >= 0 &&
-      tbe.dir_sharers.count() == 1 &&
+  // EP-RNF is directory metadata, not an authoritative data-bearing sharer.
+  // If it is the sole remaining record and HN-F has no local data or owner,
+  // use the same downstream data source as a ReadUnique miss.
+  if (is_HN && !tbe.dataValid && !tbe.dir_ownerExists &&
+      epRnfMachineVersion >= 0 && tbe.dir_sharers.count() == 1 &&
       tbe.dir_sharers.isElement(tbe.epRnfMachineID)) {
-    tbe.use_DCT := false;
-  }
-  if (tbe.use_DCT) {
-    tbe.actions.push(Event:SendSnpUniqueFwd);
-    tbe.actions.pushNB(Event:WaitCompAck);
-    tbe.updateDirOnCompAck := false;
-  } else if (tbe.dataMaybeDirtyUpstream) {
-    tbe.actions.push(Event:SendSnpUnique);
-    tbe.actions.push(Event:WaitCompAck);
+    DPRINTF(RubyCHIGeneric,
+            "[HNF-EP-UNIQUE-MISS-FALLBACK] addr=%#x requestor=%d reqType=%d\n",
+            address, tbe.requestor, tbe.reqType);
+    tbe.dir_sharers.remove(tbe.epRnfMachineID);
+    // Discard stale permission metadata. The fallback below reacquires data
+    // and global unique permission as separate ordered operations.
+    tbe.dataUnique := false;
+    tbe.dataMaybeDirtyUpstream := false;
+
+    tbe.actions.push(Event:ReadMissPipe);
     if (tbe.epProxyOp == EpProxyOp:RecallUnique) {
+      tbe.actions.push(Event:WaitCompAck);
       tbe.actions.pushNB(Event:SendCompUCResp);
+    } else {
+      // Data and permission are separate here. Fetch a clean shared snapshot,
+      // then snoop EP-RNF so its existing OuterUpgradeReq path performs the
+      // global invalidation barrier before this HN-F grants local uniqueness.
+      tbe.use_DMT := false;
+      tbe.epReadUniqueFallback := true;
+      tbe.is_stale := false;
+      tbe.actions.push(Event:SendReadNoSnpSharedData);
+      tbe.actions.push(Event:SendSnpCleanInvalid);
+      tbe.actions.push(Event:CompleteEPRNFReadUniqueUpgrade);
+      tbe.actions.push(Event:WaitCompAck);
+      tbe.actions.pushNB(Event:SendCompData);
     }
-    tbe.actions.pushNB(Event:SendCompData);
+    tbe.actions.push(Event:CheckCacheFill);
+    tbe.actions.push(Event:TagArrayWrite);
   } else {
-    // no one will send us data unless we explicitly ask
-    tbe.actions.push(Event:SendSnpUniqueRetToSrc);
-    tbe.actions.push(Event:WaitCompAck);
-    if (tbe.epProxyOp == EpProxyOp:RecallUnique) {
-      tbe.actions.pushNB(Event:SendCompUCResp);
+    tbe.actions.push(Event:ReadMissPipe);
+    // SnpUniqueFwd can be used only if the line is cached at a single
+    // requester; so force it off if that's the case
+    tbe.use_DCT := tbe.use_DCT && (tbe.dir_sharers.count() == 1) &&
+                   (tbe.dir_sharers.isElement(tbe.requestor) == false);
+    // v4: DCT fallback — if requester is EP-RNF, force non-DCT snoop path
+    if (tbe.use_DCT && epRnfMachineVersion >= 0 &&
+        tbe.requestor == tbe.epRnfMachineID) {
+      tbe.use_DCT := false;
     }
-    tbe.actions.pushNB(Event:SendCompData);
+    // v4: DCT fallback — if sole sharer is EP-RNF, force non-DCT snoop path
+    if (tbe.use_DCT && epRnfMachineVersion >= 0 &&
+        tbe.dir_sharers.count() == 1 &&
+        tbe.dir_sharers.isElement(tbe.epRnfMachineID)) {
+      tbe.use_DCT := false;
+    }
+    if (tbe.use_DCT) {
+      tbe.actions.push(Event:SendSnpUniqueFwd);
+      tbe.actions.pushNB(Event:WaitCompAck);
+      tbe.updateDirOnCompAck := false;
+    } else if (tbe.dataMaybeDirtyUpstream) {
+      tbe.actions.push(Event:SendSnpUnique);
+      tbe.actions.push(Event:WaitCompAck);
+      if (tbe.epProxyOp == EpProxyOp:RecallUnique) {
+        tbe.actions.pushNB(Event:SendCompUCResp);
+      }
+      tbe.actions.pushNB(Event:SendCompData);
+    } else {
+      // no one will send us data unless we explicitly ask
+      tbe.actions.push(Event:SendSnpUniqueRetToSrc);
+      tbe.actions.push(Event:WaitCompAck);
+      if (tbe.epProxyOp == EpProxyOp:RecallUnique) {
+        tbe.actions.pushNB(Event:SendCompUCResp);
+      }
+      tbe.actions.pushNB(Event:SendCompData);
+    }
+    // just tag update since data any data would become stale
+    tbe.actions.pushNB(Event:TagArrayWrite);
   }
-  // just tag update since data any data would become stale
-  tbe.actions.pushNB(Event:TagArrayWrite);
 }
 
 action(Initiate_ReadUnique_Hit_InvUpstream, desc="") {
@@ -1789,6 +1825,34 @@ action(Send_ReadNoSnp, desc="") {
   }
 }
 
+action(Send_ReadNoSnpSharedData, desc="") {
+  assert(is_HN);
+  assert(tbe.epReadUniqueFallback);
+  assert(tbe.epProxyOp == EpProxyOp:NoProxyOp);
+  assert(tbe.reqType == CHIRequestType:ReadUnique);
+  assert(tbe.use_DMT == false);
+  assert(tbe.dataValid == false);
+  assert(tbe.dir_ownerExists == false);
+  assert(tbe.dir_sharers.isEmpty());
+
+  clearExpectedReqResp(tbe);
+  tbe.expected_req_resp.addExpectedDataType(CHIDataType:CompData_SC);
+  tbe.expected_req_resp.addExpectedRespType(CHIResponseType:RespSepData);
+  tbe.expected_req_resp.setExpectedCount(2);
+  tbe.dataBlkValid.clear();
+  outgoingTransactionStart(address, curTransitionEvent());
+
+  enqueue(reqOutPort, CHIRequestMsg, request_latency) {
+    prepareRequest(tbe, CHIRequestType:ReadNoSnp, out_msg);
+    out_msg.Destination.add(mapAddressToDownstreamMachine(tbe.addr));
+    out_msg.dataToFwdRequestor := false;
+    out_msg.ubcc_needed_perm := 0;
+    out_msg.ubcc_write_intent := false;
+    out_msg.ubcc_publish_on_data := true;
+    allowRequestRetry(tbe, out_msg);
+  }
+}
+
 action(Send_ReadNoSnpDMT, desc="") {
   assert(is_HN);
   assert(tbe.use_DMT);
@@ -2043,6 +2107,14 @@ action(Send_SnpCleanInvalid, desc="") {
   assert(tbe.expected_snp_resp.hasExpected() == false);
   // at least one sharer or owner othrwise should not execute this
   assert(tbe.dir_sharers.count() > 0);
+  if (tbe.epReadUniqueFallback) {
+    assert(tbe.dataValid);
+    assert(tbe.dataBlkValid.isFull());
+    assert(tbe.dataDirty == false);
+    assert(tbe.dir_ownerExists == false);
+    assert(tbe.dir_sharers.count() == 1);
+    assert(tbe.dir_sharers.isElement(tbe.epRnfMachineID));
+  }
   enqueue(snpOutPort, CHIRequestMsg, snoop_latency) {
     prepareRequest(tbe, CHIRequestType:SnpCleanInvalid, out_msg);
     out_msg.Destination.addNetDest(tbe.dir_sharers);
@@ -2050,6 +2122,35 @@ action(Send_SnpCleanInvalid, desc="") {
     out_msg.ns := tbe.ns;
   }
   setExpectedForInvSnoop(tbe, false);
+}
+
+action(CompleteEPRNFReadUniqueUpgrade, desc="") {
+  assert(is_HN);
+  assert(tbe.epReadUniqueFallback);
+  assert(tbe.epProxyOp == EpProxyOp:NoProxyOp);
+  assert(tbe.dir_ownerExists == false);
+  assert(tbe.dir_sharers.isEmpty());
+
+  if (tbe.is_stale) {
+    // EP-RNF abandoned the upgrade because another global winner exists.
+    // The shared snapshot is no longer authoritative; retry the ordinary
+    // unique downstream path now that this node is no longer a sharer.
+    tbe.dataValid := false;
+    tbe.dataBlkValid.clear();
+    tbe.dataUnique := false;
+    tbe.dataDirty := false;
+    tbe.dataMaybeDirtyUpstream := false;
+    tbe.requestorToBeExclusiveOwner := false;
+    tbe.is_stale := false;
+    tbe.actions.pushFront(Event:SendReadNoSnp);
+  } else {
+    assert(tbe.dataValid);
+    assert(tbe.dataBlkValid.isFull());
+    assert(tbe.dataDirty == false);
+    assert(tbe.dataMaybeDirtyUpstream == false);
+    tbe.dataUnique := true;
+  }
+  tbe.epReadUniqueFallback := false;
 }
 
 action(Send_SnpCleanInvalid_NoReq, desc="") {
@@ -2905,6 +3006,9 @@ action(UpdateDirState_FromSnpResp, desc="") {
         tbe.dataValid := false;
         tbe.is_stale := true;
       }
+      if (in_msg.stale && tbe.epReadUniqueFallback) {
+        tbe.is_stale := true;
+      }
 
     } else if (in_msg.type == CHIResponseType:SnpResp_SC) {
       // expected from a sharer that already has it in shared state
@@ -3083,6 +3187,7 @@ action(Send_Retry_Hazard, desc="") {
 action(Send_CompData, desc="") {
   assert(is_valid(tbe));
   assert(tbe.dataValid);
+  assert(tbe.dataBlkValid.isFull());
 
   bool is_rd_once := tbe.reqType == CHIRequestType:ReadOnce;
   bool is_rd_no_snp := tbe.reqType == CHIRequestType:ReadNoSnp;

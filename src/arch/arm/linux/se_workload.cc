@@ -152,6 +152,9 @@ syncWaitFunc(SyscallDesc *desc, ThreadContext *tc, uint64_t node_mask,
 {
     auto *sys = dynamic_cast<System *>(tc->getSystemPtr());
     if (!sys) return (int64_t)-1;
+    if ((node_mask >> 32) != 0 || (active_threads >> 32) != 0 ||
+        active_threads == 0)
+        return (int64_t)-EINVAL;
     int ret = sys->syncWait.barrierArrive(tc,
         static_cast<uint32_t>(node_mask),
         static_cast<uint32_t>(active_threads));

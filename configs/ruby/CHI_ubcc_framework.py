@@ -368,6 +368,21 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
                  for nid in range(num_nodes)]
             hnf_wrapper, hnf_cntrl = _make_hnf(
                 ruby_system, hnf_ranges, HNFCache, node_id)
+            # Occupancy tracking is enabled only for explicit L3 experiments.
+            if os.environ.get("EP_TRACK_L3_OCCUPANCY", "0") == "1":
+                hnf_cntrl.cache.track_l3_occupancy = True
+                hnf_cntrl.cache.occupancy_sample_interval = 256
+                hnf_cntrl.cache.occupancy_node_id = node_id
+                hnf_cntrl.cache.occupancy_socket_id = sid
+                hnf_cntrl.cache.occupancy_dsm_ranges = [
+                    NodeConfig.dsm_range_for(nid, seg_size, cfg.phy_base,
+                                             num_sockets, sid)
+                    for nid in range(num_nodes)
+                ]
+                hnf_cntrl.cache.occupancy_metadata_ranges = [
+                    cfg.metadata_private_range(sid),
+                    cfg.metadata_backstore_range(sid),
+                ]
             configure_l3_dsm_policy(hnf_cntrl)
             nd['hnf_cntrls'].append(hnf_cntrl)
             nd['hnf_wrappers'].append(hnf_wrapper)

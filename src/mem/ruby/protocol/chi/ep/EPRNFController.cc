@@ -410,14 +410,15 @@ EPRNFController::recvSnoopMsg(const CHIRequestMsg *msg)
     bool hasRecall = _backend && _backend->hasActiveRecall(msg->m_addr);
 
     // ---- Fast path: no in-flight txn, no active recall ----
-    if (!inflight && !hasRecall) {
+    if (!inflight &&
+        (!hasRecall || msg->m_ep_proxy_op == EpProxyOp_NoProxyOp)) {
         return processSnoopImmediate(msg);
     }
 
     // ---- §10.2: Benign self-snoop (recall-induced) → IMMED clean ----
     // Must be checked BEFORE STALE arbitration, otherwise the recall's own
     // post-RecallResponse cleanup snoop would be aborted, causing liveness bug.
-    if (hasRecall) {
+    if (hasRecall && msg->m_ep_proxy_op != EpProxyOp_NoProxyOp) {
         DPRINTF(RubyEP, "[RECALL-SNOOP] node=%d PA=0x%lx "
                "recall-induced snoop — immediate clean SnpResp_I\n",
                _nodeId, msg->m_addr);
@@ -815,7 +816,8 @@ EPRNFController::handleSnpCleanInvalid(const CHIRequestMsg *msg)
     //     Just respond SnpResp_I immediately; the RECALL handles ownership transfer.
     if (isDsmLine) {
         auto chiIt = _pendingChiTxns.find(msg->m_addr);
-        if (chiIt != _pendingChiTxns.end()) {
+        if (chiIt != _pendingChiTxns.end() &&
+            msg->m_ep_proxy_op != EpProxyOp_NoProxyOp) {
             DPRINTF(RubyEP, "[SELF-SNOOP] node=%d SnpCleanInvalid PA=0x%lx "
                    "pendingChiTxn op=%d — immediate SnpResp_I\n",
                    _nodeId, msg->m_addr,
@@ -827,7 +829,8 @@ EPRNFController::handleSnpCleanInvalid(const CHIRequestMsg *msg)
     // ---- RECALL snoop guard: if EPBackend has an active recall for this PA,
     //     the SnpCleanInvalid is RECALL-induced (TC98 §6.1) — the UBCC RECALL
     //     handles ownership transfer, so no OuterUpgradeReq is needed.
-    if (isDsmLine && backend && backend->hasActiveRecall(msg->m_addr)) {
+    if (isDsmLine && backend && backend->hasActiveRecall(msg->m_addr) &&
+        msg->m_ep_proxy_op != EpProxyOp_NoProxyOp) {
         DPRINTF(RubyEP, "[RECALL-SNOOP] node=%d SnpCleanInvalid PA=0x%lx "
                "during active recall — immediate SnpResp_I\n",
                _nodeId, msg->m_addr);

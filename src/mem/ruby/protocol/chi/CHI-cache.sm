@@ -475,6 +475,7 @@ machine(MachineType:Cache, "Cache coherency protocol") :
     SendReadShared,       out_trans="yes", desc="Send a ReadShared or ReadNotSharedDirty is allow_SD is false";
     SendReadOnce,         out_trans="yes", desc="Send a ReadOnce";
     SendReadNoSnp,        out_trans="yes", desc="Send a SendReadNoSnp";
+    SendReadNoSnpSharedData, out_trans="yes", desc="Fetch shared data before an EP-RNF upgrade";
     SendReadNoSnpDMT,     out_trans="yes", desc="Send a SendReadNoSnp using DMT";
     SendReadUnique,       out_trans="yes", desc="Send a ReadUnique";
     SendMakeReadUnique,   out_trans="yes", desc="Send a MakeReadUnique";
@@ -525,6 +526,7 @@ machine(MachineType:Cache, "Cache coherency protocol") :
     CheckUpgrade_FromStore, desc="Upgrade needed by a Store";
     CheckUpgrade_FromCU,    desc="Upgrade needed by an upstream CleanUnique";
     CheckUpgrade_FromRU,    desc="Upgrade needed by an upstream ReadUnique";
+    CompleteEPRNFReadUniqueUpgrade, desc="Complete or recover a sole EP-RNF ReadUnique upgrade";
 
     // Snoop requests
     // SnpNotSharedDirty are sent instead of SnpShared for ReadNotSharedDirty
@@ -773,6 +775,7 @@ machine(MachineType:Cache, "Cache coherency protocol") :
     bool is_req_hazard, desc="Snoop hazard with an outstanding request";
     bool is_repl_hazard, desc="Snoop hazard with an outstanding writeback request";
     bool is_stale,      desc="Request is now stale because of a snoop hazard";
+    bool epReadUniqueFallback, default="false", desc="ReadUnique is using shared-data then EP-RNF upgrade fallback";
 
     // Tracks requests sent downstream
     CHIRequestType pendReqType, desc="Sent request type";
@@ -787,6 +790,9 @@ machine(MachineType:Cache, "Cache coherency protocol") :
     NetDest pendReqDest;
     bool pendReqD2OrigReq;
     bool pendReqRetToSrc;
+    int pendReqUbccNeededPerm;
+    bool pendReqUbccWriteIntent;
+    bool pendReqUbccPublishOnData;
 
     // This TBE stalled a message and thus we need to call wakeUpBuffers
     // at some point

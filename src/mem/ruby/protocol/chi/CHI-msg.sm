@@ -142,6 +142,7 @@ structure(CHIRequestMsg, desc="", interface="Message") {
   int ubcc_needed_perm, desc="UBCC needed permission (0=Shared,1=Unique)", default="0";
   bool ubcc_write_intent, desc="UBCC write intent for MESI E/M distinction", default="false";
   int ubcc_ingress_socket, desc="Original requester socket for UBCC source routing", default="0";
+  bool ubcc_publish_on_data, desc="Publish lossless one-way grant after final data beat", default="false";
 
   // v4: EP-RNF proxy operation (internal gem5 bookkeeping only).
   // Set by EP-RNF on proxy requests to HN-F to enable special completion

@@ -54,3 +54,18 @@ class RubyCache(SimObject):
     dataAccessLatency = Param.Cycles(1, "cycles for a data array access")
     tagAccessLatency = Param.Cycles(1, "cycles for a tag array access")
     resourceStalls = Param.Bool(False, "stall if there is a resource failure")
+
+    # Optional cache-line occupancy instrumentation.  This is intentionally
+    # disabled by default so ordinary Ruby caches pay no accounting cost.
+    track_l3_occupancy = Param.Bool(False, "track classified L3 occupancy")
+    occupancy_sample_interval = Param.Unsigned(
+        0, "emit one L3 occupancy sample after this many mutations; 0 disables"
+    )
+    occupancy_node_id = Param.Int(-1, "node identity for occupancy reports")
+    occupancy_socket_id = Param.Int(-1, "socket identity for occupancy reports")
+    occupancy_dsm_ranges = VectorParam.AddrRange(
+        [], "address ranges classified as DSM by occupancy tracking"
+    )
+    occupancy_metadata_ranges = VectorParam.AddrRange(
+        [], "address ranges classified as metadata by occupancy tracking"
+    )

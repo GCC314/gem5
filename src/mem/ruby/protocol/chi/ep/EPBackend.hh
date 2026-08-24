@@ -833,6 +833,8 @@ class EPBackend : public SimObject
     void registerHADataCache(int sourceSocket, CacheMemory *cache);
     void invalidateHADataCaches(int sourceSocket, uint64_t localLinePa);
     bool hasHADataCacheLine(int sourceSocket, uint64_t localLinePa) const;
+    bool readHADataCacheLine(int sourceSocket, uint64_t localLinePa,
+                             DataBlock &data) const;
     int requestHAPresenceProbe(uint64_t linePa, HAProbeAction action,
                                uint64_t expectedEpoch, int dstNode,
                                int dstSocket, uint64_t &ioReqId,

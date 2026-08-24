@@ -162,12 +162,20 @@ EPSNFController::wakeup()
                     dat->m_m_shared_hint = sharedHint;
                     const bool lastBeat = (i == dataMsgsPerLine - 1);
                     std::function<void()> onSent;
-                    if (lastBeat && _backend->haEndpointEnabled()) {
+                    if (lastBeat &&
+                        (_backend->haEndpointEnabled() || it->publishOnData)) {
                         onSent = [this, linePa = it->linePa,
                                   neededPerm = it->neededPerm,
-                                  writeIntent = it->writeIntent] {
-                            _backend->completeHARemoteGrant(
-                                linePa, neededPerm, writeIntent, _socketId);
+                                  writeIntent = it->writeIntent,
+                                  publishOnData = it->publishOnData] {
+                            if (_backend->haEndpointEnabled()) {
+                                _backend->completeHARemoteGrant(
+                                    linePa, neededPerm, writeIntent, _socketId);
+                            }
+                            if (publishOnData) {
+                                _backend->notifyLocalLinePublished(
+                                    linePa, _socketId);
+                            }
                         };
                     }
                     sendDataReliable(dat, std::move(onSent));
@@ -371,6 +379,7 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
         entry.hnReq = msg->m_requestor;
         entry.fwdReq = msg->m_fwdRequestor;
         entry.dataToFwdReq = msg->m_dataToFwdRequestor;
+        entry.publishOnData = msg->m_ubcc_publish_on_data;
         _retryQueue.push_back(entry);
         scheduleEvent(Cycles(epsnf_retry_cycles()));
         return true;
@@ -435,6 +444,7 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
             entry.hnReq = msg->m_requestor;
             entry.fwdReq = msg->m_fwdRequestor;
             entry.dataToFwdReq = msg->m_dataToFwdRequestor;
+            entry.publishOnData = msg->m_ubcc_publish_on_data;
             _retryQueue.push_back(entry);
             scheduleEvent(Cycles(epsnf_retry_cycles()));
             return true;
@@ -491,12 +501,18 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
         // at HN-F (see docs/tbe-race-condition.svg for details).
         PendingDataOutput pending;
         pending.msg = dat;
-        if (i == dataMsgsPerLine - 1 && _backend->haEndpointEnabled() &&
-            !internalRecall) {
+        if (i == dataMsgsPerLine - 1 && !internalRecall &&
+            (_backend->haEndpointEnabled() || msg->m_ubcc_publish_on_data)) {
             pending.onSent = [this, linePa = msg->m_addr, neededPerm,
-                              writeIntent] {
-                _backend->completeHARemoteGrant(
-                    linePa, neededPerm, writeIntent, _socketId);
+                              writeIntent,
+                              publishOnData = msg->m_ubcc_publish_on_data] {
+                if (_backend->haEndpointEnabled()) {
+                    _backend->completeHARemoteGrant(
+                        linePa, neededPerm, writeIntent, _socketId);
+                }
+                if (publishOnData) {
+                    _backend->notifyLocalLinePublished(linePa, _socketId);
+                }
             };
         }
         _deferredCompData.push_back(std::move(pending));

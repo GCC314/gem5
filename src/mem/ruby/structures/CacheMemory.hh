@@ -45,6 +45,7 @@
 #include <unordered_map>
 #include <vector>
 
+#include "base/addr_range.hh"
 #include "base/statistics.hh"
 #include "mem/cache/replacement_policies/base.hh"
 #include "mem/cache/replacement_policies/replaceable_entry.hh"
@@ -160,6 +161,29 @@ class CacheMemory : public SimObject
     Addr getAddressAtIdx(int idx) const;
 
   private:
+    enum OccupancyClass : unsigned
+    {
+        OccDsm = 0,
+        OccMetadata,
+        OccOther,
+        OccNumClasses
+    };
+
+    struct PendingReplacement
+    {
+        Addr incoming = 0;
+        Addr victim = 0;
+        OccupancyClass victimClass = OccOther;
+        bool valid = false;
+        bool victimDeallocated = false;
+    };
+
+    OccupancyClass occupancyClass(Addr address) const;
+    void recordOccupancyAllocate(Addr address, int64_t cache_set);
+    void recordOccupancyDeallocate(Addr address, int64_t cache_set);
+    void updateOccupancyStats();
+    void maybeEmitOccupancySample();
+
     // convert a Address to its location in the cache
     int64_t addressToCacheSet(Addr address) const;
 
@@ -195,6 +219,25 @@ class CacheMemory : public SimObject
     int m_start_index_bit;
     bool m_resource_stalls;
     int m_block_size;
+
+    const bool m_track_l3_occupancy;
+    const uint64_t m_occupancy_sample_interval;
+    const int m_occupancy_node_id;
+    const int m_occupancy_socket_id;
+    const std::vector<AddrRange> m_occupancy_dsm_ranges;
+    const std::vector<AddrRange> m_occupancy_metadata_ranges;
+    uint64_t m_occupancy_current[OccNumClasses] = {};
+    uint64_t m_occupancy_peak[OccNumClasses] = {};
+    uint64_t m_occupancy_allocations[OccNumClasses] = {};
+    uint64_t m_occupancy_deallocations[OccNumClasses] = {};
+    uint64_t m_occupancy_replacements[OccNumClasses][OccNumClasses] = {};
+    uint64_t m_occupancy_current_total = 0;
+    uint64_t m_occupancy_peak_total = 0;
+    uint64_t m_occupancy_allocation_total = 0;
+    uint64_t m_occupancy_deallocation_total = 0;
+    uint64_t m_occupancy_replacement_total = 0;
+    uint64_t m_occupancy_mutations = 0;
+    mutable std::vector<PendingReplacement> m_pending_replacements;
 
     /**
      * We store all the ReplacementData in a 2-dimensional array. By doing
@@ -251,6 +294,17 @@ class CacheMemory : public SimObject
           statistics::Formula m_prefetch_accesses;
 
           statistics::Vector m_accessModeType;
+
+          statistics::Scalar occupancyCurrentTotal;
+          statistics::Scalar occupancyPeakTotal;
+          statistics::Scalar occupancyAllocationsTotal;
+          statistics::Scalar occupancyDeallocationsTotal;
+          statistics::Scalar occupancyReplacementsTotal;
+          statistics::Vector occupancyCurrent;
+          statistics::Vector occupancyPeak;
+          statistics::Vector occupancyAllocations;
+          statistics::Vector occupancyDeallocations;
+          statistics::Vector occupancyReplacementFromTo;
       } cacheMemoryStats;
 
     public:

@@ -410,12 +410,16 @@ void initializeTBE(TBE tbe, Addr addr, int storSlot) {
   tbe.doCacheFill := false;
 
   tbe.pendReqType := CHIRequestType:null;
+  tbe.pendReqUbccNeededPerm := 0;
+  tbe.pendReqUbccWriteIntent := false;
+  tbe.pendReqUbccPublishOnData := false;
 
   tbe.pendAction := Event:null;
   tbe.finalState := State:null;
   tbe.delayNextAction := intToTick(0);
 
   tbe.is_stale := false;
+  tbe.epReadUniqueFallback := false;
   tbe.haStoreExternalHit := false;
   tbe.haStoreMissFill := false;
   tbe.ubccIngressSocket := 0;
@@ -697,6 +701,7 @@ void prepareRequest(TBE tbe, CHIRequestType type, CHIRequestMsg & out_msg) {
   out_msg.ubcc_needed_perm := 0;
   out_msg.ubcc_write_intent := false;
   out_msg.ubcc_ingress_socket := tbe.ubccIngressSocket;
+  out_msg.ubcc_publish_on_data := false;
 
   // v4: propagate epProxyOp so the snoop recipient (EP-RNF) can distinguish
   // a self-initiated upgrade snoop (NoProxyOp, from CPU store) from a passive
@@ -754,6 +759,9 @@ void allowRequestRetry(TBE tbe, CHIRequestMsg & out_msg) {
   tbe.pendReqDest := out_msg.Destination;
   tbe.pendReqD2OrigReq := out_msg.dataToFwdRequestor;
   tbe.pendReqRetToSrc := out_msg.retToSrc;
+  tbe.pendReqUbccNeededPerm := out_msg.ubcc_needed_perm;
+  tbe.pendReqUbccWriteIntent := out_msg.ubcc_write_intent;
+  tbe.pendReqUbccPublishOnData := out_msg.ubcc_publish_on_data;
 }
 
 void prepareRequestRetry(TBE tbe, CHIRequestMsg & out_msg) {
@@ -777,10 +785,12 @@ void prepareRequestRetry(TBE tbe, CHIRequestMsg & out_msg) {
   out_msg.atomic_op.clear();
   out_msg.atomic_op.orMask(tbe.atomic_op);
 
-  // Preserve UBCC sideband from original request semantics on retry.
-  // Sideband is derived from tbe.reqType (the original CPU request type),
-  // which does not change across retries.
-  setUbccSideband(tbe, out_msg);
+  // Retry the sideband that was actually sent. Some compound transactions
+  // intentionally fetch shared data before completing a unique permission
+  // upgrade, so deriving this again from the original request is incorrect.
+  out_msg.ubcc_needed_perm := tbe.pendReqUbccNeededPerm;
+  out_msg.ubcc_write_intent := tbe.pendReqUbccWriteIntent;
+  out_msg.ubcc_publish_on_data := tbe.pendReqUbccPublishOnData;
   out_msg.ubcc_ingress_socket := tbe.ubccIngressSocket;
 }
 
