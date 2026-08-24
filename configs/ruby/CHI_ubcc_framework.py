@@ -10,6 +10,7 @@ import math
 
 import m5
 from m5.objects import *
+from m5.proxy import isproxy
 
 from . import CHI_config as chi_defs
 from .CHI_basic_framework_config import (
@@ -485,7 +486,96 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
             # DSM must not go through DL_SNF.
             snf_dests.append(nd['ep_snf_cntrls'][sid])
             nd['hnf_wrappers'][sid].setDownstream(snf_dests)
-            nd['hnf_cntrls'][sid].unproxyParams()
+            hnf_cntrl = nd['hnf_cntrls'][sid]
+            try:
+                hnf_cntrl.unproxyParams()
+            except Exception as exc:
+                # Avoid path()/str(SimObject): either can recurse when the
+                # remote configuration has a parent or multidict cycle.
+                import sys
+
+                def _obj_desc(obj):
+                    if obj is None:
+                        return "None"
+                    return "type={} name={!r} id={}".format(
+                        type(obj).__name__, getattr(obj, '_name', None),
+                        hex(id(obj)))
+
+                def _dump_parent_chain(label, obj):
+                    print("[HNF-UNPROXY-DIAG] {} parent chain".format(label),
+                          flush=True)
+                    seen = {}
+                    for depth in range(32):
+                        if obj is None:
+                            print("  {}: None".format(depth), flush=True)
+                            return
+                        obj_id = id(obj)
+                        if obj_id in seen:
+                            print("  {}: CYCLE -> depth {} {}".format(
+                                depth, seen[obj_id], _obj_desc(obj)),
+                                flush=True)
+                            return
+                        seen[obj_id] = depth
+                        print("  {}: {}".format(depth, _obj_desc(obj)),
+                              flush=True)
+                        obj = getattr(obj, '_parent', None)
+                    print("  chain exceeds 32 objects", flush=True)
+
+                def _dump_multidict(label, md):
+                    print("[HNF-UNPROXY-DIAG] {} multidict chain".format(label),
+                          flush=True)
+                    seen = {}
+                    for depth in range(64):
+                        md_id = id(md)
+                        if md_id in seen:
+                            print("  {}: CYCLE -> depth {} id={}".format(
+                                depth, seen[md_id], hex(md_id)), flush=True)
+                            return
+                        seen[md_id] = depth
+                        local = getattr(md, 'local', None)
+                        proxy_names = []
+                        if isinstance(local, dict):
+                            proxy_names = sorted(
+                                name for name, value in local.items()
+                                if isproxy(value))
+                        print("  {}: type={} id={} local_proxies={}".format(
+                            depth, type(md).__name__, hex(md_id), proxy_names),
+                            flush=True)
+                        if not hasattr(md, 'parent'):
+                            return
+                        md = md.parent
+                    print("  chain exceeds 64 multidicts", flush=True)
+
+                print("[HNF-UNPROXY-DIAG] node={} sid={} hnf={}".format(
+                    node_id, sid, _obj_desc(hnf_cntrl)), flush=True)
+                print("[HNF-UNPROXY-DIAG] exception type={} args={}".format(
+                    type(exc).__name__, tuple(type(arg).__name__
+                                              for arg in exc.args)),
+                    flush=True)
+                tb = sys.exc_info()[2]
+                while tb is not None:
+                    frame = tb.tb_frame
+                    print("[HNF-UNPROXY-DIAG] frame {}:{} {}".format(
+                        frame.f_code.co_filename, tb.tb_lineno,
+                        frame.f_code.co_name), flush=True)
+                    if frame.f_code.co_name == 'unproxyParams':
+                        param = frame.f_locals.get('param', '<not-set>')
+                        value = frame.f_locals.get('value')
+                        print("[HNF-UNPROXY-DIAG] failing param={!r} value={}".
+                              format(param, _obj_desc(value)), flush=True)
+                    tb = tb.tb_next
+                print("[HNF-UNPROXY-DIAG] hnf MRO={}".format([
+                    cls.__module__ + '.' + cls.__name__
+                    for cls in type(hnf_cntrl).__mro__
+                ]), flush=True)
+                _dump_parent_chain('hnf', hnf_cntrl)
+                _dump_parent_chain('hnf_wrapper', nd['hnf_wrappers'][sid])
+                _dump_parent_chain('ruby_system', ruby_system)
+                network = getattr(ruby_system, '_children', {}).get('network')
+                _dump_parent_chain('network', network)
+                _dump_multidict('hnf._params', hnf_cntrl._params)
+                _dump_multidict('hnf._values', hnf_cntrl._values)
+                raise
 
     for cntrl in all_cntrls:
         cntrl.data_channel_size = params.data_width
