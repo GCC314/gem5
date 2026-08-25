@@ -490,6 +490,91 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
             import faulthandler
             import sys
 
+            def _raw_md_lookup(md, key):
+                seen = {}
+                for depth in range(64):
+                    if md is None:
+                        return 'missing', None, None, depth
+                    md_id = id(md)
+                    if md_id in seen:
+                        return 'md-cycle', None, md_id, depth
+                    seen[md_id] = depth
+                    if isinstance(md, dict):
+                        if key in md:
+                            return 'found', md[key], md_id, depth
+                        return 'missing', None, md_id, depth
+                    local = getattr(md, 'local', None)
+                    if isinstance(local, dict) and key in local:
+                        return 'found', local[key], md_id, depth
+                    deleted = getattr(md, 'deleted', None)
+                    if (isinstance(deleted, dict) and
+                            deleted.get(key, False)):
+                        return 'deleted', None, md_id, depth
+                    if not hasattr(md, 'parent'):
+                        return 'missing', None, md_id, depth
+                    md = md.parent
+                return 'md-too-deep', None, id(md), 64
+
+            def _raw_eventq_chain(obj):
+                seen = {}
+                print('[EVQ-RAW] begin', flush=True)
+                for depth in range(64):
+                    if obj is None:
+                        print('[EVQ-RAW] {} object=None'.format(depth),
+                              flush=True)
+                        return
+                    obj_id = id(obj)
+                    if obj_id in seen:
+                        print('[EVQ-RAW] {} OBJECT-CYCLE id={} '
+                              'first_depth={}'.format(
+                                  depth, hex(obj_id), seen[obj_id]),
+                              flush=True)
+                        return
+                    seen[obj_id] = depth
+                    try:
+                        values = object.__getattribute__(obj, '_values')
+                    except Exception as exc:
+                        print('[EVQ-RAW] {} cannot-read-values '
+                              'obj_type={} obj_id={} exc={}'.format(
+                                  depth, type(obj).__name__, hex(obj_id),
+                                  type(exc).__name__), flush=True)
+                        return
+                    status, value, source_md_id, md_depth = _raw_md_lookup(
+                        values, 'eventq_index')
+                    try:
+                        parent = object.__getattribute__(obj, '_parent')
+                    except Exception:
+                        parent = None
+                    try:
+                        name = object.__getattribute__(obj, '_name')
+                    except Exception:
+                        name = None
+                    print('[EVQ-RAW] depth={} obj_type={} obj_name={!r} '
+                          'obj_id={} parent_type={} parent_id={} '
+                          'values_id={} lookup={} source_md={} md_depth={} '
+                          'value_type={} value_id={} proxy_attr={!r}'.format(
+                              depth, type(obj).__name__, name, hex(obj_id),
+                              (type(parent).__name__
+                               if parent is not None else None),
+                              (hex(id(parent))
+                               if parent is not None else None),
+                              hex(id(values)), status,
+                              (hex(source_md_id)
+                               if source_md_id is not None else None),
+                              md_depth,
+                              (type(value).__name__
+                               if value is not None else None),
+                              (hex(id(value))
+                               if value is not None else None),
+                              getattr(value, '_attr', None)), flush=True)
+                    if status in ('md-cycle', 'md-too-deep'):
+                        return
+                    obj = parent
+                print('[EVQ-RAW] object chain exceeds 64 levels', flush=True)
+
+            _raw_eventq_chain(hnf_cntrl)
+            print('[EVQ-RAW] entering unproxyParams', flush=True)
+
             print("[HNF-UNPROXY-WATCH] BEGIN node={} sid={} type={} id={}".
                   format(node_id, sid, type(hnf_cntrl).__name__,
                          hex(id(hnf_cntrl))), flush=True)
