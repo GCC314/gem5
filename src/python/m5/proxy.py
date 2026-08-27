@@ -179,6 +179,24 @@ class AttrProxy(BaseProxy):
         if attr.startswith("_"):
             return super().__getattr__(self, attr)
         if hasattr(self, "_pdesc"):
+            import traceback
+
+            pdesc = object.__getattribute__(self, "_pdesc")
+            print(
+                "[BOUND-PROXY-DIAG] attr={!r} proxy_type={} proxy_id={} "
+                "search_self={} search_up={} base_attr={!r} modifiers={} "
+                "param_name={!r} param_type={!r}".format(
+                    attr, type(self).__name__, hex(id(self)),
+                    object.__getattribute__(self, "_search_self"),
+                    object.__getattribute__(self, "_search_up"),
+                    object.__getattribute__(self, "_attr"),
+                    object.__getattribute__(self, "_modifiers"),
+                    getattr(pdesc, "name", None),
+                    getattr(pdesc, "ptype_str", None),
+                ),
+                flush=True,
+            )
+            traceback.print_stack(limit=12)
             raise AttributeError(
                 "Attribute reference on bound proxy " f"({self}.{attr})"
             )
