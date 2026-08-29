@@ -976,6 +976,8 @@ class EPBackend : public SimObject
         uint64_t baseEpoch;   // home-approved GRANT_HANDSHAKE baseEpoch
         uint64_t reqId;
         int sourceAdapter;
+        OuterReqType reqType;
+        bool writeIntent;
         OuterGrantType grantType;
         Tick outerStartTick;
         bool clearQueued;
@@ -983,6 +985,8 @@ class EPBackend : public SimObject
 
         PendingGrantTxn() : valid(false), linePa(0), localLinePa(0), homeNode(-1),
                             baseEpoch(0), reqId(0), sourceAdapter(0),
+                            reqType(OuterReqType::GlobalReadShared),
+                            writeIntent(false),
                             grantType(OuterGrantType::GlobalGrantShared),
                             outerStartTick(0), clearQueued(false),
                             clearSendLogged(false) {}

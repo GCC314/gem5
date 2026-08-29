@@ -30,6 +30,25 @@ namespace ruby
 namespace
 {
 
+const char *
+outerOpName(OuterReqType reqType, bool writeIntent)
+{
+    if (reqType == OuterReqType::GlobalReadShared)
+        return "read_shared";
+    return writeIntent ? "write_unique" : "read_unique";
+}
+
+const char *
+outerGrantName(OuterGrantType grantType)
+{
+    switch (grantType) {
+      case OuterGrantType::GlobalGrantShared: return "shared";
+      case OuterGrantType::GlobalGrantExclusive: return "exclusive";
+      case OuterGrantType::GlobalGrantModified: return "modified";
+    }
+    return "unknown";
+}
+
 uint64_t
 makeRequesterReqId(int nodeId, uint64_t seq)
 {
@@ -940,9 +959,12 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
             if (start) {
                 inform(
                     "[EP-PERF] kind=outer node=%d pa=0x%lx reqId=%lu "
+                    "op=%s write_intent=%d grant=%s source_socket=%d "
                     "start=%lu end=%lu latency_ps=%lu\n",
-                    _nodeId, homePa, completedReqId, start, curTick(),
-                    curTick() - start);
+                    _nodeId, homePa, completedReqId,
+                    outerOpName(txn.reqType, txn.writeIntent),
+                    txn.writeIntent ? 1 : 0, outerGrantName(txn.grantType),
+                    txn.sourceAdapter, start, curTick(), curTick() - start);
             }
             if (_epRnfCtrl) {
                 _epRnfCtrl->setOuterTxnPending(line_pa, false);
@@ -1261,6 +1283,8 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
         txn.baseEpoch = grantBaseEpoch;
         txn.reqId = reqIdVal;
         txn.sourceAdapter = adapterIdx;
+        txn.reqType = entry.pendingReq;
+        txn.writeIntent = entry.writeIntent;
         txn.grantType = grantEnv.grantType;
         txn.outerStartTick = entry.outerStartTick;
         auto existingTxn = _pendingGrantTxns.find(homePa);
@@ -1448,8 +1472,11 @@ EPBackend::notifyOneWayClearHandedOff(
            _nodeId, sourceSocket, txn.homeNode, homePa, reqId, curTick());
     if (txn.outerStartTick) {
         inform("[EP-PERF] kind=outer_oneway_root node=%d pa=0x%lx reqId=%lu "
+               "op=%s write_intent=%d grant=%s source_socket=%d "
                "start=%lu end=%lu latency_ps=%lu\n", _nodeId, homePa,
-               reqId, txn.outerStartTick, curTick(),
+               reqId, outerOpName(txn.reqType, txn.writeIntent),
+               txn.writeIntent ? 1 : 0, outerGrantName(txn.grantType),
+               txn.sourceAdapter, txn.outerStartTick, curTick(),
                curTick() - txn.outerStartTick);
     }
     if (_epRnfCtrl) {
