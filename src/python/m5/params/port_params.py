@@ -38,6 +38,7 @@
 # OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 import copy
+import traceback
 
 from .. import proxy
 from ..util import (
@@ -61,6 +62,127 @@ from .base_params import (
 # Port reference: encapsulates a reference to a particular port on a
 # particular SimObject.
 class PortRef:
+    @staticmethod
+    def _safe_parent_chain(obj, limit=12):
+        chain = []
+        seen = {}
+        for depth in range(limit):
+            if obj is None:
+                chain.append((depth, None, None, None))
+                break
+            obj_id = id(obj)
+            if obj_id in seen:
+                chain.append((depth, "CYCLE", hex(obj_id), seen[obj_id]))
+                break
+            seen[obj_id] = depth
+            chain.append((depth, type(obj).__name__,
+                          getattr(obj, "_name", None), hex(obj_id)))
+            obj = getattr(obj, "_parent", None)
+        return chain
+
+    @staticmethod
+    def _safe_obj_info(obj):
+        if obj is None:
+            return {"object": None}
+
+        values = getattr(obj, "_values", None)
+        eventq = values.get("eventq_index") if values is not None else None
+        parent = getattr(obj, "_parent", None)
+        name = getattr(obj, "_name", None)
+        parent_value = None
+        parent_child = None
+
+        if parent is not None and name is not None:
+            parent_values = getattr(parent, "_values", None)
+            parent_children = getattr(parent, "_children", None)
+            if parent_values is not None:
+                parent_value = parent_values.get(name)
+            if parent_children is not None:
+                parent_child = parent_children.get(name)
+
+        return {
+            "type": type(obj).__name__,
+            "name": name,
+            "obj_id": hex(id(obj)),
+            "values_id": hex(id(values)) if values is not None else None,
+            "eventq_type": type(eventq).__name__
+            if eventq is not None else None,
+            "eventq_id": hex(id(eventq)) if eventq is not None else None,
+            "eventq_proxy": proxy.isproxy(eventq)
+            if eventq is not None else False,
+            "parent_type": type(parent).__name__
+            if parent is not None else None,
+            "parent_name": getattr(parent, "_name", None)
+            if parent is not None else None,
+            "parent_id": hex(id(parent)) if parent is not None else None,
+            "parent_value_id": hex(id(parent_value))
+            if parent_value is not None else None,
+            "parent_child_id": hex(id(parent_child))
+            if parent_child is not None else None,
+            "obj_is_parent_value": obj is parent_value,
+            "obj_is_parent_child": obj is parent_child,
+            "cc_params": getattr(obj, "_ccParams", None) is not None,
+            "cc_object_value": getattr(obj, "_ccObject", None),
+            "parent_chain": PortRef._safe_parent_chain(obj),
+        }
+
+    @staticmethod
+    def _root_membership(obj):
+        try:
+            from m5.objects import Root
+
+            root = Root.getInstance()
+        except Exception:
+            root = None
+
+        if root is None:
+            return False, []
+
+        in_root = False
+        candidates = []
+        obj_name = getattr(obj, "_name", None)
+        obj_type = type(obj).__name__
+        obj_parent = getattr(obj, "_parent", None)
+        parent_name = getattr(obj_parent, "_name", None)
+        parent_type = (
+            type(obj_parent).__name__ if obj_parent is not None else None
+        )
+
+        try:
+            descendants = list(root.descendants())
+        except Exception as exc:
+            return False, [{"descendants_error": type(exc).__name__}]
+
+        for candidate in descendants:
+            if candidate is obj:
+                in_root = True
+            candidate_parent = getattr(candidate, "_parent", None)
+            candidate_parent_type = type(candidate_parent).__name__ \
+                if candidate_parent is not None else None
+            candidate_parent_name = getattr(candidate_parent, "_name", None) \
+                if candidate_parent is not None else None
+            if (type(candidate).__name__ == obj_type and
+                    getattr(candidate, "_name", None) == obj_name and
+                    candidate_parent_type == parent_type and
+                    candidate_parent_name == parent_name):
+                candidates.append(PortRef._safe_obj_info(candidate))
+
+        return in_root, candidates
+
+    @staticmethod
+    def _dump_getport_failure(side, ref):
+        obj = getattr(ref, "simobj", None)
+        in_root, candidates = PortRef._root_membership(obj)
+        print(
+            "[GETPORT-FAIL] side={} ref_type={} ref_id={} "
+            "port={!r} index={} info={} in_root={} candidates={}".format(
+                side, type(ref).__name__, hex(id(ref)),
+                getattr(ref, "name", None), getattr(ref, "index", -1),
+                PortRef._safe_obj_info(obj), in_root, candidates),
+            flush=True,
+        )
+        traceback.print_exc()
+
     def __init__(self, simobj, name, role, is_source):
         assert isSimObject(simobj) or isSimObjectClass(simobj)
         self.simobj = simobj
@@ -104,6 +226,28 @@ class PortRef:
     # "obj1.portA = obj2.portB", or via VectorPortElementRef.__setitem__,
     # e.g., "obj1.portA[3] = obj2.portB".
     def connect(self, other):
+        if (self.name == "out_port" and
+                type(self.simobj).__name__ == "MessageBuffer" and
+                getattr(self.simobj, "_name", None) == "reqOut"):
+            parent = getattr(self.simobj, "_parent", None)
+            print(
+                "[REQOUT-CONNECT] reqout_id={} values_id={} "
+                "controller_type={} controller_name={!r} "
+                "controller_id={} ref_id={} other_type={} other_id={} "
+                "other_simobj_type={} other_simobj_id={}".format(
+                    hex(id(self.simobj)), hex(id(self.simobj._values)),
+                    type(parent).__name__ if parent is not None else None,
+                    getattr(parent, "_name", None)
+                    if parent is not None else None,
+                    hex(id(parent)) if parent is not None else None,
+                    hex(id(self)), type(other).__name__, hex(id(other)),
+                    type(getattr(other, "simobj", None)).__name__,
+                    hex(id(other.simobj))
+                    if getattr(other, "simobj", None) is not None else None),
+                flush=True,
+            )
+            traceback.print_stack(limit=10)
+
         if isinstance(other, VectorPortRef):
             # reference to plain VectorPort is implicit append
             other = other._get_next()
@@ -203,15 +347,58 @@ class PortRef:
 
     # Call C++ to create corresponding port connection between C++ objects
     def ccConnect(self):
-        if self.ccConnected:  # already done this
+        if self.ccConnected:
             return
 
         peer = self.peer
-        if not self.peer:  # nothing to connect to
+        if not peer:
             return
 
-        port = self.simobj.getPort(self.name, self.index)
-        peer_port = peer.simobj.getPort(peer.name, peer.index)
+        interesting = (
+            (self.name == "out_port" and
+             type(self.simobj).__name__ == "MessageBuffer" and
+             getattr(self.simobj, "_name", None) == "reqOut") or
+            (getattr(peer, "name", None) == "out_port" and
+             type(getattr(peer, "simobj", None)).__name__ ==
+             "MessageBuffer" and
+             getattr(getattr(peer, "simobj", None), "_name", None) ==
+             "reqOut")
+        )
+
+        if interesting:
+            print(
+                "[REQOUT-CCCONNECT] self_ref={} self_info={} "
+                "peer_ref={} peer_info={} symmetric={}".format(
+                    {
+                        "type": type(self).__name__,
+                        "id": hex(id(self)),
+                        "port": self.name,
+                        "index": getattr(self, "index", -1),
+                    },
+                    PortRef._safe_obj_info(self.simobj),
+                    {
+                        "type": type(peer).__name__,
+                        "id": hex(id(peer)),
+                        "port": getattr(peer, "name", None),
+                        "index": getattr(peer, "index", -1),
+                    },
+                    PortRef._safe_obj_info(getattr(peer, "simobj", None)),
+                    getattr(peer, "peer", None) is self),
+                flush=True,
+            )
+
+        try:
+            port = self.simobj.getPort(self.name, self.index)
+        except Exception:
+            PortRef._dump_getport_failure("self", self)
+            raise
+
+        try:
+            peer_port = peer.simobj.getPort(peer.name, peer.index)
+        except Exception:
+            PortRef._dump_getport_failure("peer", peer)
+            raise
+
         port.bind(peer_port)
 
         self.ccConnected = True
