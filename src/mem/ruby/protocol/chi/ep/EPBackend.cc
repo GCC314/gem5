@@ -2209,7 +2209,7 @@ EPBackend::handleWriteback(uint64_t line_pa, bool keepAsClean,
                            const WritebackQueryMeta *queryMeta,
                            uint64_t *outQueryReqId,
                            uint64_t cachedQlmReqId,
-                           int sourceSocket)
+                           int sourceSocket, uint64_t *ioWritebackReqId)
 {
     DPRINTF(RubyEP,
             "EPBackend node_id=%d: handleWriteback PA=0x%lx "
@@ -2285,14 +2285,16 @@ EPBackend::handleWriteback(uint64_t line_pa, bool keepAsClean,
     }
 
     return handleWritebackWithMeta(line_pa, keepAsClean, dirtyData,
-                                    epochVal, requesterNode, sourceSocket);
+                                    epochVal, requesterNode, sourceSocket,
+                                    ioWritebackReqId);
 }
 
 int
 EPBackend::handleWritebackWithMeta(uint64_t line_pa, bool keepAsClean,
                                     const uint8_t *dirtyData,
                                     uint64_t epochVal, int requesterNode,
-                                    int sourceSocket)
+                                    int sourceSocket,
+                                    uint64_t *ioWritebackReqId)
 {
     DPRINTF(RubyEP,
             "EPBackend node_id=%d: handleWritebackWithMeta PA=0x%lx "
@@ -2329,7 +2331,7 @@ EPBackend::handleWritebackWithMeta(uint64_t line_pa, bool keepAsClean,
     }
     int wbRet = adapter->sendWritebackReq(
         homePa, requesterNode, epochVal, keepAsClean, homeNode, homeSocket,
-        dirtyData);
+        dirtyData, ioWritebackReqId);
     bool wbPending = (wbRet == -2);
     bool ok = (wbRet > 0);
     if (wbPending) {
@@ -2368,7 +2370,7 @@ EPBackend::handleWritebackWithMeta(uint64_t line_pa, bool keepAsClean,
             "ok=%d keepAsClean=%d\n",
             _nodeId, line_pa, ok, keepAsClean);
 
-    return ok || wbPending;
+    return wbPending ? -2 : (ok ? 1 : 0);
 }
 
 bool

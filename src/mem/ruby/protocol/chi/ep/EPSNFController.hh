@@ -131,6 +131,7 @@ class EPSNFController : public EPController
         uint64_t cachedEpoch;      // metadata from QLM response
         int cachedOwnerNode;
         bool cachedFound;
+        uint64_t writebackReqId;
 
         // Phase 2 async: bounded retry / backoff
         int retryCount;
@@ -140,6 +141,7 @@ class EPSNFController : public EPController
             : linePa(0), keepAsClean(false), sourceSocket(0), hasData(false),
               queryReqId(0), queryInFlight(false),
               cachedEpoch(0), cachedOwnerNode(-1), cachedFound(false),
+              writebackReqId(0),
               retryCount(0), nextRetryTick(0)
         {
             std::memset(data, 0, sizeof(data));

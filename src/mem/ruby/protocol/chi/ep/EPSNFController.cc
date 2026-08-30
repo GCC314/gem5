@@ -1082,7 +1082,8 @@ EPSNFController::processPendingWritebacks()
             wbRet = _backend->handleWriteback(it->linePa, it->keepAsClean,
                                                it->hasData ? it->data : nullptr,
                                                &meta, nullptr, 0,
-                                               it->sourceSocket);
+                                               it->sourceSocket,
+                                               &it->writebackReqId);
 
         } else if (it->queryReqId > 0) {
             // ── Phase 2 item 4: retry with stable queryReqId ──
@@ -1095,7 +1096,8 @@ EPSNFController::processPendingWritebacks()
                 nullptr,           // no pre-resolved meta
                 nullptr,           // no new outQueryReqId (reusing existing)
                 it->queryReqId,    // stable cached reqId
-                it->sourceSocket);
+                it->sourceSocket,
+                &it->writebackReqId);
             // If handleWriteback consumed a cached QLM response,
             // wbRet will be the writeback result (not -2).
             // If still pending, wbRet == -2 and we back off.
@@ -1108,7 +1110,8 @@ EPSNFController::processPendingWritebacks()
                                                nullptr,  // no cached meta
                                                &qlmReqId, // get the new reqId
                                                0,         // no cached reqId
-                                               it->sourceSocket);
+                                               it->sourceSocket,
+                                               &it->writebackReqId);
             if (wbRet == -2 && qlmReqId > 0) {
                 it->queryReqId = qlmReqId;
                 it->queryInFlight = true;

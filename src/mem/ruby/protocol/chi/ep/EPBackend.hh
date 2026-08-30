@@ -561,7 +561,8 @@ class EPBackend : public SimObject
                         const WritebackQueryMeta *queryMeta = nullptr,
                         uint64_t *outQueryReqId = nullptr,
                         uint64_t cachedQlmReqId = 0,
-                        int sourceSocket = 0);
+                        int sourceSocket = 0,
+                        uint64_t *ioWritebackReqId = nullptr);
 
     /**
      * Phase 2 async: fire a WritebackReq with previously-resolved metadata
@@ -571,9 +572,10 @@ class EPBackend : public SimObject
      * @return same semantics as handleWriteback
      */
     int handleWritebackWithMeta(uint64_t line_pa, bool keepAsClean,
-                                 const uint8_t *dirtyData,
-                                 uint64_t epochVal, int requesterNode,
-                                 int sourceSocket = 0);
+                                const uint8_t *dirtyData,
+                                uint64_t epochVal, int requesterNode,
+                                int sourceSocket = 0,
+                                uint64_t *ioWritebackReqId = nullptr);
 
     /**
      * Called by EPSNFController when HN-F completes a WriteNoSnp write

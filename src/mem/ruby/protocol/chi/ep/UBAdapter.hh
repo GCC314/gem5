@@ -90,7 +90,8 @@ class UBAdapter : public SimObject
     int sendWritebackReq(uint64_t homePa, int requesterNode,
                          uint64_t epochVal, bool keepAsClean,
                          int homeNode, int homeSocket,
-                         const uint8_t *dirtyData = nullptr);
+                         const uint8_t *dirtyData = nullptr,
+                         uint64_t *ioReqId = nullptr);
 
     int sendEvictReq(uint64_t homePa, int evictingNode,
                      uint64_t epochVal, int homeNode, int homeSocket);

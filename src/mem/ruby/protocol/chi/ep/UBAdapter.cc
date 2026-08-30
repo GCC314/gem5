@@ -629,11 +629,25 @@ int
 UBAdapter::sendWritebackReq(uint64_t homePa, int requesterNode,
                              uint64_t epochVal, bool keepAsClean,
                              int homeNode, int homeSocket,
-                             const uint8_t *dirtyData)
+                             const uint8_t *dirtyData, uint64_t *ioReqId)
 {
     if (!_port) {
         fatal("UBAdapter node=%d socket=%d: sendWritebackReq called with no transport bound\n",
               _nodeId, _socketId);
+    }
+
+    uint64_t reqId = ioReqId ? *ioReqId : 0;
+    if (reqId == 0) {
+        reqId = allocLocalReqId();
+        if (ioReqId)
+            *ioReqId = reqId;
+    }
+    PendingKey responseKey{CoherenceMessageType::WritebackResp, reqId};
+    auto ready = _readyResponses.find(responseKey);
+    if (ready != _readyResponses.end()) {
+        bool success = ready->second.b.writebackResp.success;
+        _readyResponses.erase(ready);
+        return success ? 1 : 0;
     }
 
     CoherenceMessage req;
@@ -648,7 +662,7 @@ UBAdapter::sendWritebackReq(uint64_t homePa, int requesterNode,
     req.h.requesterNode = requesterNode;
     req.h.homeLinePa = homePa;
     req.h.epoch = epochVal;
-    req.h.reqId = 0;
+    req.h.reqId = reqId;
     req.h.seqNum = _nextSeq++;
     req.h.enqueueTick = curTick();
     req.h.readyTick = curTick();
