@@ -784,10 +784,11 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
                                   txn.retryCount == 256;
         const bool highRetrySample = retryPower && txn.retryCount >= 1024;
         if (normalSample || highRetrySample) {
-            inform("[PENDING-READ-HIT] node=%d localPa=0x%lx homePa=0x%lx "
-                   "sourceSocket=%d reqId=%lu retry=%lu\n",
-                   _nodeId, line_pa, homePa, adapterIdx, txn.reqId,
-                   txn.retryCount);
+            DPRINTF(RubyEP,
+                    "[PENDING-READ-HIT] node=%d localPa=0x%lx homePa=0x%lx "
+                    "sourceSocket=%d reqId=%lu retry=%lu\n",
+                    _nodeId, line_pa, homePa, adapterIdx, txn.reqId,
+                    txn.retryCount);
         }
     }
 
@@ -951,10 +952,11 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
             OuterGrantType g = txn.grantType;
             const Tick start = txn.outerStartTick;
             const uint64_t completedReqId = txn.reqId;
-            inform("[PENDING-GRANT-ERASE] node=%d localPa=0x%lx homePa=0x%lx "
-                   "sourceSocket=%d reqId=%lu reason=clear_accepted\n",
-                   _nodeId, txn.localLinePa, pgt->first, txn.sourceAdapter,
-                   completedReqId);
+            DPRINTF(RubyEP,
+                    "[PENDING-GRANT-ERASE] node=%d localPa=0x%lx homePa=0x%lx "
+                    "sourceSocket=%d reqId=%lu reason=clear_accepted\n",
+                    _nodeId, txn.localLinePa, pgt->first, txn.sourceAdapter,
+                    completedReqId);
             _pendingGrantTxns.erase(pgt);
             if (start) {
                 inform(
@@ -1083,10 +1085,11 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
         txn.writeIntent = writeIntent;
         txn.outerStartTick = entry.outerStartTick;
         _pendingReadTxns.emplace(homePa, txn);
-        inform("[PENDING-READ-SAVE] node=%d localPa=0x%lx homePa=0x%lx "
-               "sourceSocket=%d epoch=%lu reqId=%lu perm=%d write=%d\n",
-               _nodeId, line_pa, homePa, adapterIdx, entry.epoch, reqIdVal,
-               neededPerm, writeIntent ? 1 : 0);
+        DPRINTF(RubyEP,
+                "[PENDING-READ-SAVE] node=%d localPa=0x%lx homePa=0x%lx "
+                "sourceSocket=%d epoch=%lu reqId=%lu perm=%d write=%d\n",
+                _nodeId, line_pa, homePa, adapterIdx, entry.epoch, reqIdVal,
+                neededPerm, writeIntent ? 1 : 0);
     }
 
     if (!adapter) {
@@ -1304,10 +1307,11 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
         }
         _pendingGrantTxns[homePa] = txn;
         _pendingReadTxns.erase(homePa);
-        inform("[PENDING-GRANT-SAVE] node=%d localPa=0x%lx homePa=0x%lx "
-               "sourceSocket=%d baseEpoch=%lu reqId=%lu grantType=%d\n",
-               _nodeId, line_pa, homePa, txn.sourceAdapter, txn.baseEpoch,
-               txn.reqId, static_cast<int>(txn.grantType));
+        DPRINTF(RubyEP,
+                "[PENDING-GRANT-SAVE] node=%d localPa=0x%lx homePa=0x%lx "
+                "sourceSocket=%d baseEpoch=%lu reqId=%lu grantType=%d\n",
+                _nodeId, line_pa, homePa, txn.sourceAdapter, txn.baseEpoch,
+                txn.reqId, static_cast<int>(txn.grantType));
     }
 
     DPRINTF(RubyCHIGeneric,
@@ -2988,8 +2992,9 @@ EPBackend::sendClear(uint64_t line_pa, int homeNode,
         txnIt == _pendingGrantTxns.end() || !txnIt->second.valid ||
         !txnIt->second.clearSendLogged;
     if (firstClearSend) {
-        inform("[CLEAR-SEND] node=%d pa=0x%lx homeNode=%d epoch=%lu reqId=%lu\n",
-               _nodeId, line_pa, homeNode, epoch, reqId);
+        DPRINTF(RubyEP,
+                "[CLEAR-SEND] node=%d pa=0x%lx homeNode=%d epoch=%lu reqId=%lu\n",
+                _nodeId, line_pa, homeNode, epoch, reqId);
         if (txnIt != _pendingGrantTxns.end() && txnIt->second.valid)
             txnIt->second.clearSendLogged = true;
     }

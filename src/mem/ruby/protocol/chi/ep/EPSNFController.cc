@@ -285,9 +285,9 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
             m_machineID, hnDest,
             false, false, 0, 0, MessageSizeType_Control);
         sendResponseReliable(rsp);
-        inform(
-                     "[EPSNF-WRITE-DBID] node=%d addr=0x%lx expected=0x%lx\n",
-                     _nodeId, msg->m_addr, pending.expectedMask);
+        DPRINTF(RubyEP,
+                "[EPSNF-WRITE-DBID] node=%d addr=0x%lx expected=0x%lx\n",
+                _nodeId, msg->m_addr, pending.expectedMask);
 
         DPRINTF(RubyCHIGeneric,
                 "EP_SNF node_id=%d: WriteNoSnp pending, "
@@ -821,9 +821,9 @@ EPSNFController::recvDataMsg(const CHIDataMsg *msg)
                     // it would send an untracked QLM whose reqId is lost.
                     // Instead, enqueue directly and let processPendingWritebacks
                     // handle both QLM query and WriteBackReq with stable reqId.
-                    inform(
-                                 "[EPSNF-WB-PENDING] node=%d pa=0x%lx\n",
-                                 _nodeId, writePa);
+                    DPRINTF(RubyEP,
+                            "[EPSNF-WB-PENDING] node=%d pa=0x%lx\n",
+                            _nodeId, writePa);
                     // Phase 2 async item 5: Deduplicate pending writebacks
                     // per line — retain newest dirty payload.
                     bool replaced = false;
@@ -850,10 +850,10 @@ EPSNFController::recvDataMsg(const CHIDataMsg *msg)
                             pwb.retryCount = 0;
                             pwb.nextRetryTick = 0;
                             replaced = true;
-                            inform(
-                                "[EPSNF-WB-DEDUP] node=%d pa=0x%lx "
-                                "(replaced existing entry)\n",
-                                _nodeId, writePa);
+                            DPRINTF(RubyEP,
+                                    "[EPSNF-WB-DEDUP] node=%d pa=0x%lx "
+                                    "(replaced existing entry)\n",
+                                    _nodeId, writePa);
                             break;
                         }
                     }
@@ -867,9 +867,9 @@ EPSNFController::recvDataMsg(const CHIDataMsg *msg)
                         _pendingWritebacks.push_back(pwb);
                     }
                 }
-                inform(
-                             "[EPSNF-WRITE-DONE] node=%d addr=0x%lx received=0x%lx\n",
-                             _nodeId, msg->m_addr, pendingIt->second.receivedMask);
+                DPRINTF(RubyEP,
+                        "[EPSNF-WRITE-DONE] node=%d addr=0x%lx received=0x%lx\n",
+                        _nodeId, msg->m_addr, pendingIt->second.receivedMask);
                 _pendingWrites.erase(pendingIt);
             }
         } else {
@@ -1051,11 +1051,11 @@ EPSNFController::processPendingWritebacks()
                     it->cachedEpoch = resolvedEpoch;
                     it->cachedOwnerNode = resolvedOwner;
                     it->cachedFound = resolvedFound;
-                    inform(
-                        "[EPSNF-QLM-READY] node=%d pa=0x%lx reqId=%lu "
-                        "found=%d epoch=%lu owner=%d\n",
-                        _nodeId, it->linePa, it->queryReqId,
-                        resolvedFound, resolvedEpoch, resolvedOwner);
+                    DPRINTF(RubyEP,
+                            "[EPSNF-QLM-READY] node=%d pa=0x%lx reqId=%lu "
+                            "found=%d epoch=%lu owner=%d\n",
+                            _nodeId, it->linePa, it->queryReqId,
+                            resolvedFound, resolvedEpoch, resolvedOwner);
                     if (!resolvedFound || resolvedOwner < 0) {
                         warn(
                             "[EPSNF-WB-QLM-FAIL] node=%d pa=0x%lx reqId=%lu "
@@ -1115,9 +1115,9 @@ EPSNFController::processPendingWritebacks()
             if (wbRet == -2 && qlmReqId > 0) {
                 it->queryReqId = qlmReqId;
                 it->queryInFlight = true;
-                inform(
-                    "[EPSNF-WB-QLM-ENQ] node=%d pa=0x%lx reqId=%lu\n",
-                    _nodeId, it->linePa, qlmReqId);
+                DPRINTF(RubyEP,
+                        "[EPSNF-WB-QLM-ENQ] node=%d pa=0x%lx reqId=%lu\n",
+                        _nodeId, it->linePa, qlmReqId);
             }
         }
 
@@ -1155,9 +1155,9 @@ EPSNFController::processPendingWritebacks()
 
         } else {
             // Writeback completed (or rejected) — remove from queue
-            inform(
-                "[EPSNF-WB-DONE] node=%d pa=0x%lx ret=%d retries=%d\n",
-                _nodeId, it->linePa, wbRet, it->retryCount);
+            DPRINTF(RubyEP,
+                    "[EPSNF-WB-DONE] node=%d pa=0x%lx ret=%d retries=%d\n",
+                    _nodeId, it->linePa, wbRet, it->retryCount);
             it = _pendingWritebacks.erase(it);
         }
     }

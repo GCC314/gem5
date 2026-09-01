@@ -1016,8 +1016,9 @@ UBAdapter::sendClearReq(uint64_t linePa, int srcNode,
         PendingKey rkey{CoherenceMessageType::ClearResp, reqId};
         auto rit = _readyResponses.find(rkey);
         if (rit != _readyResponses.end()) {
-            inform("[CLR-CACHE-HIT] node=%d reqId=%lu accepted=%d",
-                   _nodeId, reqId, rit->second.b.clearResp.accepted ? 1 : 0);
+            DPRINTF(RubyEP, "[CLR-CACHE-HIT] node=%d reqId=%lu accepted=%d\n",
+                    _nodeId, reqId,
+                    rit->second.b.clearResp.accepted ? 1 : 0);
             bool a = rit->second.b.clearResp.accepted;
             _inflightClearReqs.erase(reqId);
             _clearRetryTick.erase(reqId);
@@ -1033,8 +1034,9 @@ UBAdapter::sendClearReq(uint64_t linePa, int srcNode,
             // can deduplicate it without allocating a new grant transaction.
             _inflightClearReqs.erase(reqId);
         }
-        inform("[CLR-CACHE-MISS] node=%d reqId=%lu sending new ClearReq",
-               _nodeId, reqId);
+        DPRINTF(RubyEP,
+                "[CLR-CACHE-MISS] node=%d reqId=%lu sending new ClearReq\n",
+                _nodeId, reqId);
     }
 
     CoherenceMessage req;
@@ -1060,7 +1062,8 @@ UBAdapter::sendClearReq(uint64_t linePa, int srcNode,
         return -1;
     }
 
-    inform("[CLR-TX] n=%d reqId=%lu curT=%lu", _nodeId, reqId, curTick());
+    DPRINTF(RubyEP, "[CLR-TX] n=%d reqId=%lu curT=%lu\n",
+            _nodeId, reqId, curTick());
 
     // Port async path: schedule check, return pending
     if (_port) {
@@ -1478,10 +1481,12 @@ UBAdapter::recvFromRouter(const CoherenceMessage &msg)
         case CoherenceMessageType::UpgradeResp:
         case CoherenceMessageType::UpgradeDoneResp:
         case CoherenceMessageType::ClearResp: {
-            inform("[CLEAR-RESP] node=%d via=recvFromRouter pa=0x%lx src=%d accepted=%d epoch=%lu reqId=%lu",
-                   _nodeId, msg.h.homeLinePa, msg.h.srcNode,
-                   msg.b.clearResp.accepted ? 1 : 0, msg.h.epoch,
-                   msg.h.reqId);
+            DPRINTF(RubyEP,
+                    "[CLEAR-RESP] node=%d via=recvFromRouter pa=0x%lx src=%d "
+                    "accepted=%d epoch=%lu reqId=%lu\n",
+                    _nodeId, msg.h.homeLinePa, msg.h.srcNode,
+                    msg.b.clearResp.accepted ? 1 : 0, msg.h.epoch,
+                    msg.h.reqId);
             _lastResponse = msg;
             _lastResponseValid = true;
             PendingKey key{msg.h.type, msg.h.reqId};
@@ -2044,10 +2049,12 @@ UBAdapter::handleResponse(const framework::Message *m)
     if (!coh) return;
 
     if (coh->h.type == CoherenceMessageType::ClearResp) {
-        inform("[CLEAR-RESP] node=%d via=handleResponse pa=0x%lx src=%d accepted=%d epoch=%lu reqId=%lu",
-               _nodeId, coh->h.homeLinePa, coh->h.srcNode,
-               coh->b.clearResp.accepted ? 1 : 0, coh->h.epoch,
-               coh->h.reqId);
+        DPRINTF(RubyEP,
+                "[CLEAR-RESP] node=%d via=handleResponse pa=0x%lx src=%d "
+                "accepted=%d epoch=%lu reqId=%lu\n",
+                _nodeId, coh->h.homeLinePa, coh->h.srcNode,
+                coh->b.clearResp.accepted ? 1 : 0, coh->h.epoch,
+                coh->h.reqId);
     }
     if (coh->h.type == CoherenceMessageType::UpgradeResp) {
         inform("[UPGRADE-FORENSIC] stage=GEM5_RESP_RECV node=%d socket=%d "
