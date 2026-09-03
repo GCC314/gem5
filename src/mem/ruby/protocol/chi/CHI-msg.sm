@@ -144,6 +144,7 @@ structure(CHIRequestMsg, desc="", interface="Message") {
   int ubcc_ingress_socket, desc="Original requester socket for UBCC source routing", default="0";
   bool ubcc_publish_on_data, desc="Publish lossless one-way grant after final data beat", default="false";
   bool ubcc_store_auth_valid, desc="StoreCommit authorization sideband is valid", default="false";
+  bool ubcc_internal_writeback, desc="HN internal memory-only publication", default="false";
   int ubcc_store_requester, desc="StoreCommit requester node", default="-1";
   Addr ubcc_permission_epoch, desc="Committed StoreCommit permission epoch", default="0";
   int ubcc_write_disposition, desc="StoreCommit disposition (MemoryOnly=0)", default="0";
@@ -258,6 +259,7 @@ structure(CHIDataMsg, desc="", interface="Message") {
 
   // Internal transaction identity for matching write data at EP-SNF.
   bool ubcc_store_auth_valid, desc="StoreCommit authorization sideband is valid", default="false";
+  bool ubcc_internal_writeback, desc="HN internal memory-only publication", default="false";
   int ubcc_store_requester, desc="StoreCommit requester node", default="-1";
   Addr ubcc_permission_epoch, desc="Committed StoreCommit permission epoch", default="0";
   int ubcc_write_disposition, desc="StoreCommit disposition", default="0";

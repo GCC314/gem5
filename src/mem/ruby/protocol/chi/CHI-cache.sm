@@ -678,6 +678,7 @@ machine(MachineType:Cache, "Cache coherency protocol") :
     MachineID fwdRequestor, desc="Requestor to receive data on fwding snoops";
     int ubccIngressSocket, desc="Original requester socket for UBCC source routing", default="0";
     bool ubccStoreAuthValid, desc="StoreCommit authorization is valid", default="false";
+    bool ubccInternalWriteback, desc="HN internal memory-only publication", default="false";
     int ubccStoreRequester, desc="StoreCommit requester node", default="-1";
     Addr ubccPermissionEpoch, desc="Committed StoreCommit permission epoch", default="0";
     int ubccWriteDisposition, desc="StoreCommit disposition", default="0";
@@ -798,6 +799,7 @@ machine(MachineType:Cache, "Cache coherency protocol") :
     bool pendReqUbccWriteIntent;
     bool pendReqUbccPublishOnData;
     bool pendReqUbccStoreAuthValid;
+    bool pendReqUbccInternalWriteback;
     int pendReqUbccStoreRequester;
     Addr pendReqUbccPermissionEpoch;
     int pendReqUbccWriteDisposition;

@@ -265,13 +265,22 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
         pending.permissionEpoch = msg->m_ubcc_permission_epoch;
         pending.disposition = static_cast<UBWriteDisposition>(
             msg->m_ubcc_write_disposition);
-        fatal_if(!msg->m_ubcc_store_auth_valid,
-                 "EP_SNF node_id=%d socket=%d: native/non-StoreCommit "
+        pending.internalPublication = msg->m_ubcc_internal_writeback;
+        fatal_if(msg->m_ubcc_store_auth_valid == pending.internalPublication,
+                 "EP_SNF node_id=%d: WriteNoSnp must be exactly one of "
+                 "authorized StoreCommit or HN internal publication PA=0x%lx",
+                 _nodeId, msg->m_addr);
+        fatal_if(!msg->m_ubcc_store_auth_valid &&
+                     !pending.internalPublication,
+                  "EP_SNF node_id=%d socket=%d: native/non-StoreCommit "
                  "WriteNoSnp is unsupported on the DSM endpoint PA=0x%lx; "
                  "HN-F must route only authorized StoreCommit traffic here",
                  _nodeId, pending.sourceSocket, msg->m_addr);
-        fatal_if(pending.requesterNode < 0 ||
-                     pending.disposition != UBWriteDisposition::MemoryOnly,
+        fatal_if((!pending.internalPublication && pending.requesterNode < 0) ||
+                      (pending.internalPublication &&
+                       (pending.requesterNode != -1 ||
+                        pending.permissionEpoch != 0)) ||
+                      pending.disposition != UBWriteDisposition::MemoryOnly,
                  "EP_SNF node_id=%d: invalid StoreCommit authorization "
                  "PA=0x%lx requester=%d disposition=%d", _nodeId,
                  msg->m_addr, pending.requesterNode,
@@ -291,6 +300,10 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
         }
 
         if (_backend->haEndpointEnabled()) {
+            fatal_if(pending.internalPublication,
+                     "EP_SNF node_id=%d: HN internal WriteNoSnp publication "
+                     "is UBCC-only; HA requires an explicit owner disposition "
+                     "PA=0x%lx", _nodeId, msg->m_addr);
             pending.haWrite = true;
             fatal_if(!_backend->resolveHAStoreTarget(
                          msg->m_addr, pending.sourceSocket, pending.homePa,
@@ -775,9 +788,12 @@ EPSNFController::recvDataMsg(const CHIDataMsg *msg)
                  "EP_SNF node_id=%d: NCBWrData lacks DBID transaction marker "
                  "PA=0x%lx dbid=%lu", _nodeId, msg->m_addr, dbid);
         fatal_if(msg->m_addr != pending.linePa ||
-                     !msg->m_ubcc_store_auth_valid ||
-                     msg->m_ubcc_store_requester != pending.requesterNode ||
-                     msg->m_ubcc_permission_epoch != pending.permissionEpoch ||
+                      msg->m_ubcc_store_auth_valid ==
+                          pending.internalPublication ||
+                      msg->m_ubcc_internal_writeback !=
+                          pending.internalPublication ||
+                      msg->m_ubcc_store_requester != pending.requesterNode ||
+                      msg->m_ubcc_permission_epoch != pending.permissionEpoch ||
                      msg->m_ubcc_write_disposition !=
                          static_cast<int>(pending.disposition),
                  "EP_SNF node_id=%d: StoreCommit data identity mismatch id=%lu",
@@ -842,12 +858,20 @@ EPSNFController::processPendingHAWrites()
                     pending.homeNode, pending.homeSocket,
                     pending.permissionReqId, response, pending.sourceSocket);
             } else {
-                result = _backend->commitStore(
-                    pending.homePa, pending.requesterNode,
-                    pending.permissionEpoch, pending.storeCommitId,
-                    pending.expectedMask, pending.data, pending.homeNode,
-                    pending.homeSocket, pending.sourceSocket,
-                    pending.permissionReqId);
+                if (pending.internalPublication) {
+                    result = _backend->publishInternalWriteback(
+                        pending.homePa, pending.storeCommitId,
+                        pending.expectedMask, pending.data, pending.homeNode,
+                        pending.homeSocket, pending.sourceSocket,
+                        pending.permissionReqId);
+                } else {
+                    result = _backend->commitStore(
+                        pending.homePa, pending.requesterNode,
+                        pending.permissionEpoch, pending.storeCommitId,
+                        pending.expectedMask, pending.data, pending.homeNode,
+                        pending.homeSocket, pending.sourceSocket,
+                        pending.permissionReqId);
+                }
             }
             if (result == -2) {
                 pendingWork = true;

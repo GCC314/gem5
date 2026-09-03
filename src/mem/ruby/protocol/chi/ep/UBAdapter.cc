@@ -648,8 +648,9 @@ UBAdapter::sendWritebackReq(uint64_t homePa, int requesterNode,
 
     uint64_t reqId = ioReqId ? *ioReqId : 0;
     if (reqId == 0) {
-        fatal_if(kind == UBWritebackKind::StoreCommit,
-                 "UBAdapter node=%d socket=%d: StoreCommit requires caller "
+        fatal_if(kind == UBWritebackKind::StoreCommit ||
+                     kind == UBWritebackKind::InternalPublication,
+                  "UBAdapter node=%d socket=%d: memory publication requires caller "
                  "supplied stable wire reqId", _nodeId, _socketId);
         reqId = allocLocalReqId();
         if (ioReqId)
@@ -697,6 +698,12 @@ UBAdapter::sendWritebackReq(uint64_t homePa, int requesterNode,
                  (disposition != UBWriteDisposition::MemoryOnly ||
                   !dirtyData || byteMask == 0),
              "UBAdapter node=%d socket=%d: invalid StoreCommit reqId=%lu",
+              _nodeId, _socketId, reqId);
+    fatal_if(kind == UBWritebackKind::InternalPublication &&
+                 (disposition != UBWriteDisposition::MemoryOnly ||
+                  requesterNode != -1 || epochVal != 0 || !dirtyData ||
+                  byteMask == 0),
+             "UBAdapter node=%d socket=%d: invalid internal publication reqId=%lu",
              _nodeId, _socketId, reqId);
     // Carry dirty cacheline data so ubio can persist to DsmDataStore
     if (dirtyData) {

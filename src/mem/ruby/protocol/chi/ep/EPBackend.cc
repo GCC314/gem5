@@ -2386,6 +2386,31 @@ EPBackend::commitStore(uint64_t homePa, int requesterNode,
         &ioWritebackReqId);
 }
 
+int
+EPBackend::publishInternalWriteback(uint64_t homePa, uint64_t publicationId,
+                                    uint64_t byteMask, const uint8_t *data,
+                                    int homeNode, int homeSocket,
+                                    int sourceSocket,
+                                    uint64_t &ioWritebackReqId)
+{
+    fatal_if(!data || byteMask == 0 || publicationId == 0,
+             "EPBackend node_id=%d: invalid internal publication PA=0x%lx "
+             "id=%lu mask=0x%lx", _nodeId, homePa, publicationId, byteMask);
+    UBAdapter *adapter = getUBAdapter(sourceSocket);
+    fatal_if(!adapter,
+             "EPBackend node_id=%d: no internal publication adapter socket=%d",
+             _nodeId, sourceSocket);
+    fatal_if(ioWritebackReqId != 0 && ioWritebackReqId != publicationId,
+             "EPBackend node_id=%d: internal publication identity changed "
+             "wire=%lu publication=%lu", _nodeId, ioWritebackReqId,
+             publicationId);
+    ioWritebackReqId = publicationId;
+    return adapter->sendWritebackReq(
+        homePa, -1, 0, UBWritebackKind::InternalPublication,
+        UBWriteDisposition::MemoryOnly, byteMask, homeNode, homeSocket, data,
+        &ioWritebackReqId);
+}
+
 bool
 EPBackend::handleEvict(uint64_t line_pa)
 {

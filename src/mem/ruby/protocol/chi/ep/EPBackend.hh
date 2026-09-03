@@ -572,6 +572,10 @@ class EPBackend : public SimObject
                     uint64_t byteMask, const uint8_t *data,
                     int homeNode, int homeSocket, int sourceSocket,
                     uint64_t &ioWritebackReqId);
+    int publishInternalWriteback(uint64_t homePa, uint64_t publicationId,
+                                 uint64_t byteMask, const uint8_t *data,
+                                 int homeNode, int homeSocket, int sourceSocket,
+                                 uint64_t &ioWritebackReqId);
 
     /**
      * Called by EPSNFController when HN-F completes a WriteNoSnp write

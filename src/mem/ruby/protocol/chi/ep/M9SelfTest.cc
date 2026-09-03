@@ -108,7 +108,8 @@ static_assert(sizeof(cc::glob::UBWritebackKind) == 1 &&
               sizeof(cc::glob::UBWriteDisposition) == 1,
               "writeback wire enums must remain one byte");
 static_assert(static_cast<uint8_t>(cc::glob::UBWritebackKind::OwnerWriteback) == 0 &&
-              static_cast<uint8_t>(cc::glob::UBWritebackKind::StoreCommit) == 1,
+              static_cast<uint8_t>(cc::glob::UBWritebackKind::StoreCommit) == 1 &&
+              static_cast<uint8_t>(cc::glob::UBWritebackKind::InternalPublication) == 2,
               "writeback kind wire values changed");
 static_assert(static_cast<uint8_t>(cc::glob::UBWriteDisposition::MemoryOnly) == 0 &&
               static_cast<uint8_t>(cc::glob::UBWriteDisposition::DropOwner) == 1 &&

@@ -230,6 +230,7 @@ struct UBInvalidateAckBody { /* no extra fields beyond header */ };
 enum class UBWritebackKind : uint8_t {
     OwnerWriteback = 0,
     StoreCommit = 1,
+    InternalPublication = 2,
 };
 
 enum class UBWriteDisposition : uint8_t {
