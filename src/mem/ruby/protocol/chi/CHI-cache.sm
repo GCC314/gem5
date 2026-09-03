@@ -757,7 +757,8 @@ machine(MachineType:Cache, "Cache coherency protocol") :
     // See the processNextState function for details
     ExpectedMap expected_req_resp, template="<CHIResponseType,CHIDataType>";
     ExpectedMap expected_snp_resp, template="<CHIResponseType,CHIDataType>";
-    bool defer_expected_comp; // expect to receive Comp before the end of transaction
+    bool defer_expected_comp; // WriteUnique/atomic expects a later Comp
+    bool defer_writenosnp_comp, default="false"; // WriteNoSnp got DBIDResp and expects Comp after data
     CHIResponseType slicchack1; // fix compiler not including headers
     CHIDataType slicchack2; // fix compiler not including headers
 

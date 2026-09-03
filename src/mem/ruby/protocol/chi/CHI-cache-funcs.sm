@@ -399,6 +399,7 @@ void initializeTBE(TBE tbe, Addr addr, int storSlot) {
   clearExpectedReqResp(tbe);
   clearExpectedSnpResp(tbe);
   tbe.defer_expected_comp := false;
+  tbe.defer_writenosnp_comp := false;
 
   tbe.requestorToBeOwner := false;
   tbe.requestorToBeExclusiveOwner := false;

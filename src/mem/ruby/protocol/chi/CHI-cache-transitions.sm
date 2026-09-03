@@ -1112,6 +1112,7 @@ transition({BUSY_BLKD, BUSY_INTR}, SendCompData, BUSY_BLKD) {
 transition(BUSY_BLKD, SendWBData) {
   Pop_TriggerQueue;
   Send_WBData;
+  CheckWUComp;
   ProcessNextState_ClearPending;
 }
 
@@ -1649,7 +1650,9 @@ transition(BUSY_INTR, CompDBIDResp, BUSY_BLKD) {
   ProcessNextState;
 }
 
-// alternative flow for WU with separate Comp
+// Alternative split DBIDResp/Comp flow. Receive_ReqResp_WUNeedComp uses the
+// downstream request type to distinguish WriteUnique/atomic traffic from
+// HN-generated WriteNoSnp publications.
 transition({BUSY_INTR,BUSY_BLKD}, DBIDResp, BUSY_BLKD) {
   Receive_ReqResp;
   Receive_ReqResp_CopyDBID;

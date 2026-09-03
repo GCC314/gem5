@@ -3114,11 +3114,30 @@ action(Receive_ReqResp, desc="") {
 }
 
 action(Receive_ReqResp_WUNeedComp, desc="") {
-  tbe.defer_expected_comp := true;
+  // A plain DBIDResp is the first half of either a requester-side
+  // WriteUnique/atomic response or an HN-generated WriteNoSnp publication.
+  // Keep these cases separate: the latter must not accidentally change the
+  // handling of incoming WriteUnique transactions at this controller.
+  if ((tbe.pendReqType == CHIRequestType:WriteNoSnp) ||
+      (tbe.pendReqType == CHIRequestType:WriteNoSnpPtl)) {
+    assert(is_HN);
+    assert(tbe.defer_writenosnp_comp == false);
+    tbe.defer_writenosnp_comp := true;
+  } else {
+    assert((tbe.pendReqType == CHIRequestType:WriteUniqueFull) ||
+           (tbe.pendReqType == CHIRequestType:WriteUniquePtl) ||
+           (tbe.pendReqType == CHIRequestType:AtomicNoReturn));
+    assert(tbe.defer_expected_comp == false);
+    tbe.defer_expected_comp := true;
+  }
 }
 
 action(Receive_ReqResp_WUComp, desc="") {
-  if (tbe.defer_expected_comp) {
+  if (tbe.defer_writenosnp_comp) {
+    assert((tbe.pendReqType == CHIRequestType:WriteNoSnp) ||
+           (tbe.pendReqType == CHIRequestType:WriteNoSnpPtl));
+    tbe.defer_writenosnp_comp := false;
+  } else if (tbe.defer_expected_comp) {
     tbe.defer_expected_comp := false;
   } else if (tbe.expected_req_resp.receiveResp(CHIResponseType:Comp) == false) {
     error("Received unexpected message");
@@ -3348,7 +3367,20 @@ action(Send_WUData, desc="") {
 
 action(CheckWUComp, desc="") {
   assert(is_valid(tbe));
-  if (tbe.defer_expected_comp) {
+  if (tbe.defer_writenosnp_comp) {
+    // EPSNF returns DBIDResp as soon as it allocates the write-data buffer,
+    // but deliberately delays Comp until the NCBWrData is persistent at Home.
+    // Arm the Comp expectation only after queuing the data: doing it in the
+    // DBIDResp transition would block the data action and deadlock the split
+    // response flow.
+    assert(is_HN);
+    assert((tbe.pendReqType == CHIRequestType:WriteNoSnp) ||
+           (tbe.pendReqType == CHIRequestType:WriteNoSnpPtl));
+    assert(tbe.snd_msgType == CHIDataType:NCBWrData);
+    tbe.defer_writenosnp_comp := false;
+    tbe.expected_req_resp.addExpectedCount(1);
+    tbe.expected_req_resp.addExpectedRespType(CHIResponseType:Comp);
+  } else if (tbe.defer_expected_comp) {
     tbe.defer_expected_comp := false;
     tbe.expected_req_resp.addExpectedCount(1);
     tbe.expected_req_resp.addExpectedRespType(CHIResponseType:Comp);
