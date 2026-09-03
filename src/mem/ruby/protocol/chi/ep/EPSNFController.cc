@@ -220,8 +220,13 @@ EPSNFController::allocateWriteIdentity()
     fatal_if(_nextWriteIdentity > 0xffffffffULL,
              "EP_SNF node_id=%d socket=%d: write identity exhausted",
              _nodeId, _socketId);
+    // Keep endpoint publication identities disjoint from UBAdapter's ordinary
+    // low, monotonically allocated request IDs.  Node 0/socket 0/controller 0
+    // previously produced publication id 1, which could alias an earlier
+    // owner-writeback response in the adapter/UBCC replay namespace.
     const uint64_t id = (static_cast<uint64_t>(_nodeId) << 60) |
                         (static_cast<uint64_t>(_socketId) << 59) |
+                        (1ULL << 58) |
                         (static_cast<uint64_t>(m_version) << 32) |
                         _nextWriteIdentity++;
     fatal_if(id == 0 || _pendingWrites.count(id),
@@ -346,9 +351,16 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
         hnDest.add(msg->m_requestor);
         auto rsp = std::make_shared<CHIResponseMsg>(
             curTick(), cacheLineSize, m_ruby_system,
-            msg->m_addr, CHIResponseType_DBIDResp,
+            pending.linePa, CHIResponseType_DBIDResp,
             m_machineID, hnDest,
-            false, true, pending.originalTxnId, pending.dbid,
+            // CHI-cache routes ordinary responses by addr.  usesTxnId is
+            // reserved for the separate DVM TBE table, where txnId itself is
+            // used as the wakeup address.  In particular, a replacement TBE's
+            // request TxnID is its storage slot (commonly 0xffe/0xfff), not a
+            // cache-line address.  Keep the original request identity in the
+            // message for diagnostics, but route this response to linePa; the
+            // independently allocated DBID remains the NCBWrData identity.
+            false, false, pending.originalTxnId, pending.dbid,
             MessageSizeType_Control);
         sendResponseReliable(rsp);
         DPRINTF(RubyEP,
@@ -877,6 +889,15 @@ EPSNFController::processPendingHAWrites()
                 pendingWork = true;
                 continue;
             }
+            // Internal replacement publications carry no architectural owner
+            // authorization.  UBCC may reject one transiently while an outer
+            // request for the same line is still active; no data was persisted
+            // in that case, so retry the same stable publication identity.
+            // StoreCommit rejection remains fatal and exact-identity checked.
+            if (result == 0 && pending.internalPublication) {
+                pendingWork = true;
+                continue;
+            }
             fatal_if(result != 1,
                      "EP_SNF node_id=%d: store persistence failed "
                      "PA=0x%lx id=%lu result=%d",
@@ -929,7 +950,10 @@ EPSNFController::publishHAWrite(uint64_t transactionId, PendingWrite &pending)
     auto completion = std::make_shared<CHIResponseMsg>(
         curTick(), cacheLineSize, m_ruby_system, pending.linePa,
         CHIResponseType_Comp, m_machineID, destination,
-        false, true, pending.originalTxnId, 0, MessageSizeType_Control);
+        // Match the DBIDResp routing contract above: delayed Comp wakes the
+        // same active cache/replacement TBE by line address, never the DVM TBE
+        // namespace keyed by the original request TxnID/storage slot.
+        false, false, pending.originalTxnId, 0, MessageSizeType_Control);
     sendResponseReliable(completion, [this, transactionId] {
         auto it = _pendingWrites.find(transactionId);
         fatal_if(it == _pendingWrites.end() || !it->second.completionQueued,
