@@ -326,11 +326,12 @@ class EPRNFController : public EPController
         CHI::CHIRequestType queuedSnoopType; // v4: type of queued snoop
         bool queuedRetToSrc;     // v4: retToSrc for queued snoop
         Tick startTick;
-        std::function<void(bool)> onComplete;
+        std::function<void(bool, const DataBlock &, bool)> onComplete;
         // F2: Recall data capture from CHI data beats
         DataBlock recallDataBlk;
         WriteMask recallDataMask;
         bool recallDataValid;
+        bool readUniqueNoData;
 
         PendingChiTxn()
             : linePa(0), epoch(0), reqId(0),
@@ -342,7 +343,8 @@ class EPRNFController : public EPController
               snoopSlotValid(false),
               queuedSnoopType(CHI::CHIRequestType_null),
               queuedRetToSrc(false), startTick(0),
-              recallDataBlk(64), recallDataMask(64), recallDataValid(false) {}
+              recallDataBlk(64), recallDataMask(64), recallDataValid(false),
+              readUniqueNoData(false) {}
     };
 
     // ---- v4: Retry queue entry (§4.3.4, §7.5) ----
@@ -370,7 +372,8 @@ class EPRNFController : public EPController
      * @param onComplete Called when the CHI transaction completes
      */
     void startReadUnique(uint64_t linePa,
-                         std::function<void(bool)> onComplete);
+                         std::function<void(bool, const DataBlock &, bool)>
+                             onComplete);
 
     /**
      * Initiate a ReadShared to the local HN-F for read recall (§4.3.2).
@@ -378,7 +381,8 @@ class EPRNFController : public EPController
      * downgrade UD→SC and collect data.
      */
     void startReadShared(uint64_t linePa,
-                         std::function<void(bool)> onComplete);
+                         std::function<void(bool, const DataBlock &, bool)>
+                             onComplete);
 
     /**
      * Initiate a CleanUnique to the local HN-F for sharer invalidation

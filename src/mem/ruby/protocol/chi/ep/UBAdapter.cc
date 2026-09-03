@@ -321,13 +321,21 @@ UBAdapter::drainReliableOutputs()
 
 int
 UBAdapter::sendHAPermissionReq(uint64_t linePa, HAOperation operation,
-                                uint64_t permissionEpoch,
-                                const uint8_t *writeData, int dstNode,
+                                 uint64_t permissionEpoch,
+                                 uint64_t byteMask, const uint8_t *writeData,
+                                 int dstNode,
                                 int dstSocket, uint64_t &ioReqId,
                                 UBHAPermissionRespBody &outResp)
 {
     if (!_port)
         return -1;
+    fatal_if((operation == HAOperation::Read &&
+              (byteMask != 0 || writeData != nullptr)) ||
+             (operation == HAOperation::Write &&
+              (byteMask == 0 || writeData == nullptr)),
+             "UBAdapter node=%d socket=%d: invalid HA %s mask/data "
+             "PA=0x%lx mask=0x%lx", _nodeId, _socketId,
+             haOperationName(operation), linePa, byteMask);
     if (ioReqId != 0) {
         PendingKey key{CoherenceMessageType::HAPermissionResp, ioReqId};
         auto ready = _readyResponses.find(key);
@@ -350,6 +358,7 @@ UBAdapter::sendHAPermissionReq(uint64_t linePa, HAOperation operation,
     req.h.enqueueTick = req.h.readyTick = curTick();
     req.b.haPermissionReq.operation = operation;
     req.b.haPermissionReq.permissionEpoch = permissionEpoch;
+    req.b.haPermissionReq.byteMask = byteMask;
     if (operation == HAOperation::Write && writeData)
         memcpy(req.b.haPermissionReq.data, writeData, 64);
     _inflightHAPermissionReqs.insert(ioReqId);
@@ -627,7 +636,8 @@ UBAdapter::sendReadReq(
 
 int
 UBAdapter::sendWritebackReq(uint64_t homePa, int requesterNode,
-                             uint64_t epochVal, bool keepAsClean,
+                             uint64_t epochVal, UBWritebackKind kind,
+                             UBWriteDisposition disposition, uint64_t byteMask,
                              int homeNode, int homeSocket,
                              const uint8_t *dirtyData, uint64_t *ioReqId)
 {
@@ -638,6 +648,9 @@ UBAdapter::sendWritebackReq(uint64_t homePa, int requesterNode,
 
     uint64_t reqId = ioReqId ? *ioReqId : 0;
     if (reqId == 0) {
+        fatal_if(kind == UBWritebackKind::StoreCommit,
+                 "UBAdapter node=%d socket=%d: StoreCommit requires caller "
+                 "supplied stable wire reqId", _nodeId, _socketId);
         reqId = allocLocalReqId();
         if (ioReqId)
             *ioReqId = reqId;
@@ -647,8 +660,11 @@ UBAdapter::sendWritebackReq(uint64_t homePa, int requesterNode,
     if (ready != _readyResponses.end()) {
         bool success = ready->second.b.writebackResp.success;
         _readyResponses.erase(ready);
+        _inflightWritebackReqs.erase(reqId);
         return success ? 1 : 0;
     }
+    if (_inflightWritebackReqs.count(reqId))
+        return -2;
 
     CoherenceMessage req;
     req.h.type = CoherenceMessageType::WritebackReq;
@@ -666,8 +682,22 @@ UBAdapter::sendWritebackReq(uint64_t homePa, int requesterNode,
     req.h.seqNum = _nextSeq++;
     req.h.enqueueTick = curTick();
     req.h.readyTick = curTick();
-    if (keepAsClean)
+    if (disposition == UBWriteDisposition::KeepClean)
         req.h.flags |= static_cast<uint32_t>(CFLAG_KEEP_AS_CLEAN);
+    req.b.writebackReq.kind = kind;
+    req.b.writebackReq.disposition = disposition;
+    req.b.writebackReq.byteMask = byteMask;
+    fatal_if(kind == UBWritebackKind::OwnerWriteback &&
+                 (byteMask != ~0ULL ||
+                  (disposition != UBWriteDisposition::DropOwner &&
+                   disposition != UBWriteDisposition::KeepClean)),
+             "UBAdapter node=%d socket=%d: invalid OwnerWriteback reqId=%lu",
+             _nodeId, _socketId, reqId);
+    fatal_if(kind == UBWritebackKind::StoreCommit &&
+                 (disposition != UBWriteDisposition::MemoryOnly ||
+                  !dirtyData || byteMask == 0),
+             "UBAdapter node=%d socket=%d: invalid StoreCommit reqId=%lu",
+             _nodeId, _socketId, reqId);
     // Carry dirty cacheline data so ubio can persist to DsmDataStore
     if (dirtyData) {
         req.b.writebackReq.hasData = true;
@@ -690,6 +720,7 @@ UBAdapter::sendWritebackReq(uint64_t homePa, int requesterNode,
     if (!transportSend(req)) {
         return -1;
     }
+    _inflightWritebackReqs.insert(reqId);
 
     // Port async path: schedule check, return pending
     if (_port) {
@@ -698,6 +729,7 @@ UBAdapter::sendWritebackReq(uint64_t homePa, int requesterNode,
     }
 
     if (!transportRecv(CoherenceMessageType::WritebackResp, req.h.reqId)) {
+        _inflightWritebackReqs.erase(reqId);
         warn("UBAdapter node=%d: sendWritebackReq: no response PA=0x%lx\n",
              _nodeId, homePa);
         return -1;
@@ -705,11 +737,13 @@ UBAdapter::sendWritebackReq(uint64_t homePa, int requesterNode,
 
     const CoherenceMessage &resp = _lastResponse;
     if (resp.h.type != CoherenceMessageType::WritebackResp) {
+        _inflightWritebackReqs.erase(reqId);
         warn("UBAdapter node=%d: sendWritebackReq: unexpected response type %s\n",
              _nodeId, coherenceMsgTypeName(resp.h.type));
         return -1;
     }
 
+    _inflightWritebackReqs.erase(reqId);
     return resp.b.writebackResp.success ? 1 : 0;
 }
 
@@ -1095,7 +1129,7 @@ UBAdapter::sendClearReq(uint64_t linePa, int srcNode,
 
 bool
 UBAdapter::sendRecallResp(uint64_t linePa, int ownerNode,
-                           bool dataReturned, uint64_t epoch,
+                           bool ackReceived, bool dataReturned, uint64_t epoch,
                            uint64_t reqId,
                            const DataBlock *dataBlk,
                            int homeNode, int homeSocket,
@@ -1129,6 +1163,8 @@ UBAdapter::sendRecallResp(uint64_t linePa, int ownerNode,
     req.h.enqueueTick = curTick();
     req.h.readyTick = curTick();
 
+    if (ackReceived)
+        req.h.flags |= static_cast<uint32_t>(CFLAG_ACCEPTED);
     if (dataReturned)
         req.h.flags |= static_cast<uint32_t>(CFLAG_DATA_RETURNED);
     if (dataBlk && dataReturned) {

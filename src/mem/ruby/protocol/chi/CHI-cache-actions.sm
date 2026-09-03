@@ -2025,11 +2025,14 @@ action(Send_WriteNoSnp, desc="") {
 
   enqueue(reqOutPort, CHIRequestMsg, request_latency) {
     prepareRequest(tbe, CHIRequestType:WriteNoSnp, out_msg);
+    out_msg.usesTxnId := true;
+    out_msg.txnId := tbe.txnId;
     out_msg.Destination.add(mapAddressToDownstreamMachine(tbe.addr));
     allowRequestRetry(tbe, out_msg);
   }
   // allow to expect this on top of data coming from upstream;
   // so addExpectedCount
+  tbe.expected_req_resp.addExpectedRespType(CHIResponseType:DBIDResp);
   tbe.expected_req_resp.addExpectedRespType(CHIResponseType:CompDBIDResp);
   tbe.expected_req_resp.addExpectedCount(1);
 
@@ -2042,6 +2045,8 @@ action(Send_WriteNoSnp_Partial, desc="") {
 
   enqueue(reqOutPort, CHIRequestMsg, request_latency) {
     prepareRequest(tbe, CHIRequestType:WriteNoSnpPtl, out_msg);
+    out_msg.usesTxnId := true;
+    out_msg.txnId := tbe.txnId;
     out_msg.accAddr := tbe.accAddr;
     out_msg.accSize := tbe.accSize;
     out_msg.Destination.add(mapAddressToDownstreamMachine(tbe.addr));
@@ -2049,6 +2054,7 @@ action(Send_WriteNoSnp_Partial, desc="") {
   }
   // allow to expect this on top of data coming from upstream;
   // so addExpectedCount
+  tbe.expected_req_resp.addExpectedRespType(CHIResponseType:DBIDResp);
   tbe.expected_req_resp.addExpectedRespType(CHIResponseType:CompDBIDResp);
   tbe.expected_req_resp.addExpectedCount(1);
 }
@@ -2494,6 +2500,18 @@ action(Receive_ReqDataResp, desc="") {
   assert(is_valid(tbe));
   assert(tbe.expected_req_resp.hasExpected());
   peek(datInPort, CHIDataMsg) {
+    if (in_msg.ubcc_store_auth_valid) {
+      if (tbe.ubccStoreAuthValid) {
+        assert(tbe.ubccStoreRequester == in_msg.ubcc_store_requester);
+        assert(tbe.ubccPermissionEpoch == in_msg.ubcc_permission_epoch);
+        assert(tbe.ubccWriteDisposition == in_msg.ubcc_write_disposition);
+      } else {
+        tbe.ubccStoreAuthValid := true;
+        tbe.ubccStoreRequester := in_msg.ubcc_store_requester;
+        tbe.ubccPermissionEpoch := in_msg.ubcc_permission_epoch;
+        tbe.ubccWriteDisposition := in_msg.ubcc_write_disposition;
+      }
+    }
     if (address >= 671091200 && address < 671091456) {
       DPRINTF(RubyGenerated, "[META-HNF-DATA] addr=%#x type=%d txnId=%d\n",
         address, in_msg.type, in_msg.txnId);
@@ -3559,6 +3577,15 @@ action(Send_Data, desc="") {
     out_msg.addr := tbe.addr;
     out_msg.type := tbe.snd_msgType;
     out_msg.txnId := tbe.txnId;
+    // Only the authorized HN-F StoreCommit uses the EPSNF-issued DBID.
+    // Ordinary CompData/CBWrData remains address-keyed as required by the
+    // native CHI cache data input contract.
+    out_msg.usesTxnId := tbe.snd_msgType == CHIDataType:NCBWrData &&
+                         tbe.ubccStoreAuthValid;
+    out_msg.ubcc_store_auth_valid := tbe.ubccStoreAuthValid;
+    out_msg.ubcc_store_requester := tbe.ubccStoreRequester;
+    out_msg.ubcc_permission_epoch := tbe.ubccPermissionEpoch;
+    out_msg.ubcc_write_disposition := tbe.ubccWriteDisposition;
 
     int offset := tbe.snd_pendBytes.firstBitSet(true);
     assert(offset < blockSize);
@@ -3623,8 +3650,12 @@ action(Send_CompUC, desc="") {
   DPRINTF(RubyGenerated, "[HNF-CU-COMPUC] addr=%#x stale=0\n", address);
   enqueue(rspOutPort, CHIResponseMsg, response_latency) {
     out_msg.addr := address;
+    // dataValid/dir_sharers describe the post-recall coherence state and may
+    // already be cleared before this response action runs.  The transaction's
+    // byte-valid mask is the authoritative indication that SendCompData has a
+    // complete line to return.
     if (tbe.epProxyOp == EpProxyOp:RecallUnique &&
-        !tbe.dataValid && tbe.dir_sharers.isEmpty()) {
+        !tbe.dataBlkValid.isFull()) {
       out_msg.type := CHIResponseType:Comp_UC_NoData;
     } else {
       out_msg.type := CHIResponseType:Comp_UC;
@@ -4361,6 +4392,18 @@ action(Callback_HAStorePermission, desc="") {
     sequencer.completeHAStore(tbe.addr, tbe.dataBlk,
                               tbe.haStoreExternalHit);
     tbe.dataDirty := true;
+    // A CHI miss can have supplied the old clean line before the HA write
+    // permission completed.  The final64 returned by Home replaces that TBE
+    // data, so ensure it is installed in the cache rather than merely exposed
+    // to the completing CPU store.  Without this, a later owner recall can
+    // observe the pre-grant (often zero) line.
+    if (tbe.haStoreExternalHit) {
+      // This path already has a cache entry, but its data array still contains
+      // the pre-permission line.  Write final64 directly; CheckCacheFill may be
+      // suppressed when the original miss did not request a normal fill.
+      tbe.actions.push(Event:DataArrayWrite);
+      tbe.actions.push(Event:TagArrayWrite);
+    }
   } else {
     // Non-allocating StoreLine/WriteUnique: the full-line CPU payload is
     // applied only after permission, while returned HA data has already been

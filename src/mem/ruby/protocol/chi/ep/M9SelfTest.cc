@@ -79,17 +79,52 @@ static_assert(sizeof(cc::glob::CoherenceMessageHeader) == 80,
 
 // ---- HA additions: append-only enum values and fixed wire layouts ----
 static_assert(static_cast<uint16_t>(cc::glob::CoherenceMessageType::PeerExit) == 30,
-              "existing CoherenceMessageType values must remain stable");
+               "existing CoherenceMessageType values must remain stable");
 static_assert(static_cast<uint16_t>(cc::glob::CoherenceMessageType::HAPermissionReq) == 31,
-              "HA message types must be appended after PeerExit");
-static_assert(static_cast<uint16_t>(cc::glob::CoherenceMessageType::HAPresenceProbeResp) == 35,
-              "HA message type range changed");
+               "HA message types must be appended after PeerExit");
+static_assert(static_cast<uint16_t>(cc::glob::CoherenceMessageType::HAPermissionResp) == 32 &&
+              static_cast<uint16_t>(cc::glob::CoherenceMessageType::HAPermissionAck) == 33 &&
+              static_cast<uint16_t>(cc::glob::CoherenceMessageType::HAPresenceProbeReq) == 34 &&
+              static_cast<uint16_t>(cc::glob::CoherenceMessageType::HAPresenceProbeResp) == 35 &&
+              static_cast<uint16_t>(cc::glob::CoherenceMessageType::NetworkExit) == 36,
+              "explicit HA/exit message values changed");
+static_assert(cc::glob::CFLAG_WRITE_INTENT == (1u << 0) &&
+              cc::glob::CFLAG_KEEP_AS_CLEAN == (1u << 1) &&
+              cc::glob::CFLAG_ACCEPTED == (1u << 2) &&
+              cc::glob::CFLAG_DATA_RETURNED == (1u << 3) &&
+              cc::glob::CFLAG_HAS_DATA == (1u << 4) &&
+              cc::glob::CFLAG_IS_READ_RECALL == (1u << 5) &&
+              cc::glob::CFLAG_BUSY == (1u << 6) &&
+              cc::glob::CFLAG_DATA_FORWARDED == (1u << 7) &&
+              cc::glob::CFLAG_PEER_EXIT_ACK == (1u << 8) &&
+              cc::glob::CFLAG_NETWORK_EXIT_ACK == (1u << 9) &&
+              cc::glob::CFLAG_DEFERRED == (1u << 10),
+              "coherence message flag values changed");
 static_assert(sizeof(cc::glob::HAOperation) == 1 &&
               sizeof(cc::glob::HAProbeAction) == 1 &&
               sizeof(cc::glob::HAStatus) == 1,
-              "HA wire enums must remain one byte");
-static_assert(sizeof(cc::glob::UBHAPermissionReqBody) == 80,
-              "HA permission request wire body must remain 80 bytes");
+               "HA wire enums must remain one byte");
+static_assert(sizeof(cc::glob::UBWritebackKind) == 1 &&
+              sizeof(cc::glob::UBWriteDisposition) == 1,
+              "writeback wire enums must remain one byte");
+static_assert(static_cast<uint8_t>(cc::glob::UBWritebackKind::OwnerWriteback) == 0 &&
+              static_cast<uint8_t>(cc::glob::UBWritebackKind::StoreCommit) == 1,
+              "writeback kind wire values changed");
+static_assert(static_cast<uint8_t>(cc::glob::UBWriteDisposition::MemoryOnly) == 0 &&
+              static_cast<uint8_t>(cc::glob::UBWriteDisposition::DropOwner) == 1 &&
+              static_cast<uint8_t>(cc::glob::UBWriteDisposition::KeepClean) == 2,
+              "writeback disposition wire values changed");
+static_assert(sizeof(cc::glob::UBWritebackReqBody) == 80,
+              "writeback request wire body must remain 80 bytes");
+static_assert(offsetof(cc::glob::UBWritebackReqBody, kind) == 0 &&
+              offsetof(cc::glob::UBWritebackReqBody, disposition) == 1 &&
+              offsetof(cc::glob::UBWritebackReqBody, hasData) == 2 &&
+              offsetof(cc::glob::UBWritebackReqBody, reserved) == 3 &&
+              offsetof(cc::glob::UBWritebackReqBody, byteMask) == 8 &&
+              offsetof(cc::glob::UBWritebackReqBody, data) == 16,
+              "writeback request wire offsets changed");
+static_assert(sizeof(cc::glob::UBHAPermissionReqBody) == 88,
+              "HA permission request wire body must remain 88 bytes");
 static_assert(sizeof(cc::glob::UBHAPermissionRespBody) == 80,
               "HA permission response wire body must remain 80 bytes");
 static_assert(sizeof(cc::glob::UBHAPermissionAckBody) == 16,
@@ -98,10 +133,35 @@ static_assert(sizeof(cc::glob::UBHAPresenceProbeReqBody) == 16,
               "HA presence probe request wire body must remain 16 bytes");
 static_assert(sizeof(cc::glob::UBHAPresenceProbeRespBody) == 16,
               "HA presence probe response wire body must remain 16 bytes");
-static_assert(offsetof(cc::glob::UBHAPermissionReqBody, data) == 16,
+static_assert(offsetof(cc::glob::UBHAPermissionReqBody, permissionEpoch) == 8 &&
+              offsetof(cc::glob::UBHAPermissionReqBody, byteMask) == 16 &&
+              offsetof(cc::glob::UBHAPermissionReqBody, data) == 24,
               "HA permission request data wire offset changed");
-static_assert(offsetof(cc::glob::UBHAPermissionRespBody, data) == 16,
-              "HA permission response data wire offset changed");
+static_assert(offsetof(cc::glob::UBHAPermissionReqBody, operation) == 0 &&
+              offsetof(cc::glob::UBHAPermissionReqBody, reserved) == 1,
+              "HA permission request prefix offsets changed");
+static_assert(offsetof(cc::glob::UBHAPermissionRespBody, operation) == 0 &&
+              offsetof(cc::glob::UBHAPermissionRespBody, status) == 1 &&
+              offsetof(cc::glob::UBHAPermissionRespBody, hasData) == 2 &&
+              offsetof(cc::glob::UBHAPermissionRespBody, reserved) == 3 &&
+              offsetof(cc::glob::UBHAPermissionRespBody, permissionEpoch) == 8 &&
+              offsetof(cc::glob::UBHAPermissionRespBody, data) == 16,
+              "HA permission response offsets changed");
+static_assert(offsetof(cc::glob::UBHAPermissionAckBody, operation) == 0 &&
+              offsetof(cc::glob::UBHAPermissionAckBody, status) == 1 &&
+              offsetof(cc::glob::UBHAPermissionAckBody, reserved) == 2 &&
+              offsetof(cc::glob::UBHAPermissionAckBody, permissionEpoch) == 8,
+              "HA permission ack offsets changed");
+static_assert(offsetof(cc::glob::UBHAPresenceProbeReqBody, action) == 0 &&
+              offsetof(cc::glob::UBHAPresenceProbeReqBody, reserved) == 1 &&
+              offsetof(cc::glob::UBHAPresenceProbeReqBody, expectedEpoch) == 8,
+              "HA probe request offsets changed");
+static_assert(offsetof(cc::glob::UBHAPresenceProbeRespBody, action) == 0 &&
+              offsetof(cc::glob::UBHAPresenceProbeRespBody, status) == 1 &&
+              offsetof(cc::glob::UBHAPresenceProbeRespBody, present) == 2 &&
+              offsetof(cc::glob::UBHAPresenceProbeRespBody, reserved) == 3 &&
+              offsetof(cc::glob::UBHAPresenceProbeRespBody, observedEpoch) == 8,
+              "HA probe response offsets changed");
 static_assert(sizeof(cc::glob::CoherenceMessageBody) == 264,
               "HA additions must not grow the message body ABI");
 static_assert(sizeof(cc::glob::CoherenceMessage) == 344,

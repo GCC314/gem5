@@ -143,6 +143,10 @@ structure(CHIRequestMsg, desc="", interface="Message") {
   bool ubcc_write_intent, desc="UBCC write intent for MESI E/M distinction", default="false";
   int ubcc_ingress_socket, desc="Original requester socket for UBCC source routing", default="0";
   bool ubcc_publish_on_data, desc="Publish lossless one-way grant after final data beat", default="false";
+  bool ubcc_store_auth_valid, desc="StoreCommit authorization sideband is valid", default="false";
+  int ubcc_store_requester, desc="StoreCommit requester node", default="-1";
+  Addr ubcc_permission_epoch, desc="Committed StoreCommit permission epoch", default="0";
+  int ubcc_write_disposition, desc="StoreCommit disposition (MemoryOnly=0)", default="0";
 
   // v4: EP-RNF proxy operation (internal gem5 bookkeeping only).
   // Set by EP-RNF on proxy requests to HN-F to enable special completion
@@ -251,6 +255,12 @@ structure(CHIDataMsg, desc="", interface="Message") {
   // Set by EP_SNF when UBCC grants shared access to a new node.
   // HN-F uses this to register EP-RNF in dir_sharers (RegisterEPRNF_OnSharedHint).
   bool m_shared_hint, desc="UBCC shared hint for EP-RNF registration", default="false";
+
+  // Internal transaction identity for matching write data at EP-SNF.
+  bool ubcc_store_auth_valid, desc="StoreCommit authorization sideband is valid", default="false";
+  int ubcc_store_requester, desc="StoreCommit requester node", default="-1";
+  Addr ubcc_permission_epoch, desc="Committed StoreCommit permission epoch", default="0";
+  int ubcc_write_disposition, desc="StoreCommit disposition", default="0";
 
   MessageSizeType MessageSize, default="MessageSizeType_Data";
 

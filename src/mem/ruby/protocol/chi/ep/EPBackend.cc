@@ -8,9 +8,6 @@
 #include "base/logging.hh"
 #include "debug/RubyCHIGeneric.hh"
 #include "debug/RubyEP.hh"
-#include "mem/packet.hh"
-#include "mem/request.hh"
-#include "mem/simple_mem.hh"
 #include "mem/ruby/protocol/chi/ep/EPRNFController.hh"
 #include "mem/ruby/protocol/chi/ep/MetaRNFController.hh"
 #include "mem/ruby/protocol/chi/ep/UBAdapter.hh"
@@ -57,35 +54,6 @@ makeRequesterReqId(int nodeId, uint64_t seq)
 }
 
 } // anonymous namespace
-
-// ---- F3: HomeMemoryService method implementations ----
-bool HomeMemoryService::read(uint64_t homePa, uint8_t *buf, int size) const
-{
-    if (!physMem) {
-        memset(buf, 0, size);
-        return false;
-    }
-    memset(buf, 0, size);
-    RequestPtr req = std::make_shared<Request>(homePa, size, 0, RequestorID(0));
-    req->setFlags(Request::PHYSICAL);
-    Packet pkt(req, MemCmd::ReadReq);
-    pkt.dataStatic(buf);
-    physMem->functionalAccess(&pkt);
-    return true;
-}
-
-bool HomeMemoryService::write(uint64_t homePa, const uint8_t *buf, int size) const
-{
-    if (!physMem) return false;
-    RequestPtr req = std::make_shared<Request>(homePa, size, 0, RequestorID(0));
-    req->setFlags(Request::PHYSICAL);
-    Packet pkt(req, MemCmd::WriteReq);
-    pkt.dataStatic(const_cast<uint8_t*>(buf));
-    physMem->functionalAccess(&pkt);
-    return true;
-}
-
-// ---- F3: End HomeMemoryService ----
 
 // Static registry for cross-node EPBackend routing (M6)
 std::map<int, EPBackend*> EPBackend::_backendInstances;
@@ -302,8 +270,9 @@ EPBackend::wakeup()
 
 int
 EPBackend::requestHAPermission(uint64_t linePa, HAOperation operation,
-                                uint64_t permissionEpoch,
-                                const uint8_t *writeData, int dstNode,
+                                 uint64_t permissionEpoch,
+                                 uint64_t byteMask, const uint8_t *writeData,
+                                 int dstNode,
                                 int dstSocket, uint64_t &ioReqId,
                                 UBHAPermissionRespBody &outResp,
                                 int sourceSocket)
@@ -312,7 +281,8 @@ EPBackend::requestHAPermission(uint64_t linePa, HAOperation operation,
     if (!adapter)
         return -1;
     return adapter->sendHAPermissionReq(
-        linePa, operation, permissionEpoch, writeData, dstNode, dstSocket,
+        linePa, operation, permissionEpoch, byteMask, writeData,
+        dstNode, dstSocket,
         ioReqId, outResp);
 }
 
@@ -382,6 +352,13 @@ EPBackend::recordHAInstall(uint64_t localLinePa, HAOperation operation,
     entry.homeNode = homeNode;
     entry.outerStartTick = 0;
     _haRequesterLines[{sourceSocket, localLinePa}] = entry;
+}
+
+void
+EPBackend::recordHADirtyData(uint64_t localLinePa, int sourceSocket,
+                             const DataBlock &data)
+{
+    _haDirtyData[{sourceSocket, localLinePa}] = data;
 }
 
 void
@@ -842,7 +819,7 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
 
         UBHAPermissionRespBody response;
         const int status = requestHAPermission(
-            ctx.homePa, ctx.operation, ctx.permissionEpoch, nullptr,
+            ctx.homePa, ctx.operation, ctx.permissionEpoch, 0, nullptr,
             ctx.homeNode, ctx.homeSocket, ctx.reqId, response,
             ctx.sourceSocket);
         if (status == -2)
@@ -1323,9 +1300,8 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
     // Handle grant result and update bookkeeping
     OuterGrantType result = handleGrant(line_pa, grant, homeNode);
 
-    // In split-mode all grant data arrives via ReadResp payload from ubio.
-    // Use payload whenever available; only fall back to zero-fill (NoData)
-    // for truly uninitialised DSM lines (first access, no prior write).
+    // Non-transaction-owned reads require an explicit wire payload. Recall
+    // transactions may still use their transaction-owned captured payload.
     // Phase C1: route push/ReadResp grant data directly to _lastGrantDataBlock.
     // Do NOT use _recallCaptureData* — it is a controller-global slot shared
     // across all PAs and can be cleared by a concurrent unrelated Recall.
@@ -1354,15 +1330,17 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
                     _nodeId, homePa, off, w0);
             }
         }
-    } else {
-        // No payload — uninitialised line, zero-fill is correct
-        populateGrantData(homePa, GrantDataSource::NoData);
+    } else if (dataSource == GrantDataSource::RecallBuffer &&
+               _recallCaptureDataValid) {
+        populateGrantData(homePa, GrantDataSource::RecallBuffer);
         PendingGrantData &pendingData = _pendingGrantData[line_pa];
         pendingData.data = _lastGrantDataBlock;
-        pendingData.source = _lastGrantDataSource;
-        // Presence is separate from explicit NoData; only the latter may zero-fill.
-        pendingData.valid = _lastGrantDataValid &&
-            _lastGrantDataSource != GrantDataSource::NoData;
+        pendingData.source = GrantDataSource::RecallBuffer;
+        pendingData.valid = _lastGrantDataValid;
+    } else {
+        fatal("EPBackend node_id=%d: successful Home read lacks wire data "
+              "localPA=0x%lx homePA=0x%lx source=%d\n", _nodeId, line_pa,
+              homePa, static_cast<int>(dataSource));
     }
 
     // Experimental lossless one-way profile: the grant may now flow into the
@@ -1627,31 +1605,11 @@ EPBackend::populateGrantData(uint64_t homePa, GrantDataSource dataSource)
     bool dataPopulated = false;
 
     switch (dataSource) {
-        case GrantDataSource::HomeMemory: {
-            // F3: Read clean/shared data from DDR4 via HomeMemoryService.
-            // This is the single authoritative entry point for HomeMemory data.
-            auto *physMem = _ruby_system ? _ruby_system->getPhysMem() : nullptr;
-            HomeMemoryService hms(physMem);
-            if (hms.read(homePa, buf, lineSize)) {
-                _lastGrantDataBlock.setData(buf, 0, lineSize);
-                _lastGrantDataValid = true;
-                _lastGrantDataSource = GrantDataSource::HomeMemory;
-                dataPopulated = true;
-                DPRINTF(RubyCHIGeneric,
-                        "EPBackend node_id=%d: HomeMemory read PA=0x%lx OK\n",
-                        _nodeId, homePa);
-            } else {
-                // No physMem — zero-fill (valid for uninitialized DSM memory)
-                _lastGrantDataBlock.setData(buf, 0, lineSize);
-                _lastGrantDataValid = true;
-                _lastGrantDataSource = GrantDataSource::NoData;
-                dataPopulated = true;
-                DPRINTF(RubyCHIGeneric,
-                        "EPBackend node_id=%d: no physMem for HomeMemory "
-                        "PA=0x%lx, zero-filled\n", _nodeId, homePa);
-            }
+        case GrantDataSource::HomeMemory:
+            fatal("EPBackend node_id=%d: HomeMemory grant for PA=0x%lx "
+                  "requires an explicit 64-byte wire payload\n", _nodeId,
+                  homePa);
             break;
-        }
 
         case GrantDataSource::RecallBuffer: {
             // F3: Copy from recall capture buffer (dirty data from owner eviction).
@@ -1702,6 +1660,35 @@ EPBackend::lastGrantData() const
     if (!_lastGrantDataValid)
         return nullptr;
     return _lastGrantDataBlock.getData(0, 64);
+}
+
+bool
+EPBackend::getStoreAuthorization(uint64_t linePa, int sourceSocket,
+                                  int &requesterNode,
+                                  uint64_t &permissionEpoch) const
+{
+    requesterNode = _nodeId;
+    if (_haEndpointEnabled) {
+        auto it = _haRequesterLines.find({sourceSocket, linePa});
+        if (it != _haRequesterLines.end()) {
+            permissionEpoch = it->second.epoch;
+            return true;
+        }
+        for (const auto &entry : _haRemoteMisses) {
+            const HARemoteMissContext &ctx = entry.second;
+            if (std::get<0>(entry.first) == linePa &&
+                ctx.sourceSocket == sourceSocket && ctx.awaitingInstall) {
+                permissionEpoch = ctx.permissionEpoch;
+                return true;
+            }
+        }
+        return false;
+    }
+    auto it = _requesterLines.find(linePa);
+    if (it == _requesterLines.end())
+        return false;
+    permissionEpoch = it->second.epoch;
+    return true;
 }
 
 int
@@ -1897,11 +1884,6 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
 
     // Capture recallMsg fields for the async callback
     OuterRecallMsg capturedMsg = recallMsg;
-    DataBlock ownerSnapshot(64);
-    const bool ownerSnapshotValid = recallMsg.dataNeeded &&
-        readHADataCacheLine(recallMsg.sourceSocket, ownerLocalPa,
-                            ownerSnapshot);
-
     if (recallMsg.isReadRequest) {
         // Read recall: ReadShared to downgrade owner to R_S
         if (_verboseLog) {
@@ -1915,17 +1897,17 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
         // R2: Clear stale recall capture data before initiating new recall
         setRecallCaptureData(DataBlock(64), false);
         _epRnfCtrl->startReadShared(ownerLocalPa,
-            [this, capturedMsg, ownerSnapshot,
-             ownerSnapshotValid](bool success) {
+            [this, capturedMsg](bool success, const DataBlock &capturedData,
+                                bool capturedDataValid) {
                 if (_verboseLog) {
                 DPRINTF(RubyEP, "[RECALL-DIAG] node=%d ReadShared callback success=%d valid=%d\n",
-                        _nodeId, success, _recallCaptureDataValid);
+                        _nodeId, success, capturedDataValid);
                 }
                 DPRINTF(RubyEP,
                              "[RECALL-CB-ERR] node=%d kind=ReadShared linePA=0x%lx reqId=%lu success=%d valid=%d curT=%lu\n",
                              _nodeId, capturedMsg.linePa, capturedMsg.reqId,
                              success ? 1 : 0,
-                             _recallCaptureDataValid ? 1 : 0, curTick());
+                              capturedDataValid ? 1 : 0, curTick());
                 OuterRecallResponse resp;
                 resp.linePa = capturedMsg.linePa;
                 resp.ownerNode = capturedMsg.ownerNode;
@@ -1933,13 +1915,26 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
                 resp.epoch = capturedMsg.epoch;
                 resp.reqId = capturedMsg.reqId;
                 resp.sourceSocket = capturedMsg.sourceSocket;
+                // A data-bearing recall is successful only when the CHI
+                // transaction itself delivered every byte of the line.
                 resp.ackReceived = success;
-                resp.dataReturned = capturedMsg.dataNeeded && success &&
-                    (ownerSnapshotValid || _recallCaptureDataValid);
-                // R2: Gate data payload on dataReturned (not raw _recallCaptureDataValid)
+                resp.dataReturned = capturedMsg.dataNeeded &&
+                    resp.ackReceived && capturedDataValid;
+                if (capturedMsg.dataNeeded && resp.ackReceived) {
+                    const HALineKey key{capturedMsg.sourceSocket,
+                                        capturedMsg.ownerLocalPa != 0
+                                            ? capturedMsg.ownerLocalPa
+                                            : capturedMsg.linePa};
+                    auto dirty = _haDirtyData.find(key);
+                    if (dirty != _haDirtyData.end()) {
+                        resp.dataReturned = true;
+                        resp.dataPayload = dirty->second;
+                        resp.hasDataPayload = true;
+                    }
+                }
                 if (resp.dataReturned) {
-                    resp.dataPayload = ownerSnapshotValid
-                        ? ownerSnapshot : _recallCaptureDataBlock;
+                    if (capturedDataValid && !resp.hasDataPayload)
+                        resp.dataPayload = capturedData;
                     resp.hasDataPayload = true;
                 }
                 // C4: Direct-forward data to requester (requester ≠ owner ≠ home)
@@ -1995,14 +1990,14 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
         // R2: Clear stale recall capture data before initiating new recall
         setRecallCaptureData(DataBlock(64), false);
         _epRnfCtrl->startReadUnique(ownerLocalPa,
-            [this, capturedMsg, ownerSnapshot,
-             ownerSnapshotValid](bool success) {
+            [this, capturedMsg](bool success, const DataBlock &capturedData,
+                                bool capturedDataValid) {
                 inform(
                              "[RECALL-PROXY-CALLBACK] node=%d homePA=0x%lx "
                              "reqId=%lu success=%d dataValid=%d tick=%lu\n",
                              _nodeId, capturedMsg.linePa, capturedMsg.reqId,
                              success ? 1 : 0,
-                             _recallCaptureDataValid ? 1 : 0, curTick());
+                              capturedDataValid ? 1 : 0, curTick());
                 if (_verboseLog) {
                 DPRINTF(RubyEP, "[RECALL-DIAG] node=%d ReadUnique callback success=%d\n",
                         _nodeId, success);
@@ -2011,7 +2006,7 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
                              "[RECALL-CB-ERR] node=%d kind=ReadUnique linePA=0x%lx reqId=%lu success=%d valid=%d curT=%lu\n",
                              _nodeId, capturedMsg.linePa, capturedMsg.reqId,
                              success ? 1 : 0,
-                             _recallCaptureDataValid ? 1 : 0, curTick());
+                              capturedDataValid ? 1 : 0, curTick());
                 OuterRecallResponse resp;
                 resp.linePa = capturedMsg.linePa;
                 resp.ownerNode = capturedMsg.ownerNode;
@@ -2020,12 +2015,23 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
                 resp.reqId = capturedMsg.reqId;
                 resp.sourceSocket = capturedMsg.sourceSocket;
                 resp.ackReceived = success;
-                resp.dataReturned = capturedMsg.dataNeeded && success &&
-                    (ownerSnapshotValid || _recallCaptureDataValid);
-                // R2: Gate data payload on dataReturned (not raw _recallCaptureDataValid)
+                resp.dataReturned = capturedMsg.dataNeeded &&
+                    resp.ackReceived && capturedDataValid;
+                if (capturedMsg.dataNeeded && resp.ackReceived) {
+                    const HALineKey key{capturedMsg.sourceSocket,
+                                        capturedMsg.ownerLocalPa != 0
+                                            ? capturedMsg.ownerLocalPa
+                                            : capturedMsg.linePa};
+                    auto dirty = _haDirtyData.find(key);
+                    if (dirty != _haDirtyData.end()) {
+                        resp.dataReturned = true;
+                        resp.dataPayload = dirty->second;
+                        resp.hasDataPayload = true;
+                    }
+                }
                 if (resp.dataReturned) {
-                    resp.dataPayload = ownerSnapshotValid
-                        ? ownerSnapshot : _recallCaptureDataBlock;
+                    if (capturedDataValid && !resp.hasDataPayload)
+                        resp.dataPayload = capturedData;
                     resp.hasDataPayload = true;
                 }
                 // C4: Direct-forward data to requester (requester ≠ owner ≠ home)
@@ -2100,33 +2106,6 @@ EPBackend::sendRecallResponse(const OuterRecallResponse &response)
     // The entry is cleared when the SnpCleanInvalid is handled in
     // EPRNFController::handleSnpCleanInvalid via clearActiveRecall().
 
-    // R2: Require both dataReturned AND hasDataPayload before installing to home memory.
-    //
-    // NOTE (multi-process split): getBackendInstance(homeNode) only finds the
-    // home node's EPBackend when home and owner run in the SAME process. In a
-    // split (one gem5 process per node) build, a remote home returns nullptr
-    // here, physMem becomes null, and HomeMemoryService::write() no-ops
-    // (returns false). That is intentional: the authoritative delivery of
-    // recall data to the home is the IPC sendRecallResp() below, which the
-    // home node's UBCC/UBAdapter applies. This in-process write is only a
-    // same-process fast path / redundant shortcut.
-    // C4: Direct-forward sends extra copy to requester; home still needs the
-    // data via RecallResp for its authoritative home-data grant construction.
-    if (response.dataReturned && response.hasDataPayload) {
-        EPBackend *homeBackend = EPBackend::getBackendInstance(response.homeNode);
-        RubySystem *homeRuby = homeBackend ? homeBackend->getRubySystem() : nullptr;
-        auto *physMem = homeRuby ? homeRuby->getPhysMem() : nullptr;
-        HomeMemoryService hms(physMem);
-        uint8_t buf[64] = {};
-        memcpy(buf, response.dataPayload.getData(0, 64), 64);
-        bool installed = hms.write(response.linePa, buf, 64);
-        if (_verboseLog) {
-        DPRINTF(RubyEP, "[RECALL-DIAG] home-install node=%d home=%d PA=0x%lx installed=%d hasData=%d\n",
-                _nodeId, response.homeNode, response.linePa,
-                installed, response.hasDataPayload);
-        }
-    }
-
     if (!getUBAdapter(response.sourceSocket)) {
         fatal("EPBackend node_id=%d: UBAdapter required for recall response "
               "PA=0x%lx homeNode=%d sourceSocket=%d\n",
@@ -2139,7 +2118,8 @@ EPBackend::sendRecallResponse(const OuterRecallResponse &response)
     int rrHomeSocket = _addrMap.homeSocket(response.homeNode, response.linePa);
     if (rrHomeSocket < 0) rrHomeSocket = 0;
     bool ok = getUBAdapter(response.sourceSocket)->sendRecallResp(
-        response.linePa, response.ownerNode, response.dataReturned,
+        response.linePa, response.ownerNode, response.ackReceived,
+        response.dataReturned,
         response.epoch, response.reqId,
         response.hasDataPayload ? &response.dataPayload : nullptr,
         response.homeNode, rrHomeSocket);
@@ -2334,7 +2314,10 @@ EPBackend::handleWritebackWithMeta(uint64_t line_pa, bool keepAsClean,
               _nodeId, line_pa, homeNode, sourceSocket);
     }
     int wbRet = adapter->sendWritebackReq(
-        homePa, requesterNode, epochVal, keepAsClean, homeNode, homeSocket,
+        homePa, requesterNode, epochVal, UBWritebackKind::OwnerWriteback,
+        keepAsClean ? UBWriteDisposition::KeepClean
+                    : UBWriteDisposition::DropOwner,
+        ~0ULL, homeNode, homeSocket,
         dirtyData, ioWritebackReqId);
     bool wbPending = (wbRet == -2);
     bool ok = (wbRet > 0);
@@ -2375,6 +2358,32 @@ EPBackend::handleWritebackWithMeta(uint64_t line_pa, bool keepAsClean,
             _nodeId, line_pa, ok, keepAsClean);
 
     return wbPending ? -2 : (ok ? 1 : 0);
+}
+
+int
+EPBackend::commitStore(uint64_t homePa, int requesterNode,
+                       uint64_t permissionEpoch, uint64_t commitId,
+                       uint64_t byteMask, const uint8_t *data,
+                       int homeNode, int homeSocket, int sourceSocket,
+                       uint64_t &ioWritebackReqId)
+{
+    fatal_if(!data || byteMask == 0 || requesterNode < 0 || commitId == 0,
+             "EPBackend node_id=%d: invalid StoreCommit identity/data "
+             "PA=0x%lx requester=%d epoch=%lu commitId=%lu mask=0x%lx",
+             _nodeId, homePa, requesterNode, permissionEpoch, commitId,
+             byteMask);
+    UBAdapter *adapter = getUBAdapter(sourceSocket);
+    fatal_if(!adapter,
+             "EPBackend node_id=%d: no StoreCommit adapter socket=%d",
+             _nodeId, sourceSocket);
+    fatal_if(ioWritebackReqId != 0 && ioWritebackReqId != commitId,
+             "EPBackend node_id=%d: StoreCommit retry identity changed "
+             "wire=%lu commit=%lu", _nodeId, ioWritebackReqId, commitId);
+    ioWritebackReqId = commitId;
+    return adapter->sendWritebackReq(
+        homePa, requesterNode, permissionEpoch, UBWritebackKind::StoreCommit,
+        UBWriteDisposition::MemoryOnly, byteMask, homeNode, homeSocket, data,
+        &ioWritebackReqId);
 }
 
 bool

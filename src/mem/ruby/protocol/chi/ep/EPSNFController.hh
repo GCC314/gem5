@@ -44,6 +44,10 @@ class EPSNFController : public EPController
     // this is also the store's permission context: the final line is assembled
     // here and is not published to memory until its own HA Write is granted.
     struct PendingWrite {
+        uint64_t dbid = 0;
+        uint64_t storeCommitId = 0;
+        uint64_t originalTxnId = 0;
+        Addr linePa = 0;
         uint64_t expectedMask = 0;
         uint64_t receivedMask = 0;
         int sourceSocket = 0;
@@ -58,10 +62,16 @@ class EPSNFController : public EPController
         int homeSocket = -1;
         uint64_t permissionEpoch = 0;
         uint64_t permissionReqId = 0;
+        int requesterNode = -1;
+        UBWriteDisposition disposition = UBWriteDisposition::MemoryOnly;
     };
-    std::map<Addr, PendingWrite> _pendingWrites;
+    std::map<uint64_t, PendingWrite> _pendingWrites;
+    // Identity layout: node[63:60], socket[59], reserved[58:48],
+    // controller version[47:32], monotonic sequence[31:0].
+    uint64_t _nextWriteIdentity = 1;
+    uint64_t allocateWriteIdentity();
     void processPendingHAWrites();
-    void publishHAWrite(Addr linePa, PendingWrite &pending);
+    void publishHAWrite(uint64_t transactionId, PendingWrite &pending);
 
     // Q3: Retry queue for blocked grants
     struct RetryEntry {
@@ -116,39 +126,6 @@ class EPSNFController : public EPController
     };
     std::vector<DeferredGrantEntry> _deferredGrants;
     void processDeferredGrants();
-
-    // Pending writeback retry (Phase 2 async: metadata-resolution aware)
-    struct PendingWriteback {
-        uint64_t linePa;
-        bool keepAsClean;
-        int sourceSocket;
-        uint8_t data[64];
-        bool hasData;
-
-        // Phase 2 async: QueryLineMeta state
-        uint64_t queryReqId;       // stable QLM reqId (0 = no query sent yet)
-        bool queryInFlight;        // true while QLM is outstanding
-        uint64_t cachedEpoch;      // metadata from QLM response
-        int cachedOwnerNode;
-        bool cachedFound;
-        uint64_t writebackReqId;
-
-        // Phase 2 async: bounded retry / backoff
-        int retryCount;
-        Tick nextRetryTick;
-
-        PendingWriteback()
-            : linePa(0), keepAsClean(false), sourceSocket(0), hasData(false),
-              queryReqId(0), queryInFlight(false),
-              cachedEpoch(0), cachedOwnerNode(-1), cachedFound(false),
-              writebackReqId(0),
-              retryCount(0), nextRetryTick(0)
-        {
-            std::memset(data, 0, sizeof(data));
-        }
-    };
-    std::deque<PendingWriteback> _pendingWritebacks;
-    void processPendingWritebacks();
 
     // Phase 4: verbose diagnostic logging gate (I14)
     bool _verboseLog = false;

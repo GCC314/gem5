@@ -94,7 +94,7 @@ def setup_dsm_va_mapping(processes, num_nodes=DEFAULT_N, seg_size=DEFAULT_SEG_SI
             for sid in range(num_sockets):
                 dsm_pa_base = _req_node_base + (2 + seg_idx) * seg_size
                 dsm_va = dsm_va_base + seg_idx * seg_size
-                proc.map(dsm_va, dsm_pa_base, seg_size, cacheable=True)
+                proc.defer_map(dsm_va, dsm_pa_base, seg_size, cacheable=True)
                 seg_idx += 1
 
     print(f"[Q1-DSM-MAP] Installed DSM VA→PA mappings for {num_nodes} nodes, "
@@ -275,6 +275,10 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
         dl_range = NodeConfig.dsm_range_for(node_id, seg_size, cfg.phy_base)
         nd['dl_memctrl'] = _make_dram_memctrl(dl_range, system,
                                               f"dl_mc_n{node_id}")
+        # DSM timing traffic is routed exclusively through EP-SNF. Keep the
+        # legacy DL-SNF object, but do not register its overlapping backing
+        # range in System::physmem.
+        nd['dl_memctrl'].dram.in_addr_map = False
         nd['dl_snf'] = chi_defs.CHI_SNF_MainMem(ruby_system, None,
                                                 nd['dl_memctrl'],
                                                 addr_ranges=[dl_range])
@@ -519,7 +523,6 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
             # DSM must not go through DL_SNF.
             snf_dests.append(nd['ep_snf_cntrls'][sid])
             nd['hnf_wrappers'][sid].setDownstream(snf_dests)
-            nd['hnf_cntrls'][sid].unproxyParams()
 
     for cntrl in all_cntrls:
         cntrl.data_channel_size = params.data_width

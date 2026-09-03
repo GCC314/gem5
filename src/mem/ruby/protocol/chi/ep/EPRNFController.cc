@@ -541,8 +541,10 @@ EPRNFController::recvResponseMsg(const CHIResponseMsg *msg)
             if (it->second.op == PendingChiOp::ReadUnique) {
                 it->second.hnfDest = msg->m_responder;
                 it->second.readUniqueCompUCSeen = true;
-                if (msg->m_type == CHIResponseType_Comp_UC_NoData)
+                if (msg->m_type == CHIResponseType_Comp_UC_NoData) {
+                    it->second.readUniqueNoData = true;
                     it->second.readUniqueDataComplete = true;
+                }
                 tryCompleteReadUnique(msg->m_addr);
                 return true;
             }
@@ -611,6 +613,9 @@ EPRNFController::recvDataMsg(const CHIDataMsg *msg)
     // ---- ReadShared completion ----
     if (it->second.op == PendingChiOp::ReadShared) {
         it->second.hnfDest = msg->m_responder;
+        fatal_if(it->second.beatsReceived >= it->second.beatsExpected,
+                 "EP_RNF node_id=%d: excess ReadShared data beat for %#x",
+                 _nodeId, msg->m_addr);
         it->second.beatsReceived++;
         fatal_if(it->second.recallDataMask.isOverlap(msg->m_bitMask),
                  "EP_RNF node_id=%d: duplicate ReadShared data bytes for %#x",
@@ -621,7 +626,11 @@ EPRNFController::recvDataMsg(const CHIDataMsg *msg)
         it->second.recallDataValid = it->second.recallDataMask.isFull();
 
         // Send CompAck only on last beat (HN-F expects exactly 1 per txn)
-        if (it->second.beatsReceived >= it->second.beatsExpected) {
+        if (it->second.beatsReceived == it->second.beatsExpected) {
+            fatal_if(!it->second.recallDataValid,
+                     "EP_RNF node_id=%d: ReadShared final beat did not "
+                     "complete authoritative line %#x", _nodeId,
+                     msg->m_addr);
             NetDest destNet(m_ruby_system);
             destNet.add(msg->m_responder);
             auto ack = std::make_shared<CHIResponseMsg>(
@@ -654,6 +663,12 @@ EPRNFController::recvDataMsg(const CHIDataMsg *msg)
                          it->second.beatsExpected, curTick());
         }
         it->second.hnfDest = msg->m_responder;
+        fatal_if(it->second.readUniqueNoData,
+                 "EP_RNF node_id=%d: ReadUnique data after Comp_UC_NoData "
+                 "for %#x", _nodeId, msg->m_addr);
+        fatal_if(it->second.beatsReceived >= it->second.beatsExpected,
+                 "EP_RNF node_id=%d: excess ReadUnique data beat for %#x",
+                 _nodeId, msg->m_addr);
         it->second.beatsReceived++;
         fatal_if(it->second.recallDataMask.isOverlap(msg->m_bitMask),
                  "EP_RNF node_id=%d: duplicate ReadUnique data bytes for %#x",
@@ -663,7 +678,7 @@ EPRNFController::recvDataMsg(const CHIDataMsg *msg)
         it->second.recallDataMask.orMask(msg->m_bitMask);
         it->second.recallDataValid = it->second.recallDataMask.isFull();
 
-        if (it->second.beatsReceived >= it->second.beatsExpected) {
+        if (it->second.beatsReceived == it->second.beatsExpected) {
             fatal_if(!it->second.recallDataValid,
                      "EP_RNF node_id=%d: incomplete ReadUnique data for %#x",
                      _nodeId, msg->m_addr);
@@ -1012,10 +1027,14 @@ EPRNFController::sendSnpRespDataSC(const CHIRequestMsg *msg)
         wm.setMask(offset, chunkSize);
         DataBlock db(cacheLineSize);  // zero-filled
         auto dat = std::make_shared<CHIDataMsg>(
-            curTick(), cacheLineSize, m_ruby_system,
-            msg->m_addr, CHIDataType_SnpRespData_SC,
-            m_machineID, dest, db, wm,
-            false, 0, false, MessageSizeType_Data);
+            curTick(), cacheLineSize, m_ruby_system);
+        dat->m_addr = msg->m_addr;
+        dat->m_type = CHIDataType_SnpRespData_SC;
+        dat->m_responder = m_machineID;
+        dat->m_Destination = dest;
+        dat->m_dataBlk = db;
+        dat->m_bitMask = wm;
+        dat->m_MessageSize = MessageSizeType_Data;
         sendDataReliable(dat);
     }
     return true;
@@ -1068,6 +1087,8 @@ EPRNFController::finishChiTxn(uint64_t linePa, bool success)
     }
 
     auto cb = txnIt->second.onComplete;
+    const DataBlock capturedData = txnIt->second.recallDataBlk;
+    const bool capturedDataValid = txnIt->second.recallDataValid;
     bool hadQueuedSnoop = txnIt->second.snoopSlotValid;
     // Keep completion-side clearing for ReadShared only.
     // ReadUnique is retired by RECALL-SNOOP hit or by requester re-acquire
@@ -1090,7 +1111,7 @@ EPRNFController::finishChiTxn(uint64_t linePa, bool success)
 
     // Invoke completion callback
     if (cb) {
-        cb(success);
+        cb(success, capturedData, capturedDataValid);
     }
 
     // §4.3.3: Queued snoop has higher priority than deferred CHI requests
@@ -1191,7 +1212,12 @@ EPRNFController::tryCompleteReadUnique(uint64_t linePa)
         if (pending == _pendingChiTxns.end())
             return;
         pending->second.needsCompAck = false;
-        finishChiTxn(linePa, true);
+        // Comp_UC_NoData is a successful control completion for a clean line.
+        // Keep data validity independent so HA can safely fall back to Home
+        // memory, while a dirty/latest recall still has to provide its captured
+        // transaction-bound DataBlock.
+        finishChiTxn(linePa, pending->second.readUniqueNoData ||
+                                 pending->second.recallDataValid);
     });
 }
 
@@ -1318,7 +1344,8 @@ EPRNFController::processDeferredChiReqs()
 
 void
 EPRNFController::startReadShared(uint64_t linePa,
-                                 std::function<void(bool)> onComplete)
+                                 std::function<void(bool, const DataBlock &,
+                                                    bool)> onComplete)
 {
     DPRINTF(RubyCHIGeneric,
             "EP_RNF node_id=%d: startReadShared addr=0x%lx\n",
@@ -1329,7 +1356,7 @@ EPRNFController::startReadShared(uint64_t linePa,
                 "EP_RNF node_id=%d: startReadShared addr=0x%lx "
                 "already has pending txn\n",
                 _nodeId, linePa);
-        if (onComplete) onComplete(false);
+        if (onComplete) onComplete(false, DataBlock(cacheLineSize), false);
         return;
     }
 
@@ -1358,14 +1385,15 @@ EPRNFController::startReadShared(uint64_t linePa,
         warn(
                 "EP_RNF node_id=%d: startReadShared addr=0x%lx "
                 "send failed\n", _nodeId, linePa);
-        if (onComplete) onComplete(false);
+        if (onComplete) onComplete(false, DataBlock(cacheLineSize), false);
     }
 }
 
 // ---- v4: Write Recall Path (§4.3.2, §5.3) ----
 void
 EPRNFController::startReadUnique(uint64_t linePa,
-                                 std::function<void(bool)> onComplete)
+                                 std::function<void(bool, const DataBlock &,
+                                                    bool)> onComplete)
 {
     DPRINTF(RubyCHIGeneric,
             "EP_RNF node_id=%d: startReadUnique addr=0x%lx "
@@ -1390,7 +1418,7 @@ EPRNFController::startReadUnique(uint64_t linePa,
                 "EP_RNF node_id=%d: startReadUnique addr=0x%lx "
                 "already has pending txn\n",
                 _nodeId, linePa);
-        if (onComplete) onComplete(false);
+        if (onComplete) onComplete(false, DataBlock(cacheLineSize), false);
         return;
     }
 
@@ -1426,7 +1454,7 @@ EPRNFController::startReadUnique(uint64_t linePa,
         warn(
                 "EP_RNF node_id=%d: startReadUnique addr=0x%lx "
                 "send failed\n", _nodeId, linePa);
-        if (onComplete) onComplete(false);
+        if (onComplete) onComplete(false, DataBlock(cacheLineSize), false);
     }
 }
 
@@ -1467,7 +1495,10 @@ EPRNFController::startCleanUnique(uint64_t linePa,
     txn.readUniqueDataComplete = false;
     txn.readUniqueCompUCSeen = false;
     txn.startTick = curTick();
-    txn.onComplete = onComplete;
+    txn.onComplete = [onComplete](bool success, const DataBlock &, bool) {
+        if (onComplete)
+            onComplete(success);
+    };
     _pendingChiTxns[linePa] = txn;
 
     // Send CleanUnique to HN-F via reqOut with InvalidateOnly proxy op
@@ -1578,13 +1609,13 @@ EPRNFController::processRetryQueue()
 
         switch (it->second.strongestOp) {
             case PendingChiOp::ReadShared:
-                startReadShared(it->second.linePa, nullptr);
+                startReadShared(it->second.linePa, {});
                 break;
             case PendingChiOp::CleanUnique:
                 startCleanUnique(it->second.linePa, nullptr);
                 break;
             case PendingChiOp::ReadUnique:
-                startReadUnique(it->second.linePa, nullptr);
+                startReadUnique(it->second.linePa, {});
                 break;
         }
 

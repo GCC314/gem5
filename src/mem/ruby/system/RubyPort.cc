@@ -686,7 +686,8 @@ RubyPort::MemResponsePort::hitCallback(PacketPtr pkt)
 
     // Unless specified at configuration, all responses except failed SC
     // and Flush operations access M5 physical memory.
-    bool accessPhysMem = access_backing_store;
+    bool accessPhysMem = access_backing_store &&
+                         !owner.bypassBackingStore(pkt->getAddr());
 
     if (pkt->isLLSC()) {
         if (pkt->isWrite()) {

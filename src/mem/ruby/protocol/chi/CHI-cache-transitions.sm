@@ -1467,6 +1467,10 @@ transition(BUSY_BLKD, CompleteEPRNFReadUniqueUpgrade) {
 // Generic send/receive transitions
 
 // waiting for data
+// Copyback topology contract: CBWrData is sent by an RN cache to its mapped
+// downstream HN-F and is consumed by this transition. If persistence must
+// continue below an HN-F, Send_WBData converts it to NCBWrData. Therefore an
+// EP-SNF downstream of HN-F cannot legally receive CBWrData directly.
 transition(BUSY_BLKD,
            {CBWrData_I,CBWrData_SC,CBWrData_SD_PD,CBWrData_UC,CBWrData_UD_PD}) {
   Receive_ReqDataResp;

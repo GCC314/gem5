@@ -413,6 +413,10 @@ void initializeTBE(TBE tbe, Addr addr, int storSlot) {
   tbe.pendReqUbccNeededPerm := 0;
   tbe.pendReqUbccWriteIntent := false;
   tbe.pendReqUbccPublishOnData := false;
+  tbe.pendReqUbccStoreAuthValid := false;
+  tbe.pendReqUbccStoreRequester := -1;
+  tbe.pendReqUbccPermissionEpoch := static_cast(Addr, "value", 0);
+  tbe.pendReqUbccWriteDisposition := 0;
 
   tbe.pendAction := Event:null;
   tbe.finalState := State:null;
@@ -423,6 +427,10 @@ void initializeTBE(TBE tbe, Addr addr, int storSlot) {
   tbe.haStoreExternalHit := false;
   tbe.haStoreMissFill := false;
   tbe.ubccIngressSocket := 0;
+  tbe.ubccStoreAuthValid := false;
+  tbe.ubccStoreRequester := -1;
+  tbe.ubccPermissionEpoch := static_cast(Addr, "value", 0);
+  tbe.ubccWriteDisposition := 0;
 
    // v4: Derive epRnfMachineID from epRnfMachineVersion
   if (epRnfMachineVersion >= 0) {
@@ -467,6 +475,10 @@ TBE allocateRequestTBE(Addr addr, CHIRequestMsg in_msg), return_by_pointer="yes"
   tbe.requestor := in_msg.requestor;
   tbe.reqType := in_msg.type;
   tbe.ubccIngressSocket := in_msg.ubcc_ingress_socket;
+  tbe.ubccStoreAuthValid := in_msg.ubcc_store_auth_valid;
+  tbe.ubccStoreRequester := in_msg.ubcc_store_requester;
+  tbe.ubccPermissionEpoch := in_msg.ubcc_permission_epoch;
+  tbe.ubccWriteDisposition := in_msg.ubcc_write_disposition;
 
   tbe.isSeqReqValid := in_msg.isSeqReqValid;
   tbe.seqReq := in_msg.seqReq;
@@ -702,6 +714,10 @@ void prepareRequest(TBE tbe, CHIRequestType type, CHIRequestMsg & out_msg) {
   out_msg.ubcc_write_intent := false;
   out_msg.ubcc_ingress_socket := tbe.ubccIngressSocket;
   out_msg.ubcc_publish_on_data := false;
+  out_msg.ubcc_store_auth_valid := tbe.ubccStoreAuthValid;
+  out_msg.ubcc_store_requester := tbe.ubccStoreRequester;
+  out_msg.ubcc_permission_epoch := tbe.ubccPermissionEpoch;
+  out_msg.ubcc_write_disposition := tbe.ubccWriteDisposition;
 
   // v4: propagate epProxyOp so the snoop recipient (EP-RNF) can distinguish
   // a self-initiated upgrade snoop (NoProxyOp, from CPU store) from a passive
@@ -762,6 +778,10 @@ void allowRequestRetry(TBE tbe, CHIRequestMsg & out_msg) {
   tbe.pendReqUbccNeededPerm := out_msg.ubcc_needed_perm;
   tbe.pendReqUbccWriteIntent := out_msg.ubcc_write_intent;
   tbe.pendReqUbccPublishOnData := out_msg.ubcc_publish_on_data;
+  tbe.pendReqUbccStoreAuthValid := out_msg.ubcc_store_auth_valid;
+  tbe.pendReqUbccStoreRequester := out_msg.ubcc_store_requester;
+  tbe.pendReqUbccPermissionEpoch := out_msg.ubcc_permission_epoch;
+  tbe.pendReqUbccWriteDisposition := out_msg.ubcc_write_disposition;
 }
 
 void prepareRequestRetry(TBE tbe, CHIRequestMsg & out_msg) {
@@ -792,6 +812,10 @@ void prepareRequestRetry(TBE tbe, CHIRequestMsg & out_msg) {
   out_msg.ubcc_write_intent := tbe.pendReqUbccWriteIntent;
   out_msg.ubcc_publish_on_data := tbe.pendReqUbccPublishOnData;
   out_msg.ubcc_ingress_socket := tbe.ubccIngressSocket;
+  out_msg.ubcc_store_auth_valid := tbe.pendReqUbccStoreAuthValid;
+  out_msg.ubcc_store_requester := tbe.pendReqUbccStoreRequester;
+  out_msg.ubcc_permission_epoch := tbe.pendReqUbccPermissionEpoch;
+  out_msg.ubcc_write_disposition := tbe.pendReqUbccWriteDisposition;
 }
 
 void prepareRequestRetryDVM(TBE tbe, CHIRequestMsg & out_msg) {

@@ -88,8 +88,9 @@ class UBAdapter : public SimObject
 
     // ---- Phase 3: EPBackend→UBCC synchronous paths ----
     int sendWritebackReq(uint64_t homePa, int requesterNode,
-                         uint64_t epochVal, bool keepAsClean,
-                         int homeNode, int homeSocket,
+                          uint64_t epochVal, UBWritebackKind kind,
+                          UBWriteDisposition disposition, uint64_t byteMask,
+                          int homeNode, int homeSocket,
                          const uint8_t *dirtyData = nullptr,
                          uint64_t *ioReqId = nullptr);
 
@@ -126,7 +127,7 @@ class UBAdapter : public SimObject
 
     // EPBackend→UBCC fire-and-forget messages
     bool sendRecallResp(uint64_t linePa, int ownerNode,
-                        bool dataReturned, uint64_t epoch,
+                         bool ackReceived, bool dataReturned, uint64_t epoch,
                         uint64_t reqId,
                         const DataBlock *dataBlk,
                         int homeNode, int homeSocket,
@@ -180,7 +181,8 @@ class UBAdapter : public SimObject
     // non-zero ID; the adapter then polls the exact response and never emits a
     // second request.  Return: 1=response consumed, -2=pending, -1=send error.
     int sendHAPermissionReq(uint64_t linePa, HAOperation operation,
-                            uint64_t permissionEpoch, const uint8_t *writeData,
+                             uint64_t permissionEpoch, uint64_t byteMask,
+                             const uint8_t *writeData,
                             int dstNode, int dstSocket, uint64_t &ioReqId,
                             UBHAPermissionRespBody &outResp);
     bool sendHAPermissionAck(uint64_t linePa, HAOperation operation,
@@ -293,6 +295,7 @@ class UBAdapter : public SimObject
     static constexpr Tick ReadReqRetryTicks = 1000000;
     std::map<uint64_t, Tick> _inflightReadReqs;
     std::set<uint64_t> _inflightClearReqs;
+    std::set<uint64_t> _inflightWritebackReqs;
     std::set<uint64_t> _inflightHAPermissionReqs;
     std::set<uint64_t> _inflightHAPresenceProbeReqs;
     std::map<uint64_t, Tick> _clearRetryTick;

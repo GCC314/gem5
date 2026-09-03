@@ -677,6 +677,10 @@ machine(MachineType:Cache, "Cache coherency protocol") :
     MachineID requestor,    desc="Requestor ID";
     MachineID fwdRequestor, desc="Requestor to receive data on fwding snoops";
     int ubccIngressSocket, desc="Original requester socket for UBCC source routing", default="0";
+    bool ubccStoreAuthValid, desc="StoreCommit authorization is valid", default="false";
+    int ubccStoreRequester, desc="StoreCommit requester node", default="-1";
+    Addr ubccPermissionEpoch, desc="Committed StoreCommit permission epoch", default="0";
+    int ubccWriteDisposition, desc="StoreCommit disposition", default="0";
     bool use_DMT,           desc="Use DMT for this transaction";
     bool use_DCT,           desc="Use DCT for this transaction";
 
@@ -793,6 +797,10 @@ machine(MachineType:Cache, "Cache coherency protocol") :
     int pendReqUbccNeededPerm;
     bool pendReqUbccWriteIntent;
     bool pendReqUbccPublishOnData;
+    bool pendReqUbccStoreAuthValid;
+    int pendReqUbccStoreRequester;
+    Addr pendReqUbccPermissionEpoch;
+    int pendReqUbccWriteDisposition;
 
     // This TBE stalled a message and thus we need to call wakeUpBuffers
     // at some point

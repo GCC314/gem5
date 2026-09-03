@@ -8,8 +8,6 @@
 #include <tuple>
 #include <vector>
 
-#include "mem/simple_mem.hh"
-
 namespace gem5 { namespace ruby { class EPRNFController; } }
 #include "mem/ruby/common/DataBlock.hh"
 #include "mem/ruby/protocol/chi/ep/CoherenceMessage.hh"
@@ -302,14 +300,6 @@ struct RequesterLineSnapshot {
 // (included via ep/CoherenceMessage.hh forward shim).
 // OuterReqType, OuterGrantType, UpgradeCause are defined locally below.
 
-struct HomeMemoryService {
-    memory::SimpleMemory *physMem;
-    HomeMemoryService(memory::SimpleMemory *pm = nullptr) : physMem(pm) {}
-    // Implemented in EPBackend.cc
-    bool read(uint64_t homePa, uint8_t *buf, int size) const;
-    bool write(uint64_t homePa, const uint8_t *buf, int size) const;
-};
-
 // Snapshot of the last UBCC sideband observed by EP_SNF on a recvRequestMsg.
 // Used for Python test inspection of HN→EP_SNF sideband field values.
 struct SidebandSnapshot {
@@ -575,7 +565,13 @@ class EPBackend : public SimObject
                                 const uint8_t *dirtyData,
                                 uint64_t epochVal, int requesterNode,
                                 int sourceSocket = 0,
-                                uint64_t *ioWritebackReqId = nullptr);
+                                 uint64_t *ioWritebackReqId = nullptr);
+
+    int commitStore(uint64_t homePa, int requesterNode,
+                    uint64_t permissionEpoch, uint64_t commitId,
+                    uint64_t byteMask, const uint8_t *data,
+                    int homeNode, int homeSocket, int sourceSocket,
+                    uint64_t &ioWritebackReqId);
 
     /**
      * Called by EPSNFController when HN-F completes a WriteNoSnp write
@@ -732,7 +728,10 @@ class EPBackend : public SimObject
 
     /** Consume per-line grant data: 1=data, 0=explicit NoData, -1=missing. */
     int takeGrantData(uint64_t linePa, DataBlock &data,
-                      GrantDataSource &source);
+                       GrantDataSource &source);
+    bool getStoreAuthorization(uint64_t linePa, int sourceSocket,
+                               int &requesterNode,
+                               uint64_t &permissionEpoch) const;
 
     bool isDsmAddr(uint64_t pa) const;
 
@@ -816,7 +815,8 @@ class EPBackend : public SimObject
     // retain the returned value across retries.  Return values are identical to
     // UBAdapter: 1 completed, -2 pending, -1 transport/setup failure.
     int requestHAPermission(uint64_t linePa, HAOperation operation,
-                            uint64_t permissionEpoch, const uint8_t *writeData,
+                             uint64_t permissionEpoch, uint64_t byteMask,
+                             const uint8_t *writeData,
                             int dstNode, int dstSocket, uint64_t &ioReqId,
                             UBHAPermissionRespBody &outResp,
                              int sourceSocket = 0);
@@ -832,6 +832,8 @@ class EPBackend : public SimObject
     void recordHAInstall(uint64_t localLinePa, HAOperation operation,
                          uint64_t permissionEpoch, int homeNode,
                          uint64_t reqId, int sourceSocket);
+    void recordHADirtyData(uint64_t localLinePa, int sourceSocket,
+                           const DataBlock &data);
     void registerHADataCache(int sourceSocket, CacheMemory *cache);
     void invalidateHADataCaches(int sourceSocket, uint64_t localLinePa);
     bool hasHADataCacheLine(int sourceSocket, uint64_t localLinePa) const;
@@ -850,14 +852,6 @@ class EPBackend : public SimObject
                                       UBAdapter *sourceAdapter);
     void handleHAPermissionRequest(const CoherenceMessage &request,
                                    UBAdapter *sourceAdapter);
-
-    /**
-     * Get the RubySystem pointer for cross-node phys_mem access.
-     * Used by recall handlers to write owner data to the home node's
-     * backing store so that populateGrantData() on the requester side
-     * can find it.
-     */
-    RubySystem* getRubySystem() const { return _ruby_system; }
 
     // ---- M6: Cross-Node EPBackend Routing Registry ----
     /**
@@ -916,6 +910,7 @@ class EPBackend : public SimObject
     std::map<uint64_t, RequesterLineEntry> _requesterLines;
     using HALineKey = std::pair<int, uint64_t>;
     std::map<HALineKey, RequesterLineEntry> _haRequesterLines;
+    std::map<HALineKey, DataBlock> _haDirtyData;
     std::vector<std::vector<CacheMemory *>> _haDataCachesBySocket;
     uint64_t _epochCounter = 0;
 

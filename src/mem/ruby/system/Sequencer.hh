@@ -149,6 +149,7 @@ class Sequencer : public RubyPort
     RequestStatus makeRequest(PacketPtr pkt) override;
     virtual bool empty() const;
     int outstandingCount() const override { return m_outstanding_count; }
+    bool bypassBackingStore(Addr address) const override;
 
     bool isDeadlockEventScheduled() const override
     { return deadlockCheckEvent.scheduled(); }
@@ -302,6 +303,8 @@ class Sequencer : public RubyPort
         int homeSocket = 0;
         bool isWrite = false;
         bool granted = false;
+        uint64_t byteMask = 0;
+        DataBlock writeData{64};
     };
     std::unordered_map<Addr, HAPermissionState> m_haPermissions;
 

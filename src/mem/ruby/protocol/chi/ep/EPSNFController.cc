@@ -10,9 +10,6 @@
 #include "mem/ruby/protocol/CHI/CHIRequestMsg.hh"
 #include "mem/ruby/protocol/CHI/CHIResponseMsg.hh"
 #include "mem/ruby/protocol/chi/ep/UBAdapter.hh"
-#include "mem/simple_mem.hh"
-#include "mem/packet.hh"
-#include "mem/request.hh"
 #include "params/EPSNFController.hh"
 
 namespace gem5
@@ -39,6 +36,17 @@ EPSNFController::EPSNFController(const Params &p)
   : EPController(p), _backend(p.ep_backend),
     _socketId(p.socket_id)
 {
+    // allocateWriteIdentity reserves 4/1/16/32 bits for node/socket/controller/
+    // sequence. These are protocol configuration limits, not truncating casts.
+    fatal_if(_nodeId < 0 || _nodeId >= 16,
+             "EP_SNF node_id=%d: write identity supports project nodes [0,15]",
+             _nodeId);
+    fatal_if(_socketId < 0 || _socketId >= 2,
+             "EP_SNF node_id=%d: write identity supports sockets [0,1], got %d",
+             _nodeId, _socketId);
+    fatal_if(m_version > 0xffff,
+             "EP_SNF node_id=%d socket=%d: controller version %d exceeds "
+             "16-bit write identity namespace", _nodeId, _socketId, m_version);
     // v4-dual-socket: self-register with EPBackend
     if (_backend) {
         _backend->registerEpSnf(_socketId, this);
@@ -102,11 +110,6 @@ EPSNFController::wakeup()
 
     processPendingHAWrites();
 
-    // Phase 2 async: Process pending writebacks after backend poll so that
-    // freshly arrived QueryLineMetaResp messages cached in _readyResponses
-    // can resolve metadata before the WriteBackReq is attempted.
-    processPendingWritebacks();
-
     // Q3: Process retry queue — request grants that were previously BUSY
     if (!_retryQueue.empty()) {
         bool needWakeup = false;
@@ -141,7 +144,14 @@ EPSNFController::wakeup()
                 fatal_if(grantDataState == 0 &&
                              grantSource != GrantDataSource::NoData,
                          "EP_SNF node_id=%d: unavailable grant data PA=0x%lx source=%d",
-                         _nodeId, it->linePa, static_cast<int>(grantSource));
+                          _nodeId, it->linePa, static_cast<int>(grantSource));
+                int storeRequester = -1;
+                uint64_t storeEpoch = 0;
+                fatal_if(!_backend->getStoreAuthorization(
+                             it->linePa, it->ingressSocket, storeRequester,
+                             storeEpoch),
+                         "EP_SNF node_id=%d: missing grant authorization "
+                         "PA=0x%lx", _nodeId, it->linePa);
                 for (int i = 0; i < dataMsgsPerLine; i++) {
                     int offset = i * dataChannelSize;
                     int chunkSize = (i == dataMsgsPerLine - 1) ?
@@ -154,12 +164,19 @@ EPSNFController::wakeup()
                         db.setData(chunk, offset, chunkSize);
                     }
                     auto dat = std::make_shared<CHIDataMsg>(
-                        curTick(), cacheLineSize, m_ruby_system,
-                        it->linePa, dataType,
-                        m_machineID, dataDest, db, wm,
-                        false, 0, false, MessageSizeType_Data);
+                        curTick(), cacheLineSize, m_ruby_system);
+                    dat->m_addr = it->linePa;
+                    dat->m_type = dataType;
+                    dat->m_responder = m_machineID;
+                    dat->m_Destination = dataDest;
+                    dat->m_dataBlk = db;
+                    dat->m_bitMask = wm;
+                    dat->m_MessageSize = MessageSizeType_Data;
                     // v4: Set shared_hint for shared grants
                     dat->m_m_shared_hint = sharedHint;
+                    dat->m_ubcc_store_auth_valid = true;
+                    dat->m_ubcc_store_requester = storeRequester;
+                    dat->m_ubcc_permission_epoch = storeEpoch;
                     const bool lastBeat = (i == dataMsgsPerLine - 1);
                     std::function<void()> onSent;
                     if (lastBeat &&
@@ -197,6 +214,22 @@ EPSNFController::print(std::ostream& out) const
     out << "[EP_SNF node_id=" << _nodeId << " v=" << m_version << "]";
 }
 
+uint64_t
+EPSNFController::allocateWriteIdentity()
+{
+    fatal_if(_nextWriteIdentity > 0xffffffffULL,
+             "EP_SNF node_id=%d socket=%d: write identity exhausted",
+             _nodeId, _socketId);
+    const uint64_t id = (static_cast<uint64_t>(_nodeId) << 60) |
+                        (static_cast<uint64_t>(_socketId) << 59) |
+                        (static_cast<uint64_t>(m_version) << 32) |
+                        _nextWriteIdentity++;
+    fatal_if(id == 0 || _pendingWrites.count(id),
+             "EP_SNF node_id=%d socket=%d: duplicate write id=%lu",
+             _nodeId, _socketId, id);
+    return id;
+}
+
 bool
 EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
 {
@@ -206,7 +239,7 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
             "dataToFwdReq=%d\n", _nodeId, msg->m_type, msg->m_addr,
             msg->m_dataToFwdRequestor);
 
-    // A WriteNoSnp is a two-phase operation.  CompDBIDResp grants the
+    // A WriteNoSnp is a two-phase operation. DBIDResp grants the
     // sender permission to transmit NCBWrData; waiting for that data before
     // replying deadlocks the request/data handshake.
     if (msg->m_type == CHIRequestType_WriteNoSnp ||
@@ -219,13 +252,38 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
 
         PendingWrite pending;
         pending.sourceSocket = msg->m_ubcc_ingress_socket;
+        pending.dbid = allocateWriteIdentity();
+        pending.storeCommitId = pending.dbid;
+        pending.originalTxnId = msg->m_txnId;
+        pending.linePa = msg->m_addr;
         fatal_if(pending.sourceSocket < 0 ||
                       !_backend->getUBAdapter(pending.sourceSocket),
                   "EP_SNF node_id=%d: invalid WriteNoSnp requester socket %d",
                   _nodeId, pending.sourceSocket);
         pending.requestor = msg->m_requestor;
+        pending.requesterNode = msg->m_ubcc_store_requester;
+        pending.permissionEpoch = msg->m_ubcc_permission_epoch;
+        pending.disposition = static_cast<UBWriteDisposition>(
+            msg->m_ubcc_write_disposition);
+        fatal_if(!msg->m_ubcc_store_auth_valid,
+                 "EP_SNF node_id=%d socket=%d: native/non-StoreCommit "
+                 "WriteNoSnp is unsupported on the DSM endpoint PA=0x%lx; "
+                 "HN-F must route only authorized StoreCommit traffic here",
+                 _nodeId, pending.sourceSocket, msg->m_addr);
+        fatal_if(pending.requesterNode < 0 ||
+                     pending.disposition != UBWriteDisposition::MemoryOnly,
+                 "EP_SNF node_id=%d: invalid StoreCommit authorization "
+                 "PA=0x%lx requester=%d disposition=%d", _nodeId,
+                 msg->m_addr, pending.requesterNode,
+                 static_cast<int>(pending.disposition));
         if (msg->m_type == CHIRequestType_WriteNoSnpPtl) {
             const int offset = msg->m_accAddr - msg->m_addr;
+            fatal_if(offset < 0 || msg->m_accSize <= 0 ||
+                         offset >= cacheLineSize ||
+                         msg->m_accSize > cacheLineSize - offset,
+                     "EP_SNF node_id=%d: invalid partial WriteNoSnp range "
+                     "PA=0x%lx acc=0x%lx size=%d", _nodeId, msg->m_addr,
+                     msg->m_accAddr, msg->m_accSize);
             for (int i = 0; i < msg->m_accSize; ++i)
                 pending.expectedMask |= 1ULL << (offset + i);
         } else {
@@ -233,33 +291,31 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
         }
 
         if (_backend->haEndpointEnabled()) {
-            fatal_if(_pendingWrites.count(msg->m_addr),
-                     "EP_SNF node_id=%d: overlapping HA WriteNoSnp PA=0x%lx",
-                     _nodeId, msg->m_addr);
             pending.haWrite = true;
             fatal_if(!_backend->resolveHAStoreTarget(
-                         msg->m_addr, _socketId, pending.homePa,
+                         msg->m_addr, pending.sourceSocket, pending.homePa,
                          pending.homeNode, pending.homeSocket,
-                         pending.permissionEpoch),
-                     "EP_SNF node_id=%d: cannot resolve HA Write target PA=0x%lx",
+                          pending.permissionEpoch),
+                      "EP_SNF node_id=%d: cannot resolve HA Write target PA=0x%lx",
+                      _nodeId, msg->m_addr);
+            pending.permissionEpoch = msg->m_ubcc_permission_epoch;
+        } else {
+            int paViewNode = _nodeId;
+            if (!_backend->addrMap().isDsm(paViewNode, msg->m_addr))
+                paViewNode = _backend->addrMap().srcNodeId(msg->m_addr);
+            pending.homeNode = _backend->addrMap().homeNode(paViewNode,
+                                                            msg->m_addr);
+            pending.homeSocket = _backend->addrMap().homeSocket(paViewNode,
+                                                                 msg->m_addr);
+            fatal_if(pending.homeNode < 0 || pending.homeSocket < 0,
+                     "EP_SNF node_id=%d: cannot route StoreCommit PA=0x%lx",
                      _nodeId, msg->m_addr);
-
-            // Partial writes need an authoritative base line, but this is only
-            // a read into private assembly storage and cannot mutate Home.
-            if (pending.expectedMask != ~0ULL) {
-                auto *physMem = m_ruby_system->getPhysMem();
-                fatal_if(!physMem,
-                         "EP_SNF node_id=%d: no physical memory for partial HA write",
-                         _nodeId);
-                RequestPtr req = std::make_shared<Request>(
-                    pending.homePa, cacheLineSize, 0, RequestorID(0));
-                req->setFlags(Request::PHYSICAL);
-                Packet rdPkt(req, MemCmd::ReadReq);
-                rdPkt.dataStatic(pending.data);
-                physMem->functionalAccess(&rdPkt);
-            }
+            pending.homePa = _backend->addrMap().buildDsmPA(
+                pending.homeNode, pending.homeNode,
+                _backend->addrMap().dsmOffset(msg->m_addr),
+                pending.homeSocket);
         }
-        _pendingWrites[msg->m_addr] = pending;
+        _pendingWrites.emplace(pending.dbid, pending);
 
         // ── Phase C4 trace point 2: WriteNoSnp receipt ──
         {
@@ -275,15 +331,12 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
 
         NetDest hnDest(m_ruby_system);
         hnDest.add(msg->m_requestor);
-        // HA must not claim completion before permission and publication.
-        // DBIDResp permits NCBWrData; Comp is emitted after the grant.  Preserve
-        // the legacy combined response exactly when HA is disabled.
         auto rsp = std::make_shared<CHIResponseMsg>(
             curTick(), cacheLineSize, m_ruby_system,
-            msg->m_addr, pending.haWrite ? CHIResponseType_DBIDResp
-                                         : CHIResponseType_CompDBIDResp,
+            msg->m_addr, CHIResponseType_DBIDResp,
             m_machineID, hnDest,
-            false, false, 0, 0, MessageSizeType_Control);
+            false, true, pending.originalTxnId, pending.dbid,
+            MessageSizeType_Control);
         sendResponseReliable(rsp);
         DPRINTF(RubyEP,
                 "[EPSNF-WRITE-DBID] node=%d addr=0x%lx expected=0x%lx\n",
@@ -461,6 +514,14 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
     CHIDataType dataType = (neededPerm == 0) ? CHIDataType_CompData_SC
                                              : CHIDataType_CompData_UC;
     bool sharedHint = (neededPerm == 0);  // v4: always register EP-RNF for shared
+    int storeRequester = -1;
+    uint64_t storeEpoch = 0;
+    if (!internalRecall) {
+        fatal_if(!_backend->getStoreAuthorization(
+                     msg->m_addr, ingressSocket, storeRequester, storeEpoch),
+                 "EP_SNF node_id=%d: missing grant authorization PA=0x%lx",
+                 _nodeId, msg->m_addr);
+    }
 
     // ---- Q2 FIX: Splitting CompData into data-channel-sized chunks ----
     // The L2/HN-F's ExpectedMap counts data responses in CHUNKS
@@ -490,13 +551,19 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
         // else db keeps default zeros
 
         auto dat = std::make_shared<CHIDataMsg>(
-            curTick(), cacheLineSize, m_ruby_system,
-            msg->m_addr, dataType,
-            m_machineID, dataDest,
-            db, wm,
-            false, 0, false, MessageSizeType_Data);
+            curTick(), cacheLineSize, m_ruby_system);
+        dat->m_addr = msg->m_addr;
+        dat->m_type = dataType;
+        dat->m_responder = m_machineID;
+        dat->m_Destination = dataDest;
+        dat->m_dataBlk = db;
+        dat->m_bitMask = wm;
+        dat->m_MessageSize = MessageSizeType_Data;
         // v4: Set shared_hint on CompData for shared grants
         dat->m_m_shared_hint = sharedHint;
+        dat->m_ubcc_store_auth_valid = !internalRecall;
+        dat->m_ubcc_store_requester = storeRequester;
+        dat->m_ubcc_permission_epoch = storeEpoch;
         // Q3: Defer send by 1 tick to prevent same-tick TBE race
         // at HN-F (see docs/tbe-race-condition.svg for details).
         PendingDataOutput pending;
@@ -646,11 +713,13 @@ EPSNFController::processDeferredGrants()
             }
 
             auto dat = std::make_shared<CHIDataMsg>(
-                curTick(), cacheLineSize, m_ruby_system,
-                entry.linePa, dataType,
-                m_machineID, NetDest(m_ruby_system),
-                db, wm,
-                false, 0, false, MessageSizeType_Data);
+                curTick(), cacheLineSize, m_ruby_system);
+            dat->m_addr = entry.linePa;
+            dat->m_type = dataType;
+            dat->m_responder = m_machineID;
+            dat->m_dataBlk = db;
+            dat->m_bitMask = wm;
+            dat->m_MessageSize = MessageSizeType_Data;
             // v4: Set shared_hint on CompData for shared grants
             dat->m_m_shared_hint = entry.sharedHint;
 
@@ -690,194 +759,58 @@ EPSNFController::recvDataMsg(const CHIDataMsg *msg)
 {
     DPRINTF(RubyCHIGeneric, "EP_SNF node_id=%d recvDataMsg type=%d addr=0x%lx\n",
             _nodeId, msg->m_type, msg->m_addr);
-    auto pendingIt = _pendingWrites.find(msg->m_addr);
+    const uint64_t dbid = msg->m_txnId;
+    auto pendingIt = _pendingWrites.find(dbid);
     DPRINTF(RubyEP,
                  "[EPSNF-DATA-RECV] node=%d type=%d addr=0x%lx pendingWrite=%d\n",
                  _nodeId, msg->m_type, msg->m_addr,
                  pendingIt != _pendingWrites.end() ? 1 : 0);
 
-    // Q2: Write NCBWrData to DDR4 (SimpleMemory) via functionalAccess
-    if (msg->m_type == CHIDataType_NCBWrData ||
-        msg->m_type == CHIDataType_CBWrData_UC ||
+    if (msg->m_type == CHIDataType_NCBWrData) {
+        fatal_if(dbid == 0 || pendingIt == _pendingWrites.end(),
+                 "EP_SNF node_id=%d: unmatched NCBWrData PA=0x%lx id=%lu",
+                 _nodeId, msg->m_addr, dbid);
+        PendingWrite &pending = pendingIt->second;
+        fatal_if(!msg->m_usesTxnId,
+                 "EP_SNF node_id=%d: NCBWrData lacks DBID transaction marker "
+                 "PA=0x%lx dbid=%lu", _nodeId, msg->m_addr, dbid);
+        fatal_if(msg->m_addr != pending.linePa ||
+                     !msg->m_ubcc_store_auth_valid ||
+                     msg->m_ubcc_store_requester != pending.requesterNode ||
+                     msg->m_ubcc_permission_epoch != pending.permissionEpoch ||
+                     msg->m_ubcc_write_disposition !=
+                         static_cast<int>(pending.disposition),
+                 "EP_SNF node_id=%d: StoreCommit data identity mismatch id=%lu",
+                 _nodeId, dbid);
+        uint64_t beatMask = 0;
+        for (int i = 0; i < cacheLineSize; ++i) {
+            if (msg->m_bitMask.test(i)) {
+                fatal_if(!(pending.expectedMask & (1ULL << i)),
+                         "EP_SNF node_id=%d: StoreCommit data outside mask id=%lu byte=%d",
+                          _nodeId, dbid, i);
+                pending.data[i] = msg->m_dataBlk.getByte(i);
+                beatMask |= 1ULL << i;
+            }
+        }
+        pending.receivedMask |= beatMask;
+        pending.dataComplete = pending.receivedMask == pending.expectedMask;
+        if (pending.dataComplete)
+            scheduleEvent(Cycles(1));
+        return true;
+    }
+
+    if (msg->m_type == CHIDataType_CBWrData_UC ||
         msg->m_type == CHIDataType_CBWrData_UD_PD ||
         msg->m_type == CHIDataType_CBWrData_SC ||
         msg->m_type == CHIDataType_CBWrData_SD_PD ||
         msg->m_type == CHIDataType_CBWrData_I) {
-
-        uint64_t writePa = msg->m_addr;
-        uint8_t buf[64]{};
-        if (pendingIt != _pendingWrites.end() && pendingIt->second.haWrite) {
-            PendingWrite &pending = pendingIt->second;
-            const DataBlock &db = msg->m_dataBlk;
-            uint64_t beatMask = 0;
-            for (int i = 0; i < cacheLineSize; ++i) {
-                if (msg->m_bitMask.test(i)) {
-                    pending.data[i] = db.getByte(i);
-                    beatMask |= 1ULL << i;
-                }
-            }
-            pending.receivedMask |= beatMask;
-            pending.dataComplete =
-                (pending.receivedMask & pending.expectedMask) ==
-                pending.expectedMask;
-            if (pending.dataComplete) {
-                ++_haWriteAssembledCount;
-                if (_haWriteAssembledCount <= kHAWriteTraceLimit) {
-                    uint64_t w0 = 0;
-                    std::memcpy(&w0, pending.data, sizeof(w0));
-                    inform("[HA-WRITE-ASSEMBLED] node=%d pa=0x%lx "
-                           "homePa=0x%lx mask=0x%lx w0=0x%016lx "
-                           "assembledCount=%lu tick=%lu\n",
-                           _nodeId, msg->m_addr, pending.homePa,
-                           pending.receivedMask, w0,
-                           _haWriteAssembledCount, curTick());
-                }
-                scheduleEvent(Cycles(1));
-            }
-            // Critical invariant: no functional write and no legacy
-            // QLM/writeback is reachable for an HA WriteNoSnp transaction.
-            return true;
-        }
-        auto *phys_mem = m_ruby_system->getPhysMem();
-        if (phys_mem) {
-            // ---- v4: Cross-node NCBWrData routing (§4.4.2 item 3) ----
-            // Translate local PA to home PA so data goes to home node's DDR4,
-            // not the local node's memory.
-            if (_backend && _backend->isDsmAddrCrossNode(msg->m_addr)) {
-                auto &addrMap = _backend->addrMap();
-                int homeNode = addrMap.homeNode(_nodeId, msg->m_addr);
-                uint64_t offset = addrMap.dsmOffset(msg->m_addr);
-                int homeSocket = addrMap.homeSocket(_nodeId, msg->m_addr);
-                if (homeSocket < 0) homeSocket = 0;
-                writePa = addrMap.buildDsmPA(
-                    homeNode, homeNode, offset, homeSocket);
-                DPRINTF(RubyCHIGeneric,
-                        "EP_SNF node_id=%d: NCBWrData PA translation: "
-                        "local=0x%lx → home=0x%lx (homeNode=%d)\n",
-                        _nodeId, msg->m_addr, writePa, homeNode);
-            }
-
-            const DataBlock &db = msg->m_dataBlk;
-            const WriteMask &wm = msg->m_bitMask;
-            // Read current line from DDR4 (at home PA), then apply write mask
-            RequestPtr req = std::make_shared<Request>(
-                writePa, cacheLineSize, 0, RequestorID(0));
-            req->setFlags(Request::PHYSICAL);
-            Packet rdPkt(req, MemCmd::ReadReq);
-            rdPkt.dataStatic(buf);
-            phys_mem->functionalAccess(&rdPkt);
-
-            // Overwrite with incoming data at masked positions
-            for (int i = 0; i < cacheLineSize; i++) {
-                if (wm.test(i)) {
-                    buf[i] = db.getByte(i);
-                }
-            }
-
-            // ── Phase C4 trace point 1: assembled NCBWrData payload ──
-            {
-                uint64_t off = writePa & 0x1FFFULL;
-                uint64_t absOff = writePa & 0xFFFFFULL;
-                // TC132 checkpoint PAs: offsets 0x000-0x7FFC0 (ACTIVE=8192*64)
-                if (absOff < 0x80000ULL && (off % 64 == 0)) {
-                    uint64_t w0;
-                    std::memcpy(&w0, buf, 8);
-                    bool full = true;
-                    for (int i = 0; i < 64; i++)
-                        if (!msg->m_bitMask.test(i)) { full = false; break; }
-                    DPRINTF(RubyEP,
-                        "[C4-EPSNF-BEAT] node=%d pa=0x%lx writePa=0x%lx "
-                        "off=0x%lx fullMask=%d w0=0x%016lx pending=%d\n",
-                        _nodeId, msg->m_addr, writePa, absOff, full ? 1 : 0, w0,
-                        pendingIt != _pendingWrites.end() ? 1 : 0);
-                }
-            }
-
-            // Write back to DDR4 (at home PA)
-            Packet wrPkt(req, MemCmd::WriteReq);
-            wrPkt.dataStatic(buf);
-            phys_mem->functionalAccess(&wrPkt);
-
-            DPRINTF(RubyCHIGeneric,
-                    "EP_SNF node_id=%d: wrote data to DDR4 "
-                    "addr=0x%lx type=%d\n",
-                    _nodeId, writePa, msg->m_type);
-        }
-
-        if (pendingIt != _pendingWrites.end()) {
-            uint64_t beatMask = 0;
-            for (int i = 0; i < cacheLineSize; ++i) {
-                if (msg->m_bitMask.test(i))
-                    beatMask |= 1ULL << i;
-            }
-            pendingIt->second.receivedMask |= beatMask;
-            if ((pendingIt->second.receivedMask & pendingIt->second.expectedMask) ==
-                pendingIt->second.expectedMask) {
-                // writePa has been translated into the home node's address
-                // view, so a local-only DSM test suppresses remote writeback
-                // notifications after a normal L2 eviction.
-                if (_backend && _backend->isDsmAddrCrossNode(writePa)) {
-                    // Phase 2 async: do NOT call handleWriteback here —
-                    // it would send an untracked QLM whose reqId is lost.
-                    // Instead, enqueue directly and let processPendingWritebacks
-                    // handle both QLM query and WriteBackReq with stable reqId.
-                    DPRINTF(RubyEP,
-                            "[EPSNF-WB-PENDING] node=%d pa=0x%lx\n",
-                            _nodeId, writePa);
-                    // Phase 2 async item 5: Deduplicate pending writebacks
-                    // per line — retain newest dirty payload.
-                    bool replaced = false;
-                    for (auto &pwb : _pendingWritebacks) {
-                        if (pwb.linePa == writePa &&
-                            pwb.sourceSocket == pendingIt->second.sourceSocket) {
-                            // Phase 2 corrective item 3: consume stale QLM
-                            if (pwb.queryInFlight && _backend) {
-                                UBAdapter *wa = _backend->getUBAdapter(
-                                    pwb.sourceSocket);
-                                if (wa) {
-                                    uint64_t _dE; int _dO; bool _dF;
-                                    wa->tryGetQueryLineMetaResp(
-                                        pwb.queryReqId, _dE, _dO, _dF);
-                                }
-                            }
-                            pwb.keepAsClean = false;
-                            pwb.hasData = true;
-                            std::memcpy(pwb.data, buf, 64);
-                            // Reset query state — new identity
-                            pwb.queryReqId = 0;
-                            pwb.queryInFlight = false;
-                            pwb.cachedFound = false;
-                            pwb.retryCount = 0;
-                            pwb.nextRetryTick = 0;
-                            replaced = true;
-                            DPRINTF(RubyEP,
-                                    "[EPSNF-WB-DEDUP] node=%d pa=0x%lx "
-                                    "(replaced existing entry)\n",
-                                    _nodeId, writePa);
-                            break;
-                        }
-                    }
-                    if (!replaced) {
-                        PendingWriteback pwb;
-                        pwb.linePa = writePa;
-                        pwb.keepAsClean = false;
-                        pwb.sourceSocket = pendingIt->second.sourceSocket;
-                        pwb.hasData = true;
-                        std::memcpy(pwb.data, buf, 64);
-                        _pendingWritebacks.push_back(pwb);
-                    }
-                }
-                DPRINTF(RubyEP,
-                        "[EPSNF-WRITE-DONE] node=%d addr=0x%lx received=0x%lx\n",
-                        _nodeId, msg->m_addr, pendingIt->second.receivedMask);
-                _pendingWrites.erase(pendingIt);
-            }
-        } else {
-            warn(
-                         "[EPSNF-DATA-NO-PENDING-WRITE] node=%d type=%d addr=0x%lx\n",
-                         _nodeId, msg->m_type, msg->m_addr);
-        }
-        return true;
+        // CHI-cache-transitions.sm proves the topology boundary: RN CBWrData
+        // terminates at HN-F; an HN-F forwarding persistence downstream emits
+        // NCBWrData. Seeing CB here therefore indicates a routing/configuration
+        // violation, not an owner transaction from which identity may be inferred.
+        fatal("EP_SNF node_id=%d: illegal CBWrData crossed the HN-F boundary "
+              "PA=0x%lx type=%d; refusing PA/QLM identity inference\n",
+              _nodeId, msg->m_addr, msg->m_type);
     }
 
     return true;
@@ -886,75 +819,64 @@ EPSNFController::recvDataMsg(const CHIDataMsg *msg)
 void
 EPSNFController::processPendingHAWrites()
 {
-    if (!_backend || !_backend->haEndpointEnabled())
+    if (!_backend)
         return;
 
     bool pendingWork = false;
     for (auto it = _pendingWrites.begin(); it != _pendingWrites.end(); ) {
         auto current = it++;
-        const Addr linePa = current->first;
+        const uint64_t transactionId = current->first;
         PendingWrite &pending = current->second;
-        if (!pending.haWrite || !pending.dataComplete ||
-            pending.completionQueued) {
-            pendingWork |= pending.haWrite && !pending.completionQueued;
+        if (!pending.dataComplete || pending.completionQueued) {
+            pendingWork |= !pending.completionQueued;
             continue;
         }
 
         if (!pending.granted) {
-            const bool newRequest = pending.permissionReqId == 0;
+            int result = -1;
             UBHAPermissionRespBody response;
-            const int result = _backend->requestHAPermission(
-                pending.homePa, HAOperation::Write, pending.permissionEpoch,
-                pending.data, pending.homeNode, pending.homeSocket,
-                pending.permissionReqId, response, _socketId);
-            if (newRequest && pending.permissionReqId != 0) {
-                ++_haWriteReqCount;
-                if (_haWriteReqCount <= kHAWriteTraceLimit) {
-                    inform("[HA-WRITE-REQ] node=%d pa=0x%lx homePa=0x%lx "
-                           "reqId=%lu epoch=%lu reqCount=%lu tick=%lu\n",
-                           _nodeId, linePa, pending.homePa,
-                           pending.permissionReqId, pending.permissionEpoch,
-                           _haWriteReqCount, curTick());
-                }
+            if (pending.haWrite) {
+                result = _backend->requestHAPermission(
+                    pending.homePa, HAOperation::Write,
+                    pending.permissionEpoch, pending.expectedMask, pending.data,
+                    pending.homeNode, pending.homeSocket,
+                    pending.permissionReqId, response, pending.sourceSocket);
+            } else {
+                result = _backend->commitStore(
+                    pending.homePa, pending.requesterNode,
+                    pending.permissionEpoch, pending.storeCommitId,
+                    pending.expectedMask, pending.data, pending.homeNode,
+                    pending.homeSocket, pending.sourceSocket,
+                    pending.permissionReqId);
             }
             if (result == -2) {
                 pendingWork = true;
                 continue;
             }
             fatal_if(result != 1,
-                     "EP_SNF node_id=%d: HA Write transport failed PA=0x%lx result=%d",
-                     _nodeId, linePa, result);
+                     "EP_SNF node_id=%d: store persistence failed "
+                     "PA=0x%lx id=%lu result=%d",
+                     _nodeId, pending.linePa, transactionId, result);
 
-            ++_haWriteRespCount;
-            if (_haWriteRespCount <= kHAWriteTraceLimit) {
-                inform("[HA-WRITE-RESP] node=%d pa=0x%lx reqId=%lu "
-                       "op=%s status=%s epoch=%lu respCount=%lu tick=%lu\n",
-                       _nodeId, linePa, pending.permissionReqId,
-                       haOperationName(response.operation),
-                       haStatusName(response.status), response.permissionEpoch,
-                       _haWriteRespCount, curTick());
+            if (pending.haWrite) {
+                fatal_if(response.operation != HAOperation::Write ||
+                             response.permissionEpoch != pending.permissionEpoch,
+                         "EP_SNF node_id=%d: HA Write response mismatch id=%lu",
+                         _nodeId, transactionId);
+                if (response.status == HAStatus::RetryableBusy) {
+                    pending.permissionReqId = 0;
+                    pendingWork = true;
+                    continue;
+                }
+                fatal_if(response.status != HAStatus::Ok || !response.hasData,
+                         "EP_SNF node_id=%d: HA Write lacks successful final64 id=%lu",
+                         _nodeId, transactionId);
+                std::memcpy(pending.data, response.data, 64);
             }
-            fatal_if(response.operation != HAOperation::Write,
-                     "EP_SNF node_id=%d: HA Write response operation mismatch PA=0x%lx",
-                     _nodeId, linePa);
-            fatal_if(response.permissionEpoch != pending.permissionEpoch,
-                     "EP_SNF node_id=%d: HA Write epoch mismatch PA=0x%lx got=%lu expected=%lu",
-                     _nodeId, linePa, response.permissionEpoch,
-                     pending.permissionEpoch);
-            if (response.status == HAStatus::RetryableBusy) {
-                // UBAdapter consumed and retired this response. A zero ID makes
-                // the next pass a new request while retaining the exact payload.
-                pending.permissionReqId = 0;
-                pendingWork = true;
-                continue;
-            }
-            fatal_if(response.status != HAStatus::Ok,
-                     "EP_SNF node_id=%d: HA Write denied PA=0x%lx status=%s",
-                     _nodeId, linePa, haStatusName(response.status));
             pending.granted = true;
         }
 
-        publishHAWrite(linePa, pending);
+        publishHAWrite(transactionId, pending);
     }
 
     if (pendingWork)
@@ -962,28 +884,18 @@ EPSNFController::processPendingHAWrites()
 }
 
 void
-EPSNFController::publishHAWrite(Addr linePa, PendingWrite &pending)
+EPSNFController::publishHAWrite(uint64_t transactionId, PendingWrite &pending)
 {
     fatal_if(!pending.granted || pending.permissionReqId == 0,
-             "EP_SNF node_id=%d: publish before HA Write grant PA=0x%lx",
-             _nodeId, linePa);
-    auto *physMem = m_ruby_system->getPhysMem();
-    fatal_if(!physMem,
-             "EP_SNF node_id=%d: no physical memory for HA Write PA=0x%lx",
-             _nodeId, linePa);
-
-    RequestPtr req = std::make_shared<Request>(
-        pending.homePa, cacheLineSize, 0, RequestorID(0));
-    req->setFlags(Request::PHYSICAL);
-    Packet wrPkt(req, MemCmd::WriteReq);
-    wrPkt.dataStatic(pending.data);
-    physMem->functionalAccess(&wrPkt);
+             "EP_SNF node_id=%d: publish before persistence PA=0x%lx id=%lu",
+             _nodeId, pending.linePa, transactionId);
     pending.completionQueued = true;
 
     ++_haWritePublishCount;
     if (_haWritePublishCount <= kHAWriteTraceLimit) {
         inform("[HA-WRITE-PUBLISH] node=%d pa=0x%lx homePa=0x%lx "
-               "reqId=%lu publishCount=%lu tick=%lu\n", _nodeId, linePa,
+               "reqId=%lu publishCount=%lu tick=%lu\n", _nodeId,
+               pending.linePa,
                pending.homePa, pending.permissionReqId,
                _haWritePublishCount, curTick());
     }
@@ -991,180 +903,32 @@ EPSNFController::publishHAWrite(Addr linePa, PendingWrite &pending)
     NetDest destination(m_ruby_system);
     destination.add(pending.requestor);
     auto completion = std::make_shared<CHIResponseMsg>(
-        curTick(), cacheLineSize, m_ruby_system, linePa,
+        curTick(), cacheLineSize, m_ruby_system, pending.linePa,
         CHIResponseType_Comp, m_machineID, destination,
-        false, false, 0, 0, MessageSizeType_Control);
-    sendResponseReliable(completion, [this, linePa] {
-        auto it = _pendingWrites.find(linePa);
+        false, true, pending.originalTxnId, 0, MessageSizeType_Control);
+    sendResponseReliable(completion, [this, transactionId] {
+        auto it = _pendingWrites.find(transactionId);
         fatal_if(it == _pendingWrites.end() || !it->second.completionQueued,
-                 "EP_SNF node_id=%d: missing HA Write completion PA=0x%lx",
-                 _nodeId, linePa);
+                 "EP_SNF node_id=%d: missing store completion id=%lu",
+                 _nodeId, transactionId);
         PendingWrite &done = it->second;
-        fatal_if(!_backend->acknowledgeHAPermission(
-                     done.homePa, HAOperation::Write, HAStatus::Ok,
-                     done.permissionEpoch, done.homeNode, done.homeSocket,
-                     done.permissionReqId, _socketId),
-                 "EP_SNF node_id=%d: failed to queue HA Write ack PA=0x%lx",
-                 _nodeId, linePa);
+        if (done.haWrite) {
+            fatal_if(!_backend->acknowledgeHAPermission(
+                         done.homePa, HAOperation::Write, HAStatus::Ok,
+                         done.permissionEpoch, done.homeNode, done.homeSocket,
+                         done.permissionReqId, done.sourceSocket),
+                     "EP_SNF node_id=%d: failed to queue HA Write ack id=%lu",
+                     _nodeId, transactionId);
+        }
         ++_haWriteAckCount;
         if (_haWriteAckCount <= kHAWriteTraceLimit) {
             inform("[HA-WRITE-ACK] node=%d pa=0x%lx reqId=%lu "
                    "reqCount=%lu respCount=%lu ackCount=%lu tick=%lu\n",
-                   _nodeId, linePa, done.permissionReqId, _haWriteReqCount,
+                    _nodeId, done.linePa, done.permissionReqId, _haWriteReqCount,
                    _haWriteRespCount, _haWriteAckCount, curTick());
         }
         _pendingWrites.erase(it);
     });
-}
-
-void
-EPSNFController::processPendingWritebacks()
-{
-    if (_pendingWritebacks.empty()) return;
-
-    // Phase 2 async: exponential backoff constants
-    static const int MAX_RETRIES = 128;
-    static const Tick BASE_BACKOFF_TICKS = 20000;  // 20k ticks (~20 µs)
-    static const Tick MAX_BACKOFF_TICKS = 100000000; // 100M ticks cap
-
-    for (auto it = _pendingWritebacks.begin(); it != _pendingWritebacks.end(); ) {
-        Tick now = curTick();
-
-        // Bounded retry with backoff: skip if not yet time to retry
-        if (it->retryCount > 0 && now < it->nextRetryTick) {
-            ++it;
-            continue;
-        }
-
-        // ── Poll for QLM response if one is in-flight ──
-        if (it->queryInFlight && _backend) {
-            UBAdapter *wa = _backend->getUBAdapter(it->sourceSocket);
-            if (wa) {
-                uint64_t resolvedEpoch = 0;
-                int resolvedOwner = -1;
-                bool resolvedFound = false;
-                if (wa->tryGetQueryLineMetaResp(it->queryReqId,
-                                                resolvedEpoch,
-                                                resolvedOwner,
-                                                resolvedFound)) {
-                    it->queryInFlight = false;
-                    it->cachedEpoch = resolvedEpoch;
-                    it->cachedOwnerNode = resolvedOwner;
-                    it->cachedFound = resolvedFound;
-                    DPRINTF(RubyEP,
-                            "[EPSNF-QLM-READY] node=%d pa=0x%lx reqId=%lu "
-                            "found=%d epoch=%lu owner=%d\n",
-                            _nodeId, it->linePa, it->queryReqId,
-                            resolvedFound, resolvedEpoch, resolvedOwner);
-                    if (!resolvedFound || resolvedOwner < 0) {
-                        warn(
-                            "[EPSNF-WB-QLM-FAIL] node=%d pa=0x%lx reqId=%lu "
-                            "found=%d owner=%d epoch=%lu — terminal\n",
-                            _nodeId, it->linePa, it->queryReqId,
-                            resolvedFound ? 1 : 0, resolvedOwner,
-                            resolvedEpoch);
-                        it = _pendingWritebacks.erase(it);
-                        continue;
-                    }
-                }
-            }
-        }
-
-        int wbRet;
-
-        if (it->cachedFound && !it->queryInFlight) {
-            // ── Phase 2 item 4: cached metadata → exactly one writeback ──
-            EPBackend::WritebackQueryMeta meta;
-            meta.valid = true;
-            meta.epochVal = it->cachedEpoch;
-            meta.requesterNode = (it->cachedOwnerNode >= 0)
-                                 ? it->cachedOwnerNode : _nodeId;
-            wbRet = _backend->handleWriteback(it->linePa, it->keepAsClean,
-                                               it->hasData ? it->data : nullptr,
-                                               &meta, nullptr, 0,
-                                               it->sourceSocket,
-                                               &it->writebackReqId);
-
-        } else if (it->queryReqId > 0) {
-            // ── Phase 2 item 4: retry with stable queryReqId ──
-            // Reuse the existing reqId as cachedQlmReqId so
-            // sendQueryLineMetaReq checks _readyResponses by exact key
-            // without allocating a new reqId or scanning by PA.
-            wbRet = _backend->handleWriteback(
-                it->linePa, it->keepAsClean,
-                it->hasData ? it->data : nullptr,
-                nullptr,           // no pre-resolved meta
-                nullptr,           // no new outQueryReqId (reusing existing)
-                it->queryReqId,    // stable cached reqId
-                it->sourceSocket,
-                &it->writebackReqId);
-            // If handleWriteback consumed a cached QLM response,
-            // wbRet will be the writeback result (not -2).
-            // If still pending, wbRet == -2 and we back off.
-
-        } else {
-            // ── First attempt: send fresh QLM ──
-            uint64_t qlmReqId = 0;
-            wbRet = _backend->handleWriteback(it->linePa, it->keepAsClean,
-                                               it->hasData ? it->data : nullptr,
-                                               nullptr,  // no cached meta
-                                               &qlmReqId, // get the new reqId
-                                               0,         // no cached reqId
-                                               it->sourceSocket,
-                                               &it->writebackReqId);
-            if (wbRet == -2 && qlmReqId > 0) {
-                it->queryReqId = qlmReqId;
-                it->queryInFlight = true;
-                DPRINTF(RubyEP,
-                        "[EPSNF-WB-QLM-ENQ] node=%d pa=0x%lx reqId=%lu\n",
-                        _nodeId, it->linePa, qlmReqId);
-            }
-        }
-
-        if (wbRet == -2) {
-            // Writeback (or QLM) still pending — keep in queue with backoff
-            it->retryCount++;
-            if (it->retryCount > MAX_RETRIES) {
-                warn("[EPSNF-WB-FATAL] node=%d pa=0x%lx max retries exceeded\n",
-                     _nodeId, it->linePa);
-                it = _pendingWritebacks.erase(it);
-                continue;
-            }
-            Tick delay = BASE_BACKOFF_TICKS;
-            if (it->retryCount > 4) {
-                int shift = (it->retryCount - 4) / 4;
-                if (shift > 10) shift = 10;
-                delay = BASE_BACKOFF_TICKS * (1ULL << shift);
-                if (delay > MAX_BACKOFF_TICKS) delay = MAX_BACKOFF_TICKS;
-            }
-            it->nextRetryTick = now + delay;
-            DPRINTF(RubyEP,
-                "[EPSNF-WB-RETRY] node=%d pa=0x%lx retry=%d delay=%lu\n",
-                _nodeId, it->linePa, it->retryCount, delay);
-            ++it;
-
-        } else if (wbRet == -3) {
-            // ── Phase 2 corrective: terminal QLM failure ──
-            // found=false, owner<0, epoch=0 — do NOT silently discard.
-            // Retire the entry with explicit diagnostic data.
-            warn(
-                "[EPSNF-WB-TERMINAL] node=%d pa=0x%lx queryReqId=%lu "
-                "retries=%d — QLM metadata resolution FAILED\n",
-                _nodeId, it->linePa, it->queryReqId, it->retryCount);
-            it = _pendingWritebacks.erase(it);
-
-        } else {
-            // Writeback completed (or rejected) — remove from queue
-            DPRINTF(RubyEP,
-                    "[EPSNF-WB-DONE] node=%d pa=0x%lx ret=%d retries=%d\n",
-                    _nodeId, it->linePa, wbRet, it->retryCount);
-            it = _pendingWritebacks.erase(it);
-        }
-    }
-
-    // Schedule next wakeup if there are still pending entries
-    if (!_pendingWritebacks.empty())
-        scheduleEvent(Cycles(epsnf_retry_cycles()));
 }
 
 // ---- v4: write-data completion path with dedup (§5.5) ----

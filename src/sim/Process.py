@@ -41,6 +41,49 @@ class Process(SimObject):
     def map(self, vaddr, paddr, size, cacheable=False):
         pass
 
+    def __init__(self, **kwargs):
+        ancestor = kwargs.get("_ancestor")
+        super().__init__(**kwargs)
+        self._deferred_maps = list(
+            getattr(ancestor, "_deferred_maps", ()) if ancestor else ()
+        )
+
+    def defer_map(self, vaddr, paddr, size, cacheable=False):
+        """Queue a mapping until the C++ Process has been constructed."""
+        mapping = (int(vaddr), int(paddr), int(size), bool(cacheable))
+        if mapping[2] <= 0:
+            raise ValueError("Process mappings must have a positive size")
+
+        vaddr, _, size, _ = mapping
+        vend = vaddr + size
+        for queued in self._deferred_maps:
+            if queued == mapping:
+                return
+            qvaddr, _, qsize, _ = queued
+            if vaddr < qvaddr + qsize and qvaddr < vend:
+                raise ValueError(
+                    "Conflicting deferred Process mappings overlap: "
+                    f"{mapping!r} and {queued!r}"
+                )
+
+        self._deferred_maps.append(mapping)
+
+    def createCCObject(self):
+        super().createCCObject()
+
+        # Call the bound C++ method directly. Calling self.map() here would
+        # route through getCCObject() again and obscure the lifecycle boundary.
+        pending = self._deferred_maps
+        self._deferred_maps = []
+        for index, mapping in enumerate(pending):
+            try:
+                self._ccObject.map(*mapping)
+            except Exception:
+                # Successful mappings must not be replayed, but retain the
+                # failed mapping and all later mappings for a possible retry.
+                self._deferred_maps = pending[index:] + self._deferred_maps
+                raise
+
     phys_pool_id = Param.Int(0, "physical memory pool id for this process")
 
     input = Param.String("cin", "filename for stdin")

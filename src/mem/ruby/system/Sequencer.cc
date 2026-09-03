@@ -167,6 +167,17 @@ Sequencer::~Sequencer()
 }
 
 bool
+Sequencer::bypassBackingStore(Addr address) const
+{
+#if RUBY_PROTOCOL_CHI
+    return m_haEpBackend &&
+           m_haEpBackend->isDsmAddrCrossNode(makeLineAddress(address));
+#else
+    return false;
+#endif
+}
+
+bool
 Sequencer::needsHAPermission(Addr address) const
 {
 #if RUBY_PROTOCOL_CHI
@@ -227,7 +238,7 @@ Sequencer::requestHAReadPermission(Addr address, DataBlock& data,
 
     UBHAPermissionRespBody response;
     const int status = m_haEpBackend->requestHAPermission(
-        state.homePa, HAOperation::Read, state.epoch, nullptr, state.homeNode,
+        state.homePa, HAOperation::Read, state.epoch, 0, nullptr, state.homeNode,
         state.homeSocket, state.reqId, response, m_haSourceSocket);
     if (status == -2)
         return 1;
@@ -251,6 +262,7 @@ Sequencer::requestHAReadPermission(Addr address, DataBlock& data,
              "%s: successful HA read response lacks 64-byte data for line %#x",
              name(), lineAddr);
     data.setData(response.data, 0, 64);
+    m_haEpBackend->recordHADirtyData(lineAddr, m_haSourceSocket, data);
     state.granted = true;
     inform("[HA-SLICC-GATE] seq=%s phase=READ_GRANTED pa=%#x reqId=%lu "
            "epoch=%lu\n", name(), lineAddr, state.reqId, state.epoch);
@@ -288,6 +300,16 @@ Sequencer::requestHAStorePermission(Addr address, DataBlock& data)
         inform("[HA-SLICC-GATE] seq=%s phase=WRITE_ENTER pa=%#x homePa=%#lx "
                "homeNode=%d homeSocket=%d\n", name(), lineAddr,
                state.homePa, state.homeNode, state.homeSocket);
+        PacketPtr pkt = requests->second.front().pkt;
+        const unsigned offset = pkt->getAddr() - lineAddr;
+        fatal_if(offset + pkt->getSize() > 64,
+                 "%s: HA store crosses line boundary for line %#x", name(),
+                 lineAddr);
+        state.byteMask = 0;
+        for (unsigned i = 0; i < pkt->getSize(); ++i)
+            state.byteMask |= 1ULL << (offset + i);
+        state.writeData = DataBlock(64);
+        state.writeData.setData(pkt);
     }
     fatal_if(!state.isWrite,
              "%s: HA read/write overlap for line %#x", name(), lineAddr);
@@ -295,15 +317,10 @@ Sequencer::requestHAStorePermission(Addr address, DataBlock& data)
     if (state.granted)
         return 2;
 
-    // The home controller persists the request payload. Construct the final
-    // value in a temporary block so permission is requested with the eventual
-    // store contents while the live CHI TBE remains unmodified until grant.
-    DataBlock proposed(data);
-    proposed.setData(requests->second.front().pkt);
     UBHAPermissionRespBody response;
     const int status = m_haEpBackend->requestHAPermission(
-        state.homePa, HAOperation::Write, state.epoch,
-        proposed.getData(0, 64), state.homeNode, state.homeSocket, state.reqId,
+        state.homePa, HAOperation::Write, state.epoch, state.byteMask,
+        state.writeData.getData(0, 64), state.homeNode, state.homeSocket, state.reqId,
         response, m_haSourceSocket);
     if (status == -2)
         return 1;
@@ -326,8 +343,10 @@ Sequencer::requestHAStorePermission(Addr address, DataBlock& data)
     fatal_if(response.status != HAStatus::Ok,
              "%s: HA write permission denied for line %#x status=%s", name(),
              lineAddr, haStatusName(response.status));
-    if (response.hasData)
-        data.setData(response.data, 0, 64);
+    fatal_if(!response.hasData,
+             "%s: successful HA write response lacks final 64-byte data "
+             "for line %#x", name(), lineAddr);
+    data.setData(response.data, 0, 64);
     state.granted = true;
     inform("[HA-SLICC-GATE] seq=%s phase=WRITE_GRANTED pa=%#x reqId=%lu "
            "epoch=%lu\n", name(), lineAddr, state.reqId, state.epoch);
@@ -346,6 +365,11 @@ Sequencer::completeHAStore(Addr address, DataBlock& data, bool externalHit)
     // store completes under this permission; any aliases are reissued.
     writeCallback(address, data, externalHit, MachineType_NUM, Cycles(0),
                   Cycles(0), Cycles(0), true);
+    // writeCallback applies the CPU packet bytes to the authoritative final64.
+    // Capture only afterwards so a later HA owner recall returns the actual
+    // dirty line rather than the pre-store permission base.
+    m_haEpBackend->recordHADirtyData(makeLineAddress(address),
+                                     m_haSourceSocket, data);
 }
 
 void

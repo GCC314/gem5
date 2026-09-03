@@ -169,6 +169,10 @@ class RubyPort : public ClockedObject
     virtual bool isDeadlockEventScheduled() const = 0;
     virtual void descheduleDeadlockEvent() = 0;
 
+    // Some protocol-managed address ranges carry the authoritative response
+    // data in the Ruby packet and must not be overwritten by phys_mem.
+    virtual bool bypassBackingStore(Addr address) const { return false; }
+
     //
     // Called by the controller to give the sequencer a pointer.
     // A pointer to the controller is needed for atomic support.
