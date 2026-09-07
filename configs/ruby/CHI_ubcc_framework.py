@@ -455,6 +455,10 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
             hnf_cntrl.epRnfMachineVersion = nd['ep_rnf_cntrl'].version
         for sid, hnf_cntrl in enumerate(nd['hnf_cntrls']):
             hnf_cntrl.metaRnfMachineVersion = nd['meta_rnf_cntrls'][sid].version
+            bridge = HnPersistenceBridge(ep_backend=ep_backend)
+            setattr(ruby_system, f"hn_persistence_bridge_n{node_id}_s{sid}", bridge)
+            hnf_cntrl.hn_persistence_bridge = bridge
+            hnf_cntrl.ubcc_hnf_socket = sid
 
         nd['clusters'] = []
         node_cpus = _node_cpu_slice(node_id)

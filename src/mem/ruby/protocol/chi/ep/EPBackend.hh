@@ -458,6 +458,13 @@ class EPBackend : public SimObject
      */
     bool sendRecallResponse(const OuterRecallResponse &response);
 
+    /** Commit requester permission only after the matching CHI recall has
+     * completed. Keeping R_M live while the proxy is pending allows a racing
+     * HN-F replacement to retain its OwnerDrop classification. */
+    void commitRecallRequesterState(const OuterRecallMsg &recallMsg,
+                                    bool protocolComplete,
+                                    bool capturedDataValid);
+
     /**
      * Get the count of recall requests received by this EPBackend.
      */
@@ -733,9 +740,36 @@ class EPBackend : public SimObject
     /** Consume per-line grant data: 1=data, 0=explicit NoData, -1=missing. */
     int takeGrantData(uint64_t linePa, DataBlock &data,
                        GrantDataSource &source);
-    bool getStoreAuthorization(uint64_t linePa, int sourceSocket,
-                               int &requesterNode,
-                               uint64_t &permissionEpoch) const;
+    /** Resolve HN-F WriteNoSnp against requester-owned line metadata.
+     *  A full dirty owner replacement is returned as OwnerWriteback/DropOwner;
+     *  other writes retain StoreCommit/MemoryOnly semantics. */
+    bool resolveWritePersistence(uint64_t linePa, int sourceSocket,
+                                 uint64_t originalTxnId, bool fullLine,
+                                 uint64_t &homePa,
+                                 int &homeNode, int &homeSocket,
+                                 int &requesterNode,
+                                 uint64_t &permissionEpoch,
+                                 bool &ownerWriteback,
+                                 bool &storeCommit);
+    void registerHnPersistence(uint64_t linePa, uint64_t originalTxnId,
+                               int sourceSocket, bool replacement,
+                               bool fullLine);
+    void completeHnPersistence(uint64_t linePa, uint64_t originalTxnId,
+                               int sourceSocket);
+    void dropStaleOwnerReplacement(uint64_t linePa, uint64_t expectedEpoch);
+
+    size_t requesterMetadataEntries() const { return _requesterLines.size(); }
+    size_t requesterMetadataPeakEntries() const {
+        return _requesterMetadataPeakEntries;
+    }
+    size_t requesterMetadataLogicalBytes() const {
+        return _requesterLines.size() * sizeof(RequesterLineEntry) +
+            _pendingHnPersistence.size() * sizeof(HnPersistenceContext);
+    }
+    size_t requesterMetadataPeakLogicalBytes() const {
+        return _requesterMetadataPeakEntries * sizeof(RequesterLineEntry) +
+            _pendingHnPersistencePeakEntries * sizeof(HnPersistenceContext);
+    }
 
     bool isDsmAddr(uint64_t pa) const;
 
@@ -912,6 +946,7 @@ class EPBackend : public SimObject
     // ---- M5: Requester-Side Bookkeeping ----
     // Per-line entries tracking global permissions for remote DSM lines.
     std::map<uint64_t, RequesterLineEntry> _requesterLines;
+    size_t _requesterMetadataPeakEntries = 0;
     using HALineKey = std::pair<int, uint64_t>;
     std::map<HALineKey, RequesterLineEntry> _haRequesterLines;
     std::map<HALineKey, DataBlock> _haDirtyData;
@@ -1014,6 +1049,20 @@ class EPBackend : public SimObject
     // alias, or requester-state mutation cannot allocate a second reqId for the
     // same Home PA.
     std::map<uint64_t, PendingReadTxn> _pendingReadTxns;
+
+    enum class HnPersistenceKind : uint8_t {
+        MemoryOnly,
+        OwnerDrop,
+        HAWrite,
+    };
+    struct HnPersistenceContext {
+        HnPersistenceKind kind = HnPersistenceKind::MemoryOnly;
+        uint64_t epoch = 0;
+        bool consumed = false;
+    };
+    using HnPersistenceKey = std::tuple<uint64_t, uint64_t, int>;
+    std::map<HnPersistenceKey, HnPersistenceContext> _pendingHnPersistence;
+    size_t _pendingHnPersistencePeakEntries = 0;
 
     // ---- Async upgrade pending txn (mirrors PendingGrantTxn for clear) ----
     // When sendUpgradeReq returns -2 (UpgradeResp not yet arrived), we save the

@@ -263,6 +263,7 @@ class Base_CHI_Cache_Controller(CHI_Cache_Controller):
             replTriggerQueue=OrderedTriggerMessageBuffer(),
             reqRdy=TriggerMessageBuffer(),
             snpRdy=TriggerMessageBuffer(),
+            hn_persistence_bridge=HnPersistenceBridge(ep_backend=NULL),
         )
         # Set somewhat large number since we really a lot on internal
         # triggers. To limit the controller performance, tweak other

@@ -51,6 +51,11 @@ transition({I,SC,UC,SD,UD,RU,RSC,RSD,RUSD,SC_RSC,UC_RSC,SD_RSC,UD_RSC,UC_RU,UD_R
 }
 
 transition({I,SC,UC,SD,UD,RU,RSC,RSD,RUSD,SC_RSC,UC_RSC,SD_RSC,UD_RSC,UC_RU,UD_RU,UD_RSD,SD_RSD,RUSC
+            BUSY_INTR,BUSY_BLKD}, AllocProxyRequest) {
+  AllocateTBE_ProxyRequest;
+}
+
+transition({I,SC,UC,SD,UD,RU,RSC,RSD,RUSD,SC_RSC,UC_RSC,SD_RSC,UD_RSC,UC_RU,UD_RU,UD_RSD,SD_RSD,RUSC
             BUSY_INTR,BUSY_BLKD}, SendRetryAck) {
   Send_RetryAck;
   Pop_RetryTriggerQueue;

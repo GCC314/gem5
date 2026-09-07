@@ -385,7 +385,10 @@ in_port(reqInPort, CHIRequestMsg, reqIn, rank=2,
       assert(!in_msg.usesTxnId);
       DPRINTF(RubySlicc, "[NF-REQIN-ARRIVE] addr=%#x type=%d allowRetry=%d\n",
         in_msg.addr, in_msg.type, in_msg.allowRetry);
-      if (in_msg.allowRetry) {
+      if (in_msg.ep_proxy_op != EpProxyOp:NoProxyOp) {
+        trigger(Event:AllocProxyRequest, in_msg.addr,
+              getCacheEntry(in_msg.addr), getCurrentActiveTBE(in_msg.addr));
+      } else if (in_msg.allowRetry) {
         trigger(Event:AllocRequest, in_msg.addr,
               getCacheEntry(in_msg.addr), getCurrentActiveTBE(in_msg.addr));
       } else {
@@ -396,8 +399,8 @@ in_port(reqInPort, CHIRequestMsg, reqIn, rank=2,
   }
 }
 bool reqInPort_rsc_stall_handler() {
-  error("reqInPort must never stall\n");
-  return false;
+  reqInPort.recycle(clockEdge(), cyclesToTicks(stall_recycle_lat));
+  return true;
 }
 
 

@@ -54,6 +54,8 @@ class EPSNFController : public EPController
         uint8_t data[64]{};
         MachineID requestor;
         bool haWrite = false;
+        bool ownerWriteback = false;
+        bool storeCommit = false;
         bool internalPublication = false;
         bool dataComplete = false;
         bool granted = false;
