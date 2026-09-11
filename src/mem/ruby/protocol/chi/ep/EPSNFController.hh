@@ -55,6 +55,9 @@ class EPSNFController : public EPController
         MachineID requestor;
         bool haWrite = false;
         bool internalPublication = false;
+        bool replacementOwnerRelease = false;
+        int releaseRequester = -1;
+        uint64_t releaseEpoch = 0;
         bool dataComplete = false;
         bool granted = false;
         bool completionQueued = false;

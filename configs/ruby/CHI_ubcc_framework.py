@@ -455,6 +455,10 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
             hnf_cntrl.epRnfMachineVersion = nd['ep_rnf_cntrl'].version
         for sid, hnf_cntrl in enumerate(nd['hnf_cntrls']):
             hnf_cntrl.metaRnfMachineVersion = nd['meta_rnf_cntrls'][sid].version
+            if _ha_profile == 'ha-vi':
+                hnf_cntrl.ha_node_backend = ep_backend
+                hnf_cntrl.ha_node_observer = True
+                hnf_cntrl.ha_home_socket = sid
 
         nd['clusters'] = []
         node_cpus = _node_cpu_slice(node_id)

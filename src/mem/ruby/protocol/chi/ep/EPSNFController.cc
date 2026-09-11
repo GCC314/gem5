@@ -185,10 +185,8 @@ EPSNFController::wakeup()
                                   neededPerm = it->neededPerm,
                                   writeIntent = it->writeIntent,
                                   publishOnData = it->publishOnData] {
-                            if (_backend->haEndpointEnabled()) {
-                                _backend->completeHARemoteGrant(
-                                    linePa, neededPerm, writeIntent, _socketId);
-                            }
+                            // HA InstallAck is emitted by the HN final observer,
+                            // not when the SN merely enqueues its last data beat.
                             if (publishOnData) {
                                 _backend->notifyLocalLinePublished(
                                     linePa, _socketId);
@@ -285,7 +283,10 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
                       (pending.internalPublication &&
                        (pending.requesterNode != -1 ||
                         pending.permissionEpoch != 0)) ||
-                      pending.disposition != UBWriteDisposition::MemoryOnly,
+                       (pending.disposition != UBWriteDisposition::MemoryOnly &&
+                        !(pending.internalPublication &&
+                          pending.disposition == UBWriteDisposition::DropOwner &&
+                          msg->m_type == CHIRequestType_WriteNoSnp)),
                  "EP_SNF node_id=%d: invalid StoreCommit authorization "
                  "PA=0x%lx requester=%d disposition=%d", _nodeId,
                  msg->m_addr, pending.requesterNode,
@@ -304,11 +305,23 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
             pending.expectedMask = ~0ULL;
         }
 
-        if (_backend->haEndpointEnabled()) {
-            fatal_if(pending.internalPublication,
-                     "EP_SNF node_id=%d: HN internal WriteNoSnp publication "
-                     "is UBCC-only; HA requires an explicit owner disposition "
-                     "PA=0x%lx", _nodeId, msg->m_addr);
+        // The replacement TBE proves local quiescence; capture this node's
+        // existing permission incarnation, never infer the owner from Home's
+        // current PA lookup. Keep wire-data identity separate from the release
+        // snapshot, since NCBWrData must still match the original CHI request.
+        if (pending.internalPublication &&
+            pending.disposition == UBWriteDisposition::DropOwner &&
+            !_backend->haEndpointEnabled()) {
+            const auto permission = _backend->inspectRequesterState(pending.linePa);
+            if (permission.valid && permission.state ==
+                static_cast<int>(RequesterLineState::R_M)) {
+                pending.replacementOwnerRelease = true;
+                pending.releaseRequester = _nodeId;
+                pending.releaseEpoch = permission.epoch;
+            }
+        }
+
+        if (_backend->haEndpointEnabled() && !pending.internalPublication) {
             pending.haWrite = true;
             fatal_if(!_backend->resolveHAStoreTarget(
                          msg->m_addr, pending.sourceSocket, pending.homePa,
@@ -598,10 +611,7 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
             pending.onSent = [this, linePa = msg->m_addr, neededPerm,
                               writeIntent,
                               publishOnData = msg->m_ubcc_publish_on_data] {
-                if (_backend->haEndpointEnabled()) {
-                    _backend->completeHARemoteGrant(
-                        linePa, neededPerm, writeIntent, _socketId);
-                }
+                // HA completion waits for HN coherent publication.
                 if (publishOnData) {
                     _backend->notifyLocalLinePublished(linePa, _socketId);
                 }
@@ -870,7 +880,13 @@ EPSNFController::processPendingHAWrites()
                     pending.homeNode, pending.homeSocket,
                     pending.permissionReqId, response, pending.sourceSocket);
             } else {
-                if (pending.internalPublication) {
+                if (pending.replacementOwnerRelease) {
+                    pending.permissionReqId = pending.storeCommitId;
+                    result = _backend->handleWritebackWithMeta(
+                        pending.linePa, false, pending.data,
+                        pending.releaseEpoch, pending.releaseRequester,
+                        pending.sourceSocket, &pending.permissionReqId);
+                } else if (pending.internalPublication) {
                     result = _backend->publishInternalWriteback(
                         pending.homePa, pending.storeCommitId,
                         pending.expectedMask, pending.data, pending.homeNode,
@@ -894,7 +910,8 @@ EPSNFController::processPendingHAWrites()
             // request for the same line is still active; no data was persisted
             // in that case, so retry the same stable publication identity.
             // StoreCommit rejection remains fatal and exact-identity checked.
-            if (result == 0 && pending.internalPublication) {
+            if (result == 0 && pending.internalPublication &&
+                !pending.replacementOwnerRelease) {
                 pendingWork = true;
                 continue;
             }

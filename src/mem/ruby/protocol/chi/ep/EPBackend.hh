@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <array>
 #include <map>
+#include <set>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -835,9 +836,8 @@ class EPBackend : public SimObject
                                  int sourceSocket = 0);
     void recordHAInstall(uint64_t localLinePa, HAOperation operation,
                          uint64_t permissionEpoch, int homeNode,
-                         uint64_t reqId, int sourceSocket);
-    void recordHADirtyData(uint64_t localLinePa, int sourceSocket,
-                           const DataBlock &data);
+                            uint64_t reqId, int sourceSocket);
+    void observeHAHomeFinal(Addr localLinePa, int homeSocket, bool present);
     void registerHADataCache(int sourceSocket, CacheMemory *cache);
     void invalidateHADataCaches(int sourceSocket, uint64_t localLinePa);
     bool hasHADataCacheLine(int sourceSocket, uint64_t localLinePa) const;
@@ -914,7 +914,9 @@ class EPBackend : public SimObject
     std::map<uint64_t, RequesterLineEntry> _requesterLines;
     using HALineKey = std::pair<int, uint64_t>;
     std::map<HALineKey, RequesterLineEntry> _haRequesterLines;
-    std::map<HALineKey, DataBlock> _haDirtyData;
+    // Exact HN-observed resident addresses, bounded by physical HN cache and
+    // directory capacity. No data or stale per-L1 absence inference here.
+    std::set<Addr> _haNodeResident;
     std::vector<std::vector<CacheMemory *>> _haDataCachesBySocket;
     uint64_t _epochCounter = 0;
 
@@ -931,6 +933,8 @@ class EPBackend : public SimObject
     // ---- M6: Recall message envelopes ----
     OuterRecallMsg _lastRecallMsg;
     OuterRecallResponse _lastRecallResponse;
+    // Exact in-flight wire identity; a retry must not replace its callback.
+    std::set<std::tuple<uint64_t, int, uint64_t, uint64_t, int>> _pendingRecalls;
 
     // ---- M6: Recall counters ----
     uint64_t _recallReceivedCount;

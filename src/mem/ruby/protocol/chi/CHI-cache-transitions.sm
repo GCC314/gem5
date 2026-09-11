@@ -51,6 +51,16 @@ transition({I,SC,UC,SD,UD,RU,RSC,RSD,RUSD,SC_RSC,UC_RSC,SD_RSC,UD_RSC,UC_RU,UD_R
 }
 
 transition({I,SC,UC,SD,UD,RU,RSC,RSD,RUSD,SC_RSC,UC_RSC,SD_RSC,UD_RSC,UC_RU,UD_RU,UD_RSD,SD_RSD,RUSC
+            BUSY_INTR,BUSY_BLKD}, AllocProxyRequest) {
+  AllocateTBE_ProxyRequest;
+}
+
+transition(UD_T, AllocProxyRequest, UD) {
+  Unset_Timeout_Cache;
+  AllocateTBE_ProxyRequest;
+}
+
+transition({I,SC,UC,SD,UD,RU,RSC,RSD,RUSD,SC_RSC,UC_RSC,SD_RSC,UD_RSC,UC_RU,UD_RU,UD_RSD,SD_RSD,RUSC
             BUSY_INTR,BUSY_BLKD}, SendRetryAck) {
   Send_RetryAck;
   Pop_RetryTriggerQueue;
@@ -656,7 +666,7 @@ transition(BUSY_BLKD, StoreHit) {
   ProcessNextState_ClearPending;
 }
 
-transition({BUSY_BLKD,BUSY_INTR}, HAStorePermission) {
+transition({BUSY_BLKD,BUSY_INTR}, HAStorePermission, BUSY_BLKD) {
   Pop_TriggerQueue;
   Callback_HAStorePermission;
   ProcessNextState_ClearPending;
@@ -1427,6 +1437,12 @@ transition(BUSY_BLKD, MaintainCoherence) {
 transition(BUSY_BLKD, FinishCleanUnique) {
   Pop_TriggerQueue;
   Finish_CleanUnique;
+  ProcessNextState_ClearPending;
+}
+
+transition(BUSY_BLKD, CompleteInvalidateOnly) {
+  Pop_TriggerQueue;
+  Complete_InvalidateOnly;
   ProcessNextState_ClearPending;
 }
 

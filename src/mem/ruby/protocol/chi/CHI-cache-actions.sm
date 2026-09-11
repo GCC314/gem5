@@ -85,6 +85,22 @@ action(AllocateTBE_Request_WithCredit, desc="") {
   reqInPort.dequeue(clockEdge());
 }
 
+action(AllocateTBE_ProxyRequest, desc="") {
+  peek(reqInPort, CHIRequestMsg) {
+    assert(in_msg.ep_proxy_op != EpProxyOp:NoProxyOp);
+    assert(in_msg.allowRetry == false);
+  }
+  check_allocate(storTBEs);
+  storTBEs.incrementReserved();
+  peek(reqInPort, CHIRequestMsg) {
+    enqueue(reqRdyOutPort, CHIRequestMsg, allocation_latency) {
+      assert(in_msg.addr == address);
+      out_msg := in_msg;
+    }
+  }
+  reqInPort.dequeue(clockEdge());
+}
+
 action(AllocateTBE_Snoop, desc="") {
   // No retry for snoop requests; just create resource stall
   check_allocate(storSnpTBEs);
@@ -492,7 +508,14 @@ action(StallActionOnHazard, desc="") {
 
 action(Initiate_ReadShared_Miss, desc="") {
   tbe.actions.push(Event:ReadMissPipe);
-  if (is_HN && tbe.use_DMT) {
+  // A recall probes this coherent node, never the outer Home waiting on it.
+  // The normal HN same-address TBE ordering drains dirty publication first.
+  if (is_HN && tbe.epProxyOp == EpProxyOp:RecallShared) {
+    assert(!tbe.dataValid && !tbe.dataMaybeDirtyUpstream);
+    tbe.updateDirOnCompAck := false;
+    tbe.actions.push(Event:WaitCompAck);
+    tbe.actions.pushNB(Event:SendCompUCResp);
+  } else if (is_HN && tbe.use_DMT) {
     tbe.requestorToBeExclusiveOwner := true;
     tbe.dataMaybeDirtyUpstream := true; // SNF always replies with CompData_UC
     if (enable_DMT_early_dealloc) {
@@ -569,7 +592,12 @@ action(Initiate_ReadShared_HitUpstream_NoOwner, desc="") {
     tbe.dataUnique := false;
     tbe.dataMaybeDirtyUpstream := false;
     tbe.actions.push(Event:ReadMissPipe);
-    if (is_HN) {
+    if (is_HN && tbe.epProxyOp == EpProxyOp:RecallShared) {
+      assert(!tbe.dataValid);
+      tbe.updateDirOnCompAck := false;
+      tbe.actions.push(Event:WaitCompAck);
+      tbe.actions.pushNB(Event:SendCompUCResp);
+    } else if (is_HN) {
       tbe.actions.push(Event:SendReadNoSnp);
       tbe.actions.push(Event:WaitCompAck);
       tbe.actions.pushNB(Event:SendCompData);
@@ -855,6 +883,12 @@ action(Initiate_ReadUnique_HitUpstream, desc="") {
       tbe.actions.pushNB(Event:SendCompData);
     }
     // just tag update since data any data would become stale
+    if (is_HN && is_invalid(cache_entry)) {
+      // The snoop response is a forwarding payload, not an allocated HN
+      // cache line. The real new requester owns it after CompAck; do not leave
+      // dataValid set when the final state contains only directory ownership.
+      tbe.dataToBeInvalid := true;
+    }
     tbe.actions.pushNB(Event:TagArrayWrite);
   }
 }
@@ -950,8 +984,37 @@ action(Finish_CleanUnique, desc="") {
           address, tbe.epProxyOp, tbe.dir_sharers.isElement(tbe.requestor),
           tbe.dir_sharers.count());
 
+  if (epRnfMachineVersion >= 0 &&
+      tbe.requestor == tbe.epRnfMachineID &&
+      tbe.reqType == CHIRequestType:CleanUnique &&
+      tbe.epProxyOp == EpProxyOp:InvalidateOnly) {
+    // Snoop responses, not a synthetic directory clear, establish the barrier.
+    if (!tbe.dir_sharers.isEmpty()) {
+      DPRINTF(RubyGenerated, "[INV-CONTRACT] addr=%#x requestor=%s ep=%s op=%s req=%s sharers=%s ownerExists=%d owner=%s pending=%d valid=%d dirty=%d upstream=%d\n", address, tbe.requestor, tbe.epRnfMachineID, tbe.epProxyOp, tbe.reqType, tbe.dir_sharers, tbe.dir_ownerExists, tbe.dir_owner, tbe.expected_snp_resp.hasExpected(), tbe.dataValid, tbe.dataDirty, tbe.dataMaybeDirtyUpstream);
+    }
+    assert(!tbe.expected_snp_resp.hasExpected());
+    // SharedHint records EP as a proxy bookkeeping sharer. NoReq deliberately
+    // excludes this requestor: only real CPU sharers must acknowledge snoops.
+    // Validate the remaining mask before retiring exactly that configured bit.
+    NetDest real_sharers := tbe.dir_sharers;
+    real_sharers.remove(tbe.epRnfMachineID);
+    assert(real_sharers.isEmpty());
+    assert(!tbe.dir_ownerExists);
+    assert(!tbe.dataMaybeDirtyUpstream);
+    tbe.dir_sharers.remove(tbe.epRnfMachineID);
+    assert(tbe.dir_sharers.isEmpty());
+    if (tbe.dataDirty) {
+      // Preserve every authoritative byte before completing a dataless proxy.
+      // CheckWUComp waits for EPSNF's persistence Comp, not merely DBIDResp.
+      assert(is_HN);
+      assert(tbe.dataValid);
+      assert(tbe.dataBlkValid.isFull());
+      tbe.actions.push(Event:SendWriteNoSnp);
+      tbe.actions.push(Event:SendWBData);
+    }
+    tbe.actions.push(Event:CompleteInvalidateOnly);
   // everyone may have been hit by an invalidation so check again
-  if (tbe.dir_sharers.isElement(tbe.requestor) == false) {
+  } else if (tbe.dir_sharers.isElement(tbe.requestor) == false) {
     tbe.updateDirOnCompAck := false;
     // v4 self-snoop: EP-RNF proxy ReadUnique may have SnpResp_I arrive
     // before CleanUnique completes. Requestor already removed from sharers
@@ -1012,6 +1075,28 @@ action(Finish_CleanUnique, desc="") {
 }
 
 
+action(Complete_InvalidateOnly, desc="") {
+  assert(!tbe.expected_req_resp.hasExpected());
+  assert(!tbe.expected_snp_resp.hasExpected());
+  assert(tbe.dir_sharers.isEmpty());
+  assert(!tbe.dir_ownerExists);
+  // No old data may be served while the reliable CompAck is in flight.
+  // Dirty data, if any, has already been published through WriteNoSnp.
+  tbe.dataValid := false;
+  tbe.dataDirty := false;
+  tbe.dataUnique := false;
+  tbe.dataBlkValid.clear();
+  tbe.dataToBeInvalid := true;
+  tbe.doCacheFill := false;
+  tbe.requestorToBeOwner := false;
+  tbe.requestorToBeExclusiveOwner := false;
+  tbe.updateDirOnCompAck := false;
+  DPRINTF(RubyGenerated, "[INVALIDATE-BARRIER] addr=%#x sharers=0 owner=0 valid=0 pending=0\n", address);
+  tbe.actions.push(Event:SendCompUCResp);
+  tbe.actions.push(Event:WaitCompAck);
+  tbe.actions.push(Event:TagArrayWrite);
+}
+
 action(Initiate_LoadHit, desc="") {
   // Local prefetch requests do not read data array
   if (tbe.is_local_pf == false) {
@@ -1021,9 +1106,7 @@ action(Initiate_LoadHit, desc="") {
 }
 
 action(Initiate_LoadMiss, desc="") {
-  if (tbe.is_local_pf == false && sequencer.needsHAPermission(tbe.addr)) {
-    tbe.actions.push(Event:HALoadPermission);
-  } else if (tbe.doCacheFill) {
+  if (tbe.doCacheFill) {
     tbe.actions.push(Event:SendReadShared);
     tbe.actions.push(Event:CheckCacheFill);
     tbe.actions.push(Event:TagArrayWrite);
@@ -1043,16 +1126,9 @@ action(Initiate_StoreHit, desc="") {
 }
 
 action(Initiate_StoreMiss, desc="") {
-  if (sequencer.needsHAPermission(tbe.addr)) {
-    // HA Home permission/data is the outer transaction. Do not emit a legacy
-    // ReadUnique before it. First publish an authoritative Home read locally;
-    // only then form the full-line HA write payload from that base value.
-    tbe.doCacheFill := true;
-    tbe.dataToBeInvalid := false;
-    tbe.haStoreMissFill := true;
-    tbe.haStoreExternalHit := true;
-    tbe.actions.push(Event:HAStoreReadPermission);
-  } else if (tbe.doCacheFill) {
+  // HA obtains the base through EPSNF's typed Read, but must still acquire
+  // real node-local CHI ownership. Store callbacks retain the per-store gate.
+  if (tbe.doCacheFill) {
     tbe.actions.push(Event:SendReadUnique);
     tbe.actions.push(Event:CheckCacheFill);
     tbe.actions.push(Event:TagArrayWrite);
@@ -1216,15 +1292,8 @@ action(Initiate_AtomicNoReturn_SC, desc="") {
 action(Initiate_StoreUpgrade, desc="") {
   assert(tbe.dataValid);
   assert(is_valid(cache_entry));
-  if (sequencer.needsHAPermission(tbe.addr)) {
-    // The typed HA write replaces the legacy CleanUnique/UpgradeReq for a
-    // shared line. The current data block supplies the full-line base value.
-    tbe.haStoreExternalHit := true;
-    tbe.actions.push(Event:HAStorePermission);
-  } else {
-    tbe.actions.push(Event:SendCleanUnique);
-    tbe.actions.push(Event:CheckUpgrade_FromStore);
-  }
+  tbe.actions.push(Event:SendCleanUnique);
+  tbe.actions.push(Event:CheckUpgrade_FromStore);
   tbe.actions.push(Event:CheckCacheFill);
   tbe.actions.push(Event:TagArrayWrite);
 }
@@ -2027,6 +2096,19 @@ action(Send_WriteNoSnp, desc="") {
   // memory publications, not architectural outer-owner dispositions.
   if (is_HN && !tbe.ubccStoreAuthValid) {
     tbe.ubccInternalWriteback := true;
+    // Only a replacement which has drained every real upstream copy may
+    // surrender node custody. Maintenance/atomic publications remain memory
+    // only, as do non-inclusive replacements with live upstream holders.
+    if (tbe.is_repl_tbe && !tbe.dir_ownerExists &&
+        !tbe.expected_snp_resp.hasExpected() && !tbe.dataMaybeDirtyUpstream) {
+      NetDest holders := tbe.dir_sharers;
+      if (epRnfMachineVersion >= 0) {
+        holders.remove(tbe.epRnfMachineID);
+      }
+      if (holders.isEmpty()) {
+        tbe.ubccWriteDisposition := 1;
+      }
+    }
   }
 
   enqueue(reqOutPort, CHIRequestMsg, request_latency) {
@@ -2960,15 +3042,26 @@ action(UpdateDirState_FromReqResp, desc="") {
     if ((in_msg.type == CHIResponseType:CompAck) && tbe.updateDirOnCompAck) {
       assert(tbe.requestor == in_msg.responder);
 
-      // v4 SnpShared fix: EP-RNF proxy CompAck is completion-only,
-      // not a directory mutation point. Skip all directory updates
-      // for proxy special completion (InvalidateOnly/RecallUnique).
-      bool is_ep_proxy_special := epRnfMachineVersion >= 0 &&
-                                   tbe.requestor == tbe.epRnfMachineID &&
-                                   tbe.epProxyOp != EpProxyOp:NoProxyOp;
+       // Invalidating proxy operations must not acquire local rights. A
+       // data-bearing RecallShared is different: its completed external read
+       // must leave EP-RNF as a non-data-bearing sharer. Otherwise the original
+       // CPU's next CleanUnique sees only itself and bypasses the outer upgrade
+       // barrier, even though its L1/L2 correctly downgraded on SnpShared.
+       // No-data RecallShared misses disable updateDirOnCompAck at initiation.
+       bool is_ep_proxy_special := epRnfMachineVersion >= 0 &&
+                                    tbe.requestor == tbe.epRnfMachineID &&
+                                    tbe.epProxyOp != EpProxyOp:NoProxyOp &&
+                                    tbe.epProxyOp != EpProxyOp:RecallShared;
 
-      if (!is_ep_proxy_special) {
-        tbe.dir_sharers.add(in_msg.responder);
+       if (!is_ep_proxy_special) {
+         tbe.dir_sharers.add(in_msg.responder);
+         if (is_HN && tbe.epProxyOp == EpProxyOp:RecallShared) {
+           assert(!tbe.requestorToBeOwner);
+           assert(!tbe.requestorToBeExclusiveOwner);
+           DPRINTF(RubyGenerated,
+                   "[RECALL-SHARED-REGISTER] addr=%#x sharers=%d unique=%d\n",
+                   address, tbe.dir_sharers.count(), tbe.dataUnique);
+         }
 
         if (tbe.requestorToBeOwner) {
           assert(tbe.dataMaybeDirtyUpstream);
@@ -3266,7 +3359,8 @@ action(Send_CompData, desc="") {
   bool is_eprnf_req := epRnfMachineVersion >= 0 &&
                        tbe.requestor == tbe.epRnfMachineID;
   bool is_eprnf_proxy_req := is_eprnf_req &&
-                             tbe.epProxyOp != EpProxyOp:NoProxyOp;
+                             tbe.epProxyOp != EpProxyOp:NoProxyOp &&
+                             tbe.epProxyOp != EpProxyOp:RecallShared;
 
   if (is_rd_once || is_rd_no_snp) {
     tbe.snd_msgType := CHIDataType:CompData_I;
@@ -3698,7 +3792,8 @@ action(Send_CompUC, desc="") {
     // already be cleared before this response action runs.  The transaction's
     // byte-valid mask is the authoritative indication that SendCompData has a
     // complete line to return.
-    if (tbe.epProxyOp == EpProxyOp:RecallUnique &&
+    if ((tbe.epProxyOp == EpProxyOp:RecallUnique ||
+         tbe.epProxyOp == EpProxyOp:RecallShared) &&
         !tbe.dataBlkValid.isFull()) {
       out_msg.type := CHIResponseType:Comp_UC_NoData;
     } else {
@@ -3956,7 +4051,8 @@ action(ScrubEPRNF_ToI, desc="") {
   assert(is_valid(tbe));
   if (epRnfMachineVersion >= 0 &&
       tbe.requestor == tbe.epRnfMachineID &&
-      tbe.epProxyOp != EpProxyOp:NoProxyOp) {
+      tbe.epProxyOp != EpProxyOp:NoProxyOp &&
+      tbe.epProxyOp != EpProxyOp:RecallShared) {
 
     // Remove EP-RNF from dir_sharers so dir does not track it post-completion
     if (tbe.dir_sharers.isElement(tbe.epRnfMachineID)) {
@@ -4000,6 +4096,9 @@ action(Finalize_UpdateCacheFromTBE, desc="") {
     DPRINTF(RubyGenerated, "Cached data %s pfb %s\n", tbe.dataBlk, cache_entry.HWPrefetched);
   } else {
     // make sure only deallocate the cache entry if data is invalid
+    if (tbe.dataValid) {
+      DPRINTF(RubyGenerated, "[FINAL-CONTRACT] addr=%#x requestor=%s ep=%s op=%s req=%s final=%s sharers=%s ownerExists=%d owner=%s pending=%d valid=%d dirty=%d upstream=%d invalidate=%d fill=%d cache=%d full=%d\n", address, tbe.requestor, tbe.epRnfMachineID, tbe.epProxyOp, tbe.reqType, final, tbe.dir_sharers, tbe.dir_ownerExists, tbe.dir_owner, tbe.expected_snp_resp.hasExpected(), tbe.dataValid, tbe.dataDirty, tbe.dataMaybeDirtyUpstream, tbe.dataToBeInvalid, tbe.doCacheFill, is_valid(cache_entry), tbe.dataBlkValid.isFull());
+    }
     assert(tbe.dataValid == false);
     if (is_valid(cache_entry)) {
       cache.deallocate(address);
@@ -4312,7 +4411,10 @@ action(Callback_Miss, desc="") {
     int ha_gate := sequencer.requestHAStorePermission(tbe.addr, tbe.dataBlk);
     if (ha_gate == 1) {
       tbe.haStoreExternalHit := true;
-      tbe.actions.pushFront(Event:HAStorePermission);
+      // Complete the real CHI fill/CompAck before parking on Home Write.
+      // Otherwise Home's preceding Read InstallAck waits for this HN while
+      // the requester blocks the CompAck behind its Write permission poll.
+      tbe.actions.push(Event:HAStorePermission);
       tbe.delayNextAction := curTick() + cyclesToTicks(intToCycles(1));
     } else {
       DPRINTF(RubyGenerated, "Write before %s\n", tbe.dataBlk);
@@ -4419,6 +4521,12 @@ action(Callback_HAStorePermission, desc="") {
   if (ha_gate == 1) {
     tbe.actions.pushFront(Event:HAStorePermission);
     tbe.delayNextAction := curTick() + cyclesToTicks(intToCycles(1));
+  } else if (tbe.dataUnique == false) {
+    // A Home recall may have downgraded this parked TBE. HA node ownership
+    // does not confer inner CHI uniqueness: reacquire it, including invalidating
+    // other sockets in this node, before mutating the architectural store.
+    tbe.actions.pushFront(Event:CheckUpgrade_FromStore);
+    tbe.actions.pushFront(Event:SendCleanUnique);
   } else if (tbe.haStoreMissFill) {
     // The preceding HA read supplied the authoritative 64-byte base. Apply
     // this permitted write and publish it through ordinary local plumbing.
@@ -4524,6 +4632,11 @@ action(AckHAReadThenStartStore, desc="") {
 
 action(Finalize_AckHAPermission, desc="") {
   assert(is_valid(tbe));
+  if (ha_node_observer) {
+    assert(is_HN);
+    ha_node_backend.observeHAHomeFinal(tbe.addr, ha_home_socket,
+                                      tbe.finalState != State:I);
+  }
   // No-op when this TBE did not use HA. Otherwise this is deliberately after
   // cache/directory publication and immediately before request deallocation.
   // Internal HN-F/EP transactions have no Sequencer pointer and must not call

@@ -660,8 +660,14 @@ UBAdapter::sendWritebackReq(uint64_t homePa, int requesterNode,
     auto ready = _readyResponses.find(responseKey);
     if (ready != _readyResponses.end()) {
         bool success = ready->second.b.writebackResp.success;
+        const bool deferred = ready->second.h.flags &
+            static_cast<uint32_t>(CFLAG_DEFERRED);
         _readyResponses.erase(ready);
         _inflightWritebackReqs.erase(reqId);
+        if (deferred) {
+            fatal_if(success, "deferred writeback cannot be successful");
+            return -2;
+        }
         return success ? 1 : 0;
     }
     if (_inflightWritebackReqs.count(reqId))

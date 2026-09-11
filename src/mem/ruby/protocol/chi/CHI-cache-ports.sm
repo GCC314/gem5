@@ -348,8 +348,14 @@ in_port(reqRdyPort, CHIRequestMsg, reqRdy, rank=3,
             trigger(Event:Evict_Stale, in_msg.addr, cache_entry, tbe);
           }
         } else if (in_msg.type == CHIRequestType:CleanUnique) {
-          if (is_invalid(dir_entry) ||
-              (dir_entry.sharers.isElement(in_msg.requestor) == false)) {
+          // An invalidate-only proxy is not a CPU permission upgrade: the
+          // configured EP need not hold a tracked copy, even in an empty dir.
+          if (!(epRnfMachineVersion >= 0 &&
+                in_msg.requestor == createMachineID(
+                    MachineType:Cache, intToID(epRnfMachineVersion)) &&
+                in_msg.ep_proxy_op == EpProxyOp:InvalidateOnly) &&
+              (is_invalid(dir_entry) ||
+               (dir_entry.sharers.isElement(in_msg.requestor) == false))) {
             trigger(Event:CleanUnique_Stale, in_msg.addr, cache_entry, tbe);
           }
         }
@@ -385,7 +391,10 @@ in_port(reqInPort, CHIRequestMsg, reqIn, rank=2,
       assert(!in_msg.usesTxnId);
       DPRINTF(RubySlicc, "[NF-REQIN-ARRIVE] addr=%#x type=%d allowRetry=%d\n",
         in_msg.addr, in_msg.type, in_msg.allowRetry);
-      if (in_msg.allowRetry) {
+      if (in_msg.ep_proxy_op != EpProxyOp:NoProxyOp) {
+        trigger(Event:AllocProxyRequest, in_msg.addr,
+              getCacheEntry(in_msg.addr), getCurrentActiveTBE(in_msg.addr));
+      } else if (in_msg.allowRetry) {
         trigger(Event:AllocRequest, in_msg.addr,
               getCacheEntry(in_msg.addr), getCurrentActiveTBE(in_msg.addr));
       } else {
@@ -396,8 +405,8 @@ in_port(reqInPort, CHIRequestMsg, reqIn, rank=2,
   }
 }
 bool reqInPort_rsc_stall_handler() {
-  error("reqInPort must never stall\n");
-  return false;
+  reqInPort.recycle(clockEdge(), cyclesToTicks(stall_recycle_lat));
+  return true;
 }
 
 
