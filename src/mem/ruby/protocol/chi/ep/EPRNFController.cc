@@ -536,7 +536,14 @@ EPRNFController::recvResponseMsg(const CHIResponseMsg *msg)
                it != _pendingChiTxns.end() ? it->second.needsCompAck : -1);
         if (it != _pendingChiTxns.end() &&
             (it->second.op == PendingChiOp::CleanUnique ||
-             it->second.op == PendingChiOp::ReadUnique)) {
+             it->second.op == PendingChiOp::ReadUnique ||
+             (it->second.proxyOp == EpProxyOp_RecallShared &&
+              msg->m_type == CHIResponseType_Comp_UC_NoData))) {
+
+            fatal_if(it->second.proxyOp == EpProxyOp_RecallShared &&
+                         it->second.beatsReceived != 0,
+                     "RecallShared no-data completion after data for %#x",
+                     msg->m_addr);
 
             if (it->second.op == PendingChiOp::ReadUnique) {
                 it->second.hnfDest = msg->m_responder;
@@ -562,12 +569,17 @@ EPRNFController::recvResponseMsg(const CHIResponseMsg *msg)
                 false, false, 0, 0, MessageSizeType_Control);
 
             it->second.needsCompAck = true;
-            sendResponseReliable(ack, [this, linePa = msg->m_addr]() {
+            const bool completionOk =
+                it->second.proxyOp != EpProxyOp_InvalidateOnly ||
+                (!msg->m_stale && msg->m_type == CHIResponseType_Comp_UC &&
+                 it->second.beatsReceived == 0);
+            sendResponseReliable(ack, [this, linePa = msg->m_addr,
+                                       completionOk]() {
                 auto pending = _pendingChiTxns.find(linePa);
                 if (pending == _pendingChiTxns.end())
                     return;
                 pending->second.needsCompAck = false;
-                finishChiTxn(linePa, true);
+                finishChiTxn(linePa, completionOk);
             });
 
             return true;
@@ -801,6 +813,11 @@ EPRNFController::handleSnpCleanInvalid(const CHIRequestMsg *msg)
 
     EPBackend *backend = EPBackend::getBackendInstance(_nodeId);
     bool isDsmLine = backend && backend->isDsmAddrCrossNode(msg->m_addr);
+    // HA's per-store permission is acquired by Sequencer after the ordinary
+    // node-local CHI upgrade. EP is not a private holder, and must not launch
+    // a legacy UBCC OuterUpgradeReq on behalf of that inner transaction.
+    if (isDsmLine && backend->haEndpointEnabled())
+        return sendSnpRespI(msg);
     const int sourceSocket = msg->m_ubcc_ingress_socket;
     fatal_if(sourceSocket < 0 || sourceSocket >= _numSockets,
              "EP_RNF node_id=%d: invalid requester socket %d for PA=0x%lx",
@@ -930,6 +947,16 @@ EPRNFController::handleSnpCleanInvalid(const CHIRequestMsg *msg)
 bool
 EPRNFController::handleSnpUnique(const CHIRequestMsg *msg)
 {
+    // A CPU ReadUnique satisfied by a local shared copy still needs global
+    // write permission. SnpUnique and SnpCleanInvalid invalidate the same EP
+    // bookkeeping sharer; neither may acknowledge before the outer barrier.
+    // Proxy recalls already run within an outer transaction and must not
+    // recursively request another upgrade.
+    EPBackend *backend = EPBackend::getBackendInstance(_nodeId);
+    if (backend && backend->isDsmAddrCrossNode(msg->m_addr) &&
+        msg->m_ep_proxy_op == EpProxyOp_NoProxyOp) {
+        return handleSnpCleanInvalid(msg);
+    }
     // §4.3.3: SnpUnique → globalInvalidate, return SnpResp_I / SnpRespData_I(_PD)
     // §4.6.3: response depends on retToSrc, hasData, isDirty
     DPRINTF(RubyCHIGeneric,
@@ -1130,6 +1157,16 @@ EPRNFController::finishChiTxn(uint64_t linePa, bool success)
 
     // Process any remaining deferred CHI requests
     processDeferredChiReqs();
+
+    auto deferred = _deferredInvalidations.find(linePa);
+    if (deferred != _deferredInvalidations.end() &&
+        _pendingChiTxns.find(linePa) == _pendingChiTxns.end()) {
+        auto callback = std::move(deferred->second.front());
+        deferred->second.pop_front();
+        if (deferred->second.empty())
+            _deferredInvalidations.erase(deferred);
+        startCleanUnique(linePa, std::move(callback));
+    }
 }
 
 void
@@ -1368,7 +1405,7 @@ EPRNFController::startReadShared(uint64_t linePa,
     txn.epoch = 0;     // filled by caller via EPBackend
     txn.reqId = 0;
     txn.op = PendingChiOp::ReadShared;
-    txn.proxyOp = EpProxyOp_NoProxyOp;  // ReadShared has no special completion
+    txn.proxyOp = EpProxyOp_RecallShared;  // coherent local probe, no outer fetch
     txn.hnfDest = MachineID();
     txn.beatsExpected = dataMsgsPerLine;
     txn.beatsReceived = 0;
@@ -1382,7 +1419,7 @@ EPRNFController::startReadShared(uint64_t linePa,
     _pendingChiTxns[linePa] = txn;
 
     bool sent = sendChiRequest(linePa, CHIRequestType_ReadShared,
-                               EpProxyOp_NoProxyOp);
+                               EpProxyOp_RecallShared);
     if (!sent) {
         _pendingChiTxns.erase(linePa);
         warn(
@@ -1473,11 +1510,7 @@ EPRNFController::startCleanUnique(uint64_t linePa,
     if (_pendingChiTxns.find(linePa) != _pendingChiTxns.end()) {
         DPRINTF(RubyEP, "[CLEANUNIQUE-DIAG] node=%d PA=0x%lx DUPLICATE — already has pending txn op=%d\n",
                 _nodeId, linePa, (int)_pendingChiTxns[linePa].op);
-        warn(
-                "EP_RNF node_id=%d: startCleanUnique addr=0x%lx "
-                "already has pending txn\n",
-                _nodeId, linePa);
-        if (onComplete) onComplete(false);
+        _deferredInvalidations[linePa].push_back(std::move(onComplete));
         return;
     }
 

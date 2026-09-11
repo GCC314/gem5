@@ -348,8 +348,14 @@ in_port(reqRdyPort, CHIRequestMsg, reqRdy, rank=3,
             trigger(Event:Evict_Stale, in_msg.addr, cache_entry, tbe);
           }
         } else if (in_msg.type == CHIRequestType:CleanUnique) {
-          if (is_invalid(dir_entry) ||
-              (dir_entry.sharers.isElement(in_msg.requestor) == false)) {
+          // An invalidate-only proxy is not a CPU permission upgrade: the
+          // configured EP need not hold a tracked copy, even in an empty dir.
+          if (!(epRnfMachineVersion >= 0 &&
+                in_msg.requestor == createMachineID(
+                    MachineType:Cache, intToID(epRnfMachineVersion)) &&
+                in_msg.ep_proxy_op == EpProxyOp:InvalidateOnly) &&
+              (is_invalid(dir_entry) ||
+               (dir_entry.sharers.isElement(in_msg.requestor) == false))) {
             trigger(Event:CleanUnique_Stale, in_msg.addr, cache_entry, tbe);
           }
         }

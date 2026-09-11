@@ -91,6 +91,14 @@ DirEntry getDirEntry(Addr addr), return_by_pointer = "yes" {
 
 State getState(TBE tbe, CacheEntry cache_entry, Addr addr) {
   if (is_valid(tbe)) {
+      // Only a parked HA permission callback is interruptible here. Its
+      // unmodified, transaction-owned line must be available to a Home recall
+      // while the CPU waits for that very permission. Reuse the CHI hazard
+      // TBE path rather than publishing a software snapshot or faking an Ack.
+      if (tbe.state == State:BUSY_BLKD &&
+          tbe.pendAction == Event:HAStorePermission) {
+        return State:BUSY_INTR;
+      }
       return tbe.state;
   } else if (is_valid(cache_entry)) {
     return cache_entry.state;
@@ -1207,7 +1215,8 @@ State makeFinalState(TBE tbe, CacheEntry cache_entry, DirEntry dir_entry) {
   // any local owner/sharer rights after completion.
   if (epRnfMachineVersion >= 0 &&
       tbe.requestor == tbe.epRnfMachineID &&
-      tbe.epProxyOp != EpProxyOp:NoProxyOp) {
+      tbe.epProxyOp != EpProxyOp:NoProxyOp &&
+      tbe.epProxyOp != EpProxyOp:RecallShared) {
     return State:I;
   }
 

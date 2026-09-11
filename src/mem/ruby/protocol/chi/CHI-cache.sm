@@ -40,7 +40,14 @@ structure(HnPersistenceBridge, external = "yes") {
   void registerHnPersistence(Addr, Addr, int, bool, bool);
 }
 
+structure(EPBackend, external="yes") {
+  void observeHAHomeFinal(Addr address, int socket, bool present);
+}
+
 machine(MachineType:Cache, "Cache coherency protocol") :
+  EPBackend * ha_node_backend;
+  bool ha_node_observer := "False";
+  int ha_home_socket := 0;
   // Sequencer to insert Load/Store requests.
   // May be null if this is not a L1 cache
   Sequencer * sequencer;
@@ -581,6 +588,7 @@ machine(MachineType:Cache, "Cache coherency protocol") :
     TX_Data, desc="Transmit pending data messages";
     MaintainCoherence, desc="Queues a WriteBack or Evict before droping the only valid copy of the block";
     FinishCleanUnique, desc="Sends acks and perform any writeback after a CleanUnique";
+    CompleteInvalidateOnly, desc="Complete invalidation after dirty persistence";
     FinishMakeReadUnique, desc="Return Comp or CompData to requestor at the end of MakeReadUnique";
     FinishCopyBack_Stale, desc="Check if a Evict needs to be sent";
     ActionStalledOnHazard, desc="Stall a trigger action because until finish handling snoop hazard";

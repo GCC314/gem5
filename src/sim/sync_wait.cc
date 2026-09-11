@@ -29,17 +29,21 @@ int
 SyncWaitManager::barrierArrive(ThreadContext *tc, uint32_t mask,
                                 uint32_t activeThreads)
 {
-    if (mask == 0)
+    // Bit 31 explicitly identifies portable startup, not an actual plane.
+    // Keep the tagged mask as the state/wire key so ordinary barriers cannot
+    // consume a startup release (or vice versa).
+    const uint32_t planeMask = mask & ~0x80000000u;
+    if (planeMask == 0)
         return -EINVAL;
 
     uint32_t max_valid = (1u << MAX_NODE_COUNT) - 1u;
-    if (mask & ~max_valid)
+    if (planeMask & ~max_valid)
         return -EINVAL;
 
     auto &bs = _barriers[mask];
 
     if (bs.activeThreads == 0)
-        bs.activeThreads = __builtin_popcount(mask) * activeThreads;
+        bs.activeThreads = __builtin_popcount(planeMask) * activeThreads;
 
     // Local-node expected thread count for this barrier generation.
     // The workload supplies the authoritative per-node thread count via the
@@ -62,7 +66,7 @@ SyncWaitManager::barrierArrive(ThreadContext *tc, uint32_t mask,
             localBits |= (1u << _sockets[s].barrierBit);
     }
     if (localBits > 0)
-        crossNode = (mask & ~localBits) != 0;
+        crossNode = (planeMask & ~localBits) != 0;
     bs.crossNode = crossNode;
 
     for (uint32_t &seq : bs.earlyReleases) {

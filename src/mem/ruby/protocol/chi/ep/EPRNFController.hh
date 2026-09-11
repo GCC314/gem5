@@ -433,6 +433,11 @@ class EPRNFController : public EPController
 
     /** Per-cacheline pending CHI transaction tracking. */
     std::map<uint64_t, PendingChiTxn> _pendingChiTxns;
+    // Preserve each outer invalidation callback (and its captured identity)
+    // while another CHI operation owns the line. Never turn ordinary busy
+    // into a failed or silently acknowledged invalidation.
+    std::map<uint64_t, std::deque<std::function<void(bool)>>>
+        _deferredInvalidations;
 
     struct PendingResponseSend {
         CHIResponseMsgPtr msg;

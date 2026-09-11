@@ -46,6 +46,7 @@ from slicc.symbols.Symbol import Symbol
 from slicc.symbols.Var import Var
 
 python_class_map = {
+    "EPBackend": "EPBackend",
     "int": "Int",
     "NodeID": "Int",
     "uint32_t": "UInt32",
@@ -302,6 +303,8 @@ class $py_ident(RubyController):
 
             if param.rvalue is not None:
                 dflt_str = str(param.rvalue.inline()) + ", "
+            elif param.type_ast.type.c_ident == "EPBackend":
+                dflt_str = "NULL, "
 
             if param.type_ast.type.c_ident in python_class_map:
                 python_type = python_class_map[param.type_ast.type.c_ident]

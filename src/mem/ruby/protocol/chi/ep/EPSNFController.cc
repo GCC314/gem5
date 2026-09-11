@@ -175,10 +175,8 @@ EPSNFController::wakeup()
                                   neededPerm = it->neededPerm,
                                   writeIntent = it->writeIntent,
                                   publishOnData = it->publishOnData] {
-                            if (_backend->haEndpointEnabled()) {
-                                _backend->completeHARemoteGrant(
-                                    linePa, neededPerm, writeIntent, _socketId);
-                            }
+                            // HA InstallAck is emitted by the HN final observer,
+                            // not when the SN merely enqueues its last data beat.
                             if (publishOnData) {
                                 _backend->notifyLocalLinePublished(
                                     linePa, _socketId);
@@ -542,10 +540,7 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
             pending.onSent = [this, linePa = msg->m_addr, neededPerm,
                               writeIntent,
                               publishOnData = msg->m_ubcc_publish_on_data] {
-                if (_backend->haEndpointEnabled()) {
-                    _backend->completeHARemoteGrant(
-                        linePa, neededPerm, writeIntent, _socketId);
-                }
+                // HA completion waits for HN coherent publication.
                 if (publishOnData) {
                     _backend->notifyLocalLinePublished(linePa, _socketId);
                 }
