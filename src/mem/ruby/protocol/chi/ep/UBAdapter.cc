@@ -666,18 +666,12 @@ UBAdapter::sendWritebackReq(uint64_t homePa, int requesterNode,
         _inflightWritebackReqs.erase(reqId);
         if (deferred) {
             fatal_if(success, "deferred writeback cannot be successful");
-            // The deferred response retires the wire attempt, not the saved
-            // persistence identity. EPSNF no longer polls in-flight writes:
-            // explicitly schedule its retry after consuming this response.
-            if (_onResponseWired)
-                _onResponseWired();
             return -2;
         }
         return success ? 1 : 0;
     }
-    if (_inflightWritebackReqs.count(reqId)) {
+    if (_inflightWritebackReqs.count(reqId))
         return -2;
-    }
 
     CoherenceMessage req;
     req.h.type = CoherenceMessageType::WritebackReq;
@@ -1985,9 +1979,8 @@ UBAdapter::pollVisibleMessages(Tick curT, size_t budget)
         }
         if (const CoherenceMessage *bc = coherencePayload(m)) {
             if (bc->h.type == CoherenceMessageType::BarrierRelease) {
-                DPRINTF(RubyEP,
-                        "[UBADAPTER-BARRIER-RELEASE] node=%d mask=0x%x seq=%u\n",
-                        _nodeId, bc->b.barrier.mask, bc->b.barrier.seq);
+                inform("[UBADAPTER-BARRIER-RELEASE] node=%d mask=0x%x seq=%u",
+                       _nodeId, bc->b.barrier.mask, bc->b.barrier.seq);
                 if (!System::systemList.empty()) {
                     System::systemList[0]->syncWait.releaseBarrier(
                         bc->b.barrier.mask, bc->b.barrier.seq);
@@ -2127,12 +2120,10 @@ UBAdapter::handleResponse(const framework::Message *m)
       case CoherenceMessageType::UpgradeAckNotify:
       case CoherenceMessageType::HAPresenceProbeReq:
       case CoherenceMessageType::HAPermissionReq:
-        DPRINTF(RubyEP,
-                "[ASYNC-CTRL-ENQ] node=%d type=%s reqId=%lu pa=0x%lx "
-                "src=%d dst=%d curT=%lu depth=%zu\n",
-                _nodeId, coherenceMsgTypeName(coh->h.type), coh->h.reqId,
-                coh->h.homeLinePa, coh->h.srcNode, coh->h.dstNode,
-                curTick(), _deferredControls.size() + 1);
+        inform("[ASYNC-CTRL-ENQ] node=%d type=%s reqId=%lu pa=0x%lx src=%d dst=%d curT=%lu depth=%zu",
+               _nodeId, coherenceMsgTypeName(coh->h.type), coh->h.reqId,
+               coh->h.homeLinePa, coh->h.srcNode, coh->h.dstNode,
+               curTick(), _deferredControls.size() + 1);
         _deferredControls.push_back(*coh);
         return;
       default:
@@ -2268,11 +2259,9 @@ UBAdapter::drainDeferredControls()
     while (!_deferredControls.empty()) {
         CoherenceMessage msg = _deferredControls.front();
         _deferredControls.pop_front();
-        DPRINTF(RubyEP,
-                "[ASYNC-CTRL-DRAIN] node=%d type=%s reqId=%lu pa=0x%lx "
-                "curT=%lu remaining=%zu\n",
-                _nodeId, coherenceMsgTypeName(msg.h.type), msg.h.reqId,
-                msg.h.homeLinePa, curTick(), _deferredControls.size());
+        inform("[ASYNC-CTRL-DRAIN] node=%d type=%s reqId=%lu pa=0x%lx curT=%lu remaining=%zu",
+               _nodeId, coherenceMsgTypeName(msg.h.type), msg.h.reqId,
+               msg.h.homeLinePa, curTick(), _deferredControls.size());
         recvFromRouter(msg);
     }
     _drainingDeferredControls = false;

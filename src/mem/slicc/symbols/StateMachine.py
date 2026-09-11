@@ -65,7 +65,6 @@ python_class_map = {
     "DMASequencer": "DMASequencer",
     "RubyPrefetcher": "RubyPrefetcher",
     "prefetch::Base": "BasePrefetcher",
-    "HnPersistenceBridge": "HnPersistenceBridge",
     "Cycles": "Cycles",
     "Addr": "Addr",
 }
@@ -282,11 +281,6 @@ from m5.objects.Controller import RubyController
 
         if "BasePrefetcher" in python_class_map.values():
             code("from m5.objects.Prefetcher import BasePrefetcher")
-        if "HnPersistenceBridge" in python_class_map.values():
-            code(
-                "from m5.objects.HnPersistenceBridge import "
-                "HnPersistenceBridge"
-            )
 
         code(
             """

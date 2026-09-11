@@ -524,11 +524,11 @@ EPRNFController::recvResponseMsg(const CHIResponseMsg *msg)
         auto it = _pendingChiTxns.find(msg->m_addr);
         if (it != _pendingChiTxns.end() &&
             it->second.proxyOp == EpProxyOp_RecallUnique) {
-            DPRINTF(RubyEP,
-                    "[RECALL-PROXY-COMPUC] node=%d localPA=0x%lx "
-                    "beats=%d/%d tick=%lu\n",
-                    _nodeId, msg->m_addr, it->second.beatsReceived,
-                    it->second.beatsExpected, curTick());
+            inform(
+                         "[RECALL-PROXY-COMPUC] node=%d localPA=0x%lx "
+                         "beats=%d/%d tick=%lu\n",
+                         _nodeId, msg->m_addr, it->second.beatsReceived,
+                         it->second.beatsExpected, curTick());
         }
         DPRINTF(RubyEP, "[COMPUC-DIAG] node=%d received Comp_UC PA=0x%lx found=%d needsCompAck=%d\n",
                _nodeId, msg->m_addr,
@@ -667,12 +667,12 @@ EPRNFController::recvDataMsg(const CHIDataMsg *msg)
     // channels may arrive in either order under O3/network pressure.
     if (it->second.op == PendingChiOp::ReadUnique) {
         if (it->second.proxyOp == EpProxyOp_RecallUnique) {
-            DPRINTF(RubyEP,
-                    "[RECALL-PROXY-DATA] node=%d localPA=0x%lx "
-                    "type=%d nextBeat=%d/%d tick=%lu\n",
-                    _nodeId, msg->m_addr, static_cast<int>(msg->m_type),
-                    it->second.beatsReceived + 1,
-                    it->second.beatsExpected, curTick());
+            inform(
+                         "[RECALL-PROXY-DATA] node=%d localPA=0x%lx "
+                         "type=%d nextBeat=%d/%d tick=%lu\n",
+                         _nodeId, msg->m_addr, static_cast<int>(msg->m_type),
+                         it->second.beatsReceived + 1,
+                         it->second.beatsExpected, curTick());
         }
         it->second.hnfDest = msg->m_responder;
         fatal_if(it->second.readUniqueNoData,
@@ -1306,9 +1306,8 @@ EPRNFController::sendChiRequest(uint64_t linePa, CHIRequestType reqType,
     req->m_addr = linePa;
     req->m_type = reqType;
     req->m_requestor = m_machineID;
-    // EP proxy transactions currently have no RetryAck/PCrdGrant replay path.
-    // Mark them non-retryable so HN-F resource pressure stalls the original
-    // request rather than dequeuing it into an unhandled RetryAck sequence.
+    // RetryAck/PCrdGrant replay is not implemented for these custom proxy
+    // transactions. Keep them under normal downstream backpressure instead.
     req->m_allowRetry = proxyOp == EpProxyOp_NoProxyOp;
     req->m_MessageSize = MessageSizeType_Control;
     // v4: Set ep_proxy_op sideband for special completion (§4.5.4)
@@ -1448,10 +1447,10 @@ EPRNFController::startReadUnique(uint64_t linePa,
             // proxy is still pending. Its completion owns the authoritative
             // response; reporting this duplicate as failure would fabricate a
             // no-data RecallResp for a dirty owner.
-            DPRINTF(RubyEP,
-                    "[RECALL-PROXY-COALESCE] node=%d localPA=0x%lx "
-                    "proxy=RecallUnique\n",
-                    _nodeId, linePa);
+            inform(
+                "[RECALL-PROXY-COALESCE] node=%d localPA=0x%lx "
+                "proxy=RecallUnique\n",
+                _nodeId, linePa);
             return;
         }
         warn(
@@ -1481,10 +1480,10 @@ EPRNFController::startReadUnique(uint64_t linePa,
     txn.onComplete = onComplete;
     _pendingChiTxns[linePa] = txn;
 
-    DPRINTF(RubyEP,
-            "[RECALL-PROXY-ISSUE] node=%d localPA=0x%lx proxy=RecallUnique "
-            "tick=%lu\n",
-            _nodeId, linePa, curTick());
+    inform(
+                 "[RECALL-PROXY-ISSUE] node=%d localPA=0x%lx proxy=RecallUnique "
+                 "tick=%lu\n",
+                 _nodeId, linePa, curTick());
     bool sent = sendChiRequest(linePa, CHIRequestType_ReadUnique,
                                EpProxyOp_RecallUnique);
     DPRINTF(RubyEP, "[EPRNF-RECALL] node=%d startReadUnique PA=0x%lx sent=%d\n",

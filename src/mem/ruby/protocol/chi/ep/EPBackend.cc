@@ -16,7 +16,6 @@
 #include "mem/ruby/system/RubySystem.hh"
 #include "mem/ruby/structures/CacheMemory.hh"
 #include "params/EPBackend.hh"
-#include "protocol/TracePerfPolicy.hh"
 #include "sim/cur_tick.hh"
 
 namespace gem5
@@ -131,12 +130,11 @@ EPBackend::EPBackend(const Params &p)
     inform(
         "[EPBACKEND-MANIFEST] node=%d num_sockets=%d "
         "metadata_dram_base=0x%lx metadata_dram_total=%lu MiB "
-        "per_socket=%lu MiB requester_line_entry_bytes=%lu\n",
+        "per_socket=%lu MiB\n",
         _nodeId, _numSockets,
         _metadataPrivateBase,
         _metadataPrivateSize / (1024 * 1024),
-        (_metadataPrivateSize / _numSockets) / (1024 * 1024),
-        static_cast<unsigned long>(sizeof(RequesterLineEntry)));
+        (_metadataPrivateSize / _numSockets) / (1024 * 1024));
     inform("[EPBACKEND-PROFILE] node=%d ha_endpoint_profile=%s "
            "clear_profile=%s reliability=%s\n", _nodeId,
            p.ha_endpoint_profile.c_str(), p.clear_profile.c_str(),
@@ -189,11 +187,6 @@ EPBackend::getEpSnf(int socketId) const
 
 EPBackend::~EPBackend()
 {
-    inform("[EPBACKEND-METADATA-PEAK] node=%d requester_line_entries=%lu "
-           "pending_hn_persistence_entries=%lu logical_bytes=%lu\n", _nodeId,
-           static_cast<unsigned long>(_requesterMetadataPeakEntries),
-           static_cast<unsigned long>(_pendingHnPersistencePeakEntries),
-           static_cast<unsigned long>(requesterMetadataPeakLogicalBytes()));
     // M6: Deregister from cross-node routing registry
     _backendInstances.erase(_nodeId);
 }
@@ -962,7 +955,7 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
                     _nodeId, txn.localLinePa, pgt->first, txn.sourceAdapter,
                     completedReqId);
             _pendingGrantTxns.erase(pgt);
-            if (start && TracePerfPolicy::get().shouldEmit("gem5")) {
+            if (start) {
                 inform(
                     "[EP-PERF] kind=outer node=%d pa=0x%lx reqId=%lu "
                     "op=%s write_intent=%d grant=%s source_socket=%d "
@@ -1025,12 +1018,10 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
                        "(state=%d→R_M, zero cross-node messages)\n",
                         _nodeId, line_pa, static_cast<int>(st));
                 }
-                if (TracePerfPolicy::get().shouldEmit("gem5")) {
-                    inform(
-                        "[EP-PERF] kind=upgrade_silent node=%d pa=0x%lx "
-                        "start=%lu end=%lu latency_ps=0\n",
-                        _nodeId, line_pa, curTick(), curTick());
-                }
+                inform(
+                    "[EP-PERF] kind=upgrade_silent node=%d pa=0x%lx "
+                    "start=%lu end=%lu latency_ps=0\n",
+                    _nodeId, line_pa, curTick(), curTick());
                 outHomeNode = homeNode;
                 return static_cast<int>(OuterGrantType::GlobalGrantModified);
             }
@@ -1077,8 +1068,6 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
     if (!isRetry)
         entry.outerStartTick = curTick();
     _requesterLines[line_pa] = entry;
-    _requesterMetadataPeakEntries = std::max(
-        _requesterMetadataPeakEntries, _requesterLines.size());
 
     if (pendingRead == _pendingReadTxns.end()) {
         PendingReadTxn txn;
@@ -1241,8 +1230,6 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
     uint64_t ownerEpoch = grantEpoch ? grantEpoch : grantBaseEpoch;
     entry.epoch = ownerEpoch;
     _requesterLines[line_pa] = entry;
-    _requesterMetadataPeakEntries = std::max(
-        _requesterMetadataPeakEntries, _requesterLines.size());
 
     // Self-test assertion: sentinelVisibleTick <= grantVisibleTick
     if (sentinelVisibleTick > grantVisibleTick) {
@@ -1485,8 +1472,7 @@ EPBackend::notifyOneWayClearHandedOff(
     inform("[CLEAR-ONEWAY] phase=transport_handoff node=%d sourceSocket=%d "
            "homeNode=%d homePa=0x%lx reqId=%lu tick=%lu\n",
            _nodeId, sourceSocket, txn.homeNode, homePa, reqId, curTick());
-    if (txn.outerStartTick &&
-        TracePerfPolicy::get().shouldEmit("gem5")) {
+    if (txn.outerStartTick) {
         inform("[EP-PERF] kind=outer_oneway_root node=%d pa=0x%lx reqId=%lu "
                "op=%s write_intent=%d grant=%s source_socket=%d "
                "start=%lu end=%lu latency_ps=%lu\n", _nodeId, homePa,
@@ -1697,116 +1683,32 @@ EPBackend::lastGrantData() const
 }
 
 bool
-EPBackend::resolveWritePersistence(uint64_t linePa, int sourceSocket,
-                                   uint64_t originalTxnId, bool fullLine,
-                                   uint64_t &homePa,
-                                   int &homeNode, int &homeSocket,
-                                   int &requesterNode,
-                                   uint64_t &permissionEpoch,
-                                   bool &ownerWriteback,
-                                   bool &storeCommit)
+EPBackend::getStoreAuthorization(uint64_t linePa, int sourceSocket,
+                                  int &requesterNode,
+                                  uint64_t &permissionEpoch) const
 {
-    const HnPersistenceKey key{linePa, originalTxnId, sourceSocket};
-    auto pending = _pendingHnPersistence.find(key);
-    if (pending == _pendingHnPersistence.end())
-        return false;
-    fatal_if(pending->second.consumed,
-             "EPBackend node_id=%d: duplicate EPSNF consume PA=0x%lx "
-             "txn=%lu socket=%d", _nodeId, linePa, originalTxnId,
-             sourceSocket);
-    pending->second.consumed = true;
-    const HnPersistenceContext registered = pending->second;
-
     requesterNode = _nodeId;
-    ownerWriteback = false;
-    storeCommit = false;
     if (_haEndpointEnabled) {
-        const bool resolved = resolveHAStoreTarget(
-            linePa, sourceSocket, homePa, homeNode, homeSocket,
-            permissionEpoch);
-        storeCommit = resolved && registered.kind == HnPersistenceKind::HAWrite;
-        return resolved;
-    }
-
-    int paViewNode = _nodeId;
-    if (!_addrMap.isDsm(paViewNode, linePa))
-        paViewNode = _addrMap.srcNodeId(linePa);
-    homeNode = _addrMap.homeNode(paViewNode, linePa);
-    homeSocket = _addrMap.homeSocket(paViewNode, linePa);
-    if (homeNode < 0 || homeSocket < 0)
-        return false;
-    homePa = _addrMap.buildDsmPA(homeNode, homeNode,
-                                 _addrMap.dsmOffset(linePa), homeSocket);
-
-    if (registered.kind == HnPersistenceKind::OwnerDrop) {
-        fatal_if(!fullLine || registered.epoch == 0,
-                 "EPBackend node_id=%d: malformed owner persistence "
-                 "PA=0x%lx txn=%lu", _nodeId, linePa, originalTxnId);
-        permissionEpoch = registered.epoch;
-        ownerWriteback = true;
-    }
-    return true;
-}
-
-void
-EPBackend::registerHnPersistence(uint64_t linePa, uint64_t originalTxnId,
-                                 int sourceSocket, bool replacement,
-                                 bool fullLine)
-{
-    HnPersistenceContext context;
-    if (_haEndpointEnabled) {
-        context.kind = HnPersistenceKind::HAWrite;
-    } else if (replacement && fullLine) {
-        auto requester = _requesterLines.find(linePa);
-        if (requester != _requesterLines.end() &&
-            requester->second.state == RequesterLineState::R_M) {
-            context.kind = HnPersistenceKind::OwnerDrop;
-            context.epoch = requester->second.epoch;
+        auto it = _haRequesterLines.find({sourceSocket, linePa});
+        if (it != _haRequesterLines.end()) {
+            permissionEpoch = it->second.epoch;
+            return true;
         }
+        for (const auto &entry : _haRemoteMisses) {
+            const HARemoteMissContext &ctx = entry.second;
+            if (std::get<0>(entry.first) == linePa &&
+                ctx.sourceSocket == sourceSocket && ctx.awaitingInstall) {
+                permissionEpoch = ctx.permissionEpoch;
+                return true;
+            }
+        }
+        return false;
     }
-    const HnPersistenceKey key{linePa, originalTxnId, sourceSocket};
-    auto [it, inserted] = _pendingHnPersistence.emplace(key, context);
-    if (!inserted) {
-        fatal_if(it->second.kind != context.kind ||
-                     it->second.epoch != context.epoch,
-                 "EPBackend node_id=%d: HN persistence retry changed "
-                 "semantics PA=0x%lx txn=%lu socket=%d", _nodeId, linePa,
-                 originalTxnId, sourceSocket);
-        // A CHI request retry can re-enter Send_WriteNoSnp after EPSNF already
-        // consumed the original semantic registration. Re-arm the exact same
-        // key without creating an orphan or changing its classification.
-        it->second.consumed = false;
-    }
-    _pendingHnPersistencePeakEntries = std::max(
-        _pendingHnPersistencePeakEntries, _pendingHnPersistence.size());
-}
-
-void
-EPBackend::completeHnPersistence(uint64_t linePa, uint64_t originalTxnId,
-                                  int sourceSocket)
-{
-    const HnPersistenceKey key{linePa, originalTxnId, sourceSocket};
-    auto pending = _pendingHnPersistence.find(key);
-    fatal_if(pending == _pendingHnPersistence.end() ||
-                 !pending->second.consumed,
-             "EPBackend node_id=%d: invalid HN persistence completion "
-             "PA=0x%lx txn=%lu socket=%d", _nodeId, linePa, originalTxnId,
-             sourceSocket);
-    _pendingHnPersistence.erase(pending);
-}
-
-void
-EPBackend::dropStaleOwnerReplacement(uint64_t linePa, uint64_t expectedEpoch)
-{
-    auto requester = _requesterLines.find(linePa);
-    if (requester == _requesterLines.end())
-        return;
-    // Never erase a newer requester generation. A stale local dirty line can
-    // only be retired when it still names the exact rejected owner epoch.
-    if (requester->second.state == RequesterLineState::R_M &&
-        requester->second.epoch == expectedEpoch) {
-        requester->second.state = RequesterLineState::R_I;
-    }
+    auto it = _requesterLines.find(linePa);
+    if (it == _requesterLines.end())
+        return false;
+    permissionEpoch = it->second.epoch;
+    return true;
 }
 
 int
@@ -1917,33 +1819,6 @@ EPBackend::diagnoseExpectedGrant(int neededPerm, bool writeIntent) const
 // Phase 0.4: C4 Direct-Forward gate — controlled by SimObject Param direct_fwd.
 // Default True enables direct-forward (owner→requester bypass).
 
-void
-EPBackend::commitRecallRequesterState(const OuterRecallMsg &recallMsg,
-                                      bool protocolComplete,
-                                      bool capturedDataValid)
-{
-    if (!protocolComplete || (recallMsg.dataNeeded && !capturedDataValid))
-        return;
-
-    const uint64_t lookupPa = recallMsg.ownerLocalPa != 0
-        ? recallMsg.ownerLocalPa : recallMsg.linePa;
-    auto requester = _requesterLines.find(lookupPa);
-    if (requester == _requesterLines.end() ||
-        requester->second.epoch != recallMsg.epoch)
-        return;
-
-    if (requester->second.state != RequesterLineState::R_M &&
-        requester->second.state != RequesterLineState::R_E)
-        return;
-
-    requester->second.state = recallMsg.isReadRequest
-        ? RequesterLineState::R_S : RequesterLineState::R_I;
-    DPRINTF(RubyEP,
-            "[RECALL-REQUESTER-COMMIT] node=%d PA=0x%lx epoch=%lu state=%d\n",
-            _nodeId, lookupPa, recallMsg.epoch,
-            static_cast<int>(requester->second.state));
-}
-
 bool
 EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
 {
@@ -2019,6 +1894,28 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
         }
     }
 
+    // ---- M7: Update requester-side bookkeeping ----
+    // Recall result split:
+    //   - Read recall → old owner downgrades to shared (R_S)
+    //   - Unique/write recall → old owner invalidates (R_I)
+    // P1-4: Use ownerLocalPa (owner's local PA) for _requesterLines lookup.
+    // linePa is the home-node PA view and may not match the owner's local PA.
+    {
+        uint64_t lookupPa = (recallMsg.ownerLocalPa != 0)
+                               ? recallMsg.ownerLocalPa
+                               : recallMsg.linePa;
+        auto it = _requesterLines.find(lookupPa);
+        if (it != _requesterLines.end()) {
+            if (recallMsg.isReadRequest) {
+                // Downgrade to shared
+                it->second.state = RequesterLineState::R_S;
+            } else {
+                // Invalidate
+                it->second.state = RequesterLineState::R_I;
+            }
+        }
+    }
+
     // ---- F2: Real CHI recall via EP-RNF → HN-F → L2 ----
     // Replaces the functionalRead + phys_mem broadcast + fake sendRecallResponse
     // path with a proper async CHI request.  The callback sends the recall
@@ -2056,10 +1953,8 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
                 DPRINTF(RubyEP,
                              "[RECALL-CB-ERR] node=%d kind=ReadShared linePA=0x%lx reqId=%lu success=%d valid=%d curT=%lu\n",
                              _nodeId, capturedMsg.linePa, capturedMsg.reqId,
-                              success ? 1 : 0,
-                               capturedDataValid ? 1 : 0, curTick());
-                commitRecallRequesterState(
-                    capturedMsg, success, capturedDataValid);
+                             success ? 1 : 0,
+                              capturedDataValid ? 1 : 0, curTick());
                 OuterRecallResponse resp;
                 resp.linePa = capturedMsg.linePa;
                 resp.ownerNode = capturedMsg.ownerNode;
@@ -2132,12 +2027,12 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
         _epRnfCtrl->startReadUnique(ownerLocalPa,
             [this, capturedMsg](bool success, const DataBlock &capturedData,
                                 bool capturedDataValid) {
-                DPRINTF(RubyEP,
-                        "[RECALL-PROXY-CALLBACK] node=%d homePA=0x%lx "
-                        "reqId=%lu success=%d dataValid=%d tick=%lu\n",
-                        _nodeId, capturedMsg.linePa, capturedMsg.reqId,
-                        success ? 1 : 0,
-                        capturedDataValid ? 1 : 0, curTick());
+                inform(
+                             "[RECALL-PROXY-CALLBACK] node=%d homePA=0x%lx "
+                             "reqId=%lu success=%d dataValid=%d tick=%lu\n",
+                             _nodeId, capturedMsg.linePa, capturedMsg.reqId,
+                             success ? 1 : 0,
+                              capturedDataValid ? 1 : 0, curTick());
                 if (_verboseLog) {
                 DPRINTF(RubyEP, "[RECALL-DIAG] node=%d ReadUnique callback success=%d\n",
                         _nodeId, success);
@@ -2145,10 +2040,8 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
                 DPRINTF(RubyEP,
                              "[RECALL-CB-ERR] node=%d kind=ReadUnique linePA=0x%lx reqId=%lu success=%d valid=%d curT=%lu\n",
                              _nodeId, capturedMsg.linePa, capturedMsg.reqId,
-                              success ? 1 : 0,
-                               capturedDataValid ? 1 : 0, curTick());
-                commitRecallRequesterState(
-                    capturedMsg, success, capturedDataValid);
+                             success ? 1 : 0,
+                              capturedDataValid ? 1 : 0, curTick());
                 OuterRecallResponse resp;
                 resp.linePa = capturedMsg.linePa;
                 resp.ownerNode = capturedMsg.ownerNode;
@@ -2997,7 +2890,7 @@ EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
             _nodeId, homePa, epochVal, reqIdVal);
         return false;
     }
-    if (accepted && TracePerfPolicy::get().shouldEmit("gem5")) {
+    if (accepted) {
         inform(
             "[EP-PERF] kind=upgrade_network node=%d pa=0x%lx reqId=%lu "
             "start=%lu end=%lu latency_ps=%lu\n",

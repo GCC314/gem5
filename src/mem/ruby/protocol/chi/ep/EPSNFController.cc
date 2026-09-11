@@ -145,6 +145,13 @@ EPSNFController::wakeup()
                              grantSource != GrantDataSource::NoData,
                          "EP_SNF node_id=%d: unavailable grant data PA=0x%lx source=%d",
                           _nodeId, it->linePa, static_cast<int>(grantSource));
+                int storeRequester = -1;
+                uint64_t storeEpoch = 0;
+                fatal_if(!_backend->getStoreAuthorization(
+                             it->linePa, it->ingressSocket, storeRequester,
+                             storeEpoch),
+                         "EP_SNF node_id=%d: missing grant authorization "
+                         "PA=0x%lx", _nodeId, it->linePa);
                 for (int i = 0; i < dataMsgsPerLine; i++) {
                     int offset = i * dataChannelSize;
                     int chunkSize = (i == dataMsgsPerLine - 1) ?
@@ -167,6 +174,9 @@ EPSNFController::wakeup()
                     dat->m_MessageSize = MessageSizeType_Data;
                     // v4: Set shared_hint for shared grants
                     dat->m_m_shared_hint = sharedHint;
+                    dat->m_ubcc_store_auth_valid = true;
+                    dat->m_ubcc_store_requester = storeRequester;
+                    dat->m_ubcc_permission_epoch = storeEpoch;
                     const bool lastBeat = (i == dataMsgsPerLine - 1);
                     std::function<void()> onSent;
                     if (lastBeat &&
@@ -254,6 +264,33 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
                   "EP_SNF node_id=%d: invalid WriteNoSnp requester socket %d",
                   _nodeId, pending.sourceSocket);
         pending.requestor = msg->m_requestor;
+        pending.requesterNode = msg->m_ubcc_store_requester;
+        pending.permissionEpoch = msg->m_ubcc_permission_epoch;
+        pending.disposition = static_cast<UBWriteDisposition>(
+            msg->m_ubcc_write_disposition);
+        pending.internalPublication = msg->m_ubcc_internal_writeback;
+        fatal_if(msg->m_ubcc_store_auth_valid == pending.internalPublication,
+                 "EP_SNF node_id=%d: WriteNoSnp must be exactly one of "
+                 "authorized StoreCommit or HN internal publication PA=0x%lx",
+                 _nodeId, msg->m_addr);
+        fatal_if(!msg->m_ubcc_store_auth_valid &&
+                     !pending.internalPublication,
+                  "EP_SNF node_id=%d socket=%d: native/non-StoreCommit "
+                 "WriteNoSnp is unsupported on the DSM endpoint PA=0x%lx; "
+                 "HN-F must route only authorized StoreCommit traffic here",
+                 _nodeId, pending.sourceSocket, msg->m_addr);
+        fatal_if((!pending.internalPublication && pending.requesterNode < 0) ||
+                      (pending.internalPublication &&
+                       (pending.requesterNode != -1 ||
+                        pending.permissionEpoch != 0)) ||
+                       (pending.disposition != UBWriteDisposition::MemoryOnly &&
+                        !(pending.internalPublication &&
+                          pending.disposition == UBWriteDisposition::DropOwner &&
+                          msg->m_type == CHIRequestType_WriteNoSnp)),
+                 "EP_SNF node_id=%d: invalid StoreCommit authorization "
+                 "PA=0x%lx requester=%d disposition=%d", _nodeId,
+                 msg->m_addr, pending.requesterNode,
+                 static_cast<int>(pending.disposition));
         if (msg->m_type == CHIRequestType_WriteNoSnpPtl) {
             const int offset = msg->m_accAddr - msg->m_addr;
             fatal_if(offset < 0 || msg->m_accSize <= 0 ||
@@ -268,23 +305,46 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
             pending.expectedMask = ~0ULL;
         }
 
-        const bool fullLine = pending.expectedMask == ~0ULL;
-        fatal_if(!_backend->resolveWritePersistence(
-                     pending.linePa, pending.sourceSocket,
-                     pending.originalTxnId, fullLine,
-                     pending.homePa, pending.homeNode, pending.homeSocket,
-                     pending.requesterNode, pending.permissionEpoch,
-                     pending.ownerWriteback, pending.storeCommit),
-                 "EP_SNF node_id=%d: WriteNoSnp lacks EP requester metadata "
-                 "PA=0x%lx sourceSocket=%d", _nodeId, pending.linePa,
-                 pending.sourceSocket);
-        pending.disposition = pending.ownerWriteback
-            ? UBWriteDisposition::DropOwner
-            : UBWriteDisposition::MemoryOnly;
-        pending.internalPublication = !_backend->haEndpointEnabled() &&
-            !pending.ownerWriteback;
-        if (_backend->haEndpointEnabled()) {
+        // The replacement TBE proves local quiescence; capture this node's
+        // existing permission incarnation, never infer the owner from Home's
+        // current PA lookup. Keep wire-data identity separate from the release
+        // snapshot, since NCBWrData must still match the original CHI request.
+        if (pending.internalPublication &&
+            pending.disposition == UBWriteDisposition::DropOwner &&
+            !_backend->haEndpointEnabled()) {
+            const auto permission = _backend->inspectRequesterState(pending.linePa);
+            if (permission.valid && permission.state ==
+                static_cast<int>(RequesterLineState::R_M)) {
+                pending.replacementOwnerRelease = true;
+                pending.releaseRequester = _nodeId;
+                pending.releaseEpoch = permission.epoch;
+            }
+        }
+
+        if (_backend->haEndpointEnabled() && !pending.internalPublication) {
             pending.haWrite = true;
+            fatal_if(!_backend->resolveHAStoreTarget(
+                         msg->m_addr, pending.sourceSocket, pending.homePa,
+                         pending.homeNode, pending.homeSocket,
+                          pending.permissionEpoch),
+                      "EP_SNF node_id=%d: cannot resolve HA Write target PA=0x%lx",
+                      _nodeId, msg->m_addr);
+            pending.permissionEpoch = msg->m_ubcc_permission_epoch;
+        } else {
+            int paViewNode = _nodeId;
+            if (!_backend->addrMap().isDsm(paViewNode, msg->m_addr))
+                paViewNode = _backend->addrMap().srcNodeId(msg->m_addr);
+            pending.homeNode = _backend->addrMap().homeNode(paViewNode,
+                                                            msg->m_addr);
+            pending.homeSocket = _backend->addrMap().homeSocket(paViewNode,
+                                                                 msg->m_addr);
+            fatal_if(pending.homeNode < 0 || pending.homeSocket < 0,
+                     "EP_SNF node_id=%d: cannot route StoreCommit PA=0x%lx",
+                     _nodeId, msg->m_addr);
+            pending.homePa = _backend->addrMap().buildDsmPA(
+                pending.homeNode, pending.homeNode,
+                _backend->addrMap().dsmOffset(msg->m_addr),
+                pending.homeSocket);
         }
         _pendingWrites.emplace(pending.dbid, pending);
 
@@ -344,12 +404,12 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
     _backend->checkDsmAddr(msg->m_addr);
 
     if (msg->m_ep_proxy_op == EpProxyOp_RecallUnique) {
-        DPRINTF(RubyEP,
-                "[RECALL-PROXY-EPSNF] node=%d localPA=0x%lx type=%d "
-                "proxy=RecallUnique neededPerm=%d writeIntent=%d tick=%lu\n",
-                _nodeId, msg->m_addr, static_cast<int>(msg->m_type),
-                msg->m_ubcc_needed_perm,
-                msg->m_ubcc_write_intent ? 1 : 0, curTick());
+        inform(
+                     "[RECALL-PROXY-EPSNF] node=%d localPA=0x%lx type=%d "
+                     "proxy=RecallUnique neededPerm=%d writeIntent=%d tick=%lu\n",
+                     _nodeId, msg->m_addr, static_cast<int>(msg->m_type),
+                     msg->m_ubcc_needed_perm,
+                     msg->m_ubcc_write_intent ? 1 : 0, curTick());
     }
 
     // ---- M5: Read UBCC Sideband Fields ----
@@ -387,10 +447,10 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
     // Map sideband to outer request and dispatch
     int homeNode = -1;
     if (msg->m_ep_proxy_op == EpProxyOp_RecallUnique) {
-        DPRINTF(RubyEP,
-                "[RECALL-PROXY-OUTER-ENTER] node=%d localPA=0x%lx "
-                "tick=%lu\n",
-                _nodeId, msg->m_addr, curTick());
+        inform(
+                     "[RECALL-PROXY-OUTER-ENTER] node=%d localPA=0x%lx "
+                     "tick=%lu\n",
+                     _nodeId, msg->m_addr, curTick());
     }
     int grantResult = internalRecall
         ? static_cast<int>(OuterGrantType::GlobalGrantShared)
@@ -492,6 +552,14 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
     CHIDataType dataType = (neededPerm == 0) ? CHIDataType_CompData_SC
                                              : CHIDataType_CompData_UC;
     bool sharedHint = (neededPerm == 0);  // v4: always register EP-RNF for shared
+    int storeRequester = -1;
+    uint64_t storeEpoch = 0;
+    if (!internalRecall) {
+        fatal_if(!_backend->getStoreAuthorization(
+                     msg->m_addr, ingressSocket, storeRequester, storeEpoch),
+                 "EP_SNF node_id=%d: missing grant authorization PA=0x%lx",
+                 _nodeId, msg->m_addr);
+    }
 
     // ---- Q2 FIX: Splitting CompData into data-channel-sized chunks ----
     // The L2/HN-F's ExpectedMap counts data responses in CHUNKS
@@ -531,6 +599,9 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
         dat->m_MessageSize = MessageSizeType_Data;
         // v4: Set shared_hint on CompData for shared grants
         dat->m_m_shared_hint = sharedHint;
+        dat->m_ubcc_store_auth_valid = !internalRecall;
+        dat->m_ubcc_store_requester = storeRequester;
+        dat->m_ubcc_permission_epoch = storeEpoch;
         // Q3: Defer send by 1 tick to prevent same-tick TBE race
         // at HN-F (see docs/tbe-race-condition.svg for details).
         PendingDataOutput pending;
@@ -738,9 +809,17 @@ EPSNFController::recvDataMsg(const CHIDataMsg *msg)
         fatal_if(!msg->m_usesTxnId,
                  "EP_SNF node_id=%d: NCBWrData lacks DBID transaction marker "
                  "PA=0x%lx dbid=%lu", _nodeId, msg->m_addr, dbid);
-        fatal_if(msg->m_addr != pending.linePa,
-                  "EP_SNF node_id=%d: NCBWrData address mismatch id=%lu",
-                  _nodeId, dbid);
+        fatal_if(msg->m_addr != pending.linePa ||
+                      msg->m_ubcc_store_auth_valid ==
+                          pending.internalPublication ||
+                      msg->m_ubcc_internal_writeback !=
+                          pending.internalPublication ||
+                      msg->m_ubcc_store_requester != pending.requesterNode ||
+                      msg->m_ubcc_permission_epoch != pending.permissionEpoch ||
+                     msg->m_ubcc_write_disposition !=
+                         static_cast<int>(pending.disposition),
+                 "EP_SNF node_id=%d: StoreCommit data identity mismatch id=%lu",
+                 _nodeId, dbid);
         uint64_t beatMask = 0;
         for (int i = 0; i < cacheLineSize; ++i) {
             if (msg->m_bitMask.test(i)) {
@@ -787,6 +866,7 @@ EPSNFController::processPendingHAWrites()
         const uint64_t transactionId = current->first;
         PendingWrite &pending = current->second;
         if (!pending.dataComplete || pending.completionQueued) {
+            pendingWork |= !pending.completionQueued;
             continue;
         }
 
@@ -800,18 +880,12 @@ EPSNFController::processPendingHAWrites()
                     pending.homeNode, pending.homeSocket,
                     pending.permissionReqId, response, pending.sourceSocket);
             } else {
-                if (pending.ownerWriteback) {
+                if (pending.replacementOwnerRelease) {
+                    pending.permissionReqId = pending.storeCommitId;
                     result = _backend->handleWritebackWithMeta(
                         pending.linePa, false, pending.data,
-                        pending.permissionEpoch, pending.requesterNode,
+                        pending.releaseEpoch, pending.releaseRequester,
                         pending.sourceSocket, &pending.permissionReqId);
-                } else if (pending.storeCommit) {
-                    result = _backend->commitStore(
-                        pending.homePa, pending.requesterNode,
-                        pending.permissionEpoch, pending.storeCommitId,
-                        pending.expectedMask, pending.data, pending.homeNode,
-                        pending.homeSocket, pending.sourceSocket,
-                        pending.permissionReqId);
                 } else if (pending.internalPublication) {
                     result = _backend->publishInternalWriteback(
                         pending.homePa, pending.storeCommitId,
@@ -819,30 +893,25 @@ EPSNFController::processPendingHAWrites()
                         pending.homeSocket, pending.sourceSocket,
                         pending.permissionReqId);
                 } else {
-                    fatal("EP_SNF node_id=%d: unclassified WriteNoSnp "
-                          "PA=0x%lx id=%lu\n", _nodeId, pending.linePa,
-                          transactionId);
+                    result = _backend->commitStore(
+                        pending.homePa, pending.requesterNode,
+                        pending.permissionEpoch, pending.storeCommitId,
+                        pending.expectedMask, pending.data, pending.homeNode,
+                        pending.homeSocket, pending.sourceSocket,
+                        pending.permissionReqId);
                 }
             }
             if (result == -2) {
-                // Data completion and UBAdapter responses both schedule this
-                // controller directly. Polling the full pending-write map while
-                // a response is in flight adds no liveness and becomes O(N)
-                // host work under directory pressure.
+                pendingWork = true;
                 continue;
             }
-            if (result == 0 && pending.ownerWriteback) {
-                inform("[EP-WB-STALE-DROP] node=%d pa=0x%lx epoch=%lu "
-                       "dbid=%lu wireReqId=%lu\n", _nodeId, pending.linePa,
-                       pending.permissionEpoch, transactionId,
-                       pending.permissionReqId);
-                _backend->dropStaleOwnerReplacement(
-                    pending.linePa, pending.permissionEpoch);
-                pending.granted = true;
-                result = 1;
-            }
-            if (result == 0 && pending.internalPublication) {
-                pending.permissionReqId = 0;
+            // Internal replacement publications carry no architectural owner
+            // authorization.  UBCC may reject one transiently while an outer
+            // request for the same line is still active; no data was persisted
+            // in that case, so retry the same stable publication identity.
+            // StoreCommit rejection remains fatal and exact-identity checked.
+            if (result == 0 && pending.internalPublication &&
+                !pending.replacementOwnerRelease) {
                 pendingWork = true;
                 continue;
             }
@@ -916,8 +985,6 @@ EPSNFController::publishHAWrite(uint64_t transactionId, PendingWrite &pending)
                      "EP_SNF node_id=%d: failed to queue HA Write ack id=%lu",
                      _nodeId, transactionId);
         }
-        _backend->completeHnPersistence(
-            done.linePa, done.originalTxnId, done.sourceSocket);
         ++_haWriteAckCount;
         if (_haWriteAckCount <= kHAWriteTraceLimit) {
             inform("[HA-WRITE-ACK] node=%d pa=0x%lx reqId=%lu "

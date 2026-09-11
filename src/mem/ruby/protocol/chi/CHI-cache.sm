@@ -36,10 +36,6 @@
  */
 
 
-structure(HnPersistenceBridge, external = "yes") {
-  void registerHnPersistence(Addr, Addr, int, bool, bool);
-}
-
 structure(EPBackend, external="yes") {
   void observeHAHomeFinal(Addr address, int socket, bool present);
 }
@@ -130,8 +126,6 @@ machine(MachineType:Cache, "Cache coherency protocol") :
   // Set when this is used as the home node and point of coherency of the
   // system. Must be false for every other cache level.
   bool is_HN;
-  HnPersistenceBridge * hn_persistence_bridge;
-  int ubcc_hnf_socket := 0;
 
   // Enables direct memory transfers between SNs and RNs when the data is
   // not cache in the HN.
@@ -317,7 +311,7 @@ machine(MachineType:Cache, "Cache coherency protocol") :
     // request or snoop to the ready queue
     AllocRequest,           desc="Allocates a TBE for a request. Triggers a retry if table is full";
     AllocRequestWithCredit, desc="Allocates a TBE for a request. Always succeeds.";
-    AllocProxyRequest,      desc="Allocates a TBE for an EP proxy request. Stalls if table is full.";
+    AllocProxyRequest,      desc="Allocates a reliable EP proxy request or stalls until a TBE is free.";
     AllocSeqRequest,        desc="Allocates a TBE for a sequencer request. Stalls requests if table is full";
     AllocSeqDvmRequest,     desc="Allocates a TBE for a sequencer DVM request. Stalls requests if table is full";
     AllocPfRequest,         desc="Allocates a TBE for a prefetch request. Stalls requests if table is full";
@@ -692,6 +686,11 @@ machine(MachineType:Cache, "Cache coherency protocol") :
     MachineID requestor,    desc="Requestor ID";
     MachineID fwdRequestor, desc="Requestor to receive data on fwding snoops";
     int ubccIngressSocket, desc="Original requester socket for UBCC source routing", default="0";
+    bool ubccStoreAuthValid, desc="StoreCommit authorization is valid", default="false";
+    bool ubccInternalWriteback, desc="HN internal memory-only publication", default="false";
+    int ubccStoreRequester, desc="StoreCommit requester node", default="-1";
+    Addr ubccPermissionEpoch, desc="Committed StoreCommit permission epoch", default="0";
+    int ubccWriteDisposition, desc="StoreCommit disposition", default="0";
     bool use_DMT,           desc="Use DMT for this transaction";
     bool use_DCT,           desc="Use DCT for this transaction";
 
@@ -809,6 +808,11 @@ machine(MachineType:Cache, "Cache coherency protocol") :
     int pendReqUbccNeededPerm;
     bool pendReqUbccWriteIntent;
     bool pendReqUbccPublishOnData;
+    bool pendReqUbccStoreAuthValid;
+    bool pendReqUbccInternalWriteback;
+    int pendReqUbccStoreRequester;
+    Addr pendReqUbccPermissionEpoch;
+    int pendReqUbccWriteDisposition;
 
     // This TBE stalled a message and thus we need to call wakeUpBuffers
     // at some point
