@@ -90,8 +90,8 @@ action(AllocateTBE_ProxyRequest, desc="") {
     assert(in_msg.ep_proxy_op != EpProxyOp:NoProxyOp);
     assert(in_msg.allowRetry == false);
   }
-  check_allocate(storTBEs);
-  storTBEs.incrementReserved();
+  check_allocate(storEpControlTBEs);
+  storEpControlTBEs.incrementReserved();
   peek(reqInPort, CHIRequestMsg) {
     enqueue(reqRdyOutPort, CHIRequestMsg, allocation_latency) {
       assert(in_msg.addr == address);
@@ -99,6 +99,20 @@ action(AllocateTBE_ProxyRequest, desc="") {
     }
   }
   reqInPort.dequeue(clockEdge());
+}
+
+action(Receive_AcquireControl, desc="Consume handshake with normal wakeup accounting") {
+  peek(rspInPort, CHIResponseMsg) {
+    receiveAcquireControl(in_msg);
+    TBE foreground := TBEs[in_msg.addr];
+    if (is_valid(foreground) && foreground.epParkPhase == 0) {
+      wakeupPendingTgrs(foreground);
+      if (foreground.epParkRetryPending) {
+        foreground.epParkRetryPending := false;
+        enqueueDoRetry(foreground);
+      }
+    }
+  }
 }
 
 action(AllocateTBE_Snoop, desc="") {
@@ -347,6 +361,24 @@ action(Initiate_Request_Stale, desc="") {
   incomingTransactionStart(address, curTransitionEvent(), initial, was_retried);
 }
 
+action(Initiate_ParkedProxy, desc="Acquire a real request control context") {
+  TBE foreground := tbe;
+  assert(is_HN && foreground.epParkPhase == 2);
+  assert(foreground.is_req_tbe && !foreground.is_ep_control_tbe);
+  peek(reqRdyPort, CHIRequestMsg) {
+    assert(in_msg.ep_proxy_op == EpProxyOp:InvalidateOnly);
+    set_tbe(allocateRequestTBE(address, in_msg));
+  }
+  copyCacheAndDirTBEs(foreground, tbe);
+  tbe.epInterruptedAcquire := true;
+  tbe.doCacheFill := false;
+  tbe.dataToBeInvalid := true;
+  tbe.use_DMT := false;
+  tbe.use_DCT := false;
+  tbe.hasUseTimeout := false;
+  tbe.actions.pushNB(Event:TagArrayRead);
+}
+
 action(Initiate_Snoop, desc="") {
   State initial := getState(tbe, cache_entry, address);
   peek(snpRdyPort, CHIRequestMsg) {
@@ -537,6 +569,37 @@ action(Initiate_ReadShared_Miss, desc="") {
   }
   tbe.actions.push(Event:CheckCacheFill);
   tbe.actions.push(Event:TagArrayWrite);
+}
+
+action(Restart_RevokedRead, desc="Discard only an unpublished drained read attempt") {
+  assert(is_HN && (tbe.reqType == CHIRequestType:ReadShared ||
+                  tbe.reqType == CHIRequestType:ReadUnique));
+  assert(tbe.epReadAttemptRevoked && tbe.epParkPhase == 0);
+  assert(tbe.snd_pendBytes.isEmpty() && !tbe.snd_pendEv);
+  assert(!tbe.expected_snp_resp.hasExpected());
+  // WaitCompAck reserved an obligation for SendCompData, but SendCompData was
+  // never executed. No upstream CompAck can exist for this canceled send.
+  assert(tbe.pendAction == Event:SendCompData ||
+         tbe.pendAction == Event:WaitCompAck);
+  clearExpectedReqResp(tbe);
+  tbe.actions.clear();
+  tbe.pendAction := Event:null;
+  tbe.epReadAttemptRevoked := false;
+  // The drained attempt's grant authorization cannot authenticate the next
+  // attempt. The first new data response establishes the new authorization.
+  tbe.ubccStoreAuthValid := false;
+  tbe.ubccStoreRequester := -1;
+  tbe.ubccPermissionEpoch := intToAddress(0);
+  tbe.ubccWriteDisposition := 0;
+  tbe.dataValid := false;
+  tbe.dataBlkValid.clear();
+  tbe.dataUnique := false;
+  tbe.dataDirty := false;
+  assert(epNextNativeId != intToAddress(0));
+  tbe.epNativeId := epNextNativeId;
+  epNextNativeId := epNextNativeId + intToAddress(1);
+  DPRINTF(RubyEP, "[EP-PARK-REACQUIRE] controller=%s addr=%#x incarnation=%d parentTxn=%d\n",
+          machineID, address, tbe.epNativeId, tbe.txnId);
 }
 
 action(Initiate_ReadShared_Hit, desc="") {
@@ -1866,6 +1929,11 @@ action(Send_ReadShared, desc="") {
 }
 
 action(Send_ReadNoSnp, desc="") {
+  if (ep_acquire_observer && !tbe.is_ep_control_tbe &&
+      ha_node_backend.isDsmAddrCrossNode(address) &&
+      !epCompletedAcquires.isPresent(address)) {
+    check_allocate(epCompletedAcquires);
+  }
   assert(is_HN);
   assert((tbe.use_DMT == false) ||
          ((tbe.reqType == CHIRequestType:AtomicReturn) ||
@@ -1895,6 +1963,10 @@ action(Send_ReadNoSnp, desc="") {
 }
 
 action(Send_ReadNoSnpSharedData, desc="") {
+  if (ep_acquire_observer && ha_node_backend.isDsmAddrCrossNode(address) &&
+      !epCompletedAcquires.isPresent(address)) {
+    check_allocate(epCompletedAcquires);
+  }
   assert(is_HN);
   assert(tbe.epReadUniqueFallback);
   assert(tbe.epProxyOp == EpProxyOp:NoProxyOp);
@@ -1923,6 +1995,11 @@ action(Send_ReadNoSnpSharedData, desc="") {
 }
 
 action(Send_ReadNoSnpDMT, desc="") {
+  if (ep_acquire_observer && !tbe.is_ep_control_tbe &&
+      ha_node_backend.isDsmAddrCrossNode(address) &&
+      !epCompletedAcquires.isPresent(address)) {
+    check_allocate(epCompletedAcquires);
+  }
   assert(is_HN);
   assert(tbe.use_DMT);
 
@@ -2091,6 +2168,10 @@ action(Send_WriteCleanFull, desc="") {
 
 action(Send_WriteNoSnp, desc="") {
   assert(is_valid(tbe));
+  // Forensic victim filter; do not change publication classification.
+  if (address == 335740928) {
+    DPRINTF(RubyEPVerbose, "[WB-DIAG] stage=HN_BEFORE_CLASSIFY pa=%#x txn=%d hn=%d repl=%d proxy=%s auth=%d internal=%d disposition=%d ownerExists=%d sharers=%s expectedSnoop=%d upstreamDirty=%d valid=%d dirty=%d full=%d\n", address, tbe.txnId, is_HN, tbe.is_repl_tbe, tbe.epProxyOp, tbe.ubccStoreAuthValid, tbe.ubccInternalWriteback, tbe.ubccWriteDisposition, tbe.dir_ownerExists, tbe.dir_sharers, tbe.expected_snp_resp.hasExpected(), tbe.dataMaybeDirtyUpstream, tbe.dataValid, tbe.dataDirty, tbe.dataBlkValid.isFull());
+  }
 
   // Replacement, maintenance and atomic write-through generated by an HN are
   // memory publications, not architectural outer-owner dispositions.
@@ -2111,6 +2192,9 @@ action(Send_WriteNoSnp, desc="") {
     }
   }
 
+  if (address == 335740928) {
+    DPRINTF(RubyEPVerbose, "[WB-DIAG] stage=HN_AFTER_CLASSIFY pa=%#x txn=%d internal=%d disposition=%d proxy=%s\n", address, tbe.txnId, tbe.ubccInternalWriteback, tbe.ubccWriteDisposition, tbe.epProxyOp);
+  }
   enqueue(reqOutPort, CHIRequestMsg, request_latency) {
     prepareRequest(tbe, CHIRequestType:WriteNoSnp, out_msg);
     out_msg.usesTxnId := true;
@@ -3414,6 +3498,9 @@ action(Send_CompData, desc="") {
 
 action(Send_WBData, desc="") {
   assert(is_valid(tbe));
+  if (address == 335740928) {
+    DPRINTF(RubyEPVerbose, "[WB-DIAG] stage=HN_SEND_WBDATA pa=%#x txn=%d proxy=%s valid=%d dirty=%d full=%d\n", address, tbe.txnId, tbe.epProxyOp, tbe.dataValid, tbe.dataDirty, tbe.dataBlkValid.isFull());
+  }
   if (is_HN) {
     assert(tbe.dataBlkValid.isFull());
     assert(tbe.dataDirty);
@@ -3785,6 +3872,9 @@ action(Send_CompI, desc="") {
 
 action(Send_CompUC, desc="") {
   assert(is_valid(tbe));
+  if (address == 335740928) {
+    DPRINTF(RubyEPVerbose, "[WB-DIAG] stage=HN_COMP_DECISION pa=%#x txn=%d repl=%d proxy=%s valid=%d dirty=%d full=%d ownerExists=%d sharers=%s\n", address, tbe.txnId, tbe.is_repl_tbe, tbe.epProxyOp, tbe.dataValid, tbe.dataDirty, tbe.dataBlkValid.isFull(), tbe.dir_ownerExists, tbe.dir_sharers);
+  }
   DPRINTF(RubyGenerated, "[HNF-CU-COMPUC] addr=%#x stale=0\n", address);
   enqueue(rspOutPort, CHIResponseMsg, response_latency) {
     out_msg.addr := address;
@@ -4054,6 +4144,9 @@ action(ScrubEPRNF_ToI, desc="") {
       tbe.epProxyOp != EpProxyOp:NoProxyOp &&
       tbe.epProxyOp != EpProxyOp:RecallShared) {
 
+    if (address == 335740928) {
+      DPRINTF(RubyEPVerbose, "[WB-DIAG] stage=HN_SCRUB_BEFORE_CLEAR pa=%#x txn=%d proxy=%s valid=%d dirty=%d full=%d\n", address, tbe.txnId, tbe.epProxyOp, tbe.dataValid, tbe.dataDirty, tbe.dataBlkValid.isFull());
+    }
     // Remove EP-RNF from dir_sharers so dir does not track it post-completion
     if (tbe.dir_sharers.isElement(tbe.epRnfMachineID)) {
       tbe.dir_sharers.remove(tbe.epRnfMachineID);
@@ -4221,6 +4314,7 @@ action(CheckCacheFill, desc="") {
 
 action(Finalize_DeallocateRequest, desc="") {
   assert(is_valid(tbe));
+  bool interrupted_acquire := tbe.is_ep_control_tbe && tbe.epInterruptedAcquire;
   assert(tbe.actions.empty());
   DPRINTF(RubyGenerated, "[NF-FINAL-DEALLOC] addr=%#x reqType=%d isReqTBE=%d\n",
     tbe.addr, tbe.reqType, tbe.is_req_tbe);
@@ -4228,7 +4322,51 @@ action(Finalize_DeallocateRequest, desc="") {
   wakeupPendingSnps(tbe);
   wakeupPendingTgrs(tbe);
 
+  if (tbe.is_ep_control_tbe && tbe.epInterruptedAcquire) {
+    TBE foreground := TBEs[address];
+    assert(is_valid(foreground) && foreground.epParkPhase == 2);
+    if (foreground.dataValid && foreground.dataBlkValid.isFull() &&
+        (foreground.pendAction == Event:SendCompData ||
+         foreground.pendAction == Event:WaitCompAck) &&
+        (foreground.reqType == CHIRequestType:ReadShared ||
+         foreground.reqType == CHIRequestType:ReadUnique)) {
+      // No CompData has been published upstream: its action is still parked.
+      // Retain CPU/native parent identity, but never reuse this revoked result.
+      foreground.epReadAttemptRevoked := true;
+    }
+    // Revocation changes custody, not the acquisition's pending response or
+    // retry counters. Never copy the control's completion state into it.
+    copyCacheAndDirTBEs(tbe, foreground);
+    // The foreground reserved its directory tag before being parked. Proxy
+    // finalization may remove that tag. Restore only an empty reservation,
+    // never old sharers/owner, so its later authorized fill can publish normally.
+    if (!directory.isTagPresent(address)) {
+      directory.allocate(address);
+      DirEntry reservation := getDirEntry(address);
+      reservation.state := State:I;
+      reservation.ownerExists := false;
+      reservation.ownerIsExcl := false;
+      reservation.sharers.clear();
+    }
+    DPRINTF(RubyEP, "[EP-PARK-LOCAL-FINAL] controller=%s addr=%#x resumePending=%d phase=%d\n",
+            machineID, address, foreground.epResumePending, foreground.epParkPhase);
+    if (foreground.epResumePending) {
+      foreground.epResumePending := false;
+      foreground.epParkPhase := 3;
+      assert(foreground.epUpstreamId != intToAddress(0));
+      sendAcquireControl(foreground, CHIResponseType:AcquireResume,
+                         foreground.requestor, foreground.epUpstreamId);
+    }
+  }
+
   if (tbe.is_req_tbe) {
+    if (ep_acquire_observer && !tbe.is_ep_control_tbe &&
+        epCompletedAcquires.isPresent(address)) {
+      TBE completed := epCompletedAcquires[address];
+      completed.addr := tbe.addr;
+      completed.epNativeId := tbe.epNativeId;
+      completed.epParkControl := tbe.epParkControl;
+    }
     deallocateReqTBE(tbe);
     processRetryQueue();
 
@@ -4243,7 +4381,11 @@ action(Finalize_DeallocateRequest, desc="") {
   }
   unset_tbe();
 
-  incomingTransactionEnd(address, curTransitionNextState());
+  // The legacy profiler has one address-keyed record, owned by foreground.
+  // A nested control must not retire that still-running transaction's record.
+  if (!interrupted_acquire) {
+    incomingTransactionEnd(address, curTransitionNextState());
+  }
 }
 
 action(Finalize_DeallocateDvmRequest, desc="") {
@@ -4636,6 +4778,14 @@ action(Finalize_AckHAPermission, desc="") {
     assert(is_HN);
     ha_node_backend.observeHAHomeFinal(tbe.addr, ha_home_socket,
                                       tbe.finalState != State:I);
+  }
+  if (ep_acquire_observer) {
+    if (!tbe.is_ep_control_tbe && tbe.is_req_tbe &&
+        (tbe.pendReqType == CHIRequestType:ReadNoSnp ||
+         tbe.pendReqType == CHIRequestType:ReadNoSnpSep)) {
+      ha_node_backend.observeNativeAcquireDone(tbe.addr, ha_home_socket,
+                                               tbe.epNativeId);
+    }
   }
   // No-op when this TBE did not use HA. Otherwise this is deliberately after
   // cache/directory publication and immediately before request deallocation.

@@ -3,6 +3,7 @@
 #include "base/logging.hh"
 #include "debug/RubyCHIGeneric.hh"
 #include "debug/RubyEP.hh"
+#include "debug/RubyEPVerbose.hh"
 #include "mem/ruby/network/Network.hh"
 #include "mem/ruby/protocol/CHI/CHIProtocolInfo.hh"
 #include "mem/ruby/protocol/MemoryMsg.hh"
@@ -156,17 +157,17 @@ EPController::wakeup()
     bool pending = false;
 
     DPRINTF(RubyCHIGeneric, "EP node_id=%d: wakeup checking messages\n", _nodeId);
-    pending = pending || receiveAllRdyMessages<CHIResponseMsg>(rspIn,
-         [this](const CHIResponseMsg* msg){ return recvResponseMsg(msg); });
+    pending = receiveAllRdyMessages<CHIResponseMsg>(rspIn,
+         [this](const CHIResponseMsg* msg){ return recvResponseMsg(msg); }) || pending;
 
-    pending = pending || receiveAllRdyMessages<CHIDataMsg>(datIn,
-         [this](const CHIDataMsg* msg){ return recvDataMsg(msg); });
+    pending = receiveAllRdyMessages<CHIDataMsg>(datIn,
+         [this](const CHIDataMsg* msg){ return recvDataMsg(msg); }) || pending;
 
-    pending = pending || receiveAllRdyMessages<CHIRequestMsg>(snpIn,
-         [this](const CHIRequestMsg* msg){ return recvSnoopMsg(msg); });
+    pending = receiveAllRdyMessages<CHIRequestMsg>(snpIn,
+         [this](const CHIRequestMsg* msg){ return recvSnoopMsg(msg); }) || pending;
 
-    pending = pending || receiveAllRdyMessages<CHIRequestMsg>(reqIn,
-         [this](const CHIRequestMsg* msg){ return recvRequestMsg(msg); });
+    pending = receiveAllRdyMessages<CHIRequestMsg>(reqIn,
+         [this](const CHIRequestMsg* msg){ return recvRequestMsg(msg); }) || pending;
 
     if (pending) {
         scheduleEvent(Cycles(1));
@@ -574,9 +575,11 @@ EPRNFController::recvResponseMsg(const CHIResponseMsg *msg)
                 (!msg->m_stale && msg->m_type == CHIResponseType_Comp_UC &&
                  it->second.beatsReceived == 0);
             sendResponseReliable(ack, [this, linePa = msg->m_addr,
+                                       generation = it->second.generation,
                                        completionOk]() {
                 auto pending = _pendingChiTxns.find(linePa);
-                if (pending == _pendingChiTxns.end())
+                if (pending == _pendingChiTxns.end() ||
+                    pending->second.generation != generation)
                     return;
                 pending->second.needsCompAck = false;
                 finishChiTxn(linePa, completionOk);
@@ -651,9 +654,11 @@ EPRNFController::recvDataMsg(const CHIDataMsg *msg)
                 m_machineID, destNet,
                 false, false, 0, 0, MessageSizeType_Control);
             it->second.needsCompAck = true;
-            sendResponseReliable(ack, [this, linePa = msg->m_addr]() {
+            sendResponseReliable(ack, [this, linePa = msg->m_addr,
+                                       generation = it->second.generation]() {
                 auto pending = _pendingChiTxns.find(linePa);
-                if (pending == _pendingChiTxns.end())
+                if (pending == _pendingChiTxns.end() ||
+                    pending->second.generation != generation)
                     return;
                 pending->second.needsCompAck = false;
                 finishChiTxn(linePa, true);
@@ -1116,6 +1121,8 @@ EPRNFController::finishChiTxn(uint64_t linePa, bool success)
     auto cb = txnIt->second.onComplete;
     const DataBlock capturedData = txnIt->second.recallDataBlk;
     const bool capturedDataValid = txnIt->second.recallDataValid;
+    if (linePa == 0x14030000)
+        DPRINTF(RubyEPVerbose, "[WB-DIAG] stage=RNF_FINISH pa=%#lx node=%d op=%d success=%d captured=%d explicitNoData=%d\n", linePa, _nodeId, static_cast<int>(txnIt->second.op), success, capturedDataValid, txnIt->second.readUniqueNoData);
     bool hadQueuedSnoop = txnIt->second.snoopSlotValid;
     // Keep completion-side clearing for ReadShared only.
     // ReadUnique is retired by RECALL-SNOOP hit or by requester re-acquire
@@ -1161,11 +1168,12 @@ EPRNFController::finishChiTxn(uint64_t linePa, bool success)
     auto deferred = _deferredInvalidations.find(linePa);
     if (deferred != _deferredInvalidations.end() &&
         _pendingChiTxns.find(linePa) == _pendingChiTxns.end()) {
-        auto callback = std::move(deferred->second.front());
+        auto invalidation = std::move(deferred->second.front());
         deferred->second.pop_front();
         if (deferred->second.empty())
             _deferredInvalidations.erase(deferred);
-        startCleanUnique(linePa, std::move(callback));
+        startCleanUnique(linePa, std::move(invalidation.onComplete),
+                         invalidation.sourceSocket);
     }
 }
 
@@ -1244,9 +1252,11 @@ EPRNFController::tryCompleteReadUnique(uint64_t linePa)
         false, false, 0, 0, MessageSizeType_Control);
 
     it->second.needsCompAck = true;
-    sendResponseReliable(ack, [this, linePa]() {
+    sendResponseReliable(ack, [this, linePa,
+                               generation = it->second.generation]() {
         auto pending = _pendingChiTxns.find(linePa);
-        if (pending == _pendingChiTxns.end())
+        if (pending == _pendingChiTxns.end() ||
+            pending->second.generation != generation)
             return;
         pending->second.needsCompAck = false;
         // Comp_UC_NoData is a successful control completion for a clean line.
@@ -1261,7 +1271,7 @@ EPRNFController::tryCompleteReadUnique(uint64_t linePa)
 // ---- Q3: CHI Request to HN-F ----
 bool
 EPRNFController::sendChiRequest(uint64_t linePa, CHIRequestType reqType,
-                                EpProxyOp proxyOp)
+                                EpProxyOp proxyOp, int sourceSocket)
 {
     // Q3: Serialize CHI requests to prevent TBE reservation exhaustion
     // in the HN-F.  When the HN-F processes multiple requests in the same
@@ -1275,6 +1285,7 @@ EPRNFController::sendChiRequest(uint64_t linePa, CHIRequestType reqType,
         d.linePa = linePa;
         d.reqType = reqType;
         d.proxyOp = proxyOp;
+        d.sourceSocket = sourceSocket;
         d.startTick = curTick();
         _deferredChiReqs.push_back(d);
         scheduleEvent(Cycles(1));
@@ -1288,6 +1299,7 @@ EPRNFController::sendChiRequest(uint64_t linePa, CHIRequestType reqType,
         d.linePa = linePa;
         d.reqType = reqType;
         d.proxyOp = proxyOp;
+        d.sourceSocket = sourceSocket;
         d.startTick = curTick();
         _deferredChiReqs.push_back(d);
         scheduleEvent(Cycles(1));
@@ -1312,6 +1324,7 @@ EPRNFController::sendChiRequest(uint64_t linePa, CHIRequestType reqType,
     req->m_MessageSize = MessageSizeType_Control;
     // v4: Set ep_proxy_op sideband for special completion (§4.5.4)
     req->m_ep_proxy_op = proxyOp;
+    req->m_ubcc_ingress_socket = sourceSocket;
 
     // v4-dual-socket: select HN-F destination by PA.homeSocket (§3.4 change 3)
     int homeSocket = decodeHomeSocket(linePa);
@@ -1321,6 +1334,10 @@ EPRNFController::sendChiRequest(uint64_t linePa, CHIRequestType reqType,
 
     // Send on reqOut → HN-F's reqIn
     bool sent = sendRequestMsg(req);
+    if ((linePa & 0xffffffffffULL) == 0x10c21280ULL) {
+        DPRINTF(RubyEPVerbose, "[INV147] stage=RNF_SEND node=%d localPA=%#lx key=%#lx type=%s proxy=%s sent=%d\n",
+                _nodeId, linePa, linePa & 0xffffffffffULL, reqType, proxyOp, sent);
+    }
     if (sent) {
         _lastChiRequestSendTick = curTick();
     } else {
@@ -1330,6 +1347,7 @@ EPRNFController::sendChiRequest(uint64_t linePa, CHIRequestType reqType,
         d.linePa = linePa;
         d.reqType = reqType;
         d.proxyOp = proxyOp;
+        d.sourceSocket = sourceSocket;
         d.startTick = curTick();
         _deferredChiReqs.push_back(d);
         scheduleEvent(Cycles(1));
@@ -1366,6 +1384,7 @@ EPRNFController::processDeferredChiReqs()
         req->m_allowRetry = d.proxyOp == EpProxyOp_NoProxyOp;
         req->m_MessageSize = MessageSizeType_Control;
         req->m_ep_proxy_op = d.proxyOp;
+        req->m_ubcc_ingress_socket = d.sourceSocket;
         req->m_Destination.clear();
         req->m_Destination.add(selectHnfDestination(d.linePa));
 
@@ -1384,7 +1403,8 @@ EPRNFController::processDeferredChiReqs()
 void
 EPRNFController::startReadShared(uint64_t linePa,
                                  std::function<void(bool, const DataBlock &,
-                                                    bool)> onComplete)
+                                                    bool)> onComplete,
+                                 int sourceSocket)
 {
     DPRINTF(RubyCHIGeneric,
             "EP_RNF node_id=%d: startReadShared addr=0x%lx\n",
@@ -1400,6 +1420,8 @@ EPRNFController::startReadShared(uint64_t linePa,
     }
 
     PendingChiTxn txn;
+    fatal_if(_nextChiGeneration == 0, "EP CHI generation exhausted");
+    txn.generation = _nextChiGeneration++;
     txn.linePa = linePa;
     txn.epoch = 0;     // filled by caller via EPBackend
     txn.reqId = 0;
@@ -1418,7 +1440,7 @@ EPRNFController::startReadShared(uint64_t linePa,
     _pendingChiTxns[linePa] = txn;
 
     bool sent = sendChiRequest(linePa, CHIRequestType_ReadShared,
-                               EpProxyOp_RecallShared);
+                               EpProxyOp_RecallShared, sourceSocket);
     if (!sent) {
         _pendingChiTxns.erase(linePa);
         warn(
@@ -1432,7 +1454,8 @@ EPRNFController::startReadShared(uint64_t linePa,
 void
 EPRNFController::startReadUnique(uint64_t linePa,
                                  std::function<void(bool, const DataBlock &,
-                                                    bool)> onComplete)
+                                                    bool)> onComplete,
+                                 int sourceSocket)
 {
     DPRINTF(RubyCHIGeneric,
             "EP_RNF node_id=%d: startReadUnique addr=0x%lx "
@@ -1462,6 +1485,8 @@ EPRNFController::startReadUnique(uint64_t linePa,
     }
 
     PendingChiTxn txn;
+    fatal_if(_nextChiGeneration == 0, "EP CHI generation exhausted");
+    txn.generation = _nextChiGeneration++;
     txn.linePa = linePa;
     txn.epoch = 0;     // filled by caller via EPBackend
     txn.reqId = 0;
@@ -1485,7 +1510,7 @@ EPRNFController::startReadUnique(uint64_t linePa,
                  "tick=%lu\n",
                  _nodeId, linePa, curTick());
     bool sent = sendChiRequest(linePa, CHIRequestType_ReadUnique,
-                               EpProxyOp_RecallUnique);
+                               EpProxyOp_RecallUnique, sourceSocket);
     DPRINTF(RubyEP, "[EPRNF-RECALL] node=%d startReadUnique PA=0x%lx sent=%d\n",
             _nodeId, linePa, sent);
     if (!sent) {
@@ -1499,22 +1524,44 @@ EPRNFController::startReadUnique(uint64_t linePa,
 
 void
 EPRNFController::startCleanUnique(uint64_t linePa,
-                                  std::function<void(bool)> onComplete)
+                                  std::function<void(bool)> onComplete,
+                                  int sourceSocket)
 {
+    fatal_if(sourceSocket < 0 || sourceSocket >= _numSockets,
+             "EP_RNF node_id=%d: invalid control source socket=%d PA=%#lx",
+             _nodeId, sourceSocket, linePa);
+    // The control ingress is not the PA's Home socket. Preserve it through
+    // both deferral queues and the HN TBE's existing source-routing sideband.
+    DPRINTF(RubyEP, "[INV-SOURCE] node=%d PA=%#lx sourceSocket=%d\n",
+            _nodeId, linePa, sourceSocket);
     DPRINTF(RubyCHIGeneric,
             "EP_RNF node_id=%d: startCleanUnique addr=0x%lx\n",
             _nodeId, linePa);
 
     // Check for duplicate pending transaction on this line
+    if ((linePa & 0xffffffffffULL) == 0x10c21280ULL) {
+        auto diag = _pendingChiTxns.find(linePa);
+        DPRINTF(RubyEPVerbose, "[INV147] stage=RNF_CLEAN_START node=%d localPA=%#lx key=%#lx socket=%d pending=%d op=%d proxy=%d start=%lu generation=%lu upgrade=%d\n",
+                _nodeId, linePa, linePa & 0xffffffffffULL, sourceSocket,
+                diag != _pendingChiTxns.end(),
+                diag != _pendingChiTxns.end() ? static_cast<int>(diag->second.op) : -1,
+                diag != _pendingChiTxns.end() ? static_cast<int>(diag->second.proxyOp) : -1,
+                diag != _pendingChiTxns.end() ? diag->second.startTick : 0,
+                diag != _pendingChiTxns.end() ? diag->second.generation : 0,
+                _upgradePending.find(linePa) != _upgradePending.end());
+    }
     if (_pendingChiTxns.find(linePa) != _pendingChiTxns.end()) {
         DPRINTF(RubyEP, "[CLEANUNIQUE-DIAG] node=%d PA=0x%lx DUPLICATE — already has pending txn op=%d\n",
                 _nodeId, linePa, (int)_pendingChiTxns[linePa].op);
-        _deferredInvalidations[linePa].push_back(std::move(onComplete));
+        _deferredInvalidations[linePa].push_back(
+            {std::move(onComplete), sourceSocket});
         return;
     }
 
     // Create pending transaction entry
     PendingChiTxn txn;
+    fatal_if(_nextChiGeneration == 0, "EP CHI generation exhausted");
+    txn.generation = _nextChiGeneration++;
     txn.linePa = linePa;
     txn.epoch = 0;     // filled by caller via EPBackend
     txn.reqId = 0;
@@ -1538,7 +1585,7 @@ EPRNFController::startCleanUnique(uint64_t linePa,
 
     // Send CleanUnique to HN-F via reqOut with InvalidateOnly proxy op
     bool sent = sendChiRequest(linePa, CHIRequestType_CleanUnique,
-                               EpProxyOp_InvalidateOnly);
+                               EpProxyOp_InvalidateOnly, sourceSocket);
     DPRINTF(RubyEP, "[CLEANUNIQUE-DIAG] node=%d PA=0x%lx sendChiRequest sent=%d\n",
             _nodeId, linePa, sent);
     if (!sent) {

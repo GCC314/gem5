@@ -11,6 +11,9 @@
 
 namespace gem5 { namespace ruby { class EPRNFController; } }
 #include "mem/ruby/common/DataBlock.hh"
+#include "mem/ruby/protocol/chi/ep/BoundaryTransactions.hh"
+#include "mem/ruby/protocol/chi/ep/BoundaryAuthorityTable.hh"
+#include <optional>
 #include "mem/ruby/protocol/chi/ep/CoherenceMessage.hh"
 #include "mem/ruby/protocol/chi/ep/NodeAddressMap.hh"
 #include "params/EPBackend.hh"
@@ -266,13 +269,6 @@ struct OuterUpgradeDoneAck {
 
 // Requester-side per-line bookkeeping state.
 // Tracks the global permission held by this requester for a remote DSM line.
-enum class RequesterLineState {
-    R_I,            // No global permission
-    R_WAIT_GRANT,   // Remote miss issued, waiting for home grant
-    R_S,            // Shared read permission held
-    R_E,            // Clean exclusive owner permission (GrantExclusive)
-    R_M             // Dirty modified owner permission (GrantModified)
-};
 
 // Per-line requester bookkeeping entry.
 struct RequesterLineEntry {
@@ -284,6 +280,7 @@ struct RequesterLineEntry {
     bool writeIntent;
     int homeNode;      // Home node for this remote line (-1 if local)
     Tick outerStartTick = 0; // First issue tick for protocol latency evidence
+    uint64_t leaseId = 0; // HA Home holder receipt; never a reusable write permit
 };
 
 // ---- M5 Inspection API return types ----
@@ -448,6 +445,9 @@ class EPBackend : public SimObject
      * @return          True if recall was accepted/processed
      */
     bool handleRecallRequest(const OuterRecallMsg &recallMsg);
+    // Boundary admission is performed only at EP endpoints, never by HN-F.
+    bool canAcceptRecall(uint64_t localPa, uint64_t reqId, int socket) const;
+    BoundaryTransactions &boundaryTransactions() { return _boundaryTransactions; }
 
     /**
      * Send a recall response back to the home UBCC.
@@ -576,7 +576,11 @@ class EPBackend : public SimObject
     int publishInternalWriteback(uint64_t homePa, uint64_t publicationId,
                                  uint64_t byteMask, const uint8_t *data,
                                  int homeNode, int homeSocket, int sourceSocket,
-                                 uint64_t &ioWritebackReqId);
+                                 uint64_t &ioWritebackReqId,
+                                 uint64_t parentReqId = 0,
+                                 uint64_t parentEpoch = 0);
+    bool getPendingInvalidation(uint64_t localPa, int socket,
+                                OuterInvalidateMsg &message) const;
 
     /**
      * Called by EPSNFController when HN-F completes a WriteNoSnp write
@@ -624,6 +628,9 @@ class EPBackend : public SimObject
      * @return        True if invalidation was accepted/processed
      */
     bool handleInvalidationRequest(const OuterInvalidateMsg &invMsg);
+    bool canAcceptInvalidation(uint64_t pa, uint64_t id, int socket) const {
+        return _boundaryTransactions.canInvalidate(pa, id, socket);
+    }
 
     /**
      * Send an invalidation acknowledgment back to the home UBCC.
@@ -770,6 +777,9 @@ class EPBackend : public SimObject
     /** v4-dual-socket: register per-socket EP-SNF controller (§3.5) */
     void registerEpSnf(int socketId, EPSNFController *ctrl);
     EPSNFController* getEpSnf(int socketId) const;
+    void observeNativeAcquireDone(Addr address, int socket, Addr incarnation);
+    bool holdAuthority(Addr pa, BoundaryBorrowToken &borrow);
+    void closeAuthority(BoundaryBorrowToken borrow);
 
     /** Handle QueryLineMetaResp from UBCC via UBAdapter (v4-dual-socket). */
     void handleQueryLineMetaResp(const CoherenceMessage &msg);
@@ -834,6 +844,7 @@ class EPBackend : public SimObject
                                  HAStatus status, uint64_t permissionEpoch,
                                  int dstNode, int dstSocket, uint64_t reqId,
                                  int sourceSocket = 0);
+    void notifyHAAckHandedOff(uint64_t linePa, uint64_t reqId, int sourceSocket);
     void recordHAInstall(uint64_t localLinePa, HAOperation operation,
                          uint64_t permissionEpoch, int homeNode,
                             uint64_t reqId, int sourceSocket);
@@ -911,12 +922,107 @@ class EPBackend : public SimObject
 
     // ---- M5: Requester-Side Bookkeeping ----
     // Per-line entries tracking global permissions for remote DSM lines.
-    std::map<uint64_t, RequesterLineEntry> _requesterLines;
+    BoundaryAuthorityTable _authority;
+    // Compatibility views contain no ownership storage and cannot allocate.
+    // All access state, holder identity and physical residency live in _authority.
+    class AuthorityView {
+      public:
+        struct Reference {
+            RequesterLineState &state;
+            uint64_t &epoch;
+            uint64_t lineAddr;
+            OuterReqType pendingReq;
+            uint64_t reqId;
+            bool writeIntent;
+            int homeNode;
+            Tick outerStartTick;
+            uint64_t &leaseId;
+            BoundaryAuthorityTable::Entry *entry;
+            bool ha;
+            operator RequesterLineEntry() const {
+                RequesterLineEntry v{};
+                v.lineAddr = lineAddr; v.state = state; v.epoch = epoch;
+                v.pendingReq = pendingReq; v.reqId = reqId;
+                v.writeIntent = writeIntent; v.homeNode = homeNode;
+                v.outerStartTick = outerStartTick; v.leaseId = leaseId;
+                return v;
+            }
+            Reference &operator=(const RequesterLineEntry &v) {
+                state = v.state;
+                epoch = ha ? v.leaseId : v.epoch;
+                return *this;
+            }
+        };
+        struct iterator {
+            std::optional<Reference> second;
+            // Arrow returns a pair-shaped proxy without copying authority.
+            struct Pair { Reference second; };
+            mutable std::optional<Pair> proxy;
+            iterator() = default;
+            explicit iterator(Reference r) : second(r) {}
+            iterator(const iterator &o) : second(o.second) {}
+            iterator &operator=(const iterator &o) {
+                second.reset(); if (o.second) second.emplace(*o.second);
+                proxy.reset(); return *this;
+            }
+            Pair *operator->() const { proxy.emplace(Pair{*second}); return &*proxy; }
+            bool operator==(const iterator &o) const { return bool(second) == bool(o.second); }
+            bool operator!=(const iterator &o) const { return !(*this == o); }
+        };
+        AuthorityView(EPBackend &backend, bool ha) : backend(backend), ha(ha) {}
+        iterator find(uint64_t pa) const;
+        iterator find(std::pair<int, uint64_t> key) const { return find(key.second); }
+        iterator end() const { return {}; }
+        Reference operator[](uint64_t pa) {
+            auto it = find(pa);
+            assert(it.second); // lookup-only; admission precedes external effects
+            return *it.second;
+        }
+        Reference operator[](std::pair<int, uint64_t> key) { return (*this)[key.second]; }
+        void erase(std::pair<int, uint64_t> key) {
+            auto it = find(key);
+            if (it != end()) it->second.state = RequesterLineState::R_I;
+        }
+        size_t size() const { return backend._authority.occupancy(); }
+      private:
+        EPBackend &backend;
+        bool ha;
+    };
+    AuthorityView _requesterLines{*this, false};
+    BoundaryTransactions _boundaryTransactions;
     using HALineKey = std::pair<int, uint64_t>;
-    std::map<HALineKey, RequesterLineEntry> _haRequesterLines;
+    AuthorityView _haRequesterLines{*this, true};
+    struct HAGrantReceipt {
+        uint64_t homePa = 0, reqId = 0, leaseId = 0;
+        int socket = -1;
+        bool live = false;
+        BoundaryBorrowToken borrow;
+    };
+    std::array<HAGrantReceipt, BoundaryTransactions::Capacity> _haGrantReceipts{};
     // Exact HN-observed resident addresses, bounded by physical HN cache and
     // directory capacity. No data or stale per-L1 absence inference here.
-    std::set<Addr> _haNodeResident;
+    struct ResidentView {
+        EPBackend &backend;
+        size_t count(Addr pa) const;
+        void insert(Addr pa);
+        void erase(Addr pa);
+    } _haNodeResident{*this};
+    bool authorityKey(Addr pa, uint32_t &key) const;
+    bool reserveAuthority(Addr pa);
+    struct AuthorityRelease {
+        bool externalControlDone = false;
+        BoundaryStableToken stable;
+        BoundaryTransactions::Token ticket;
+        Addr localPa = 0, homePa = 0;
+        uint64_t identity = 0, reqId = 0, writeId = 0;
+        int home = -1, socket = 0;
+        RequesterLineState access = RequesterLineState::R_I;
+        bool nativeDone = false, dataValid = false, persisted = false, homeDone = false;
+        DataBlock data{64};
+    } _authorityRelease;
+    uint64_t _releaseSequence = 1;
+    void startAuthorityRelease(BoundaryStableToken victim);
+    void progressAuthorityRelease();
     std::vector<std::vector<CacheMemory *>> _haDataCachesBySocket;
     uint64_t _epochCounter = 0;
 
@@ -974,6 +1080,7 @@ class EPBackend : public SimObject
     // ---- upgrade_invalidate_fix: PendingGrantTxn (§3.3.3) ----
     // Independent grant tuple context for Clear replay correctness (D5).
     struct PendingGrantTxn {
+        BoundaryTransactions::Token ticket;
         bool valid;
         uint64_t linePa;
         uint64_t localLinePa;
@@ -1002,6 +1109,7 @@ class EPBackend : public SimObject
     std::map<uint64_t, PendingGrantTxn> _pendingGrantTxns;
 
     struct PendingReadTxn {
+        BoundaryTransactions::Token ticket;
         uint64_t homePa = 0;
         uint64_t localLinePa = 0;
         int homeNode = -1;
@@ -1025,6 +1133,7 @@ class EPBackend : public SimObject
     // UpgradeResp, instead of allocating a fresh reqId that the home rejects
     // (existing outstanding) — the death loop that hung TC3/8/10/11.
     struct PendingUpgradeTxn {
+        BoundaryTransactions::Token ticket;
         bool valid;
         uint64_t linePa;
         int homeNode;
@@ -1039,6 +1148,13 @@ class EPBackend : public SimObject
                                acceptedPending(false) {}
     };
     std::map<uint64_t, PendingUpgradeTxn> _pendingUpgradeTxns;
+
+    struct PendingInvalidation {
+        OuterInvalidateMsg message;
+        bool complete = false;
+        BoundaryTransactions::Token ticket;
+    };
+    std::map<HALineKey, PendingInvalidation> _pendingInvalidations;
 
     // InvalidateReqs that arrived while a SnpCleanInvalid-upgrade was held.
     // They are deferred until the held snoop is resolved (SnpResp_I sent),

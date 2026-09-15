@@ -9,6 +9,8 @@
 #include <vector>
 
 #include "mem/ruby/common/DataBlock.hh"
+#include "mem/ruby/protocol/chi/ep/BoundaryQueue.hh"
+#include "mem/ruby/protocol/chi/ep/BoundarySlots.hh"
 #include "mem/ruby/protocol/chi/ep/EPBackend.hh"
 #include "mem/ruby/protocol/chi/ep/EPRNFController.hh"
 #include "params/EPSNFController.hh"
@@ -30,6 +32,13 @@ class EPSNFController : public EPController
     void print(std::ostream& out) const override;
 
     void selfTest();
+    bool parkAcquisition(Addr line, uint64_t control,
+                         std::function<void()> onParked);
+    void resumeAcquisition(Addr line, uint64_t control);
+    void nativeAcquireDone(Addr line, uint64_t incarnation);
+    // Admission is checked for every socket before any Park is emitted.
+    bool canParkAcquisitions(Addr line, uint64_t control) const;
+    unsigned acquisitionCount(Addr line) const;
 
   protected:
     bool recvRequestMsg(const CHIRequestMsg *msg) override;
@@ -39,11 +48,13 @@ class EPSNFController : public EPController
 
     EPBackend *_backend = nullptr;
     int _socketId = 0;  // v4-dual-socket
+    bool _parkMicrotestIssued = false;
 
     // A WriteNoSnp grants the DBID before its data beats arrive.  In HA mode
     // this is also the store's permission context: the final line is assembled
     // here and is not published to memory until its own HA Write is granted.
     struct PendingWrite {
+        BoundaryTransactions::Token boundaryToken;
         uint64_t dbid = 0;
         uint64_t storeCommitId = 0;
         uint64_t originalTxnId = 0;
@@ -55,6 +66,8 @@ class EPSNFController : public EPController
         MachineID requestor;
         bool haWrite = false;
         bool internalPublication = false;
+        uint64_t parentInvalidateReqId = 0;
+        uint64_t parentInvalidateEpoch = 0;
         bool replacementOwnerRelease = false;
         int releaseRequester = -1;
         uint64_t releaseEpoch = 0;
@@ -69,7 +82,8 @@ class EPSNFController : public EPController
         int requesterNode = -1;
         UBWriteDisposition disposition = UBWriteDisposition::MemoryOnly;
     };
-    std::map<uint64_t, PendingWrite> _pendingWrites;
+    BoundarySlots<uint64_t, PendingWrite,
+                  BoundaryTransactions::OrdinaryCapacity> _pendingWrites;
     // Identity layout: node[63:60], socket[59], reserved[58:48],
     // controller version[47:32], monotonic sequence[31:0].
     uint64_t _nextWriteIdentity = 1;
@@ -79,6 +93,7 @@ class EPSNFController : public EPController
 
     // Q3: Retry queue for blocked grants
     struct RetryEntry {
+        BoundaryTransactions::Token foreground;
         uint64_t linePa;
         int neededPerm;
         bool writeIntent;
@@ -87,8 +102,34 @@ class EPSNFController : public EPController
         MachineID fwdReq;     // fwdRequestor (if dataToFwdReq)
         bool dataToFwdReq;
         bool publishOnData;
+        bool needsReadReceipt;
+        uint64_t nativeTxnId;
+        uint64_t nativeIncarnation = 0;
+        uint64_t parkControl = 0;
+        unsigned parkPhase = 0;
+        bool nativeDataPublished = false;
+        bool nativeDone = false;
+        bool closeSent = false;
+        bool microHeld = false;
+        BoundaryBorrowToken authorityBorrow;
+        std::function<void()> onParked;
     };
-    std::deque<RetryEntry> _retryQueue;
+    BoundaryQueue<RetryEntry, BoundaryTransactions::OrdinaryCapacity> _retryQueue;
+
+    // This is a response replay window, not storage for live obligations.
+    // Entries reach it only after nativeDone AND the Resume acknowledgement.
+    struct RetiredControl {
+        Addr line = 0;
+        uint64_t incarnation = 0;
+        uint64_t control = 0;
+        MachineID responder;
+    };
+    std::array<RetiredControl, BoundaryTransactions::OrdinaryCapacity>
+        _retiredControls{};
+    unsigned _retiredControlCursor = 0;
+    unsigned _microOtherClosed = 0;
+    std::function<void()> _microLatePark;
+    void rememberRetiredControl(const RetryEntry &entry);
 
     // Q3: Deferred CompData sends (1-tick delay for TBE race fix)
     struct PendingDataOutput {

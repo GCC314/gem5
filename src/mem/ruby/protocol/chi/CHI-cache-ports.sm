@@ -78,7 +78,10 @@ in_port(rspInPort, CHIResponseMsg, rspIn, rank=10,
   if (rspInPort.isReady(clockEdge())) {
     printResources();
     peek(rspInPort, CHIResponseMsg) {
-      if (in_msg.usesTxnId) {
+      if (isAcquireControl(in_msg.type)) {
+        trigger(Event:EpAcquireControl, in_msg.addr,
+                getCacheEntry(in_msg.addr), getCurrentActiveTBE(in_msg.addr));
+      } else if (in_msg.usesTxnId) {
         // A ResponseMsg that uses transaction ID
         // is separate from the memory system,
         // uses a separate TBE table and doesn't have a cache entry
@@ -113,8 +116,15 @@ in_port(datInPort, CHIDataMsg, datIn, rank=9,
       // count up to block_size (64) instead of data_channel_size (32).
       // EPSNF sends a single 64B CompData with fillMask().
       assert(in_msg.bitMask.count() <= blockSize);
+      TBE destination := getCurrentActiveTBE(in_msg.addr);
+      if (in_msg.ep_native_id != intToAddress(0)) {
+        destination := getAcquireTBE(in_msg.addr, in_msg.ep_native_id);
+        // A drained/revoked attempt cannot supply data to a newer incarnation.
+        // Fail closed until replay-credit retirement is explicitly supported.
+        assert(is_valid(destination));
+      }
       trigger(dataToEvent(in_msg.type), in_msg.addr,
-              getCacheEntry(in_msg.addr), getCurrentActiveTBE(in_msg.addr));
+              getCacheEntry(in_msg.addr), destination);
     }
   }
 }
@@ -219,11 +229,18 @@ in_port(retryTriggerInPort, RetryTriggerMsg, retryTriggerQueue, rank=6,
         CacheEntry entry := getCacheEntry(in_msg.addr);
         if (ev == Event:DoRetry) {
           assert(is_valid(tbe));
-          if (tbe.is_req_hazard || tbe.is_repl_hazard) {
+          if (tbe.epParkPhase != 0 && tbe.is_req_tbe) {
+            tbe.epParkRetryPending := true;
+            retryTriggerInPort.dequeue(clockEdge());
+          } else if (tbe.is_req_hazard || tbe.is_repl_hazard) {
             ev := Event:DoRetry_Hazard;
+            trigger(ev, in_msg.addr, entry, tbe);
+          } else {
+            trigger(ev, in_msg.addr, entry, tbe);
           }
+        } else {
+          trigger(ev, in_msg.addr, entry, tbe);
         }
-        trigger(ev, in_msg.addr, entry, tbe);
       }
     }
   }
@@ -246,9 +263,38 @@ in_port(triggerInPort, TriggerMsg, triggerQueue, rank=5,
         assert(is_valid(tbe));
         trigger(tbe.pendAction, in_msg.addr, nullCacheEntry(), tbe);
       } else {
-        TBE tbe := getCurrentActiveTBE(in_msg.addr);
+        TBE tbe := getActionTBE(in_msg.addr, in_msg.epContextId);
         assert(is_valid(tbe));
-        if (in_msg.from_hazard != (tbe.is_req_hazard || tbe.is_repl_hazard)) {
+        if (in_msg.addr == 2199304409728) {
+          DPRINTF(RubyEPVerbose, "[INV147] stage=NATIVE_ACTION localPA=%#x key=0x10c21280 hn=%d txn=%d action=%s proxy=%s expectedSnoop=%d valid=%d dirty=%d full=%d\n", in_msg.addr, is_HN, tbe.txnId, tbe.pendAction, tbe.epProxyOp, tbe.expected_snp_resp.hasExpected(), tbe.dataValid, tbe.dataDirty, tbe.dataBlkValid.isFull());
+        }
+        if (tbe.epParkPhase != 0 && tbe.is_req_tbe &&
+            !(tbe.epParkPhase == 1 && tbe.pendAction == Event:TX_Data)) {
+          // Preserve the original action and all expected-response counters.
+          // Resume wakes this address; no timer repeatedly replays callbacks.
+          tbe.wakeup_pending_tgr := true;
+          Addr stallAddr := in_msg.addr;
+          stall_and_wait(triggerInPort, stallAddr);
+        } else if (tbe.epReadAttemptRevoked && tbe.epParkPhase == 0) {
+          TBE oldAttempt := epCompletedAcquires[in_msg.addr];
+          if (ep_acquire_observer && is_valid(oldAttempt)) {
+            // The unpublished attempt is locally drained, but changing its
+            // incarnation cannot itself retire EPSNF. Close the old observer
+            // before restarting this CPU parent with a new acquisition.
+            if (!oldAttempt.epParkUpstreamAck) {
+              oldAttempt.epParkUpstreamAck := true;
+              ha_node_backend.observeNativeAcquireDone(tbe.addr, ha_home_socket,
+                                                       tbe.epNativeId);
+            }
+            triggerInPort.recycle(clockEdge(), cyclesToTicks(stall_recycle_lat));
+          } else {
+          if (tbe.reqType == CHIRequestType:ReadUnique) {
+            trigger(Event:EpRestartUnique, in_msg.addr, getCacheEntry(in_msg.addr), tbe);
+          } else {
+            trigger(Event:EpRestartRead, in_msg.addr, getCacheEntry(in_msg.addr), tbe);
+          }
+          }
+        } else if (in_msg.from_hazard != (tbe.is_req_hazard || tbe.is_repl_hazard)) {
           // possible when handling a snoop hazard and an action from the
           // the initial transaction got woken up. Stall the action until the
           // hazard ends
@@ -326,6 +372,27 @@ in_port(reqRdyPort, CHIRequestMsg, reqRdy, rank=3,
 
         DirEntry dir_entry := getDirEntry(in_msg.addr);
 
+        if (ep_acquire_observer && is_invalid(tbe) &&
+            in_msg.ep_proxy_op == EpProxyOp:NoProxyOp &&
+            epCompletedAcquires.isPresent(in_msg.addr)) {
+          // Local-only acquire fence. Control traffic must still run so a
+          // retained observer can discharge Park/Resume and send Close.
+          reqRdyPort.recycle(clockEdge(), cyclesToTicks(stall_recycle_lat));
+        } else {
+
+        if (is_HN && is_valid(tbe) && tbe.epParkPhase == 2 &&
+            !tbe.is_ep_control_tbe &&
+            in_msg.ep_proxy_op == EpProxyOp:InvalidateOnly) {
+          trigger(Event:EpParkedInvalidate, in_msg.addr, cache_entry, tbe);
+        }
+
+        if (in_msg.addr == 2199304409728) {
+          DPRINTF(RubyEPVerbose, "[INV147] stage=NATIVE_READY localPA=%#x key=0x10c21280 hn=%d type=%s proxy=%s requestor=%s tbe=%d\n", in_msg.addr, is_HN, in_msg.type, in_msg.ep_proxy_op, in_msg.requestor, is_valid(tbe));
+          if (is_valid(tbe)) {
+            DPRINTF(RubyEPVerbose, "[INV147] stage=NATIVE_READY_TBE localPA=%#x txn=%d action=%s proxy=%s expectedSnoop=%d valid=%d dirty=%d full=%d\n", in_msg.addr, tbe.txnId, tbe.pendAction, tbe.epProxyOp, tbe.expected_snp_resp.hasExpected(), tbe.dataValid, tbe.dataDirty, tbe.dataBlkValid.isFull());
+          }
+        }
+
         // Special case for possibly stale writebacks or evicts
         if (in_msg.type == CHIRequestType:WriteBackFull) {
           if (is_invalid(dir_entry) || (dir_entry.ownerExists == false) ||
@@ -362,6 +429,7 @@ in_port(reqRdyPort, CHIRequestMsg, reqRdy, rank=3,
 
         // Normal request path
         trigger(reqToEvent(in_msg.type, in_msg.is_local_pf), in_msg.addr, cache_entry, tbe);
+        }
       }
     }
   }
@@ -389,6 +457,9 @@ in_port(reqInPort, CHIRequestMsg, reqIn, rank=2,
       // DVM Sync and TLBIs from external sources will use txnId requests,
       // but they aren't implemented yet.
       assert(!in_msg.usesTxnId);
+      if (in_msg.addr == 2199304409728) {
+        DPRINTF(RubyEPVerbose, "[INV147] stage=NATIVE_INGRESS localPA=%#x key=0x10c21280 hn=%d type=%s proxy=%s requestor=%s retry=%d\n", in_msg.addr, is_HN, in_msg.type, in_msg.ep_proxy_op, in_msg.requestor, in_msg.allowRetry);
+      }
       DPRINTF(RubySlicc, "[NF-REQIN-ARRIVE] addr=%#x type=%d allowRetry=%d\n",
         in_msg.addr, in_msg.type, in_msg.allowRetry);
       if (in_msg.ep_proxy_op != EpProxyOp:NoProxyOp) {
@@ -460,6 +531,9 @@ in_port(pfInPort, RubyRequest, prefetchQueue, rank=0) {
 
 void processNextState(Addr address, TBE tbe, CacheEntry cache_entry) {
   assert(is_valid(tbe));
+  if (tbe.epParkPhase == 1) {
+    finishAcquireParkDrain(tbe);
+  }
   DPRINTF(RubySlicc, "GoToNextState expected_req_resp=%d expected_snp_resp=%d snd_pendEv=%d snd_pendBytes=%d\n",
                       tbe.expected_req_resp.expected(),
                       tbe.expected_snp_resp.expected(),
@@ -492,6 +566,7 @@ void processNextState(Addr address, TBE tbe, CacheEntry cache_entry) {
     assert(tbe.pendAction != Event:null);
     enqueue(triggerOutPort, TriggerMsg, trigger_latency) {
       out_msg.addr := tbe.addr;
+      out_msg.epContextId := tbe.epNativeId;
       // TODO - put usesTxnId on the TBE?
       out_msg.usesTxnId := tbe.is_dvm_tbe || tbe.is_dvm_snp_tbe;
       out_msg.from_hazard := tbe.is_req_hazard || tbe.is_repl_hazard;

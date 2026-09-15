@@ -68,6 +68,7 @@ void outgoingTransactionStart(Addr, Event, bool);
 void outgoingTransactionEnd(Addr, bool, bool);
 Event curTransitionEvent();
 State curTransitionNextState();
+void wakeUpBuffers(Addr addr);
 
 
 ////////////////////////////////////////////////////////////////////////////
@@ -97,6 +98,12 @@ State getState(TBE tbe, CacheEntry cache_entry, Addr addr) {
       // TBE path rather than publishing a software snapshot or faking an Ack.
       if (tbe.state == State:BUSY_BLKD &&
           tbe.pendAction == Event:HAStorePermission) {
+        return State:BUSY_INTR;
+      }
+      // Only a fully acknowledged Park can expose committed custody to a real
+      // upstream snoop. PARK_DRAIN still uses the original state and counters.
+      if (tbe.epParkPhase == 2 && !tbe.is_ep_control_tbe &&
+          tbe.state == State:BUSY_BLKD) {
         return State:BUSY_INTR;
       }
       return tbe.state;
@@ -142,6 +149,10 @@ TBE getDvmTBE(Addr txnId), return_by_pointer="yes" {
 }
 
 TBE getCurrentActiveTBE(Addr addr), return_by_pointer="yes" {
+  TBE control_tbe := epControlTBEs[addr];
+  if (is_valid(control_tbe)) {
+    return control_tbe;
+  }
   // snoops take precedence over wbs and reqs
   // it's invalid to have a replacement and a req active at the same time
   // for the same line
@@ -160,6 +171,209 @@ TBE getCurrentActiveTBE(Addr addr), return_by_pointer="yes" {
     return repl_tbe;
   }
   return OOD;
+}
+
+bool isAcquireControl(CHIResponseType type) {
+  return type == CHIResponseType:AcquirePark ||
+         type == CHIResponseType:AcquireParkAck ||
+         type == CHIResponseType:AcquireResume ||
+         type == CHIResponseType:AcquireResumeAck ||
+         type == CHIResponseType:AcquireClose ||
+         type == CHIResponseType:AcquireCloseAck;
+}
+
+// Park messages always address the retained foreground, never whichever
+// same-address snoop/control TBE happens to have execution priority.
+TBE getAcquireTBE(Addr addr, Addr incarnation), return_by_pointer="yes" {
+  TBE candidate := TBEs[addr];
+  if (is_valid(candidate) && candidate.epNativeId == incarnation) {
+    return candidate;
+  }
+  return OOD;
+}
+
+TBE getActionTBE(Addr addr, Addr incarnation), return_by_pointer="yes" {
+  if (incarnation == intToAddress(0)) {
+    return getCurrentActiveTBE(addr);
+  }
+  TBE candidate := epControlTBEs[addr];
+  if (is_valid(candidate) && candidate.epNativeId == incarnation) {
+    return candidate;
+  }
+  candidate := TBEs[addr];
+  if (is_valid(candidate) && candidate.epNativeId == incarnation) {
+    TBE hazard := snpTBEs[addr];
+    if (is_valid(hazard) && candidate.epParkPhase == 0) {
+      return hazard;
+    }
+    return candidate;
+  }
+  candidate := snpTBEs[addr];
+  if (is_valid(candidate) && candidate.epNativeId == incarnation) {
+    return candidate;
+  }
+  candidate := replTBEs[addr];
+  if (is_valid(candidate) && candidate.epNativeId == incarnation) {
+    return candidate;
+  }
+  return OOD;
+}
+
+void sendAcquireControl(TBE tbe, CHIResponseType type, MachineID destination,
+                        Addr receiverId) {
+  enqueue(rspOutPort, CHIResponseMsg, 1) {
+    out_msg.addr := tbe.addr;
+    out_msg.type := type;
+    out_msg.responder := machineID;
+    out_msg.Destination.add(destination);
+    out_msg.usesTxnId := false;
+    out_msg.txnId := receiverId;
+    out_msg.dbid := tbe.epParkControl;
+    out_msg.MessageSize := MessageSizeType:Control;
+  }
+}
+
+void finishAcquireParkDrain(TBE foreground) {
+  if (foreground.epParkPhase == 1 && foreground.epParkUpstreamAck &&
+      foreground.snd_pendBytes.isEmpty() && !foreground.snd_pendEv &&
+      !foreground.expected_snp_resp.hasExpected() &&
+      (foreground.dataBlkValid.isEmpty() || foreground.dataBlkValid.isFull())) {
+    // A wholly missing downstream grant is deliberately not a drain dependency.
+    // Partial data, however, must finish into its already-reserved native TBE.
+    foreground.epParkPhase := 2;
+    sendAcquireControl(foreground, CHIResponseType:AcquireParkAck,
+                       foreground.epParkDownstream, foreground.epNativeId);
+  }
+}
+
+bool receiveAcquireControl(CHIResponseMsg msg) {
+  if (msg.type == CHIResponseType:AcquireClose) {
+    // ACK owns a full identity copy before the credit can be reused. A
+    // duplicate Close is idempotent and cannot free another incarnation.
+    enqueue(rspOutPort, CHIResponseMsg, 1) {
+      out_msg := msg;
+      out_msg.type := CHIResponseType:AcquireCloseAck;
+      out_msg.responder := machineID;
+      out_msg.Destination.clear();
+      out_msg.Destination.add(msg.responder);
+      out_msg.MessageSize := MessageSizeType:Control;
+    }
+    TBE record := epCompletedAcquires[msg.addr];
+    if (is_valid(record) && record.epNativeId == msg.txnId &&
+        record.epParkDownstream == msg.responder) {
+      epCompletedAcquires.deallocate(msg.addr);
+      DPRINTF(RubyEP, "[EP-ACQUIRE-CLOSE] addr=%#x incarnation=%d credit=returned\n", msg.addr, msg.txnId);
+    }
+    return true;
+  }
+  if (msg.type == CHIResponseType:AcquireCloseAck) { return true; }
+  TBE foreground := getAcquireTBE(msg.addr, msg.txnId);
+  if (msg.type == CHIResponseType:AcquireParkAck ||
+      msg.type == CHIResponseType:AcquireResumeAck) {
+    foreground := TBEs[msg.addr];
+    if (is_valid(foreground)) {
+      if (foreground.epUpstreamId != msg.txnId) {
+        return true;
+      }
+    }
+  }
+  // No PA-only fallback: stale control must not pause a reused TBE.
+  if (is_invalid(foreground)) {
+      TBE completed := epCompletedAcquires[msg.addr];
+      if (is_valid(completed) && completed.addr == msg.addr &&
+          completed.epNativeId == msg.txnId) {
+        if (msg.type == CHIResponseType:AcquirePark) {
+          if (completed.epParkControl == intToAddress(0) ||
+              (completed.epParkControl == msg.dbid &&
+               completed.epParkDownstream == msg.responder)) {
+            completed.epParkControl := msg.dbid;
+            completed.epParkDownstream := msg.responder;
+            sendAcquireControl(completed, CHIResponseType:AcquireParkAck,
+                               msg.responder, msg.txnId);
+          }
+        } else if (msg.type == CHIResponseType:AcquireResume &&
+                   completed.epParkControl == msg.dbid &&
+                   completed.epParkDownstream == msg.responder) {
+          sendAcquireControl(completed, CHIResponseType:AcquireResumeAck,
+                             msg.responder, msg.txnId);
+        }
+        return true;
+      }
+    // Unknown ACKs have no callback obligation and cannot address a new TBE.
+    return true;
+  }
+  assert(msg.dbid != intToAddress(0));
+  DPRINTF(RubyEP, "[EP-PARK-RX] controller=%s addr=%#x type=%s incarnation=%d control=%d phase=%d\n",
+          machineID, msg.addr, msg.type, msg.txnId, msg.dbid,
+          foreground.epParkPhase);
+  if (msg.type == CHIResponseType:AcquirePark) {
+    if (foreground.epParkPhase != 0) {
+      if (foreground.epParkControl == msg.dbid &&
+          foreground.epParkDownstream == msg.responder &&
+          foreground.epParkPhase == 2) {
+        sendAcquireControl(foreground, CHIResponseType:AcquireParkAck,
+                           msg.responder, msg.txnId);
+      }
+      return true;
+    }
+    assert(foreground.epParkPhase == 0);
+    foreground.epParkControl := msg.dbid;
+    foreground.epParkDownstream := msg.responder;
+    foreground.epParkPhase := 1;
+    foreground.epParkUpstreamAck := false;
+    if (foreground.epUpstreamId != intToAddress(0)) {
+      sendAcquireControl(foreground, CHIResponseType:AcquirePark,
+                         foreground.requestor, foreground.epUpstreamId);
+    } else {
+      foreground.epParkUpstreamAck := true;
+    }
+    finishAcquireParkDrain(foreground);
+  } else if (msg.type == CHIResponseType:AcquireParkAck) {
+    if (foreground.epParkPhase != 1) { return true; }
+    assert(foreground.epParkPhase == 1);
+    assert(foreground.epParkControl == msg.dbid);
+    assert(foreground.requestor == msg.responder);
+    foreground.epParkUpstreamAck := true;
+    finishAcquireParkDrain(foreground);
+  } else if (msg.type == CHIResponseType:AcquireResume) {
+    if (foreground.epParkPhase == 0 &&
+        foreground.epParkControl == msg.dbid &&
+        foreground.epParkDownstream == msg.responder) {
+      sendAcquireControl(foreground, CHIResponseType:AcquireResumeAck,
+                         msg.responder, msg.txnId);
+      return true;
+    }
+    if (foreground.epParkPhase == 3) { return true; }
+    assert(foreground.epParkPhase == 2);
+    assert(foreground.epParkControl == msg.dbid);
+    assert(foreground.epParkDownstream == msg.responder);
+    TBE control := epControlTBEs[msg.addr];
+    if (is_valid(control)) {
+      // EP-RNF can observe Comp before the HN consumes its CompAck. Do not
+      // resume acquisition while the native control still owns the address.
+      foreground.epResumePending := true;
+    } else {
+      foreground.epParkPhase := 3;
+      if (foreground.epUpstreamId != intToAddress(0)) {
+        sendAcquireControl(foreground, CHIResponseType:AcquireResume,
+                           foreground.requestor, foreground.epUpstreamId);
+      } else {
+        sendAcquireControl(foreground, CHIResponseType:AcquireResumeAck,
+                           foreground.epParkDownstream, foreground.epNativeId);
+        foreground.epParkPhase := 0;
+      }
+    }
+  } else {
+    assert(msg.type == CHIResponseType:AcquireResumeAck);
+    if (foreground.epParkPhase != 3) { return true; }
+    assert(foreground.epParkPhase == 3);
+    assert(foreground.epParkControl == msg.dbid);
+    assert(foreground.requestor == msg.responder);
+    sendAcquireControl(foreground, CHIResponseType:AcquireResumeAck,
+                       foreground.epParkDownstream, foreground.epNativeId);
+    foreground.epParkPhase := 0;
+  }
+  return true;
 }
 
 AccessPermission getAccessPermission(Addr addr) {
@@ -402,6 +616,17 @@ void initializeTBE(TBE tbe, Addr addr, int storSlot) {
 
   tbe.addr := addr;
 
+  // Never reuse an incarnation, even when storage slots or native DBIDs recycle.
+  assert(epNextNativeId != intToAddress(0));
+  tbe.epNativeId := epNextNativeId;
+  epNextNativeId := epNextNativeId + intToAddress(1);
+  tbe.epUpstreamId := intToAddress(0);
+  tbe.epParkControl := intToAddress(0);
+  tbe.epParkPhase := 0;
+  tbe.epParkRetryPending := false;
+  tbe.epResumePending := false;
+  tbe.epParkUpstreamAck := false;
+
   tbe.storSlot := storSlot;
 
   clearExpectedReqResp(tbe);
@@ -459,14 +684,23 @@ TBE allocateRequestTBE(Addr addr, CHIRequestMsg in_msg), return_by_pointer="yes"
   // We must have reserved resources for this allocation.
   // P0-1: Protocol invariant — a matching AllocateTBE_Request must
   // have incremented the reservation before we consume it.
-  assert(storTBEs.reserved() > 0);
-  storTBEs.decrementReserved();
-  assert(storTBEs.areNSlotsAvailable(1));
-
-  TBEs.allocate(addr);
   TBE tbe := TBEs[addr];
-
-  initializeTBE(tbe, addr, storTBEs.addEntryToNewSlot());
+  if (in_msg.ep_proxy_op != EpProxyOp:NoProxyOp) {
+    assert(is_HN);
+    assert(storEpControlTBEs.reserved() > 0);
+    storEpControlTBEs.decrementReserved();
+    epControlTBEs.allocate(addr);
+    tbe := epControlTBEs[addr];
+    initializeTBE(tbe, addr, storEpControlTBEs.addEntryToNewSlot());
+    tbe.is_ep_control_tbe := true;
+  } else {
+    assert(storTBEs.reserved() > 0);
+    storTBEs.decrementReserved();
+    assert(storTBEs.areNSlotsAvailable(1));
+    TBEs.allocate(addr);
+    tbe := TBEs[addr];
+    initializeTBE(tbe, addr, storTBEs.addEntryToNewSlot());
+  }
   if (fromSequencer(in_msg.type)) {
     assert(in_msg.txnId == max_outstanding_transactions);
     tbe.txnId := static_cast(Addr, "value", tbe.storSlot);
@@ -485,6 +719,7 @@ TBE allocateRequestTBE(Addr addr, CHIRequestMsg in_msg), return_by_pointer="yes"
   tbe.accSize := in_msg.accSize;
   tbe.requestor := in_msg.requestor;
   tbe.reqType := in_msg.type;
+  tbe.epUpstreamId := in_msg.ep_native_id;
   tbe.ubccIngressSocket := in_msg.ubcc_ingress_socket;
   tbe.ubccStoreAuthValid := in_msg.ubcc_store_auth_valid;
   tbe.ubccInternalWriteback := in_msg.ubcc_internal_writeback;
@@ -670,6 +905,7 @@ void scheduleSendData(TBE tbe, int when) {
     tbe.pendAction := Event:TX_Data;
     enqueue(triggerOutPort, TriggerMsg, intToCycles(when)) {
       out_msg.addr := tbe.addr;
+      out_msg.epContextId := tbe.epNativeId;
       out_msg.from_hazard := tbe.is_req_hazard || tbe.is_repl_hazard;
     }
   }
@@ -718,6 +954,21 @@ void prepareRequest(TBE tbe, CHIRequestType type, CHIRequestMsg & out_msg) {
   out_msg.is_local_pf := false;
   out_msg.is_remote_pf := tbe.is_local_pf || tbe.is_remote_pf;
   out_msg.txnId := tbe.txnId;
+
+  out_msg.ep_native_id := tbe.epNativeId;
+
+  if (ep_acquire_observer && !tbe.is_ep_control_tbe &&
+      ha_node_backend.isDsmAddrCrossNode(tbe.addr) &&
+      (type == CHIRequestType:ReadNoSnp || type == CHIRequestType:ReadNoSnpSep) &&
+      !epCompletedAcquires.isPresent(tbe.addr)) {
+    // Credit was checked before any send-side effects. Reserve before the
+    // request can expose this identity to EPSNF, not at native completion.
+    epCompletedAcquires.allocate(tbe.addr);
+    TBE record := epCompletedAcquires[tbe.addr];
+    record.addr := tbe.addr;
+    record.epNativeId := tbe.epNativeId;
+    record.epParkDownstream := mapAddressToDownstreamMachine(tbe.addr);
+  }
 
   assert(tbe.txnId != static_cast(Addr, "value", -1));
 
@@ -804,6 +1055,8 @@ void prepareRequestRetry(TBE tbe, CHIRequestMsg & out_msg) {
   out_msg.allowRetry := false;
 
   out_msg.addr := tbe.addr;
+  out_msg.txnId := tbe.txnId;
+  out_msg.ep_native_id := tbe.epNativeId;
   out_msg.requestor := machineID;
   out_msg.fwdRequestor := tbe.requestor;
   out_msg.accAddr := tbe.pendReqAccAddr;
@@ -831,6 +1084,7 @@ void prepareRequestRetry(TBE tbe, CHIRequestMsg & out_msg) {
   out_msg.ubcc_store_requester := tbe.pendReqUbccStoreRequester;
   out_msg.ubcc_permission_epoch := tbe.pendReqUbccPermissionEpoch;
   out_msg.ubcc_write_disposition := tbe.pendReqUbccWriteDisposition;
+  out_msg.ep_proxy_op := tbe.epProxyOp;
 }
 
 void prepareRequestRetryDVM(TBE tbe, CHIRequestMsg & out_msg) {
@@ -857,12 +1111,16 @@ void prepareRequestRetryDVM(TBE tbe, CHIRequestMsg & out_msg) {
 
 void enqueueDoRetry(TBE tbe) {
   if (tbe.rcvdRetryAck && tbe.rcvdRetryCredit) {
-    enqueue(retryTriggerOutPort, RetryTriggerMsg, 0) {
-      out_msg.addr := tbe.addr;
-      out_msg.usesTxnId := tbe.is_dvm_tbe || tbe.is_dvm_snp_tbe;
-      out_msg.event := Event:DoRetry;
+    if (tbe.epParkPhase != 0) {
+      tbe.epParkRetryPending := true;
+    } else {
+      enqueue(retryTriggerOutPort, RetryTriggerMsg, 0) {
+        out_msg.addr := tbe.addr;
+        out_msg.usesTxnId := tbe.is_dvm_tbe || tbe.is_dvm_snp_tbe;
+        out_msg.event := Event:DoRetry;
+      }
+      destsWaitingRetry.removeNetDest(tbe.pendReqDest);
     }
-    destsWaitingRetry.removeNetDest(tbe.pendReqDest);
   }
 }
 
@@ -1112,8 +1370,13 @@ void copyCacheAndDirTBEs(TBE src, TBE dst) {
 void deallocateReqTBE(TBE tbe) {
   assert(is_valid(tbe));
   assert(tbe.is_req_tbe);
-  storTBEs.removeEntryFromSlot(tbe.storSlot);
-  TBEs.deallocate(tbe.addr);
+  if (tbe.is_ep_control_tbe) {
+    storEpControlTBEs.removeEntryFromSlot(tbe.storSlot);
+    epControlTBEs.deallocate(tbe.addr);
+  } else {
+    storTBEs.removeEntryFromSlot(tbe.storSlot);
+    TBEs.deallocate(tbe.addr);
+  }
 }
 
 void deallocateSnpTBE(TBE tbe) {

@@ -311,6 +311,8 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
         _ha_profile = os.environ.get("EP_HA_PROFILE", "ubcc")
         _clear_profile = os.environ.get("OURCC_CLEAR_PROFILE", "ack")
         ep_backend = EPBackend(node_id=node_id, ruby_system=ruby_system,
+                                   authority_entries=int(os.environ.get("EP_AUTHORITY_ENTRIES", "4096")),
+                                   boundary_demand_slots=int(os.environ.get("EP_BOUNDARY_DEMAND_SLOTS", "64")),
                                  meta_rnf=NULL,
                                  ub_adapter=nd['ub_adapter'],
                                 # Socket-plane: pass ALL per-socket UBAdapters so
@@ -341,6 +343,11 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
                 version=chi_defs.Versions.getVersion(chi_defs.CHI_Cache_Controller),
                 ruby_system=ruby_system, node_id=node_id,
                 socket_id=sid,
+                park_microtest_wrap=(os.environ.get("EP_PARK_MICROTEST_WRAP") == "1"),
+                park_microtest=(os.environ.get("EP_PARK_MICROTEST") == "1"
+                                and node_id == 1),
+                park_microtest_partial=(os.environ.get("EP_PARK_MICROTEST_PARTIAL") == "1"
+                                        and node_id == 1),
                 data_channel_size=params.data_width,
                 ep_backend=ep_backend,
                 addr_ranges=[NodeConfig.dsm_range_for(nid, seg_size, cfg.phy_base,
@@ -455,6 +462,9 @@ def create_ubcc_system(options, full_system, system, dma_ports, bootmem,
             hnf_cntrl.epRnfMachineVersion = nd['ep_rnf_cntrl'].version
         for sid, hnf_cntrl in enumerate(nd['hnf_cntrls']):
             hnf_cntrl.metaRnfMachineVersion = nd['meta_rnf_cntrls'][sid].version
+            hnf_cntrl.ha_node_backend = ep_backend
+            hnf_cntrl.ep_acquire_observer = True
+            hnf_cntrl.ha_home_socket = sid
             if _ha_profile == 'ha-vi':
                 hnf_cntrl.ha_node_backend = ep_backend
                 hnf_cntrl.ha_node_observer = True

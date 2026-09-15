@@ -132,6 +132,7 @@ structure(CHIRequestMsg, desc="", interface="Message") {
 
   bool usesTxnId,       desc="True if using a Transaction ID", default="false";
   Addr txnId,           desc="Transaction ID", default="0";
+  Addr ep_native_id,    desc="Internal acquiring controller incarnation (not DVM txnId)", default="0";
   bool ns,              desc="Secure State of the transaction. NS=NonSecure", default="true";
 
   MessageSizeType MessageSize, default="MessageSizeType_Control";
@@ -189,6 +190,17 @@ enumeration(CHIResponseType, desc="...") {
 
   RetryAck;
   PCrdGrant;
+
+  // Project-internal acquisition control, not architectural AMBA CHI opcodes.
+  // txnId identifies the receiver's acquisition incarnation; dbid identifies
+  // the boundary control. Neither field grants cache or Home permission.
+  AcquirePark;
+  AcquireParkAck;
+  AcquireResume;
+  AcquireResumeAck;
+  // Internal observer lifetime protocol; not public ARM CHI opcodes.
+  AcquireClose;
+  AcquireCloseAck;
 
   null;
 }
@@ -252,6 +264,7 @@ structure(CHIDataMsg, desc="", interface="Message") {
   WriteMask bitMask,    desc="Which bytes in the data block are valid";
   bool usesTxnId,       desc="True if using a Transaction ID", default="false";
   Addr txnId,           desc="Transaction ID", default="0";
+  Addr ep_native_id,    desc="Receiver acquisition incarnation; zero for legacy native paths", default="0";
 
   // UBCC Sideband: shared hint on CompData.
   // Set by EP_SNF when UBCC grants shared access to a new node.

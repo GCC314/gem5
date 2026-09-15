@@ -12,6 +12,13 @@
 #include "mem/ruby/common/DataBlock.hh"
 #include "mem/ruby/protocol/chi/ep/CoherenceMessage.hh"
 #include "mem/ruby/protocol/chi/ep/NodeAddressMap.hh"
+#include "mem/ruby/protocol/chi/ep/BoundaryResponses.hh"
+#include "protocol/ControlCredits.hh"
+#include "protocol/ControlFrame.hh"
+#include "protocol/ResponseFrame.hh"
+#include "protocol/ProgressFrame.hh"
+#include "protocol/FixedQueue.hh"
+#include "mem/ruby/protocol/chi/ep/BoundaryQueue.hh"
 #include "params/UBAdapter.hh"
 #include "sim/sim_object.hh"
 #include "sim/eventq.hh"
@@ -92,8 +99,15 @@ class UBAdapter : public SimObject
                           UBWriteDisposition disposition, uint64_t byteMask,
                           int homeNode, int homeSocket,
                          const uint8_t *dirtyData = nullptr,
-                         uint64_t *ioReqId = nullptr);
+                         uint64_t *ioReqId = nullptr,
+                         uint64_t parentReqId = 0, uint64_t parentEpoch = 0,
+                         uint64_t *mergedRecallReqId = nullptr);
 
+    // Caller owns the single serial escape identity until matched Home ACK.
+    // 1=applied/duplicate, 2=exact foreign retirement, 3=stale (NOT success),
+    // 0=retry/rejected, negative=not ready/invalid. Identity is checked here.
+    int sendConditionalRelease(uint64_t homePa, uint64_t lease,
+        int homeNode, int homeSocket, uint64_t reqId);
     int sendEvictReq(uint64_t homePa, int evictingNode,
                      uint64_t epochVal, int homeNode, int homeSocket);
 
@@ -118,10 +132,10 @@ class UBAdapter : public SimObject
                             int homeNode, int homeSocket);
 
     // Cross-node EPBackend→EPBackend (fire-and-forget via router)
-    void sendRecallReqToOwner(int targetNode,
+    bool sendRecallReqToOwner(int targetNode,
                               const OuterRecallMsg &recallMsg,
                               int homeSocket);
-    void sendInvalidateReqToSharer(int targetNode,
+    bool sendInvalidateReqToSharer(int targetNode,
                                     const OuterInvalidateMsg &invMsg,
                                     int homeSocket);
 
@@ -213,7 +227,6 @@ class UBAdapter : public SimObject
 
     /** Event-driven response processing. Replaces busy-poll transportRecv. */
     void wakeup();
-    void checkResponseCallbacks();
     void scheduleResponseCheck();
     void handleResponse(const framework::Message *m);
 
@@ -243,7 +256,16 @@ class UBAdapter : public SimObject
 
     /** Send through the owned opaque framework port. */
     bool transportSend(const CoherenceMessage &msg);
+    bool reserveResponse(const CoherenceMessage &msg, bool cancel = false);
+    void cacheResponse(const CoherenceMessage &msg);
     bool transportSendReliable(const CoherenceMessage &msg);
+    bool sendControlReply(CoherenceMessage msg);
+    bool reserveMetadataReply(const CoherenceMessage &request);
+    bool sendMetadataReply(const CoherenceMessage &reply);
+    void sendMetaRNFLineErrorResponse(framework::Port *port,
+        CoherenceMessageType type, MetaRNFLineStatus status,
+        uint64_t reqId, uint64_t bucketOffset, int node, int socket,
+        int dstNode, int dstSocket, uint32_t source, uint32_t target);
     void drainReliableOutputs();
     size_t pollVisibleMessages(Tick curT, size_t budget);
 
@@ -270,25 +292,12 @@ class UBAdapter : public SimObject
     struct PendingKey {
         CoherenceMessageType respType;
         uint64_t reqId;
+        bool operator==(const PendingKey &o) const {
+            return respType == o.respType && reqId == o.reqId;
+        }
         bool operator<(const PendingKey &o) const {
             return std::tie(respType, reqId) < std::tie(o.respType, o.reqId);
         }
-    };
-
-    struct PendingTxn {
-        CoherenceMessageType reqType;
-        CoherenceMessageType respType;
-        uint64_t reqId;
-        uint64_t homeLinePa;
-        int homeNode;
-        uint64_t epoch;
-        std::function<void(const CoherenceMessage&)> onResp;
-
-        PendingTxn()
-            : reqType(CoherenceMessageType::ReadReq),
-              respType(CoherenceMessageType::ReadResp),
-              reqId(0), homeLinePa(0),
-              homeNode(-1), epoch(0) {}
     };
 
     static constexpr size_t MaxInflightReadReqs = 64;
@@ -300,8 +309,12 @@ class UBAdapter : public SimObject
     std::set<uint64_t> _inflightHAPresenceProbeReqs;
     std::map<uint64_t, Tick> _clearRetryTick;
 
-    std::map<PendingKey, PendingTxn> _pendingByReqId;
-    std::map<PendingKey, CoherenceMessage> _readyResponses;
+    // Nine response classes, 64 pre-reserved cells per class. These are
+    // transport obligations, not independent line authority or BTT entries.
+    BoundaryResponses<PendingKey, cc::glob::ResponseFrame, 9 * 64> _readyResponses;
+    uint64_t _releaseReqId = 0;
+    uint64_t _releasePa = 0, _releaseLease = 0;
+    int _releaseHome = -1, _releaseSocket = -1;
 
     /** Last response (for sync transportRecv fallback and recvFromRouter). */
     CoherenceMessage _lastResponse;
@@ -319,12 +332,45 @@ class UBAdapter : public SimObject
     friend class EPSNFController;
 
     // Deferred async control messages (InvalidateReq/RecallReq/UpgradeAckNotify)
-    std::deque<CoherenceMessage> _deferredControls;
+    // Four receive leases from each of at most 256 Home planes. No generic
+    // notifications are staged here: their storage is in their original root.
+    cc::glob::FixedQueue<cc::glob::ControlFrame> _deferredControls;
+    cc::glob::ControlCredits<CoherenceMessageHeader> _controlReceipts;
+    struct ControlOutput {
+        cc::glob::ProgressFrame reply;
+        bool queued = false;
+        bool reserved = false;
+    };
+    struct LeasedControlOutput {
+        cc::glob::ControlReply reply;
+        bool queued = false;
+    };
+    std::unique_ptr<std::array<LeasedControlOutput, 4>[]> _controlOutputs;
+    std::array<ControlOutput, 64> _clearOutputs{};
+    std::array<ControlOutput, 64> _haAckOutputs{};
+    struct MetadataReply {
+        CoherenceMessage message;
+        bool reserved = false;
+        bool ready = false;
+    };
+    std::array<MetadataReply, 64> _metadataReplies{};
+    std::array<MetadataReply, 64> _pageReplies{};
+    std::unique_ptr<MetadataReply[]> _permissionReplies;
+    struct DirectChild {
+        CoherenceMessageHeader request;
+        CoherenceMessageHeader dataHeader;
+        std::array<uint8_t, 64> data{};
+        bool live = false;
+        bool ready = false;
+        Tick grantWaitStart = 0;
+    };
+    std::array<DirectChild, 64> _directChildren{};
+    BoundaryQueue<CoherenceMessage, 64> _directOutputs;
     bool _drainingDeferredControls = false;
 
     // Ordered, lossless-at-the-adapter-boundary output queue.  A full opaque
     // transport is retried by wakeup() without changing reqId or wire fields.
-    std::deque<CoherenceMessage> _reliableOutputs;
+    BoundaryQueue<CoherenceMessage, 64 * 4> _reliableOutputs;
 };
 
 } // namespace ruby

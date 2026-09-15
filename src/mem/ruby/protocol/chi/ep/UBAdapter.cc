@@ -74,12 +74,25 @@ UBAdapter::UBAdapter(const Params &p)
       _numSockets(p.num_sockets),
       _localNode(p.local_node),
       _addrMap(p.num_nodes, p.num_sockets, 128ULL * 1024 * 1024),
-      _responseCheckEvent([this]{ wakeup(); }, name() + ".responseCheck")
+      _responseCheckEvent([this]{ wakeup(); }, name() + ".responseCheck"),
+      _deferredControls(p.num_nodes * p.num_sockets * 4),
+      _controlReceipts(p.num_nodes * p.num_sockets),
+      _controlOutputs(new std::array<LeasedControlOutput, 4>[p.num_nodes * p.num_sockets]{}),
+      _permissionReplies(new MetadataReply[p.num_nodes * p.num_sockets * 64]{})
 {
     fatal_if(sizeof(CoherenceMessage) > framework::GetMaxPayloadSize(),
               "UBAdapter: CoherenceMessage size (%zu) exceeds framework payload (%zu)",
               sizeof(CoherenceMessage), framework::GetMaxPayloadSize());
     DPRINTF(RubyEP, "UBAdapter node=%d socket=%d created\n", _nodeId, _socketId);
+    inform("[EP-CONTROL-STORAGE] node=%d socket=%d peers=%u slots=%lu input_bytes=%lu output_bytes=%lu lease_bytes=%lu response_bank_bytes=%lu progress_bytes=%lu ordinary_output_bytes=%lu",
+           _nodeId, _socketId, _controlReceipts.peerCount(),
+           static_cast<unsigned long>(_deferredControls.capacity()),
+           static_cast<unsigned long>(_deferredControls.capacity() * sizeof(cc::glob::ControlFrame)),
+           static_cast<unsigned long>(_controlReceipts.peerCount() * 4 * sizeof(LeasedControlOutput)),
+           static_cast<unsigned long>(_controlReceipts.storageBytes()),
+           static_cast<unsigned long>(sizeof(_readyResponses)),
+           static_cast<unsigned long>(sizeof(_clearOutputs) + sizeof(_haAckOutputs)),
+           static_cast<unsigned long>(sizeof(_reliableOutputs)));
 }
 
 UBAdapter::~UBAdapter()
@@ -240,8 +253,74 @@ UBAdapter::startup()
 }
 
 bool
+UBAdapter::reserveResponse(const CoherenceMessage &msg, bool cancel)
+{
+    CoherenceMessageType response;
+    switch (msg.h.type) {
+      case CoherenceMessageType::ReadReq: response = CoherenceMessageType::ReadResp; break;
+      case CoherenceMessageType::WritebackReq: response = CoherenceMessageType::WritebackResp; break;
+      case CoherenceMessageType::EvictReq:
+        if (msg.b.evictReq.receiptAck) return true;
+        response = CoherenceMessageType::EvictResp; break;
+      case CoherenceMessageType::UpgradeReq: response = CoherenceMessageType::UpgradeResp; break;
+      case CoherenceMessageType::UpgradeDoneReq: response = CoherenceMessageType::UpgradeDoneResp; break;
+      case CoherenceMessageType::ClearReq:
+        if (msg.b.clearReq.reason == 1) return true;
+        response = CoherenceMessageType::ClearResp; break;
+      case CoherenceMessageType::QueryLineMetaReq: response = CoherenceMessageType::QueryLineMetaResp; break;
+      case CoherenceMessageType::HAPermissionReq: response = CoherenceMessageType::HAPermissionResp; break;
+      case CoherenceMessageType::HAPresenceProbeReq: response = CoherenceMessageType::HAPresenceProbeResp; break;
+      default: return true;
+    }
+    if (cancel) {
+        _readyResponses.erase(PendingKey{response, msg.h.reqId});
+        return true;
+    }
+    return _readyResponses.reserve({response, msg.h.reqId}, msg, 64);
+}
+
+void
+UBAdapter::cacheResponse(const CoherenceMessage &msg)
+{
+    if (msg.h.type == CoherenceMessageType::ReadResp &&
+        (msg.h.flags & static_cast<uint32_t>(CFLAG_DATA_FORWARDED))) {
+        for (auto &child : _directChildren) {
+            const auto &r = child.request;
+            if (!child.live || r.reqId != msg.h.reqId ||
+                r.homeLinePa != msg.h.homeLinePa || r.dstNode != msg.h.homeNode ||
+                r.dstSocket != msg.h.homeSocket || r.srcNode != msg.h.dstNode ||
+                r.srcSocket != msg.h.dstSocket) continue;
+            // Provisional data is not permission. Home must subsequently
+            // authenticate its source/epoch before this child can be consumed.
+            if (!child.ready) {
+                child.dataHeader = msg.h;
+                memcpy(child.data.data(), msg.b.readResp.grantData, 64);
+                child.ready = true;
+                DPRINTF(RubyEP, "[C4-CHILD-RECEIVED] reqId=%lu owner=%u home=%u permission=0\n",
+                        msg.h.reqId, msg.h.srcNode, msg.h.homeNode);
+            }
+            return;
+        }
+        return; // retired parent or wrong route cannot allocate a child
+    }
+    const bool delivered = _readyResponses.deliver({msg.h.type, msg.h.reqId}, msg);
+    if (delivered && _backend &&
+        _backend->boundaryTransactions().creditUsage(BoundaryPool::Ordinary) ==
+        _backend->boundaryTransactions().demandLimit()) {
+        inform("[EP-CREDIT-FULL-RESPONSE] node=%d socket=%d reqId=%lu type=%s ordinary=%u reserved=1",
+               _nodeId, _socketId, msg.h.reqId, coherenceMsgTypeName(msg.h.type),
+               _backend->boundaryTransactions().demandLimit());
+    }
+    if (!delivered) {
+        DPRINTF(RubyEP, "[RSP-NO-RESERVATION] type=%s reqId=%lu pa=%#lx\n",
+                coherenceMsgTypeName(msg.h.type), msg.h.reqId, msg.h.homeLinePa);
+    }
+}
+
+bool
 UBAdapter::transportSend(const CoherenceMessage &msg)
 {
+    if (!reserveResponse(msg)) return false;
     if (_port) {
         uint64_t sendTs = 0;
         if (!sendCoherenceMessage(_port, msg, curTick(), msg.h.reqId,
@@ -253,6 +332,12 @@ UBAdapter::transportSend(const CoherenceMessage &msg)
                                   &sendTs)) {
             warn("UBAdapter node=%d socket=%d: transportSend port send failed (reqId=%lu)",
                  _nodeId, _socketId, msg.h.reqId);
+            // Retried Read/Clear/Upgrade may still have an older wire copy
+            // outstanding. Its promise must survive a failed retransmission.
+            if (msg.h.type == CoherenceMessageType::QueryLineMetaReq ||
+                msg.h.type == CoherenceMessageType::UpgradeDoneReq ||
+                msg.h.type == CoherenceMessageType::EvictReq)
+                reserveResponse(msg, true);
             return false;
         }
 
@@ -285,8 +370,46 @@ UBAdapter::transportSend(const CoherenceMessage &msg)
 bool
 UBAdapter::transportSendReliable(const CoherenceMessage &msg)
 {
+    if (msg.h.type == CoherenceMessageType::RecallResp ||
+        msg.h.type == CoherenceMessageType::InvalidateAck ||
+        msg.h.type == CoherenceMessageType::HAPresenceProbeResp)
+        return sendControlReply(msg);
+    if ((msg.h.type == CoherenceMessageType::ClearReq && msg.b.clearReq.reason == 1) ||
+        msg.h.type == CoherenceMessageType::HAPermissionAck) {
+        if (msg.h.type == CoherenceMessageType::HAPermissionAck) {
+            for (auto &out : _haAckOutputs) {
+                const auto &h = out.reply.h;
+                if (!out.reserved || h.reqId != msg.h.reqId ||
+                    h.homeLinePa != msg.h.homeLinePa || h.dstNode != msg.h.dstNode ||
+                    h.dstSocket != msg.h.dstSocket) continue;
+                if (!out.queued) { out.reply = msg; out.queued = true; }
+                scheduleResponseCheck();
+                return true;
+            }
+            return false;
+        }
+        auto &outputs = msg.h.type == CoherenceMessageType::ClearReq ?
+            _clearOutputs : _haAckOutputs;
+        for (const auto &out : outputs)
+            if (out.queued && out.reply.h.reqId == msg.h.reqId &&
+                out.reply.h.homeLinePa == msg.h.homeLinePa) return true;
+        for (auto &out : outputs) {
+            if (out.queued) continue;
+            out.reply = msg; out.queued = true;
+            scheduleResponseCheck();
+            return true;
+        }
+        return false;
+    }
+    if (!reserveResponse(msg)) return false;
+    for (const auto &queued : _reliableOutputs) {
+        if (queued.h.type == msg.h.type && queued.h.reqId == msg.h.reqId &&
+            queued.h.epoch == msg.h.epoch && queued.h.homeLinePa == msg.h.homeLinePa &&
+            queued.h.dstNode == msg.h.dstNode && queued.h.dstSocket == msg.h.dstSocket)
+            return true;
+    }
     if (!_reliableOutputs.empty()) {
-        _reliableOutputs.push_back(msg);
+        if (!_reliableOutputs.push_back(msg)) return false;
         scheduleResponseCheck();
         return true;
     }
@@ -298,7 +421,7 @@ UBAdapter::transportSendReliable(const CoherenceMessage &msg)
         }
         return true;
     }
-    _reliableOutputs.push_back(msg);
+    if (!_reliableOutputs.push_back(msg)) return false;
     scheduleResponseCheck();
     return true;
 }
@@ -306,17 +429,118 @@ UBAdapter::transportSendReliable(const CoherenceMessage &msg)
 void
 UBAdapter::drainReliableOutputs()
 {
+    while (!_directOutputs.empty()) {
+        if (!transportSend(*_directOutputs.begin())) break;
+        _directOutputs.erase(_directOutputs.begin());
+    }
+    for (auto &out : _metadataReplies)
+        if (out.ready && transportSend(out.message)) out = {};
+    for (auto &out : _pageReplies)
+        if (out.ready && transportSend(out.message)) out = {};
+    for (unsigned i = 0; i < _numNodes * _numSockets * 64; ++i) {
+        auto &out = _permissionReplies[i];
+        if (out.ready && transportSend(out.message)) out = {};
+    }
+    for (auto &out : _haAckOutputs) {
+        if (!out.queued || !transportSend(out.reply)) continue;
+        const auto h = out.reply.h;
+        out = {};
+        if (_backend) _backend->notifyHAAckHandedOff(h.homeLinePa, h.reqId, _socketId);
+    }
+    for (auto &out : _clearOutputs) {
+        if (!out.queued || !transportSend(out.reply)) continue;
+        out.queued = false;
+        if (_backend) _backend->notifyOneWayClearHandedOff(
+            out.reply.h.homeLinePa, _socketId, out.reply.h.reqId);
+    }
+    for (unsigned peer = 0; peer < _controlReceipts.peerCount(); ++peer) {
+        for (unsigned slot = 0; slot < 4; ++slot) {
+            auto &out = _controlOutputs[peer][slot];
+            if (!out.queued || !transportSend(out.reply.expand())) continue;
+            out.queued = false;
+            _controlReceipts.complete(peer, out.reply.h.seqNum);
+        }
+    }
     while (!_reliableOutputs.empty()) {
-        const CoherenceMessage message = _reliableOutputs.front();
+        const CoherenceMessage message = *_reliableOutputs.begin();
         if (!transportSend(message))
             break;
-        _reliableOutputs.pop_front();
+        _reliableOutputs.erase(_reliableOutputs.begin());
         if (_backend && message.h.type == CoherenceMessageType::ClearReq &&
             message.b.clearReq.reason == 1) {
             _backend->notifyOneWayClearHandedOff(
                 message.h.homeLinePa, _socketId, message.h.reqId);
         }
     }
+}
+
+bool
+UBAdapter::reserveMetadataReply(const CoherenceMessage &request)
+{
+    auto &outputs = (request.h.type == CoherenceMessageType::MetaRNFReadReq ||
+        request.h.type == CoherenceMessageType::MetaRNFWriteReq) ?
+        _pageReplies : _metadataReplies;
+    for (const auto &out : outputs)
+        if (out.reserved && out.message.h.reqId == request.h.reqId &&
+            (out.ready ? out.message.h.dstNode : out.message.h.srcNode) == request.h.srcNode &&
+            (out.ready ? out.message.h.dstSocket : out.message.h.srcSocket) == request.h.srcSocket)
+            return false; // exact retransmission joins the admitted callback
+    for (auto &out : outputs) {
+        if (out.reserved) continue;
+        out.message.h = request.h;
+        out.reserved = true;
+        return true;
+    }
+    return false;
+}
+
+bool
+UBAdapter::sendMetadataReply(const CoherenceMessage &reply)
+{
+    auto &outputs = (reply.h.type == CoherenceMessageType::MetaRNFReadResp ||
+        reply.h.type == CoherenceMessageType::MetaRNFWriteResp) ?
+        _pageReplies : _metadataReplies;
+    for (auto &out : outputs) {
+        if (!out.reserved || out.message.h.reqId != reply.h.reqId ||
+            (out.ready ? out.message.h.dstNode : out.message.h.srcNode) != reply.h.dstNode ||
+            (out.ready ? out.message.h.dstSocket : out.message.h.srcSocket) != reply.h.dstSocket)
+            continue;
+        out.message = reply;
+        out.ready = true;
+        scheduleResponseCheck();
+        return true;
+    }
+    return false;
+}
+
+bool
+UBAdapter::sendControlReply(CoherenceMessage msg)
+{
+    const unsigned peer = msg.h.dstNode * _numSockets + msg.h.dstSocket;
+    if (peer >= _controlReceipts.peerCount()) return false;
+    for (unsigned slot = 0; slot < 4; ++slot) {
+        const auto *receipt = _controlReceipts.get(peer, slot);
+        const auto &h = receipt->header;
+        if (!receipt->active || h.reqId != msg.h.reqId ||
+            h.epoch != msg.h.epoch || h.homeLinePa != msg.h.homeLinePa)
+            continue;
+        const bool typeMatches =
+            (h.type == CoherenceMessageType::RecallReq && msg.h.type == CoherenceMessageType::RecallResp) ||
+            (h.type == CoherenceMessageType::InvalidateReq && msg.h.type == CoherenceMessageType::InvalidateAck) ||
+            (h.type == CoherenceMessageType::HAPresenceProbeReq && msg.h.type == CoherenceMessageType::HAPresenceProbeResp);
+        if (!typeMatches) continue;
+        auto &out = _controlOutputs[peer][slot];
+        msg.h.seqNum = h.seqNum;
+        if (out.queued) return true;
+        // The receive lease reserved this exact output cell before invoking
+        // native callbacks. Ordinary/output congestion cannot reject it.
+        out.reply = cc::glob::ControlReply(msg);
+        out.queued = true;
+        drainReliableOutputs();
+        scheduleResponseCheck();
+        return true;
+    }
+    return false;
 }
 
 int
@@ -341,6 +565,10 @@ UBAdapter::sendHAPermissionReq(uint64_t linePa, HAOperation operation,
         auto ready = _readyResponses.find(key);
         if (ready != _readyResponses.end()) {
             outResp = ready->second.b.haPermissionResp;
+            if (outResp.status != HAStatus::Ok) {
+                for (auto &out : _haAckOutputs)
+                    if (out.reserved && out.reply.h.reqId == ioReqId) out = {};
+            }
             _readyResponses.erase(ready);
             _inflightHAPermissionReqs.erase(ioReqId);
             return 1;
@@ -348,6 +576,10 @@ UBAdapter::sendHAPermissionReq(uint64_t linePa, HAOperation operation,
         return -2;
     }
 
+    ControlOutput *ackReservation = nullptr;
+    for (auto &out : _haAckOutputs)
+        if (!out.reserved) { ackReservation = &out; break; }
+    if (!ackReservation) return -2;
     ioReqId = allocLocalReqId();
     CoherenceMessage req;
     req.h.type = CoherenceMessageType::HAPermissionReq;
@@ -361,8 +593,15 @@ UBAdapter::sendHAPermissionReq(uint64_t linePa, HAOperation operation,
     req.b.haPermissionReq.byteMask = byteMask;
     if (operation == HAOperation::Write && writeData)
         memcpy(req.b.haPermissionReq.data, writeData, 64);
+    ackReservation->reply.h = req.h;
+    ackReservation->reserved = true;
+    if (!transportSendReliable(req)) {
+        *ackReservation = {};
+        _readyResponses.erase(PendingKey{CoherenceMessageType::HAPermissionResp, ioReqId});
+        ioReqId = 0;
+        return -2;
+    }
     _inflightHAPermissionReqs.insert(ioReqId);
-    transportSendReliable(req);
     return -2;
 }
 
@@ -414,8 +653,12 @@ UBAdapter::sendHAPresenceProbeReq(uint64_t linePa, HAProbeAction action,
     req.h.enqueueTick = req.h.readyTick = curTick();
     req.b.haPresenceProbeReq.action = action;
     req.b.haPresenceProbeReq.expectedEpoch = expectedEpoch;
+    if (!transportSendReliable(req)) {
+        _readyResponses.erase(PendingKey{CoherenceMessageType::HAPresenceProbeResp, ioReqId});
+        ioReqId = 0;
+        return -2;
+    }
     _inflightHAPresenceProbeReqs.insert(ioReqId);
-    transportSendReliable(req);
     return -2;
 }
 
@@ -433,7 +676,17 @@ UBAdapter::sendHAPermissionResp(const CoherenceMessage &request,
     resp.h.seqNum = _nextSeq++;
     resp.h.enqueueTick = resp.h.readyTick = curTick();
     resp.b.haPermissionResp = body;
-    return transportSendReliable(resp);
+    const unsigned peer = request.h.srcNode * _numSockets + request.h.srcSocket;
+    if (peer >= unsigned(_numNodes * _numSockets)) return false;
+    for (unsigned i = peer * 64; i < (peer + 1) * 64; ++i) {
+        auto &out = _permissionReplies[i];
+        if (!out.reserved || out.message.h.reqId != request.h.reqId) continue;
+        out.message = resp;
+        out.ready = true;
+        scheduleResponseCheck();
+        return true;
+    }
+    return false;
 }
 
 bool
@@ -566,7 +819,58 @@ UBAdapter::sendReadReq(
         PendingKey rkey{CoherenceMessageType::ReadResp, reqId};
         auto rit = _readyResponses.find(rkey);
         if (rit != _readyResponses.end()) {
-            const CoherenceMessage &resp = rit->second;
+            CoherenceMessage resp = rit->second;
+            if (resp.b.readResp.recallNeeded && resp.b.readResp.recallOwnerNode >= 0) {
+                OuterRecallMsg relay;
+                relay.linePa = homePa;
+                relay.ownerNode = resp.b.readResp.recallOwnerNode;
+                relay.homeNode = homeNode;
+                relay.ownerLocalPa = _addrMap.buildDsmPA(relay.ownerNode, homeNode,
+                    _addrMap.dsmOffset(homePa), homeSocket);
+                relay.epoch = resp.b.readResp.committedEpoch;
+                relay.reqId = reqId;
+                relay.requesterNode = _nodeId;
+                relay.requesterSocket = _socketId;
+                relay.sourceSocket = _socketId;
+                relay.isReadRequest = reqType == 0;
+                relay.dataNeeded = true;
+                if (!sendRecallReqToOwner(relay.ownerNode, relay, homeSocket)) return -2;
+                // Only consume the response after the original intent is
+                // retained. The backend must not generate a second relay.
+                resp.b.readResp.recallNeeded = false;
+            }
+            for (auto &child : _directChildren) {
+                if (!child.live || child.request.reqId != reqId) continue;
+                const bool authenticated = child.ready && child.dataHeader.srcNode == resp.h.targetNode &&
+                    child.dataHeader.srcSocket == resp.h.homeSocket &&
+                    child.dataHeader.epoch == resp.b.readResp.committedEpoch;
+                const bool directGrant = resp.h.flags & static_cast<uint32_t>(CFLAG_DIRECT_GRANT);
+                if (directGrant && !authenticated) {
+                    if (!child.grantWaitStart) child.grantWaitStart = curTick();
+                    if (curTick() - child.grantWaitStart >= ReadReqRetryTicks) {
+                        // Poll the exact Home root for authoritative fallback.
+                        // No new reqId, no premature Clear, no second child.
+                        if (transportSend(req)) {
+                            _readyResponses.erase(rit);
+                            child.grantWaitStart = curTick();
+                        }
+                    }
+                    return -2;
+                }
+                if (authenticated) {
+                    fatal_if(!directGrant && memcmp(child.data.data(), resp.b.readResp.grantData, 64),
+                              "authenticated C4 data differs from Home completion reqId=%lu", reqId);
+                    memcpy(resp.b.readResp.grantData, child.data.data(), 64);
+                    resp.h.flags |= static_cast<uint32_t>(CFLAG_HAS_DATA);
+                    if (directGrant)
+                        inform("[C4-DATA-ONLY-COMPLETE] reqId=%lu owner=%u epoch=%lu home_payload=0",
+                               reqId, resp.h.targetNode, child.dataHeader.epoch);
+                    DPRINTF(RubyEP, "[C4-CHILD-AUTHENTICATED] reqId=%lu owner=%u epoch=%lu\n",
+                            reqId, resp.h.targetNode, child.dataHeader.epoch);
+                }
+                child = {};
+                break;
+            }
             if (outGrantVisibleTick) *outGrantVisibleTick = resp.b.readResp.grantVisibleTick;
             if (outSentinelVisibleTick) *outSentinelVisibleTick = resp.b.readResp.sentinelVisibleTick;
             if (outRecallNeeded) *outRecallNeeded = resp.b.readResp.recallNeeded;
@@ -593,16 +897,26 @@ UBAdapter::sendReadReq(
         if (inflight != _inflightReadReqs.end()) {
             if (curTick() < inflight->second)
                 return -2;
-            _inflightReadReqs.erase(inflight);
         }
     }
 
     _lastResponseValid = false;
-    if (_port && _inflightReadReqs.size() >= MaxInflightReadReqs) {
+    if (_port && !_inflightReadReqs.count(reqId) &&
+        _inflightReadReqs.size() >= MaxInflightReadReqs) {
         warn("UBAdapter node=%d: bounded ReadReq table full (%zu), "
              "reqId=%lu stays BUSY\n",
              _nodeId, _inflightReadReqs.size(), reqId);
         return -1;
+    }
+    DirectChild *childReservation = nullptr;
+    for (auto &child : _directChildren)
+        if (child.live && child.request.reqId == reqId) { childReservation = &child; break; }
+    if (!childReservation) {
+        for (auto &child : _directChildren)
+            if (!child.live) { childReservation = &child; break; }
+        if (!childReservation) return -2;
+        childReservation->request = req.h;
+        childReservation->live = true;
     }
     if (!transportSend(req)) {
         return -1;
@@ -639,8 +953,11 @@ UBAdapter::sendWritebackReq(uint64_t homePa, int requesterNode,
                              uint64_t epochVal, UBWritebackKind kind,
                              UBWriteDisposition disposition, uint64_t byteMask,
                              int homeNode, int homeSocket,
-                             const uint8_t *dirtyData, uint64_t *ioReqId)
+                             const uint8_t *dirtyData, uint64_t *ioReqId,
+                             uint64_t parentReqId, uint64_t parentEpoch,
+                             uint64_t *mergedRecallReqId)
 {
+    if (mergedRecallReqId) *mergedRecallReqId = 0;
     if (!_port) {
         fatal("UBAdapter node=%d socket=%d: sendWritebackReq called with no transport bound\n",
               _nodeId, _socketId);
@@ -660,6 +977,13 @@ UBAdapter::sendWritebackReq(uint64_t homePa, int requesterNode,
     auto ready = _readyResponses.find(responseKey);
     if (ready != _readyResponses.end()) {
         bool success = ready->second.b.writebackResp.success;
+        fatal_if(ready->second.h.homeLinePa != homePa ||
+                     ready->second.h.epoch != epochVal ||
+                     ready->second.h.srcNode != homeNode ||
+                     ready->second.h.srcSocket != homeSocket,
+                 "WritebackResp identity mismatch reqId=%lu", reqId);
+        if (mergedRecallReqId)
+            *mergedRecallReqId = ready->second.b.writebackResp.mergedRecallReqId;
         const bool deferred = ready->second.h.flags &
             static_cast<uint32_t>(CFLAG_DEFERRED);
         _readyResponses.erase(ready);
@@ -694,6 +1018,8 @@ UBAdapter::sendWritebackReq(uint64_t homePa, int requesterNode,
     req.b.writebackReq.kind = kind;
     req.b.writebackReq.disposition = disposition;
     req.b.writebackReq.byteMask = byteMask;
+    req.b.writebackReq.parentInvalidateReqId = parentReqId;
+    req.b.writebackReq.parentInvalidateEpoch = parentEpoch;
     fatal_if(kind == UBWritebackKind::OwnerWriteback &&
                  (byteMask != ~0ULL ||
                   (disposition != UBWriteDisposition::DropOwner &&
@@ -757,10 +1083,70 @@ UBAdapter::sendWritebackReq(uint64_t homePa, int requesterNode,
     }
 
     _inflightWritebackReqs.erase(reqId);
+    if (mergedRecallReqId)
+        *mergedRecallReqId = resp.b.writebackResp.mergedRecallReqId;
     return resp.b.writebackResp.success ? 1 : 0;
 }
 
 // ---- Evict Request ----
+
+int
+UBAdapter::sendConditionalRelease(uint64_t homePa, uint64_t lease,
+    int homeNode, int homeSocket, uint64_t reqId)
+{
+    if (!reqId || !lease || (homePa & 63) || homeNode < 0 || homeSocket < 0)
+        return -1;
+    if (_releaseReqId && (_releaseReqId != reqId || _releasePa != homePa ||
+        _releaseLease != lease || _releaseHome != homeNode ||
+        _releaseSocket != homeSocket)) return -2;
+    const PendingKey key{CoherenceMessageType::EvictResp, reqId};
+    const auto found = _readyResponses.find(key);
+    if (found != _readyResponses.end()) {
+        const auto &r = found->second;
+        if (!_releaseReqId || r.h.homeLinePa != homePa || r.h.epoch != lease ||
+            r.h.srcNode != homeNode || r.h.srcSocket != homeSocket ||
+            r.h.dstNode != _nodeId || r.h.dstSocket != _socketId)
+            return -1;
+        const auto outcome = r.b.evictResp.result;
+        const bool typedSuccess = outcome == UBReleaseResult::Applied ||
+            outcome == UBReleaseResult::Duplicate ||
+            outcome == UBReleaseResult::AlreadyRetiredMatch;
+        const bool ok = typedSuccess ||
+            (outcome == UBReleaseResult::Legacy && r.b.evictResp.success);
+        if (typedSuccess) {
+            CoherenceMessage ack;
+            ack.h.type = CoherenceMessageType::EvictReq;
+            ack.h.srcNode = _nodeId; ack.h.srcSocket = _socketId;
+            ack.h.dstNode = homeNode; ack.h.dstSocket = homeSocket;
+            ack.h.homeNode = homeNode; ack.h.homeSocket = homeSocket;
+            ack.h.requesterNode = _nodeId;
+            ack.h.homeLinePa = homePa; ack.h.epoch = lease;
+            ack.h.reqId = reqId; ack.h.seqNum = _nextSeq++;
+            ack.b.evictReq.receiptAck = true;
+            if (!transportSend(ack)) return -2;
+        }
+        _readyResponses.erase(found);
+        _releaseReqId = 0;
+        if (outcome == UBReleaseResult::AlreadyRetiredMatch) return 2;
+        if (outcome == UBReleaseResult::Stale) return 3;
+        return ok ? 1 : 0;
+    }
+    if (_releaseReqId) return -2;
+    CoherenceMessage request;
+    request.h.type = CoherenceMessageType::EvictReq;
+    request.h.srcNode = _nodeId; request.h.srcSocket = _socketId;
+    request.h.dstNode = homeNode; request.h.dstSocket = homeSocket;
+    request.h.homeNode = homeNode; request.h.homeSocket = homeSocket;
+    request.h.requesterNode = _nodeId;
+    request.h.homeLinePa = homePa; request.h.epoch = lease;
+    request.h.reqId = reqId;
+    request.h.seqNum = _nextSeq++;
+    if (!transportSend(request)) return -1;
+    _releaseReqId = reqId; _releasePa = homePa; _releaseLease = lease;
+    _releaseHome = homeNode; _releaseSocket = homeSocket;
+    scheduleResponseCheck();
+    return -2;
+}
 
 int
 UBAdapter::sendEvictReq(uint64_t homePa, int evictingNode, uint64_t epochVal,
@@ -777,12 +1163,17 @@ UBAdapter::sendEvictReq(uint64_t homePa, int evictingNode, uint64_t epochVal,
               _nodeId, _socketId);
     }
 
-    // Port async: check cached response first
-    if (_port && _lastResponseValid &&
-        _lastResponse.h.type == CoherenceMessageType::EvictResp &&
-        _lastResponse.h.homeLinePa == homePa) {
-        return _lastResponse.b.evictResp.success ? 1 : 0;
+    // Legacy no-ID eviction is explicitly one serial transaction per adapter.
+    // Never consult a controller-global last response from another line.
+    const PendingKey legacyEvict{CoherenceMessageType::EvictResp, 0};
+    auto evict = _readyResponses.find(legacyEvict);
+    if (evict != _readyResponses.end()) {
+        if (evict->second.h.homeLinePa != homePa) return -2;
+        const bool success = evict->second.b.evictResp.success;
+        _readyResponses.erase(evict);
+        return success ? 1 : 0;
     }
+    if (_readyResponses.reserved(legacyEvict)) return -2;
 
     CoherenceMessage req;
     req.h.type = CoherenceMessageType::EvictReq;
@@ -967,11 +1358,14 @@ UBAdapter::sendUpgradeDoneReq(uint64_t homePa, int requesterNode,
     }
 
     // Port async: check cached response first
-    if (_port && _lastResponseValid &&
-        _lastResponse.h.type == CoherenceMessageType::UpgradeDoneResp &&
-        _lastResponse.h.reqId == reqId) {
-        return _lastResponse.b.upgradeDoneResp.accepted ? 1 : 0;
+    const PendingKey doneKey{CoherenceMessageType::UpgradeDoneResp, reqId};
+    auto done = _readyResponses.find(doneKey);
+    if (done != _readyResponses.end()) {
+        const bool accepted = done->second.b.upgradeDoneResp.accepted;
+        _readyResponses.erase(done);
+        return accepted ? 1 : 0;
     }
+    if (_readyResponses.reserved(doneKey)) return -2;
 
     CoherenceMessage req;
     req.h.type = CoherenceMessageType::UpgradeDoneReq;
@@ -1180,6 +1574,8 @@ UBAdapter::sendRecallResp(uint64_t linePa, int ownerNode,
         req.h.flags |= static_cast<uint32_t>(CFLAG_ACCEPTED);
     if (dataReturned)
         req.h.flags |= static_cast<uint32_t>(CFLAG_DATA_RETURNED);
+    if (dataForwarded)
+        req.h.flags |= static_cast<uint32_t>(CFLAG_DATA_FORWARDED);
     if (dataBlk && dataReturned) {
         req.h.flags |= static_cast<uint32_t>(CFLAG_HAS_DATA);
         memcpy(req.b.recallResp.data, dataBlk->getData(0, 64), 64);
@@ -1235,12 +1631,19 @@ bool
 UBAdapter::sendDirectData(const CoherenceMessage &msg)
 {
     if (!_port) return false;
-    return transportSend(msg);
+    if (_directOutputs.empty() && transportSend(msg)) return true;
+    for (const auto &queued : _directOutputs)
+        if (queued.h.reqId == msg.h.reqId && queued.h.homeLinePa == msg.h.homeLinePa &&
+            queued.h.dstNode == msg.h.dstNode && queued.h.dstSocket == msg.h.dstSocket)
+            return true;
+    if (!_directOutputs.push_back(msg)) return false;
+    scheduleResponseCheck();
+    return true;
 }
 
 // ---- Cross-node Recall Request (EPBackend → EPBackend via router) ----
 
-void
+bool
 UBAdapter::sendRecallReqToOwner(int targetNode,
                                  const OuterRecallMsg &recallMsg,
                                  int homeSocket)
@@ -1278,13 +1681,24 @@ UBAdapter::sendRecallReqToOwner(int targetNode,
     if (recallMsg.dataNeeded)
         req.h.flags |= static_cast<uint32_t>(CFLAG_HAS_DATA);
 
-    // Fire-and-forget: no response expected from the remote adapter
-    (void)transportSend(req);
+    // Route intent through the actual Home. It shares the Home's four-credit
+    // window rather than fabricating a second sequence domain for that peer.
+    req.h.flags |= static_cast<uint32_t>(CFLAG_HOME_CONTROL_RELAY);
+    req.h.srcSocket = _socketId;
+    req.h.dstNode = recallMsg.homeNode;
+    req.h.dstSocket = homeSocket;
+    if (!_directOutputs.push_back(req)) {
+        // Existing foreground root still owns the unsent intent; retry cannot
+        // substitute a different identity. This API must be made fallible.
+        return false;
+    }
+    scheduleResponseCheck();
+    return true;
 }
 
 // ---- Cross-node Invalidate Request (EPBackend → EPBackend via router) ----
 
-void
+bool
 UBAdapter::sendInvalidateReqToSharer(int targetNode,
                                       const OuterInvalidateMsg &invMsg,
                                       int homeSocket)
@@ -1317,8 +1731,13 @@ UBAdapter::sendInvalidateReqToSharer(int targetNode,
     req.h.enqueueTick = curTick();
     req.h.readyTick = curTick();
 
-    // Fire-and-forget
-    (void)transportSend(req);
+    req.h.flags |= static_cast<uint32_t>(CFLAG_HOME_CONTROL_RELAY);
+    req.h.srcSocket = _socketId;
+    req.h.dstNode = invMsg.homeNode;
+    req.h.dstSocket = homeSocket;
+    if (!_directOutputs.push_back(req)) return false;
+    scheduleResponseCheck();
+    return true;
 }
 
 // ---- v4-dual-socket: QueryLineMetaReq (async with stable reqId) ----
@@ -1383,6 +1802,7 @@ UBAdapter::sendQueryLineMetaReq(uint64_t homePa, int homeNode, int homeSocket,
 
     _lastResponseValid = false;
     if (!transportSend(req)) {
+        if (outReqId) *outReqId = 0;
         return -1;
     }
 
@@ -1475,8 +1895,8 @@ UBAdapter::sendHomeWritebackNotify(uint64_t homePa, uint64_t epoch,
 
 // Phase 2: typed error response helper for MetaRNF line requests.
 // Always makes best-effort to send a response; never silently drops.
-static void
-sendMetaRNFLineErrorResponse(framework::Port *port,
+void
+UBAdapter::sendMetaRNFLineErrorResponse(framework::Port *port,
                                CoherenceMessageType respType,
                                MetaRNFLineStatus st,
                                uint64_t reqId, uint64_t bucketOffset,
@@ -1499,8 +1919,7 @@ sendMetaRNFLineErrorResponse(framework::Port *port,
         resp.b.metaRNFLineWriteResp.bucketOffset = bucketOffset;
     }
 
-    if (!sendCoherenceMessage(port, resp, curTick(), reqId,
-                              sourceId, targetId)) {
+    if (!sendMetadataReply(resp)) {
         // Port unavailable — log DEBUG-only, not stderr.
         DPRINTF(RubyEP,
                 "[DEBUG-PHASE2] node=%d: cannot send %s for reqId=%lu bucketOffset=0x%lx (no port/buffer)\n",
@@ -1538,8 +1957,7 @@ UBAdapter::recvFromRouter(const CoherenceMessage &msg)
                     msg.h.reqId);
             _lastResponse = msg;
             _lastResponseValid = true;
-            PendingKey key{msg.h.type, msg.h.reqId};
-            _readyResponses[key] = msg;
+            cacheResponse(msg);
             break;
         }
         case CoherenceMessageType::QueryLineMetaResp:
@@ -1547,16 +1965,14 @@ UBAdapter::recvFromRouter(const CoherenceMessage &msg)
             _lastResponse = msg;
             _lastResponseValid = true;
             {
-                PendingKey qk{CoherenceMessageType::QueryLineMetaResp, msg.h.reqId};
-                _readyResponses[qk] = msg;
+                cacheResponse(msg);
             }
             break;
         case CoherenceMessageType::HAPermissionResp:
         case CoherenceMessageType::HAPresenceProbeResp: {
             _lastResponse = msg;
             _lastResponseValid = true;
-            PendingKey key{msg.h.type, msg.h.reqId};
-            _readyResponses[key] = msg;
+            cacheResponse(msg);
             break;
         }
         case CoherenceMessageType::HAPresenceProbeReq:
@@ -1566,12 +1982,27 @@ UBAdapter::recvFromRouter(const CoherenceMessage &msg)
                 warn("UBAdapter node=%d: HA probe received without backend", _nodeId);
             break;
         case CoherenceMessageType::HAPermissionReq:
+        {
+            const unsigned peer = msg.h.srcNode * _numSockets + msg.h.srcSocket;
+            if (peer >= unsigned(_numNodes * _numSockets)) return;
+            MetadataReply *reservation = nullptr;
+            for (unsigned i = peer * 64; i < (peer + 1) * 64; ++i) {
+                auto &out = _permissionReplies[i];
+                if (out.reserved && out.message.h.reqId == msg.h.reqId) return;
+                if (!out.reserved && !reservation) reservation = &out;
+            }
+            // A source holds at most64 permission response promises. Each
+            // grants the destination one reply cell before callback dispatch.
+            panic_if(!reservation, "permission sender exceeded response credit window");
+            reservation->message.h = msg.h;
+            reservation->reserved = true;
             if (_backend)
                 _backend->handleHAPermissionRequest(msg, this);
             else
                 warn("UBAdapter node=%d: HA permission request without backend",
                      _nodeId);
             break;
+        }
         case CoherenceMessageType::HAPermissionAck:
             // Ack is terminal at the endpoint.  The HA controller owns any
             // permission transaction state; gem5 intentionally has none here.
@@ -1638,11 +2069,21 @@ UBAdapter::recvFromRouter(const CoherenceMessage &msg)
         }
 
         case CoherenceMessageType::MetaRNFReadReq: {
+            if (!reserveMetadataReply(msg)) break;
             // UBIO's backstore schema uses compact page IDs. Map the ID into
             // this socket's metadata DRAM range before issuing CHI accesses.
             uint64_t pageId = msg.h.homeLinePa;
             auto *metaRNF = MetaRNFController::getInstance(_nodeId, _socketId);
-            if (!metaRNF) break;
+            if (!metaRNF) {
+                CoherenceMessage error;
+                error.h = msg.h;
+                error.h.type = CoherenceMessageType::MetaRNFReadResp;
+                std::swap(error.h.srcNode, error.h.dstNode);
+                std::swap(error.h.srcSocket, error.h.dstSocket);
+                error.b.metaRNF = UBMetaRNFBody{};
+                sendMetadataReply(error);
+                break;
+            }
             constexpr uint64_t pageBytes = 256;
             uint64_t pagePa = metaRNF->metadataRangeStart() + pageId * pageBytes;
             uint64_t reqId = msg.h.reqId;
@@ -1650,6 +2091,13 @@ UBAdapter::recvFromRouter(const CoherenceMessage &msg)
                 pagePa + pageBytes > metaRNF->metadataRangeEnd()) {
                 warn("UBAdapter node=%d: metadata page ID 0x%lx out of range",
                      _nodeId, pageId);
+                CoherenceMessage error;
+                error.h = msg.h;
+                error.h.type = CoherenceMessageType::MetaRNFReadResp;
+                std::swap(error.h.srcNode, error.h.dstNode);
+                std::swap(error.h.srcSocket, error.h.dstSocket);
+                error.b.metaRNF = UBMetaRNFBody{};
+                sendMetadataReply(error);
                 break;
             }
             auto tport = _port;
@@ -1666,7 +2114,7 @@ UBAdapter::recvFromRouter(const CoherenceMessage &msg)
             for (int i = 0; i < 4; i++) {
                 uint64_t blockPa = pagePa + i * 64;
                 metaRNF->issueRead(blockPa,
-                    [tport, reqId, state, i, pageId, srcNode, srcSocket,
+                    [this, tport, reqId, state, i, pageId, srcNode, srcSocket,
                      dstNode, dstSocket, sourceId, targetId]
                     (bool ok, const MetaRNFController::MetaLine &db) {
                     if (ok) memcpy(&state->buf[i*64], db.data(), 64);
@@ -1681,8 +2129,7 @@ UBAdapter::recvFromRouter(const CoherenceMessage &msg)
                         resp.h.homeLinePa = pageId;
                         resp.b.metaRNF.pagePa = pageId;
                         memcpy(resp.b.metaRNF.data, state->buf, 256);
-                        if (!sendCoherenceMessage(tport, resp, curTick(), reqId,
-                                                  sourceId, targetId))
+                        if (!sendMetadataReply(resp))
                             warn("UBAdapter: failed to send MetaRNFReadResp reqId=%lu",
                                  reqId);
                         delete state;
@@ -1692,15 +2139,32 @@ UBAdapter::recvFromRouter(const CoherenceMessage &msg)
             break;
         }
         case CoherenceMessageType::MetaRNFWriteReq: {
+            if (!reserveMetadataReply(msg)) break;
             uint64_t pageId = msg.h.homeLinePa;
             auto *metaRNF = MetaRNFController::getInstance(_nodeId, _socketId);
-            if (!metaRNF) break;
+            if (!metaRNF) {
+                CoherenceMessage error;
+                error.h = msg.h;
+                error.h.type = CoherenceMessageType::MetaRNFWriteResp;
+                std::swap(error.h.srcNode, error.h.dstNode);
+                std::swap(error.h.srcSocket, error.h.dstSocket);
+                error.h.flags = 0;
+                sendMetadataReply(error);
+                break;
+            }
             constexpr uint64_t pageBytes = 256;
             uint64_t pagePa = metaRNF->metadataRangeStart() + pageId * pageBytes;
             if (pagePa < metaRNF->metadataRangeStart() ||
                 pagePa + pageBytes > metaRNF->metadataRangeEnd()) {
                 warn("UBAdapter node=%d: metadata page ID 0x%lx out of range",
                      _nodeId, pageId);
+                CoherenceMessage error;
+                error.h = msg.h;
+                error.h.type = CoherenceMessageType::MetaRNFWriteResp;
+                std::swap(error.h.srcNode, error.h.dstNode);
+                std::swap(error.h.srcSocket, error.h.dstSocket);
+                error.h.flags = 0;
+                sendMetadataReply(error);
                 break;
             }
             // Phase D2: track completion of all 4 sub-writes, then send
@@ -1736,7 +2200,7 @@ UBAdapter::recvFromRouter(const CoherenceMessage &msg)
                 MetaRNFController::MetaLine ml;
                 memcpy(ml.data(), &msg.b.metaRNF.data[i * 64], 64);
                 metaRNF->issueWrite(pagePa + i * 64, ml,
-                    [ws](bool ok) {
+                    [this, ws](bool ok) {
                         if (!ok) ws->anyFailed = true;
                         if (--ws->pending > 0) return;
                         // All 4 sub-writes done — send ack to UBIO
@@ -1757,9 +2221,7 @@ UBAdapter::recvFromRouter(const CoherenceMessage &msg)
                             resp.h.flags = 0;
                         else
                             resp.h.flags = 1;  // D2: bit 0 = durable
-                        if (!sendCoherenceMessage(ws->port, resp, curTick(),
-                                                  ws->reqId, ws->sourceId,
-                                                  ws->targetId))
+                        if (!sendMetadataReply(resp))
                             warn("UBAdapter: failed to send MetaRNFWriteResp reqId=%lu",
                                  ws->reqId);
                         delete ws;
@@ -1771,6 +2233,7 @@ UBAdapter::recvFromRouter(const CoherenceMessage &msg)
         // ---- Phase 2+3: 64B line operations with typed status ----
         // Req B: ubio sends logical bucketOffset; UBAdapter computes physical PA.
         case CoherenceMessageType::MetaRNFLineReadReq: {
+            if (!reserveMetadataReply(msg)) break;
             uint64_t bucketOffset = msg.b.metaRNFLineReadReq.bucketOffset;
             auto *metaRNF = MetaRNFController::getInstance(_nodeId, _socketId);
             if (!metaRNF) {
@@ -1810,7 +2273,7 @@ UBAdapter::recvFromRouter(const CoherenceMessage &msg)
                 dstNode * _numSockets + dstSocket);
             auto tport = _port;
             metaRNF->issueReadLine(physPa,
-                [tport, reqId, bucketOffset, nodeId = _nodeId, srcSocket,
+                [this, tport, reqId, bucketOffset, nodeId = _nodeId, srcSocket,
                  dstNode, dstSocket, sourceId, targetId]
                 (MetaRNFLineStatus st, const MetaRNFController::MetaLine &data) {
                     CoherenceMessage resp;
@@ -1824,14 +2287,14 @@ UBAdapter::recvFromRouter(const CoherenceMessage &msg)
                     resp.b.metaRNFLineReadResp.bucketOffset = bucketOffset;
                     if (st == MetaRNFLineStatus::Ok)
                         memcpy(resp.b.metaRNFLineReadResp.data, data.data(), 64);
-                    if (!sendCoherenceMessage(tport, resp, curTick(), reqId,
-                                              sourceId, targetId))
+                    if (!sendMetadataReply(resp))
                         warn("UBAdapter: failed to send MetaRNFLineReadResp reqId=%lu",
                              reqId);
                 });
             break;
         }
         case CoherenceMessageType::MetaRNFLineWriteReq: {
+            if (!reserveMetadataReply(msg)) break;
             uint64_t bucketOffset = msg.b.metaRNFLineWriteReq.bucketOffset;
             auto *metaRNF = MetaRNFController::getInstance(_nodeId, _socketId);
             if (!metaRNF) {
@@ -1873,7 +2336,7 @@ UBAdapter::recvFromRouter(const CoherenceMessage &msg)
             MetaRNFController::MetaLine ml;
             memcpy(ml.data(), msg.b.metaRNFLineWriteReq.data, 64);
             metaRNF->issueWriteLine(physPa, ml,
-                [tport, reqId, bucketOffset, nodeId = _nodeId, srcSocket,
+                [this, tport, reqId, bucketOffset, nodeId = _nodeId, srcSocket,
                  dstNode, dstSocket, sourceId, targetId]
                 (MetaRNFLineStatus st) {
                     CoherenceMessage resp;
@@ -1885,8 +2348,7 @@ UBAdapter::recvFromRouter(const CoherenceMessage &msg)
                     resp.h.reqId = reqId;
                     resp.b.metaRNFLineWriteResp.status = st;
                     resp.b.metaRNFLineWriteResp.bucketOffset = bucketOffset;
-                    if (!sendCoherenceMessage(tport, resp, curTick(), reqId,
-                                              sourceId, targetId))
+                    if (!sendMetadataReply(resp))
                         warn("UBAdapter: failed to send MetaRNFLineWriteResp reqId=%lu",
                              reqId);
                 });
@@ -2009,7 +2471,6 @@ UBAdapter::pollVisibleMessages(Tick curT, size_t budget)
         handleResponse(m);
     }
     drainDeferredControls();
-    checkResponseCallbacks();
     return processed;
 }
 
@@ -2060,29 +2521,6 @@ UBAdapter::wakeup()
 }
 
 void
-UBAdapter::checkResponseCallbacks()
-{
-    if (!_port || _readyResponses.empty()) return;
-
-    bool delivered = false;
-    for (auto rit = _readyResponses.begin(); rit != _readyResponses.end(); ) {
-        const PendingKey &rkey = rit->first;
-        auto pit = _pendingByReqId.find(rkey);
-        if (pit != _pendingByReqId.end() && pit->second.onResp) {
-            pit->second.onResp(rit->second);
-            _pendingByReqId.erase(pit);
-            rit = _readyResponses.erase(rit);
-            delivered = true;
-        } else {
-            ++rit;
-        }
-    }
-    if (delivered && _onResponseWired) {
-        DPRINTF(RubyEP, "[RSP-WIRED] node=%d firing wakeup\n", _nodeId);
-    }
-}
-
-void
 UBAdapter::handleResponse(const framework::Message *m)
 {
     if (!_port) return;
@@ -2114,17 +2552,50 @@ UBAdapter::handleResponse(const framework::Message *m)
     }
 
     // Async control messages: enqueue FIFO, process later via drainDeferredControls
+    if (coh->h.type == CoherenceMessageType::UpgradeAckNotify) {
+        recvFromRouter(*coh);
+        return;
+    }
+    if (coh->h.type == CoherenceMessageType::HAPermissionReq) {
+        recvFromRouter(*coh);
+        return;
+    }
+    if (coh->h.type == CoherenceMessageType::RecallReq ||
+        coh->h.type == CoherenceMessageType::InvalidateReq ||
+        coh->h.type == CoherenceMessageType::HAPresenceProbeReq) {
+        const unsigned peer = coh->h.srcNode * _numSockets + coh->h.srcSocket;
+        using Receipt = decltype(_controlReceipts)::Receipt;
+        const auto result = _controlReceipts.receive(peer, coh->h);
+        panic_if(result == Receipt::Invalid,
+                 "Home control violated receive lease node=%d peer=%u reqId=%lu lease=%lu",
+                 _nodeId, peer, coh->h.reqId, coh->h.seqNum);
+        if (result == Receipt::Stale) return;
+        if (result == Receipt::New) {
+            // A higher lease can only be issued after Home received the prior
+            // response. Cancel a queued replay of that retired response before
+            // its slot is reused by the new native callback.
+            _controlOutputs[peer][coh->h.seqNum & 3].queued = false;
+        }
+        if (result == Receipt::Duplicate) {
+            const auto *receipt = _controlReceipts.get(peer, coh->h.seqNum & 3);
+            if (!receipt->active) {
+                auto &out = _controlOutputs[peer][coh->h.seqNum & 3];
+                out.queued = true;
+                drainReliableOutputs();
+            }
+            return;
+        }
+    }
     switch (coh->h.type) {
       case CoherenceMessageType::InvalidateReq:
       case CoherenceMessageType::RecallReq:
-      case CoherenceMessageType::UpgradeAckNotify:
       case CoherenceMessageType::HAPresenceProbeReq:
-      case CoherenceMessageType::HAPermissionReq:
         inform("[ASYNC-CTRL-ENQ] node=%d type=%s reqId=%lu pa=0x%lx src=%d dst=%d curT=%lu depth=%zu",
                _nodeId, coherenceMsgTypeName(coh->h.type), coh->h.reqId,
                coh->h.homeLinePa, coh->h.srcNode, coh->h.dstNode,
                curTick(), _deferredControls.size() + 1);
-        _deferredControls.push_back(*coh);
+        panic_if(!_deferredControls.push_back(cc::glob::ControlFrame(*coh)),
+                 "control lease accounting exceeded reserved receive storage");
         return;
       default:
         break;
@@ -2159,22 +2630,12 @@ UBAdapter::handleResponse(const framework::Message *m)
         return;
     }
 
-    // Dispatch via _pendingByReqId — now keyed by (respType, reqId)
-    PendingKey key{coh->h.type, coh->h.reqId};
-    auto it = _pendingByReqId.find(key);
-
+    // Responses are consumed by the retry-based callers using exact identity.
     // Store in ready-response cache for retry-based sendReadReq
-    _readyResponses[key] = *coh;
+    cacheResponse(*coh);
 
-    // Dedup guard release: once the ReadResp for this reqId has landed in the
-    // ready-response cache, the outer request is no longer "in flight" — the
-    // next sendReadReq retry will consume the cached response (and would erase
-    // the marker there anyway). Clear it here unconditionally so the dedup
-    // marker can never outlive its response, even on paths without an onResp
-    // callback.
-    if (coh->h.type == CoherenceMessageType::ReadResp) {
-        _inflightReadReqs.erase(coh->h.reqId);
-    }
+    // The read reservation includes the response slot. Keep it until the
+    // exact retry consumes the payload, not merely until transport arrival.
     if (coh->h.type == CoherenceMessageType::ClearResp)
     {
         _inflightClearReqs.erase(coh->h.reqId);
@@ -2197,13 +2658,6 @@ UBAdapter::handleResponse(const framework::Message *m)
                 _nodeId, _socketId, static_cast<int>(coh->h.type),
                 coh->h.reqId);
         _onResponseWired();
-    }
-
-    // If there's a direct callback, also invoke it
-    if (it != _pendingByReqId.end() && it->second.onResp) {
-        _inflightReadReqs.erase(coh->h.reqId);
-        it->second.onResp(*coh);
-        _pendingByReqId.erase(it);
     }
 
     // Event-driven completion of a held SnpCleanInvalid-upgrade: an
@@ -2256,9 +2710,56 @@ UBAdapter::drainDeferredControls()
 {
     if (_drainingDeferredControls) return;
     _drainingDeferredControls = true;
-    while (!_deferredControls.empty()) {
-        CoherenceMessage msg = _deferredControls.front();
-        _deferredControls.pop_front();
+    for (auto selected = _deferredControls.begin(); selected != _deferredControls.end(); ) {
+        // Independent lines may drain around a blocked control. A failed
+        // backend admission retains the exact original payload, not a fake ACK.
+        CoherenceMessage msg = selected->expand();
+        const auto pa = msg.h.localLinePa ? msg.h.localLinePa : msg.h.homeLinePa;
+        if (_backend && msg.h.type == CoherenceMessageType::RecallReq) {
+            if (!_backend->canAcceptRecall(pa, msg.h.reqId, _socketId)) {
+                ++selected;
+                continue;
+            }
+            OuterRecallMsg recall;
+            recall.linePa = msg.h.homeLinePa;
+            recall.ownerLocalPa = msg.h.localLinePa;
+            recall.ownerNode = msg.h.targetNode;
+            recall.homeNode = msg.h.homeNode;
+            recall.epoch = msg.h.epoch;
+            recall.reqId = msg.h.reqId;
+            recall.isReadRequest = msg.h.flags & static_cast<uint32_t>(CFLAG_IS_READ_RECALL);
+            recall.dataNeeded = msg.h.flags & static_cast<uint32_t>(CFLAG_HAS_DATA);
+            recall.requesterNode = msg.h.requesterNode;
+            recall.requesterSocket = msg.h.ingressSocket;
+            recall.sourceSocket = _socketId;
+            if (!_backend->handleRecallRequest(recall)) {
+                ++selected;
+                continue;
+            }
+            selected = _deferredControls.erase(selected);
+            continue;
+        }
+        if (msg.h.type == CoherenceMessageType::InvalidateReq && _backend) {
+            if (!_backend->canAcceptInvalidation(pa, msg.h.reqId, _socketId)) {
+                ++selected;
+                continue;
+            }
+            OuterInvalidateMsg inv;
+            inv.linePa = msg.h.homeLinePa;
+            inv.sharerLocalPa = msg.h.localLinePa;
+            inv.sharerNode = msg.h.targetNode;
+            inv.homeNode = msg.h.homeNode;
+            inv.sourceSocket = _socketId;
+            inv.epoch = msg.h.epoch;
+            inv.reqId = msg.h.reqId;
+            if (!_backend->handleInvalidationRequest(inv)) {
+                ++selected;
+                continue;
+            }
+            selected = _deferredControls.erase(selected);
+            continue;
+        }
+        selected = _deferredControls.erase(selected);
         inform("[ASYNC-CTRL-DRAIN] node=%d type=%s reqId=%lu pa=0x%lx curT=%lu remaining=%zu",
                _nodeId, coherenceMsgTypeName(msg.h.type), msg.h.reqId,
                msg.h.homeLinePa, curTick(), _deferredControls.size());

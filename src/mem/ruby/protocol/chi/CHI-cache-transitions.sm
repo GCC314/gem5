@@ -40,6 +40,24 @@
 ////////////////////////////////////////////////////////////////////////////
 
 // Allocate resources and move to the ready queue
+transition({I,SC,UC,UD,SD,UD_T,RU,RSC,RSD,RUSC,RUSD,
+            SC_RSC,SD_RSC,SD_RSD,UC_RSC,UC_RU,UD_RU,UD_RSD,UD_RSC,
+            BUSY_BLKD,BUSY_INTR}, EpAcquireControl) {
+  Receive_AcquireControl;
+  Pop_RespInQueue;
+}
+transition({BUSY_BLKD,BUSY_INTR}, EpRestartRead, BUSY_BLKD) {
+  Pop_TriggerQueue;
+  Restart_RevokedRead;
+  Initiate_ReadShared_Miss;
+  ProcessNextState;
+}
+transition({BUSY_BLKD,BUSY_INTR}, EpRestartUnique, BUSY_BLKD) {
+  Pop_TriggerQueue;
+  Restart_RevokedRead;
+  Initiate_ReadUnique_Miss;
+  ProcessNextState;
+}
 transition({I,SC,UC,SD,UD,RU,RSC,RSD,RUSD,SC_RSC,UC_RSC,SD_RSC,UD_RSC,UC_RU,UD_RU,UD_RSD,SD_RSD,RUSC
             BUSY_INTR,BUSY_BLKD}, AllocRequest) {
   AllocateTBE_Request;
@@ -383,6 +401,13 @@ transition({BUSY_BLKD, BUSY_INTR}, FinishMakeReadUnique, BUSY_BLKD) {
 }
 
 // CleanUnique
+
+transition({BUSY_BLKD,BUSY_INTR}, EpParkedInvalidate, BUSY_BLKD) {
+  Initiate_ParkedProxy;
+  Initiate_CleanUnique;
+  Pop_ReqRdyQueue;
+  ProcessNextState;
+}
 
 transition({I, SC, UC, SD, UD, RU, RSC, RSD, RUSD, RUSC,
             SC_RSC, SD_RSD, SD_RSC, UC_RSC, UC_RU, UD_RU, UD_RSD, UD_RSC}, CleanUnique, BUSY_BLKD) {

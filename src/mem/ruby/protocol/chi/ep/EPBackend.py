@@ -10,6 +10,8 @@ class EPBackend(SimObject):
     cxx_class = "gem5::ruby::EPBackend"
 
     node_id = Param.Int(0, "Node ID for this backend")
+    authority_entries = Param.Unsigned(4096, "Fixed authority admission geometry (1..4096)")
+    boundary_demand_slots = Param.Unsigned(64, "Ordinary BTT admission credits (1..64)")
     ruby_system = Param.RubySystem("")
     ub_adapter = Param.UBAdapter(NULL, "UBAdapter for message-path UBCC access (legacy, use ub_adapters)")
     ub_adapters = VectorParam.UBAdapter([], "per-socket UBAdapters (index == socket_id); "

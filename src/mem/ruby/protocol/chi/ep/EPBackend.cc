@@ -1,4 +1,5 @@
 #include "mem/ruby/protocol/chi/ep/EPBackend.hh"
+#include "debug/RubyEPVerbose.hh"
 
 #include <cstring>
 #include <algorithm>
@@ -75,6 +76,7 @@ EPBackend::EPBackend(const Params &p)
     _metadataPrivateSize(p.metadata_private_size),
     _lastGrantDataBlock(64),  // cache line size = 64 bytes
     _lastGrantDataValid(false),
+    _authority(64, p.authority_entries),
     _lastSideband{false, 0, 0, false, -1, -1, -1},
     _recallReceivedCount(0),
     _recallResponseSentCount(0),
@@ -86,6 +88,12 @@ EPBackend::EPBackend(const Params &p)
                        p.ha_endpoint_profile == "ha"),
     _losslessOneWayClearEnabled(p.clear_profile == "lossless-oneway")
 {
+    fatal_if(p.authority_entries < 1 || p.authority_entries > 4096,
+             "authority_entries must be 1..4096");
+    fatal_if(!_boundaryTransactions.setOrdinaryLimit(p.boundary_demand_slots),
+             "boundary_demand_slots must be 1..64 before admission");
+    inform("[EP-CREDIT-GEOMETRY] node=%d ordinary=%u control=8 escape=1 physical=73",
+           _nodeId, p.boundary_demand_slots);
     fatal_if(p.ha_endpoint_profile != "ubcc" &&
              p.ha_endpoint_profile != "ha-vi" &&
              p.ha_endpoint_profile != "ha",
@@ -266,6 +274,211 @@ EPBackend::wakeup()
         if (adapter && adapter->port())
             adapter->wakeup();
     }
+    progressAuthorityRelease();
+}
+
+bool EPBackend::authorityKey(Addr pa, uint32_t &key) const
+{
+    int view = _nodeId;
+    if (!_addrMap.isDsm(view, pa)) view = _addrMap.srcNodeId(pa);
+    return BoundaryAuthorityTable::keyFromAddress(_addrMap, view, pa, 0, key);
+}
+
+EPBackend::AuthorityView::iterator
+EPBackend::AuthorityView::find(uint64_t pa) const
+{
+    uint32_t key;
+    if (!backend.authorityKey(pa, key)) return {};
+    auto *e = backend._authority.metadata(backend._authority.find(key));
+    if (!e) return {};
+    const int home = (key >> 23) & 63;
+    const Addr homePa = backend._addrMap.buildDsmPA(home, home,
+        uint64_t(key & 0x1fffff) << 6, (key >> 21) & 3);
+    const auto pending = backend._pendingReadTxns.find(homePa);
+    const auto *p = pending == backend._pendingReadTxns.end() ? nullptr : &pending->second;
+    return iterator(Reference{e->access, e->epoch, pa,
+        p && p->neededPerm ? OuterReqType::GlobalReadUnique : OuterReqType::GlobalReadShared,
+        p ? p->reqId : 0, p && p->writeIntent, home,
+        p ? p->outerStartTick : 0, e->epoch, e, ha});
+}
+
+size_t EPBackend::ResidentView::count(Addr pa) const
+{
+    uint32_t key;
+    if (!backend.authorityKey(pa, key)) return 0;
+    const auto *e = backend._authority.get(backend._authority.find(key));
+    return e && e->resident;
+}
+
+void EPBackend::ResidentView::insert(Addr pa)
+{
+    uint32_t key;
+    fatal_if(!backend.authorityKey(pa, key), "invalid HA resident address");
+    auto *e = backend._authority.metadata(backend._authority.find(key));
+    fatal_if(!e, "HA native install without reserved authority");
+    e->resident = true;
+}
+
+void EPBackend::ResidentView::erase(Addr pa)
+{
+    uint32_t key;
+    if (!backend.authorityKey(pa, key)) return;
+    if (auto *e = backend._authority.metadata(backend._authority.find(key)))
+        e->resident = false;
+}
+
+bool EPBackend::reserveAuthority(Addr pa)
+{
+    uint32_t key;
+    if (!authorityKey(pa, key)) return false;
+    if (const auto *e = _authority.get(_authority.find(key)))
+        return e->state == BoundaryAuthorityTable::State::Live;
+    const auto result = _authority.tryReserve(key, 0);
+    if (result.result == BoundaryAuthorityTable::Admission::ReleaseCandidate)
+        startAuthorityRelease(result.token);
+    return result.result == BoundaryAuthorityTable::Admission::Reserved;
+}
+
+void EPBackend::startAuthorityRelease(BoundaryStableToken victim)
+{
+    if (_authorityRelease.stable.valid() || !_epRnfCtrl) return;
+    const auto *old = _authority.get(victim);
+    if (!old || old->refs || old->state != BoundaryAuthorityTable::State::Live) return;
+    const int home = (old->key >> 23) & 63, socket = (old->key >> 21) & 3;
+    const Addr offset = uint64_t(old->key & 0x1fffff) << 6;
+    const Addr pa = _addrMap.buildDsmPA(_nodeId, home, offset, socket);
+    const Addr homePa = _addrMap.buildDsmPA(home, home, offset, socket);
+    if (_pendingReadTxns.count(homePa)) return;
+    const auto grant = _pendingGrantTxns.find(homePa);
+    if (grant != _pendingGrantTxns.end() && grant->second.valid) return;
+    if (_pendingUpgradeTxns.count(pa)) return;
+    for (const auto &inv : _pendingInvalidations)
+        if (inv.first.second == pa) return;
+    for (const auto &recall : _pendingRecalls)
+        if (std::get<0>(recall) == homePa) return;
+    if (!_epRnfCtrl->canStartBoundaryControl(pa) ||
+        _boundaryTransactions.find(pa).valid()) return;
+    fatal_if(_releaseSequence >= (1ULL << 48), "authority release ID exhausted");
+    const uint64_t id = (0xedULL << 56) | (uint64_t(_nodeId) << 48) | _releaseSequence;
+    for (auto *snf : _epSnfs)
+        if (snf && !snf->canParkAcquisitions(pa, id)) return;
+    const uint64_t identity = old->epoch;
+    const auto access = old->access;
+    BoundaryStableToken release;
+    if (_authority.beginRelease(victim, release) != BoundaryResult::Applied) return;
+    BoundaryTransactions::Token ticket;
+    const auto result = _boundaryTransactions.tryOperation(pa, identity, _nodeId,
+        BoundaryOperation::Release, id, socket, BoundaryPool::Escape,
+        release, {}, ticket, _authority);
+    if (result != BoundaryResult::Applied) {
+        _authority.cancelRelease(release);
+        return;
+    }
+    ++_releaseSequence;
+    auto &r = _authorityRelease;
+    r.stable = release; r.ticket = ticket; r.localPa = pa;
+    r.homePa = homePa;
+    r.identity = identity; r.reqId = id; r.home = home; r.socket = socket;
+    r.access = access;
+    auto launch = [this, release, id, pa, socket] {
+        _epRnfCtrl->startReadUnique(pa,
+            [this, release, id](bool ok, const DataBlock &data, bool valid) {
+                auto &r = _authorityRelease;
+                if (r.reqId != id || r.stable.generation != release.generation ||
+                    r.stable.slot != release.slot) return;
+                fatal_if(!ok, "authority native release failed; custody retained");
+                fatal_if(!valid && r.access == RequesterLineState::R_M &&
+                         !_haEndpointEnabled, "authority release lost dirty owner data");
+                r.nativeDone = true; r.dataValid = valid;
+                if (valid) r.data = data;
+                for (auto *snf : _epSnfs)
+                    if (snf) snf->resumeAcquisition(r.localPa, id);
+                progressAuthorityRelease();
+            }, socket);
+    };
+    unsigned branches = 0;
+    for (auto *snf : _epSnfs) if (snf && snf->acquisitionCount(pa)) ++branches;
+    if (!branches) launch();
+    else {
+        auto remaining = std::make_shared<unsigned>(branches);
+        for (auto *snf : _epSnfs) {
+            if (!snf || !snf->acquisitionCount(pa)) continue;
+            fatal_if(!snf->parkAcquisition(pa, id, [remaining, launch] {
+                if (--*remaining == 0) launch();
+            }), "authority release lost prechecked Park admission");
+        }
+    }
+    inform("[EP-AUTHORITY-RELEASE] phase=native node=%d pa=%#lx id=%lu epoch=%lu\n",
+           _nodeId, pa, id, identity);
+}
+
+void EPBackend::progressAuthorityRelease()
+{
+    auto &r = _authorityRelease;
+    if (!r.stable.valid() || !r.nativeDone) return;
+    auto *adapter = getUBAdapter(r.socket);
+    if (!adapter) return;
+    bool homeDone = r.homeDone;
+    if (!homeDone && !_haEndpointEnabled && r.access == RequesterLineState::R_M) {
+        const int result = handleWritebackWithMeta(r.localPa, false,
+            r.data.getData(0, 64), r.identity, _nodeId, r.socket, &r.writeId);
+        homeDone = result == 1;
+    } else if (!homeDone) {
+        if (r.dataValid && !r.persisted && !r.externalControlDone) {
+            // Coherent capture is published before a clean/VI holder is dropped.
+            if (!r.writeId) r.writeId = r.reqId;
+            const int result = publishInternalWriteback(r.homePa, r.writeId, ~0ULL,
+                r.data.getData(0, 64), r.home, r.socket, r.socket, r.writeId);
+            if (result != 1) return;
+            r.persisted = true;
+        }
+        if (!r.identity) {
+            // Only a never-granted reservation can lack an authority identity.
+            if (r.access != RequesterLineState::R_I) return;
+            homeDone = true;
+        } else {
+            const int result = adapter->sendConditionalRelease(r.homePa, r.identity,
+                r.home, r.socket, r.reqId);
+            if (result == 2 || (result == 3 && r.externalControlDone))
+                inform("[EP-RETIREMENT-PROOF] node=%d keypa=%#lx lease=%lu release=%lu slot=%u generation=%lu kind=%s\n",
+                    _nodeId, r.homePa, r.identity, r.reqId, r.stable.slot,
+                    r.stable.generation, result == 2 ? "home-exact" : "native-control-exact");
+            homeDone = result == 1 || (_haEndpointEnabled && (result == 2 ||
+                (result == 3 && r.externalControlDone)));
+        }
+    }
+    if (!homeDone) return;
+    r.homeDone = true;
+    for (auto *snf : _epSnfs)
+        if (snf && snf->acquisitionCount(r.localPa)) return;
+    if (const auto *ticket = _boundaryTransactions.get(r.ticket)) {
+        if (!ticket->operationDone)
+            fatal_if(_boundaryTransactions.finishOperation(r.ticket,
+                BoundaryOperation::Release, r.reqId, r.socket) != BoundaryResult::Applied,
+                "authority release transaction mismatch");
+    }
+    if (_boundaryTransactions.get(r.ticket)) return;
+    fatal_if(_authority.completeRelease(r.stable, true) != BoundaryResult::Applied,
+             "authority release premature retirement");
+    inform("[EP-AUTHORITY-RELEASE] phase=retired node=%d pa=%#lx id=%lu\n",
+           _nodeId, r.localPa, r.reqId);
+    r = AuthorityRelease{};
+}
+
+bool EPBackend::holdAuthority(Addr pa, BoundaryBorrowToken &borrow)
+{
+    if (borrow.valid()) return true;
+    if (!reserveAuthority(pa)) return false;
+    uint32_t key;
+    if (!authorityKey(pa, key)) return false;
+    return _authority.borrow(_authority.find(key), borrow) == BoundaryResult::Applied;
+}
+
+void EPBackend::closeAuthority(BoundaryBorrowToken borrow)
+{
+    if (borrow.valid())
+        fatal_if(_authority.dropBorrow(borrow) != BoundaryResult::Applied,
+                 "nativeClose authority borrow identity mismatch");
 }
 
 int
@@ -280,10 +493,36 @@ EPBackend::requestHAPermission(uint64_t linePa, HAOperation operation,
     UBAdapter *adapter = getUBAdapter(sourceSocket);
     if (!adapter)
         return -1;
-    return adapter->sendHAPermissionReq(
+    if (!reserveAuthority(linePa)) return -2;
+    HAGrantReceipt *receipt = nullptr;
+    for (auto &entry : _haGrantReceipts) {
+        if (entry.live && entry.homePa == linePa && entry.socket == sourceSocket &&
+            entry.reqId == ioReqId) {
+            receipt = &entry;
+            break;
+        }
+    }
+    if (!receipt) {
+        for (auto &entry : _haGrantReceipts) {
+            if (!entry.live) { receipt = &entry; break; }
+        }
+        if (!receipt) return -2;
+        *receipt = {linePa, ioReqId, 0, sourceSocket, true};
+        if (!holdAuthority(linePa, receipt->borrow)) { *receipt = {}; return -2; }
+    }
+    const int result = adapter->sendHAPermissionReq(
         linePa, operation, permissionEpoch, byteMask, writeData,
         dstNode, dstSocket,
         ioReqId, outResp);
+    receipt->reqId = ioReqId;
+    if (result == 1 && outResp.status == HAStatus::Ok) {
+        fatal_if(!outResp.leaseId, "HA grant missing Home holder identity");
+        receipt->leaseId = outResp.leaseId;
+    } else if (result == 1 || (result < 0 && result != -2 && !ioReqId)) {
+        closeAuthority(receipt->borrow);
+        *receipt = {};
+    }
+    return result;
 }
 
 bool
@@ -328,8 +567,17 @@ EPBackend::acknowledgeHAPermission(uint64_t linePa, HAOperation operation,
                                    int sourceSocket)
 {
     UBAdapter *adapter = getUBAdapter(sourceSocket);
-    return adapter && adapter->sendHAPermissionAck(
+    const bool accepted = adapter && adapter->sendHAPermissionAck(
         linePa, operation, status, permissionEpoch, dstNode, dstSocket, reqId);
+    return accepted;
+}
+
+void
+EPBackend::notifyHAAckHandedOff(uint64_t linePa, uint64_t reqId, int sourceSocket)
+{
+        for (auto &entry : _haGrantReceipts)
+            if (entry.live && entry.homePa == linePa && entry.socket == sourceSocket &&
+                entry.reqId == reqId) { closeAuthority(entry.borrow); entry = {}; break; }
 }
 
 void
@@ -351,6 +599,12 @@ EPBackend::recordHAInstall(uint64_t localLinePa, HAOperation operation,
     entry.writeIntent = operation == HAOperation::Write;
     entry.homeNode = homeNode;
     entry.outerStartTick = 0;
+    const uint64_t homePa = _addrMap.buildDsmPA(homeNode, homeNode,
+        _addrMap.dsmOffset(localLinePa), _addrMap.homeSocket(_nodeId, localLinePa));
+    for (const auto &receipt : _haGrantReceipts)
+        if (receipt.live && receipt.homePa == homePa && receipt.reqId == reqId &&
+            receipt.socket == sourceSocket) entry.leaseId = receipt.leaseId;
+    fatal_if(!entry.leaseId, "HA install lacks retained Home lease");
     _haRequesterLines[{sourceSocket, localLinePa}] = entry;
 }
 
@@ -556,7 +810,7 @@ EPBackend::handleHAPresenceProbeRequest(const CoherenceMessage &request,
                     if (ok)
                         invalidateHADataCaches(targetSocket, localPa);
                     complete(ok);
-                });
+                }, targetSocket);
         }
     } else {
         complete(false);
@@ -761,6 +1015,7 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
     uint64_t homePa = _addrMap.buildDsmPA(homeNode, homeNode, offset, homeSocket);
 
     auto pendingRead = _pendingReadTxns.find(homePa);
+    if (!reserveAuthority(line_pa)) return -2;
     if (pendingRead != _pendingReadTxns.end()) {
         PendingReadTxn &txn = pendingRead->second;
         if (txn.localLinePa != line_pa || txn.sourceAdapter != adapterIdx ||
@@ -934,7 +1189,9 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
             }
         }
         if (pgt != _pendingGrantTxns.end() && pgt->second.valid) {
-            PendingGrantTxn &txn = pgt->second;
+            // Completion may retire the owning descriptor. Keep the original
+            // wire identity and performance metadata independent of its storage.
+            const PendingGrantTxn txn = pgt->second;
             const bool sameSource = txn.sourceAdapter == adapterIdx;
             if (_losslessOneWayClearEnabled && txn.clearQueued)
                 return -2;
@@ -1071,6 +1328,9 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
 
     if (pendingRead == _pendingReadTxns.end()) {
         PendingReadTxn txn;
+        txn.ticket = _boundaryTransactions.find(line_pa);
+        if (!_boundaryTransactions.get(txn.ticket) ||
+            !_boundaryTransactions.get(txn.ticket)->foregroundId) return -2;
         txn.homePa = homePa;
         txn.localLinePa = line_pa;
         txn.homeNode = homeNode;
@@ -1082,6 +1342,11 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
         txn.writeIntent = writeIntent;
         txn.outerStartTick = entry.outerStartTick;
         _pendingReadTxns.emplace(homePa, txn);
+        if ((line_pa & 0xffffffffffULL) == 0x10c21280ULL) {
+            DPRINTF(RubyEPVerbose, "[INV147] stage=OUTER_READ_CREATE node=%d localPA=%#lx homePA=%#lx key=%#lx socket=%d epoch=%lu req=%lu perm=%d write=%d retry=%d\n",
+                    _nodeId, line_pa, homePa, line_pa & 0xffffffffffULL,
+                    adapterIdx, entry.epoch, reqIdVal, neededPerm, writeIntent, isRetry);
+        }
         DPRINTF(RubyEP,
                 "[PENDING-READ-SAVE] node=%d localPa=0x%lx homePa=0x%lx "
                 "sourceSocket=%d epoch=%lu reqId=%lu perm=%d write=%d\n",
@@ -1194,7 +1459,8 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
                 "EPBackend node_id=%d: routing recall to owner "
                 "EPBackend node %d via UBAdapter\n",
                 _nodeId, recallOwnerNode);
-        getUBAdapter(0)->sendRecallReqToOwner(recallOwnerNode, recallMsg, homeSocket);
+        if (!getUBAdapter(adapterIdx)->sendRecallReqToOwner(recallOwnerNode, recallMsg, homeSocket))
+            return -2;
     }
 
     // ---- M8: Invalidation now owned by Home UBCC (direct fanout) ----
@@ -1276,6 +1542,7 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
     // upgrade_invalidate_fix D5: save PendingGrantTxn for Clear tuple correctness
     {
         PendingGrantTxn txn;
+        txn.ticket = _pendingReadTxns.at(homePa).ticket;
         txn.valid = true;
         txn.linePa = homePa;
         txn.localLinePa = line_pa;
@@ -1381,6 +1648,7 @@ EPBackend::handleRemoteMiss(uint64_t line_pa, int neededPerm, bool writeIntent,
     if (clearRet == -2) return -2;
     if (clearRet <= 0)
         return -1;
+    _pendingGrantTxns.erase(homePa);
 
     // ---- M6: Clear outer txn pending and signal completion (after Clear) ----
     if (_epRnfCtrl) {
@@ -1465,6 +1733,10 @@ EPBackend::notifyOneWayClearHandedOff(
         return;
     }
     const PendingGrantTxn txn = txnIt->second;
+    if (const auto *owner = _boundaryTransactions.get(txn.ticket)) {
+        _boundaryTransactions.finishForeground(txn.ticket, owner->foregroundId,
+            owner->foregroundSocket, BoundaryTransactions::HomeCommit);
+    }
     inform("[PENDING-GRANT-ERASE] node=%d localPa=0x%lx homePa=0x%lx "
            "sourceSocket=%d reqId=%lu reason=oneway_transport_handoff\n",
            _nodeId, txn.localLinePa, homePa, sourceSocket, reqId);
@@ -1492,6 +1764,7 @@ EPBackend::handleRemoteDemandMiss(uint64_t line_pa, int neededPerm,
                                   bool writeIntent, int ingressSocket,
                                   int& outHomeNode)
 {
+    if (!reserveAuthority(line_pa)) return -2;
     // HA mode must enter handleRemoteMiss without mutating legacy requester
     // state; that function branches to HAPermissionReq before all legacy work.
     if (!_haEndpointEnabled) {
@@ -1688,6 +1961,10 @@ EPBackend::getStoreAuthorization(uint64_t linePa, int sourceSocket,
                                   uint64_t &permissionEpoch) const
 {
     requesterNode = _nodeId;
+    uint32_t authority;
+    if (!authorityKey(linePa, authority)) return false;
+    const auto *stable = _authority.get(_authority.find(authority));
+    if (!stable || stable->state != BoundaryAuthorityTable::State::Live) return false;
     if (_haEndpointEnabled) {
         auto it = _haRequesterLines.find({sourceSocket, linePa});
         if (it != _haRequesterLines.end()) {
@@ -1820,6 +2097,17 @@ EPBackend::diagnoseExpectedGrant(int neededPerm, bool writeIntent) const
 // Default True enables direct-forward (owner→requester bypass).
 
 bool
+EPBackend::canAcceptRecall(uint64_t localPa, uint64_t reqId, int socket) const
+{
+    if (_haEndpointEnabled) return true; // Preserve HA per-store/probe admission.
+    const auto *entry = _boundaryTransactions.get(_boundaryTransactions.find(localPa));
+    if (entry && entry->recallId == reqId && entry->recallSocket == socket)
+        return true; // Exact duplicate is coalesced before CHI admission.
+    return _epRnfCtrl && _epRnfCtrl->canStartBoundaryControl(localPa) &&
+        (_haEndpointEnabled || _boundaryTransactions.canRecall(localPa, reqId, socket));
+}
+
+bool
 EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
 {
     if (_verboseLog) {
@@ -1847,6 +2135,32 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
         fatal("EPBackend node_id=%d: recall target mismatch "
               "expected=%d got=%d\n",
               _nodeId, recallMsg.ownerNode, _nodeId);
+    }
+
+    const uint64_t boundaryPa = recallMsg.ownerLocalPa != 0 ?
+        recallMsg.ownerLocalPa : recallMsg.linePa;
+    if (_pendingRecalls.count(std::make_tuple(recallMsg.linePa,
+            recallMsg.homeNode, recallMsg.epoch, recallMsg.reqId,
+            recallMsg.sourceSocket)))
+        return true;
+    BoundaryTransactions::Token boundaryToken;
+    if (!_haEndpointEnabled) {
+        if (!canAcceptRecall(boundaryPa, recallMsg.reqId, recallMsg.sourceSocket))
+            return false;
+        // Snapshot BEFORE revoking requester access. A replacement already in
+        // flight owns the same entry and its incarnation cannot be overwritten.
+        const auto permission = inspectRequesterState(boundaryPa);
+        const bool custody = permission.valid &&
+            permission.state == static_cast<int>(RequesterLineState::R_M);
+        fatal_if(custody && permission.epoch != recallMsg.epoch,
+                 "Recall cannot relabel dirty custody PA=%#lx held=%lu incoming=%lu",
+                 boundaryPa, permission.epoch, recallMsg.epoch);
+        boundaryToken = _boundaryTransactions.recall(
+            boundaryPa, recallMsg.epoch, recallMsg.ownerNode, custody,
+            recallMsg.reqId, recallMsg.sourceSocket);
+        fatal_if(!boundaryToken.valid(),
+                 "Recall boundary incarnation mismatch PA=%#lx epoch=%lu",
+                 boundaryPa, recallMsg.epoch);
     }
 
     // Store recall message for inspection
@@ -1944,8 +2258,26 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
         // R2: Clear stale recall capture data before initiating new recall
         setRecallCaptureData(DataBlock(64), false);
         _epRnfCtrl->startReadShared(ownerLocalPa,
-            [this, capturedMsg](bool success, const DataBlock &capturedData,
+            [this, capturedMsg, boundaryToken](bool success, const DataBlock &capturedData,
                                 bool capturedDataValid) {
+                if (boundaryToken.valid()) {
+                    const auto *entry = _boundaryTransactions.get(boundaryToken);
+                    fatal_if(!entry, "stale RecallShared boundary completion");
+                    const bool merged = entry->persisted &&
+                        entry->mergedRecallId == capturedMsg.reqId;
+                    fatal_if(success && !capturedDataValid && entry->custody &&
+                                 !merged && capturedMsg.dataNeeded,
+                             "RecallShared lost native data custody");
+                    fatal_if(!_boundaryTransactions.finishRecall(boundaryToken,
+                                 capturedMsg.reqId, capturedMsg.sourceSocket),
+                             "RecallShared boundary identity mismatch");
+                    if (merged) {
+                        _pendingRecalls.erase(std::make_tuple(capturedMsg.linePa,
+                            capturedMsg.homeNode, capturedMsg.epoch,
+                            capturedMsg.reqId, capturedMsg.sourceSocket));
+                        return; // Home already published this exact parent.
+                    }
+                }
                 if (_verboseLog) {
                 DPRINTF(RubyEP, "[RECALL-DIAG] node=%d ReadShared callback success=%d valid=%d\n",
                         _nodeId, success, capturedDataValid);
@@ -1983,24 +2315,23 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
                             CoherenceMessage directData;
                             directData.h.type = CoherenceMessageType::ReadResp;
                             directData.h.srcNode = _nodeId;
-                            directData.h.srcSocket = 0;
+                            directData.h.srcSocket = capturedMsg.sourceSocket;
                             directData.h.dstNode = capturedMsg.requesterNode;
                             directData.h.dstSocket = capturedMsg.requesterSocket;
                             directData.h.homeNode = capturedMsg.homeNode;
-                            directData.h.homeSocket = 0;
+                            directData.h.homeSocket = _addrMap.homeSocket(capturedMsg.homeNode, capturedMsg.linePa);
                             directData.h.homeLinePa = capturedMsg.linePa;
                             directData.h.epoch = capturedMsg.epoch;
                             // C4: reqId=0 so this ReadResp is NOT consumed
                             // by the requester's synchronous sendReadReq poll.
                             // The push-grant from home carries the full metadata.
-                            directData.h.reqId = 0;
+                            directData.h.reqId = capturedMsg.reqId;
                             directData.h.flags = static_cast<uint32_t>(CFLAG_DATA_FORWARDED)
                                                | static_cast<uint32_t>(CFLAG_HAS_DATA)
                                                | static_cast<uint32_t>(CFLAG_DATA_RETURNED);
                             memcpy(directData.b.readResp.grantData,
                                    resp.dataPayload.getData(0, 64), 64);
-                            getUBAdapter(0)->sendDirectData(directData);
-                            resp.dataForwarded = true;
+                            resp.dataForwarded = getUBAdapter(capturedMsg.sourceSocket)->sendDirectData(directData);
                             resp.dataForwardedTo = capturedMsg.requesterNode;
                             if (_verboseLog) {
                             DPRINTF(RubyEP, "[C4-FORWARD] RS node=%d forward data to requester=%d PA=0x%lx\n",
@@ -2010,7 +2341,7 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
                     }
                 }
                 sendRecallResponse(resp);
-            });
+            }, capturedMsg.sourceSocket);
     } else {
         // Write recall: ReadUnique with RecallUnique proxy op
         if (_verboseLog) {
@@ -2025,8 +2356,26 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
         // R2: Clear stale recall capture data before initiating new recall
         setRecallCaptureData(DataBlock(64), false);
         _epRnfCtrl->startReadUnique(ownerLocalPa,
-            [this, capturedMsg](bool success, const DataBlock &capturedData,
+            [this, capturedMsg, boundaryToken](bool success, const DataBlock &capturedData,
                                 bool capturedDataValid) {
+                if (boundaryToken.valid()) {
+                    const auto *entry = _boundaryTransactions.get(boundaryToken);
+                    fatal_if(!entry, "stale RecallUnique boundary completion");
+                    const bool merged = entry->persisted &&
+                        entry->mergedRecallId == capturedMsg.reqId;
+                    fatal_if(success && !capturedDataValid && entry->custody &&
+                                 !merged && capturedMsg.dataNeeded,
+                             "RecallUnique lost native data custody");
+                    fatal_if(!_boundaryTransactions.finishRecall(boundaryToken,
+                                 capturedMsg.reqId, capturedMsg.sourceSocket),
+                             "RecallUnique boundary identity mismatch");
+                    if (merged) {
+                        _pendingRecalls.erase(std::make_tuple(capturedMsg.linePa,
+                            capturedMsg.homeNode, capturedMsg.epoch,
+                            capturedMsg.reqId, capturedMsg.sourceSocket));
+                        return;
+                    }
+                }
                 inform(
                              "[RECALL-PROXY-CALLBACK] node=%d homePA=0x%lx "
                              "reqId=%lu success=%d dataValid=%d tick=%lu\n",
@@ -2068,23 +2417,22 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
                             CoherenceMessage directData;
                             directData.h.type = CoherenceMessageType::ReadResp;
                             directData.h.srcNode = _nodeId;
-                            directData.h.srcSocket = 0;
+                            directData.h.srcSocket = capturedMsg.sourceSocket;
                             directData.h.dstNode = capturedMsg.requesterNode;
                             directData.h.dstSocket = capturedMsg.requesterSocket;
                             directData.h.homeNode = capturedMsg.homeNode;
-                            directData.h.homeSocket = 0;
+                            directData.h.homeSocket = _addrMap.homeSocket(capturedMsg.homeNode, capturedMsg.linePa);
                             directData.h.homeLinePa = capturedMsg.linePa;
                             directData.h.epoch = capturedMsg.epoch;
                             // C4: reqId=0 so this ReadResp is NOT consumed
                             // by the requester's synchronous sendReadReq poll.
-                            directData.h.reqId = 0;
+                            directData.h.reqId = capturedMsg.reqId;
                             directData.h.flags = static_cast<uint32_t>(CFLAG_DATA_FORWARDED)
                                                | static_cast<uint32_t>(CFLAG_HAS_DATA)
                                                | static_cast<uint32_t>(CFLAG_DATA_RETURNED);
                             memcpy(directData.b.readResp.grantData,
                                    resp.dataPayload.getData(0, 64), 64);
-                            getUBAdapter(0)->sendDirectData(directData);
-                            resp.dataForwarded = true;
+                            resp.dataForwarded = getUBAdapter(capturedMsg.sourceSocket)->sendDirectData(directData);
                             resp.dataForwardedTo = capturedMsg.requesterNode;
                             if (_verboseLog) {
                             DPRINTF(RubyEP, "[C4-FORWARD] RU node=%d forward data to requester=%d PA=0x%lx\n",
@@ -2094,7 +2442,7 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
                     }
                 }
                 sendRecallResponse(resp);
-            });
+            }, capturedMsg.sourceSocket);
     }
 
     // Return true: recall initiated asynchronously.
@@ -2148,7 +2496,7 @@ EPBackend::sendRecallResponse(const OuterRecallResponse &response)
         response.dataReturned,
         response.epoch, response.reqId,
         response.hasDataPayload ? &response.dataPayload : nullptr,
-        response.homeNode, rrHomeSocket);
+        response.homeNode, rrHomeSocket, response.dataForwarded);
 
     if (!ok) {
         warn("EPBackend node_id=%d: home UBCC rejected recall response "
@@ -2179,6 +2527,10 @@ EPBackend::clearActiveRecall(uint64_t pa)
 bool
 EPBackend::hasRequesterExclusive(uint64_t pa) const
 {
+    uint32_t key;
+    if (!authorityKey(pa, key)) return false;
+    const auto *stable = _authority.get(_authority.find(key));
+    if (!stable || stable->state != BoundaryAuthorityTable::State::Live) return false;
     auto it = _requesterLines.find(pa);
     if (it == _requesterLines.end()) {
         if (_verboseLog) {
@@ -2339,12 +2691,13 @@ EPBackend::handleWritebackWithMeta(uint64_t line_pa, bool keepAsClean,
               "PA=0x%lx homeNode=%d sourceSocket=%d\n",
               _nodeId, line_pa, homeNode, sourceSocket);
     }
+    uint64_t mergedRecallReqId = 0;
     int wbRet = adapter->sendWritebackReq(
         homePa, requesterNode, epochVal, UBWritebackKind::OwnerWriteback,
         keepAsClean ? UBWriteDisposition::KeepClean
                     : UBWriteDisposition::DropOwner,
         ~0ULL, homeNode, homeSocket,
-        dirtyData, ioWritebackReqId);
+        dirtyData, ioWritebackReqId, 0, 0, &mergedRecallReqId);
     bool wbPending = (wbRet == -2);
     bool ok = (wbRet > 0);
     if (wbPending) {
@@ -2362,8 +2715,16 @@ EPBackend::handleWritebackWithMeta(uint64_t line_pa, bool keepAsClean,
     // Update requester bookkeeping based on result
     auto it = _requesterLines.find(line_pa);
     if (ok) {
+        const auto token = _boundaryTransactions.find(line_pa);
+        if (const auto *entry = _boundaryTransactions.get(token)) {
+            if (ioWritebackReqId && entry->writeId == *ioWritebackReqId) {
+                fatal_if(!_boundaryTransactions.publication(token,
+                             *ioWritebackReqId, sourceSocket, mergedRecallReqId),
+                         "OwnerWB boundary publication identity mismatch");
+            }
+        }
         _writebackCount++;
-        if (it != _requesterLines.end()) {
+        if (it != _requesterLines.end() && it->second.epoch == epochVal) {
             if (keepAsClean) {
                 // Owner retains clean exclusive (G_E)
                 it->second.state = RequesterLineState::R_E;
@@ -2417,7 +2778,9 @@ EPBackend::publishInternalWriteback(uint64_t homePa, uint64_t publicationId,
                                     uint64_t byteMask, const uint8_t *data,
                                     int homeNode, int homeSocket,
                                     int sourceSocket,
-                                    uint64_t &ioWritebackReqId)
+                                    uint64_t &ioWritebackReqId,
+                                    uint64_t parentReqId,
+                                    uint64_t parentEpoch)
 {
     fatal_if(!data || byteMask == 0 || publicationId == 0,
              "EPBackend node_id=%d: invalid internal publication PA=0x%lx "
@@ -2434,7 +2797,18 @@ EPBackend::publishInternalWriteback(uint64_t homePa, uint64_t publicationId,
     return adapter->sendWritebackReq(
         homePa, -1, 0, UBWritebackKind::InternalPublication,
         UBWriteDisposition::MemoryOnly, byteMask, homeNode, homeSocket, data,
-        &ioWritebackReqId);
+        &ioWritebackReqId, parentReqId, parentEpoch);
+}
+
+bool
+EPBackend::getPendingInvalidation(uint64_t localPa, int socket,
+                                  OuterInvalidateMsg &message) const
+{
+    auto it = _pendingInvalidations.find(HALineKey{socket, localPa});
+    if (it == _pendingInvalidations.end() || it->second.complete)
+        return false;
+    message = it->second.message;
+    return true;
 }
 
 bool
@@ -2545,7 +2919,56 @@ EPBackend::handleInvalidationRequest(const OuterInvalidateMsg &invMsg)
     uint64_t lookupPa = (invMsg.sharerLocalPa != 0)
                            ? invMsg.sharerLocalPa
                            : invMsg.linePa;
+    // No requester-state mutation or callback allocation before admission.
     bool hadLocalCopy = false;
+    const HALineKey invKey{invMsg.sourceSocket, lookupPa};
+    if (_haEndpointEnabled && invMsg.epoch) {
+        uint32_t key;
+        if (authorityKey(lookupPa, key)) {
+            const auto *entry = _authority.get(_authority.find(key));
+            if (entry && entry->epoch && entry->epoch != invMsg.epoch)
+                return false; // never drain or mutate a successor lease
+        }
+    }
+    auto pendingInv = _pendingInvalidations.find(invKey);
+    if ((lookupPa & 0xffffffffffULL) == 0x10c21280ULL) {
+        auto diagLine = _requesterLines.find(lookupPa);
+        auto diagRead = _pendingReadTxns.find(invMsg.linePa);
+        DPRINTF(RubyEPVerbose, "[INV147] stage=INV_ENTRY node=%d localPA=%#lx homePA=%#lx key=%#lx socket=%d epoch=%lu req=%lu state=%d pendingInv=%d complete=%d pendingRead=%d readReq=%lu\n",
+                _nodeId, lookupPa, invMsg.linePa, lookupPa & 0xffffffffffULL,
+                invMsg.sourceSocket, invMsg.epoch, invMsg.reqId,
+                diagLine == _requesterLines.end() ? -1 : static_cast<int>(diagLine->second.state),
+                pendingInv != _pendingInvalidations.end(),
+                pendingInv != _pendingInvalidations.end() ? pendingInv->second.complete : false,
+                diagRead != _pendingReadTxns.end(),
+                diagRead != _pendingReadTxns.end() ? diagRead->second.reqId : 0);
+    }
+    if (pendingInv != _pendingInvalidations.end()) {
+        const auto &original = pendingInv->second.message;
+        // R_I blocks new local accesses, but is NOT proof of CHI completion.
+        if (original.reqId != invMsg.reqId || original.epoch != invMsg.epoch ||
+            original.homeNode != invMsg.homeNode ||
+            original.linePa != invMsg.linePa)
+            return false; // transport retains a different control generation
+        if (!pendingInv->second.complete)
+            return true; // exact retransmission joins the original barrier
+        OuterInvalidationAck ack;
+        ack.linePa = original.linePa;
+        ack.ackNode = _nodeId;
+        ack.homeNode = original.homeNode;
+        ack.sourceSocket = original.sourceSocket;
+        ack.epoch = original.epoch;
+        ack.reqId = original.reqId;
+        if (sendInvalidationAck(ack)) _pendingInvalidations.erase(pendingInv);
+        return true;
+    }
+    // Reserve only after stale-lease rejection, but before mutating access or
+    // starting any native callback. A park conflict retains the original frame.
+    for (auto *snf : _epSnfs)
+        if (snf && !snf->canParkAcquisitions(lookupPa, invMsg.reqId)) return false;
+    const auto controlTicket = _boundaryTransactions.invalidate(lookupPa,
+        invMsg.epoch, _nodeId, invMsg.reqId, invMsg.sourceSocket);
+    if (!controlTicket.valid()) return false;
     {
         const HALineKey haKey{invMsg.sourceSocket, lookupPa};
         auto it = _haEndpointEnabled ? _haRequesterLines.find(haKey)
@@ -2582,7 +3005,7 @@ EPBackend::handleInvalidationRequest(const OuterInvalidateMsg &invMsg)
         // InvalidateAck directly (bypass startCleanUnique — no second
         // CleanUnique to the HN-F). After the store retries, a new upgrade
         // request will be issued when the line is re-fetched.
-        if (_epRnfCtrl->isHeldUpgradeRejected(lookupPa)) {
+        if (!_haEndpointEnabled && _epRnfCtrl->isHeldUpgradeRejected(lookupPa)) {
             // TC16 dual-upgrade race LOSER path (abandon-and-downgrade).
             //
             // Our global OuterUpgradeReq was rejected by home because another
@@ -2665,15 +3088,25 @@ EPBackend::handleInvalidationRequest(const OuterInvalidateMsg &invMsg)
     // callback before sending invalidation ack.  Previous code directly
     // ack'd, bypassing HN-F and losing grant/invalidation serialization.
     if (_epRnfCtrl) {
+        // Admission is node-wide. Never begin a subset of the fanout and then
+        // fall back to an unparked invalidation if another socket is busy.
+        for (auto *snf : _epSnfs) {
+            if (snf && !snf->canParkAcquisitions(invMsg.sharerLocalPa,
+                                               invMsg.reqId))
+                return false;
+        }
         // Capture invMsg by value for the callback
         OuterInvalidateMsg capturedMsg = invMsg;
+        _pendingInvalidations.emplace(invKey,
+            PendingInvalidation{invMsg, false, controlTicket});
         if (_verboseLog) {
         DPRINTF(RubyEP, "[INVAL-DIAG] node=%d calling startCleanUnique PA=0x%lx\n",
                 _nodeId, capturedMsg.sharerLocalPa);
         }
-        _epRnfCtrl->startCleanUnique(
+        auto launchNative = [this, capturedMsg, invKey]() {
+          _epRnfCtrl->startCleanUnique(
             capturedMsg.sharerLocalPa,
-            [this, capturedMsg](bool ok) {
+            [this, capturedMsg, invKey](bool ok) {
                 if (_verboseLog) {
                 DPRINTF(RubyEP, "[INVAL-DIAG] node=%d startCleanUnique callback PA=0x%lx ok=%d\n",
                         _nodeId, capturedMsg.linePa, ok);
@@ -2688,8 +3121,38 @@ EPBackend::handleInvalidationRequest(const OuterInvalidateMsg &invMsg)
                 ack.sourceSocket = capturedMsg.sourceSocket;
                 ack.epoch = capturedMsg.epoch;
                 ack.reqId = capturedMsg.reqId;
-                sendInvalidationAck(ack);
-            });
+                _pendingInvalidations.at(invKey).complete = true;
+                if (sendInvalidationAck(ack)) _pendingInvalidations.erase(invKey);
+                // Release local execution at local drain, independently of
+                // transport acceptance of the global parent's ACK. The outer
+                // install fence remains owned by the backend transaction.
+                for (auto *snf : _epSnfs) {
+                    if (snf)
+                        snf->resumeAcquisition(capturedMsg.sharerLocalPa,
+                                               capturedMsg.reqId);
+                }
+            }, capturedMsg.sourceSocket);
+        };
+        unsigned branches = 0;
+        for (auto *snf : _epSnfs)
+            if (snf && snf->acquisitionCount(capturedMsg.sharerLocalPa))
+                ++branches;
+        if (!branches) {
+            launchNative();
+        } else {
+            auto remaining = std::make_shared<unsigned>(branches);
+            for (auto *snf : _epSnfs) {
+                if (!snf || !snf->acquisitionCount(capturedMsg.sharerLocalPa))
+                    continue;
+                const bool admitted = snf->parkAcquisition(
+                    capturedMsg.sharerLocalPa, capturedMsg.reqId,
+                    [remaining, launchNative] {
+                        assert(*remaining > 0);
+                        if (--*remaining == 0) launchNative();
+                    });
+                assert(admitted);
+            }
+        }
         return true;
     } else {
         fatal("EPBackend node_id=%d: invalidation path requires EP-RNF "
@@ -2697,6 +3160,15 @@ EPBackend::handleInvalidationRequest(const OuterInvalidateMsg &invMsg)
               "for PA=0x%lx\n",
               _nodeId, invMsg.linePa);
     }
+}
+
+void
+EPBackend::observeNativeAcquireDone(Addr address, int socket, Addr incarnation)
+{
+    // Notification only: the ingress descriptor was reserved before the read
+    // left EPSNF. No table allocation or native backpressure is permitted here.
+    if (auto *snf = getEpSnf(socket))
+        snf->nativeAcquireDone(address, incarnation);
 }
 
 bool
@@ -2722,6 +3194,42 @@ EPBackend::sendInvalidationAck(const OuterInvalidationAck &ack)
     bool ok = getUBAdapter(ack.sourceSocket)->sendInvalidateAck(
         ack.linePa, ack.ackNode, ack.epoch, ack.reqId,
         ack.homeNode, ackHomeSocket);
+    if (ok) {
+        const Addr localPa = _addrMap.buildDsmPA(_nodeId, ack.homeNode,
+            _addrMap.dsmOffset(ack.linePa), ackHomeSocket);
+        _boundaryTransactions.finishInvalidate(_boundaryTransactions.find(localPa),
+            ack.reqId, ack.sourceSocket);
+    }
+
+    if (ok && _haEndpointEnabled && ack.epoch && ack.reqId) {
+        // Only a completed native invalidate handed to the reliable ACK path
+        // consumes authority. R_I and a raw stale release response do not.
+        const Addr localPa = _addrMap.buildDsmPA(_nodeId, ack.homeNode,
+            _addrMap.dsmOffset(ack.linePa), ackHomeSocket);
+        uint32_t key;
+        if (authorityKey(localPa, key)) {
+            const auto token = _authority.find(key);
+            auto *entry = _authority.metadata(token);
+            if (entry && entry->epoch == ack.epoch) {
+                auto &release = _authorityRelease;
+                if (release.stable.valid() && release.stable.slot == token.slot &&
+                    release.stable.generation == token.generation &&
+                    release.identity == ack.epoch && release.home == ack.homeNode &&
+                    release.homePa == ack.linePa) {
+                    release.externalControlDone = true;
+                    inform("[EP-RETIREMENT-CONTROL] node=%d keypa=%#lx lease=%lu control=%lu release=%lu generation=%lu\n",
+                        _nodeId, ack.linePa, ack.epoch, ack.reqId,
+                        release.reqId, token.generation);
+                } else if (entry->state == BoundaryAuthorityTable::State::Live) {
+                    // Keep any existing borrowers and generation intact; a
+                    // subsequent escape has no old Home authority to release.
+                    entry->epoch = 0;
+                    entry->access = RequesterLineState::R_I;
+                    entry->resident = false;
+                }
+            }
+        }
+    }
 
     if (!ok) {
         warn("EPBackend node_id=%d: home UBCC rejected invalidation ack "
@@ -2812,6 +3320,9 @@ EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
     // race and can drive fresh-reqId churn.
     if (!hadPending) {
         PendingUpgradeTxn txn;
+        txn.ticket = _boundaryTransactions.foreground(line_pa, epochVal,
+            _nodeId, reqIdVal, sourceSocket);
+        if (!txn.ticket.valid()) return false;
         txn.valid = true;
         txn.linePa = line_pa;
         txn.homeNode = homeNode;
@@ -2857,6 +3368,7 @@ EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
         // hits the cached UpgradeResp, rather than allocating a new reqId that
         // the home rejects (existing outstanding).
         PendingUpgradeTxn txn;
+        txn.ticket = put->second.ticket;
         txn.valid = true;
         txn.linePa = line_pa;
         txn.homeNode = homeNode;
@@ -2948,6 +3460,7 @@ EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
             _lastUpgradeAck = ack;
 
             PendingUpgradeTxn txn;
+            txn.ticket = put->second.ticket;
             txn.valid = true;
             txn.linePa = line_pa;
             txn.homeNode = homeNode;
@@ -2968,8 +3481,8 @@ EPBackend::notifyLocalWriteUpgrade(uint64_t line_pa, int homeNode,
             ack.accepted = true;  // immediate: Ack(true) ready now
             _lastUpgradeAck = ack;
 
-            if (put != _pendingUpgradeTxns.end())
-                put->second.valid = false;
+            // Keep the credit through the caller's native response and
+            // matching UpgradeDone, not merely through permission arrival.
 
             DPRINTF(RubyEP,
                     "EPBackend node_id=%d: upgrade accepted immediate "
@@ -3035,10 +3548,10 @@ EPBackend::sendUpgradeDone(uint64_t line_pa, int homeNode, int sourceSocket,
     doneAck.dstNode = _nodeId;
     doneAck.epoch = epoch;
     doneAck.reqId = reqId;
-    doneAck.accepted = accepted || donePending;
+    doneAck.accepted = accepted;
     _lastUpgradeDoneAck = doneAck;
-
-    return accepted || donePending;
+    if (accepted) clearPendingUpgradeTxn(line_pa);
+    return accepted;
 }
 
 // ---- v4: Clear / ClearAck (§3.5) ----
@@ -3048,6 +3561,16 @@ EPBackend::sendClear(uint64_t line_pa, int homeNode,
                      uint64_t epoch, uint64_t reqId, int sourceAdapter)
 {
     auto txnIt = _pendingGrantTxns.find(line_pa);
+    // A stale caller must not substitute the current generation's baseEpoch or
+    // consume its Clear response. Validate before logging/mutating state or
+    // sending anything to the adapter.
+    if (txnIt == _pendingGrantTxns.end() || !txnIt->second.valid ||
+        txnIt->second.linePa != line_pa ||
+        txnIt->second.homeNode != homeNode ||
+        txnIt->second.baseEpoch != epoch ||
+        txnIt->second.reqId != reqId ||
+        txnIt->second.sourceAdapter != sourceAdapter)
+        return 0;
     const bool firstClearSend =
         txnIt == _pendingGrantTxns.end() || !txnIt->second.valid ||
         !txnIt->second.clearSendLogged;
@@ -3109,6 +3632,11 @@ EPBackend::sendClear(uint64_t line_pa, int homeNode,
     // Consume the pending grant txn only once the clear is actually accepted,
     // so retries while it is still pending (clearRet==-2) keep matching reqId.
     if (accepted && txnIt != _pendingGrantTxns.end() && txnIt->second.valid) {
+        if (const auto *owner = _boundaryTransactions.get(txnIt->second.ticket)) {
+            _boundaryTransactions.finishForeground(txnIt->second.ticket,
+                owner->foregroundId, owner->foregroundSocket,
+                BoundaryTransactions::HomeCommit);
+        }
         txnIt->second.valid = false;
     }
 
@@ -3150,7 +3678,8 @@ EPBackend::notifyUpgradeAckReady(uint64_t linePa)
             callbackPa = _addrMap.buildDsmPA(_nodeId, homeNode, offset,
                                              homeSocket);
             _lastUpgradeAck.accepted = true;
-            clearPendingUpgradeTxn(callbackPa);
+            // Permission ready is not retirement: retain the owner until the
+            // native snoop response and Home UpgradeDone acknowledgement.
         }
         DPRINTF(RubyEP,
                 "EPBackend node_id=%d: notifyUpgradeAckReady PA=0x%lx "
@@ -3168,8 +3697,18 @@ void
 EPBackend::clearPendingUpgradeTxn(uint64_t linePa)
 {
     auto it = _pendingUpgradeTxns.find(linePa);
-    if (it != _pendingUpgradeTxns.end())
-        it->second.valid = false;
+    if (it != _pendingUpgradeTxns.end()) {
+        const auto ticket = it->second.ticket;
+        if (const auto *e = _boundaryTransactions.get(ticket)) {
+            const auto id = e->foregroundId;
+            const auto socket = e->foregroundSocket;
+            _boundaryTransactions.finishForeground(ticket, id, socket,
+                BoundaryTransactions::HomeCommit);
+            _boundaryTransactions.finishForeground(ticket, id, socket,
+                BoundaryTransactions::NativeClose);
+        }
+        _pendingUpgradeTxns.erase(it);
+    }
 }
 
 void

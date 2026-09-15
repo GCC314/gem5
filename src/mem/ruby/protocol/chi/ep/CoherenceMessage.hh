@@ -151,6 +151,8 @@ enum CoherenceMessageFlags : uint32_t {
     CFLAG_PEER_EXIT_ACK   = 1u << 8,  // PeerExit ACK; clear means Notify
     CFLAG_NETWORK_EXIT_ACK = 1u << 9, // NetworkExit ACK; clear means Request
     CFLAG_DEFERRED         = 1u << 10, // Request accepted into deferred replay
+    CFLAG_HOME_CONTROL_RELAY = 1u << 11, // EP intent; Home owns control lease
+    CFLAG_DIRECT_GRANT = 1u << 12, // Home authority; data is a separate child
 };
 
 // ---- Message Header (fixed envelope) ----
@@ -250,18 +252,28 @@ struct UBWritebackReqBody {
         : kind(UBWritebackKind::OwnerWriteback),
           disposition(UBWriteDisposition::DropOwner), hasData(0), reserved{},
           byteMask(0), data{} {}
+    // Optional InvalidateReq dependency; never an architectural owner epoch.
+    uint64_t parentInvalidateReqId = 0;
+    uint64_t parentInvalidateEpoch = 0;
 };
 
 struct UBWritebackRespBody {
     bool success;
-    UBWritebackRespBody() : success(false) {}
+    // Exact Recall completed by this persisted OwnerWriteback; zero means none.
+    uint64_t mergedRecallReqId;
+    UBWritebackRespBody() : success(false), mergedRecallReqId(0) {}
 };
 
-struct UBEvictReqBody { /* no extra fields beyond header */ };
+struct UBEvictReqBody { bool receiptAck = false; };
+
+enum class UBReleaseResult : uint8_t {
+    Legacy, Applied, Duplicate, Busy, Stale, Invalid, AlreadyRetiredMatch
+};
 
 struct UBEvictRespBody {
     bool success;
     UBEvictRespBody() : success(false) {}
+    UBReleaseResult result = UBReleaseResult::Legacy;
 };
 
 struct UBUpgradeReqBody {
@@ -387,6 +399,7 @@ struct UBHAPermissionRespBody {
     uint8_t reserved[5];
     uint64_t permissionEpoch;
     uint8_t data[64];
+    uint64_t leaseId = 0; // Home-issued holder identity, NOT a per-store permit
     UBHAPermissionRespBody()
         : operation(HAOperation::Read), status(HAStatus::InvalidArgument),
           hasData(0), reserved{}, permissionEpoch(0), data{} {}

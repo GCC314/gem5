@@ -115,7 +115,7 @@ static_assert(static_cast<uint8_t>(cc::glob::UBWriteDisposition::MemoryOnly) == 
               static_cast<uint8_t>(cc::glob::UBWriteDisposition::DropOwner) == 1 &&
               static_cast<uint8_t>(cc::glob::UBWriteDisposition::KeepClean) == 2,
               "writeback disposition wire values changed");
-static_assert(sizeof(cc::glob::UBWritebackReqBody) == 80,
+static_assert(sizeof(cc::glob::UBWritebackReqBody) == 96,
               "writeback request wire body must remain 80 bytes");
 static_assert(offsetof(cc::glob::UBWritebackReqBody, kind) == 0 &&
               offsetof(cc::glob::UBWritebackReqBody, disposition) == 1 &&
@@ -126,8 +126,8 @@ static_assert(offsetof(cc::glob::UBWritebackReqBody, kind) == 0 &&
               "writeback request wire offsets changed");
 static_assert(sizeof(cc::glob::UBHAPermissionReqBody) == 88,
               "HA permission request wire body must remain 88 bytes");
-static_assert(sizeof(cc::glob::UBHAPermissionRespBody) == 80,
-              "HA permission response wire body must remain 80 bytes");
+static_assert(sizeof(cc::glob::UBHAPermissionRespBody) == 88,
+              "HA response includes the 8-byte Home holder lease");
 static_assert(sizeof(cc::glob::UBHAPermissionAckBody) == 16,
               "HA permission ack wire body must remain 16 bytes");
 static_assert(sizeof(cc::glob::UBHAPresenceProbeReqBody) == 16,

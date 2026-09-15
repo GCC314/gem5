@@ -5,12 +5,14 @@
 #include "base/logging.hh"
 #include "debug/RubyCHIGeneric.hh"
 #include "debug/RubyEP.hh"
+#include "debug/RubyEPVerbose.hh"
 #include "mem/ruby/common/DataBlock.hh"
 #include "mem/ruby/protocol/CHI/CHIDataMsg.hh"
 #include "mem/ruby/protocol/CHI/CHIRequestMsg.hh"
 #include "mem/ruby/protocol/CHI/CHIResponseMsg.hh"
 #include "mem/ruby/protocol/chi/ep/UBAdapter.hh"
 #include "params/EPSNFController.hh"
+#include "sim/eventq.hh"
 
 namespace gem5
 {
@@ -57,6 +59,11 @@ void
 EPSNFController::init()
 {
     EPController::init();
+    DPRINTF(RubyEPVerbose, "[WB-DIAG] stage=ARMED tracePa=0x14030000 node=%d socket=%d\n",
+            _nodeId, _socketId);
+    if (debug::RubyEPVerbose) {
+        trace::output().flush();
+    }
     fatal_if(!_backend, "EP_SNF node_id=%d: no backend attached", _nodeId);
 
     // Phase 1: Store SimObject params into file-local statics.
@@ -114,7 +121,27 @@ EPSNFController::wakeup()
     if (!_retryQueue.empty()) {
         bool needWakeup = false;
         for (auto it = _retryQueue.begin(); it != _retryQueue.end(); ) {
+            if (it->parkPhase != 0) {
+                ++it;
+                continue;
+            }
+            if (it->nativeDataPublished) {
+                ++it;
+                continue;
+            }
+            if (_pendingData.size() + _deferredCompData.size() +
+                    dataMsgsPerLine > 128 ||
+                (it->needsReadReceipt && _pendingResponses.size() +
+                    2 * _pendingWrites.size() >= 127)) {
+                needWakeup = true;
+                break;
+            }
             int homeNode = -1;
+            if (!_backend->holdAuthority(it->linePa, it->authorityBorrow)) {
+                needWakeup = true;
+                ++it;
+                continue;
+            }
             int grantResult = _backend->handleRemoteMiss(
                 it->linePa, it->neededPerm, it->writeIntent,
                 it->ingressSocket, homeNode);
@@ -145,6 +172,16 @@ EPSNFController::wakeup()
                              grantSource != GrantDataSource::NoData,
                          "EP_SNF node_id=%d: unavailable grant data PA=0x%lx source=%d",
                           _nodeId, it->linePa, static_cast<int>(grantSource));
+                // Early HN retirement is legal only once the complete line is
+                // local and all native data beats can drain without Home.
+                if (it->needsReadReceipt) {
+                    auto rsp = std::make_shared<CHIResponseMsg>(
+                        curTick(), cacheLineSize, m_ruby_system,
+                        it->linePa, CHIResponseType_ReadReceipt,
+                        m_machineID, hnDest, false, false,
+                        it->nativeTxnId, 0, MessageSizeType_Control);
+                    sendResponseReliable(rsp);
+                }
                 int storeRequester = -1;
                 uint64_t storeEpoch = 0;
                 fatal_if(!_backend->getStoreAuthorization(
@@ -152,6 +189,15 @@ EPSNFController::wakeup()
                              storeEpoch),
                          "EP_SNF node_id=%d: missing grant authorization "
                          "PA=0x%lx", _nodeId, it->linePa);
+                const bool partialMicro = params().park_microtest_partial &&
+                    !params().park_microtest &&
+                    !_parkMicrotestIssued;
+                if (partialMicro) {
+                    fatal_if(dataMsgsPerLine != 2,
+                             "Partial Park micro requires exactly two native beats");
+                    _parkMicrotestIssued = true;
+                    it->nativeDataPublished = true;
+                }
                 for (int i = 0; i < dataMsgsPerLine; i++) {
                     int offset = i * dataChannelSize;
                     int chunkSize = (i == dataMsgsPerLine - 1) ?
@@ -166,6 +212,7 @@ EPSNFController::wakeup()
                     auto dat = std::make_shared<CHIDataMsg>(
                         curTick(), cacheLineSize, m_ruby_system);
                     dat->m_addr = it->linePa;
+                    dat->m_ep_native_id = it->dataToFwdReq ? 0 : it->nativeIncarnation;
                     dat->m_type = dataType;
                     dat->m_responder = m_machineID;
                     dat->m_Destination = dataDest;
@@ -193,9 +240,39 @@ EPSNFController::wakeup()
                             }
                         };
                     }
-                    sendDataReliable(dat, std::move(onSent));
+                    if (partialMicro && lastBeat) {
+                        // Bounded, test-only delayed second beat. Data is real
+                        // and already present locally; no fake grant or ACK.
+                        schedule(new EventFunctionWrapper(
+                            [this, dat, onSent] {
+                                sendDataReliable(dat, onSent);
+                            }, name() + ".partialParkData", true),
+                            clockEdge(Cycles(80)));
+                    } else {
+                        sendDataReliable(dat, std::move(onSent));
+                    }
                 }
-                it = _retryQueue.erase(it);
+                if (partialMicro) {
+                    const Addr line = it->linePa;
+                    const uint64_t control = allocateWriteIdentity();
+                    schedule(new EventFunctionWrapper([this, line, control] {
+                        fatal_if(!parkAcquisition(line, control, [this, line, control] {
+                            inform("[PARK-MICRO] stage=PARKED node=%d line=%#lx control=%lu",
+                                   _nodeId, line, control);
+                            _backend->getEpRnfController()->startCleanUnique(
+                                line, [this, line, control](bool ok) {
+                                    fatal_if(!ok, "Partial Park native control failed");
+                                    inform("[PARK-MICRO] stage=LOCAL_CONTROL_DONE node=%d line=%#lx control=%lu",
+                                           _nodeId, line, control);
+                                    resumeAcquisition(line, control);
+                                }, _socketId);
+                        }), "Partial Park admission failed");
+                    }, name() + ".partialPark", true), clockEdge(Cycles(16)));
+                    ++it;
+                } else {
+                    it->nativeDataPublished = true;
+                    ++it;
+                }
             } else {
                 needWakeup = true;
                 ++it;
@@ -236,6 +313,21 @@ EPSNFController::allocateWriteIdentity()
 bool
 EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
 {
+    // A new same-K request is not evidence that the old observer is dead.
+    // Keep the old descriptor until its exact CloseAck consumes queue ownership.
+    for (const auto &entry : _retryQueue) {
+        if (entry.linePa == msg->m_addr && entry.hnReq == msg->m_requestor &&
+            entry.nativeIncarnation != msg->m_ep_native_id &&
+            (msg->m_type == CHIRequestType_ReadNoSnp ||
+             msg->m_type == CHIRequestType_ReadNoSnpSep))
+            return false;
+    }
+    if ((msg->m_addr & 0xffffffffffULL) == 0x10c21280ULL) {
+        DPRINTF(RubyEPVerbose, "[INV147] stage=SNF_REQUEST node=%d localPA=%#lx key=%#lx type=%s proxy=%s txn=%lu requestor=%s socket=%d\n",
+                _nodeId, msg->m_addr, msg->m_addr & 0xffffffffffULL,
+                msg->m_type, msg->m_ep_proxy_op, msg->m_txnId,
+                msg->m_requestor, msg->m_ubcc_ingress_socket);
+    }
     DPRINTF(RubyCHIGeneric, "[DEBUG-EPSNF-RECV] EP_SNF node_id=%d recvRequestMsg type=%s addr=0x%lx\n",
             _nodeId, msg->m_type, msg->m_addr);
     DPRINTF(RubyEP, "EP_SNF node_id=%d recvRequestMsg type=%d addr=0x%lx "
@@ -247,6 +339,15 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
     // replying deadlocks the request/data handshake.
     if (msg->m_type == CHIRequestType_WriteNoSnp ||
         msg->m_type == CHIRequestType_WriteNoSnpPtl) {
+
+        // Reserve payload/DBID and both response descriptors before consuming
+        // the native request. Data and completion remain independently runnable.
+        const size_t writeLimit = msg->m_ubcc_internal_writeback ? 64 : 56;
+        if (_pendingWrites.size() >= writeLimit ||
+            _pendingResponses.size() + 2 * _pendingWrites.size() >= 128) {
+            scheduleEvent(Cycles(1));
+            return false;
+        }
 
         if (!_backend) {
             fatal("EP_SNF node_id=%d: no backend for write\n", _nodeId);
@@ -269,6 +370,20 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
         pending.disposition = static_cast<UBWriteDisposition>(
             msg->m_ubcc_write_disposition);
         pending.internalPublication = msg->m_ubcc_internal_writeback;
+        // The HN's actual InvalidateOnly TBE marks this sub-operation. Capture
+        // the control identity once, before any publication retry; ordinary HN
+        // maintenance on the same PA must never borrow this authorization.
+        if (pending.internalPublication &&
+            msg->m_ep_proxy_op == EpProxyOp_InvalidateOnly &&
+            !_backend->haEndpointEnabled()) {
+            OuterInvalidateMsg parent;
+            fatal_if(!_backend->getPendingInvalidation(
+                         pending.linePa, pending.sourceSocket, parent),
+                     "InvalidateOnly publication has no live control PA=%#lx",
+                     pending.linePa);
+            pending.parentInvalidateReqId = parent.reqId;
+            pending.parentInvalidateEpoch = parent.epoch;
+        }
         fatal_if(msg->m_ubcc_store_auth_valid == pending.internalPublication,
                  "EP_SNF node_id=%d: WriteNoSnp must be exactly one of "
                  "authorized StoreCommit or HN internal publication PA=0x%lx",
@@ -313,11 +428,23 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
             pending.disposition == UBWriteDisposition::DropOwner &&
             !_backend->haEndpointEnabled()) {
             const auto permission = _backend->inspectRequesterState(pending.linePa);
-            if (permission.valid && permission.state ==
-                static_cast<int>(RequesterLineState::R_M)) {
+            if (pending.linePa == 0x14030000)
+                DPRINTF(RubyEPVerbose, "[WB-DIAG] stage=SNF_PERMISSION pa=%#lx node=%d socket=%d valid=%d state=%d epoch=%lu\n", pending.linePa, _nodeId, pending.sourceSocket, permission.valid, permission.state, permission.epoch);
+            auto &bank = _backend->boundaryTransactions();
+            const auto *stable = bank.get(bank.find(pending.linePa));
+            if ((stable && stable->custody && !stable->persisted) ||
+                (permission.valid && permission.state ==
+                 static_cast<int>(RequesterLineState::R_M))) {
                 pending.replacementOwnerRelease = true;
-                pending.releaseRequester = _nodeId;
-                pending.releaseEpoch = permission.epoch;
+                pending.releaseRequester = stable ? stable->owner : _nodeId;
+                pending.releaseEpoch = stable ? stable->epoch : permission.epoch;
+                pending.boundaryToken = bank.write(pending.linePa,
+                    pending.releaseEpoch, pending.releaseRequester,
+                    pending.storeCommitId, pending.sourceSocket);
+                if (!pending.boundaryToken.valid()) {
+                    scheduleEvent(Cycles(1));
+                    return false;
+                }
             }
         }
 
@@ -346,7 +473,19 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
                 _backend->addrMap().dsmOffset(msg->m_addr),
                 pending.homeSocket);
         }
-        _pendingWrites.emplace(pending.dbid, pending);
+        if (pending.linePa == 0x14030000) {
+            DPRINTF(RubyEPVerbose, "[WB-DIAG] stage=SNF_CREATE pa=%#lx homePA=%#lx node=%d socket=%d home=%d homeSocket=%d txn=%lu dbid=%lu store=%lu internal=%d disposition=%d proxy=%d release=%d requester=%d epoch=%lu releaseRequester=%d releaseEpoch=%lu parent=%lu parentEpoch=%lu mask=%#lx\n",
+                    pending.linePa, pending.homePa, _nodeId, pending.sourceSocket,
+                    pending.homeNode, pending.homeSocket, pending.originalTxnId,
+                    pending.dbid, pending.storeCommitId, pending.internalPublication,
+                    static_cast<int>(pending.disposition), static_cast<int>(msg->m_ep_proxy_op),
+                    pending.replacementOwnerRelease, pending.requesterNode,
+                    pending.permissionEpoch, pending.releaseRequester, pending.releaseEpoch,
+                    pending.parentInvalidateReqId, pending.parentInvalidateEpoch, pending.expectedMask);
+        }
+        fatal_if(!_pendingWrites.emplace(pending.dbid, pending).second,
+                 "EP_SNF: reserved write descriptor unavailable id=%lu",
+                 pending.dbid);
 
         // ── Phase C4 trace point 2: WriteNoSnp receipt ──
         {
@@ -445,6 +584,15 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
         _backend->haEndpointEnabled() && _backend->hasActiveRecall(msg->m_addr);
 
     // Map sideband to outer request and dispatch
+    // Bound demand descriptors before issuing any outer side effect. Response
+    // and data channels drain independently of this admission decision.
+    if (_retryQueue.size() >= 64 ||
+        _pendingData.size() + _deferredCompData.size() +
+            dataMsgsPerLine * (_retryQueue.size() + 1) > 128 ||
+        _pendingResponses.size() + 2 * _pendingWrites.size() >= 127) {
+        scheduleEvent(Cycles(1));
+        return false;
+    }
     int homeNode = -1;
     if (msg->m_ep_proxy_op == EpProxyOp_RecallUnique) {
         inform(
@@ -452,7 +600,19 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
                      "tick=%lu\n",
                      _nodeId, msg->m_addr, curTick());
     }
-    int grantResult = internalRecall
+    BoundaryBorrowToken authorityBorrow;
+    BoundaryTransactions::Token foreground;
+    if (!internalRecall) {
+        foreground = _backend->boundaryTransactions().foreground(
+            msg->m_addr, 0, _nodeId, allocateWriteIdentity(), _socketId);
+        if (!foreground.valid()) {
+            scheduleEvent(Cycles(1));
+            return false;
+        }
+    }
+    const bool admitted = internalRecall ||
+        _backend->holdAuthority(msg->m_addr, authorityBorrow);
+    int grantResult = !admitted ? -2 : internalRecall
         ? static_cast<int>(OuterGrantType::GlobalGrantShared)
         : _backend->handleRemoteDemandMiss(
               msg->m_addr, neededPerm, writeIntent, ingressSocket, homeNode);
@@ -463,6 +623,7 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
                 "EP_SNF node_id=%d: grant BUSY for PA=0x%lx, queuing retry\n",
                 _nodeId, msg->m_addr);
         EPSNFController::RetryEntry entry;
+        entry.foreground = foreground;
         entry.linePa = msg->m_addr;
         entry.neededPerm = neededPerm;
         entry.writeIntent = writeIntent;
@@ -471,7 +632,30 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
         entry.fwdReq = msg->m_fwdRequestor;
         entry.dataToFwdReq = msg->m_dataToFwdRequestor;
         entry.publishOnData = msg->m_ubcc_publish_on_data;
-        _retryQueue.push_back(entry);
+        entry.needsReadReceipt = msg->m_type == CHIRequestType_ReadNoSnpSep;
+        entry.nativeTxnId = msg->m_txnId;
+        entry.nativeIncarnation = msg->m_ep_native_id;
+        entry.authorityBorrow = authorityBorrow;
+        fatal_if(!_retryQueue.push_back(entry),
+                 "EP_SNF: reserved read descriptor unavailable");
+        if (params().park_microtest && !params().park_microtest_partial &&
+            !_parkMicrotestIssued) {
+            _parkMicrotestIssued = true;
+            const Addr line = entry.linePa;
+            const uint64_t control = allocateWriteIdentity();
+            fatal_if(!parkAcquisition(line, control, [this, line, control] {
+                inform("[PARK-MICRO] stage=PARKED node=%d line=%#lx control=%lu",
+                       _nodeId, line, control);
+                auto *rnf = _backend->getEpRnfController();
+                fatal_if(!rnf, "Park microtest requires real EP-RNF");
+                rnf->startCleanUnique(line, [this, line, control](bool ok) {
+                    fatal_if(!ok, "Park microtest native invalidation failed");
+                    inform("[PARK-MICRO] stage=LOCAL_CONTROL_DONE node=%d line=%#lx control=%lu",
+                           _nodeId, line, control);
+                    resumeAcquisition(line, control);
+                }, _socketId);
+            }), "Park microtest failed admission");
+        }
         scheduleEvent(Cycles(epsnf_retry_cycles()));
         return true;
     }
@@ -498,16 +682,6 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
         dataDest.add(msg->m_requestor);
     }
 
-    // For ReadNoSnpSep (early-dealloc DMT), send ReadReceipt to HN-F.
-    if (msg->m_type == CHIRequestType_ReadNoSnpSep) {
-        auto rsp = std::make_shared<CHIResponseMsg>(
-            curTick(), cacheLineSize, m_ruby_system,
-            msg->m_addr, CHIResponseType_ReadReceipt,
-            m_machineID, hnDest,
-            false, false, 0, 0, MessageSizeType_Control);
-        sendResponseReliable(rsp);
-    }
-
     DataBlock grantData(cacheLineSize);
     GrantDataSource grantSource = GrantDataSource::NoData;
     int grantDataState = internalRecall ? 0 : _backend->takeGrantData(
@@ -528,6 +702,7 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
                     "deferring to retry queue\n",
                     _nodeId, static_cast<int>(grantSource));
             EPSNFController::RetryEntry entry;
+            entry.foreground = foreground;
             entry.linePa = msg->m_addr;
             entry.neededPerm = neededPerm;
             entry.writeIntent = writeIntent;
@@ -536,7 +711,12 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
             entry.fwdReq = msg->m_fwdRequestor;
             entry.dataToFwdReq = msg->m_dataToFwdRequestor;
             entry.publishOnData = msg->m_ubcc_publish_on_data;
-            _retryQueue.push_back(entry);
+            entry.needsReadReceipt = msg->m_type == CHIRequestType_ReadNoSnpSep;
+            entry.nativeTxnId = msg->m_txnId;
+            entry.nativeIncarnation = msg->m_ep_native_id;
+            entry.authorityBorrow = authorityBorrow;
+            fatal_if(!_retryQueue.push_back(entry),
+                     "EP_SNF: reserved read descriptor unavailable");
             scheduleEvent(Cycles(epsnf_retry_cycles()));
             return true;
         }
@@ -544,6 +724,18 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
         DPRINTF(RubyCHIGeneric,
                 "EP_SNF node_id=%d: CompData fallback to zeros "
                 "(NoData source)\n", _nodeId);
+    }
+
+    // Do not release the HN routing context while data still depends on Home.
+    // The retry descriptor retains this obligation until the complete line is
+    // available; both immediate and deferred paths send it exactly once.
+    if (msg->m_type == CHIRequestType_ReadNoSnpSep) {
+        auto rsp = std::make_shared<CHIResponseMsg>(
+            curTick(), cacheLineSize, m_ruby_system,
+            msg->m_addr, CHIResponseType_ReadReceipt,
+            m_machineID, hnDest, false, false, msg->m_txnId, 0,
+            MessageSizeType_Control);
+        sendResponseReliable(rsp);
     }
 
     // ---- v4: shared_hint + CompData type for shared grants (§4.4.2, §5.1) ----
@@ -591,6 +783,7 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
         auto dat = std::make_shared<CHIDataMsg>(
             curTick(), cacheLineSize, m_ruby_system);
         dat->m_addr = msg->m_addr;
+        dat->m_ep_native_id = msg->m_dataToFwdRequestor ? 0 : msg->m_ep_native_id;
         dat->m_type = dataType;
         dat->m_responder = m_machineID;
         dat->m_Destination = dataDest;
@@ -618,6 +811,26 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
             };
         }
         _deferredCompData.push_back(std::move(pending));
+    }
+
+    if (!internalRecall) {
+        RetryEntry retained{};
+        retained.linePa = msg->m_addr;
+        retained.neededPerm = neededPerm;
+        retained.writeIntent = writeIntent;
+        retained.ingressSocket = ingressSocket;
+        retained.hnReq = msg->m_requestor;
+        retained.fwdReq = msg->m_fwdRequestor;
+        retained.dataToFwdReq = msg->m_dataToFwdRequestor;
+        retained.publishOnData = msg->m_ubcc_publish_on_data;
+        retained.needsReadReceipt = false;
+        retained.nativeTxnId = msg->m_txnId;
+        retained.nativeIncarnation = msg->m_ep_native_id;
+        retained.authorityBorrow = authorityBorrow;
+        retained.foreground = foreground;
+        retained.nativeDataPublished = true;
+        fatal_if(!_retryQueue.push_back(retained),
+                 "EPSNF lost reserved native completion descriptor");
     }
 
     // Schedule deferred sends.
@@ -785,8 +998,247 @@ EPSNFController::recvSnoopMsg(const CHIRequestMsg *msg)
 bool
 EPSNFController::recvResponseMsg(const CHIResponseMsg *msg)
 {
+    if (msg->m_type == CHIResponseType_AcquireCloseAck) {
+        for (auto it = _retryQueue.begin(); it != _retryQueue.end(); ++it) {
+            if (it->linePa != msg->m_addr ||
+                it->nativeIncarnation != msg->m_txnId ||
+                it->hnReq != msg->m_responder ||
+                it->parkControl != msg->m_dbid || !it->closeSent)
+                continue;
+            rememberRetiredControl(*it);
+            if (const auto *owner = _backend->boundaryTransactions().get(it->foreground)) {
+                const auto id = owner->foregroundId;
+                const auto socket = owner->foregroundSocket;
+                if (_backend->haEndpointEnabled())
+                    _backend->boundaryTransactions().finishForeground(it->foreground,
+                        id, socket, BoundaryTransactions::HomeCommit);
+                _backend->boundaryTransactions().finishForeground(it->foreground,
+                    id, socket, BoundaryTransactions::NativeClose);
+            }
+            _backend->closeAuthority(it->authorityBorrow);
+            _retryQueue.erase(it);
+            if (_microLatePark && ++_microOtherClosed == 257) {
+                inform("[CLOSE-MICRO] other_closed=257 old_observer_live=1");
+                auto late = std::move(_microLatePark);
+                late();
+            }
+            DPRINTF(RubyEP, "[EP-ACQUIRE-RETIRED] node=%d socket=%d addr=%#lx incarnation=%lu occupancy=%u closeAck=1\n",
+                    _nodeId, _socketId, msg->m_addr, msg->m_txnId,
+                    static_cast<unsigned>(_retryQueue.size()));
+            scheduleEvent(Cycles(1));
+            return true;
+        }
+        return true; // Duplicate ACK cannot retire a new incarnation.
+    }
+    if (msg->m_type == CHIResponseType_AcquireParkAck ||
+        msg->m_type == CHIResponseType_AcquireResumeAck) {
+        for (auto &entry : _retryQueue) {
+            if (entry.linePa != msg->m_addr ||
+                entry.nativeIncarnation != msg->m_txnId ||
+                entry.hnReq != msg->m_responder ||
+                entry.parkControl != msg->m_dbid)
+                continue;
+            if (msg->m_type == CHIResponseType_AcquireParkAck) {
+                // An exact duplicate must not call the parent barrier twice.
+                if (entry.parkPhase != 1)
+                    return true;
+                entry.parkPhase = 2;
+                auto callback = std::move(entry.onParked);
+                if (callback) callback();
+            } else {
+                if (entry.parkPhase != 3)
+                    return true;
+                entry.parkPhase = 0;
+                if (params().park_microtest || params().park_microtest_partial) {
+                    inform("[PARK-MICRO] stage=RESUMED node=%d line=%#lx control=%lu",
+                           _nodeId, entry.linePa, entry.parkControl);
+                }
+                scheduleEvent(Cycles(1));
+                if (entry.nativeDone) {
+                    // The normal completion may have arrived while this
+                    // handshake owned the descriptor. Settle each obligation
+                    // independently, then retire through the same identity API.
+                    const auto line = entry.linePa;
+                    const auto incarnation = entry.nativeIncarnation;
+                    nativeAcquireDone(line, incarnation);
+                }
+            }
+            return true;
+        }
+        for (const auto &retired : _retiredControls) {
+            if (retired.line == msg->m_addr &&
+                retired.incarnation == msg->m_txnId &&
+                retired.control == msg->m_dbid &&
+                retired.responder == msg->m_responder)
+                return true;
+        }
+        // ACKs have no response obligation. Unknown generations may never
+        // consume a current descriptor or invoke its role callback.
+        DPRINTF(RubyEP, "[EP-PARK-STALE-ACK] addr=%#lx incarnation=%lu control=%lu\n",
+                msg->m_addr, msg->m_txnId, msg->m_dbid);
+        return true;
+    }
     DPRINTF(RubyCHIGeneric, "EP_SNF node_id=%d recvResponseMsg\n", _nodeId);
     return true;
+}
+
+bool
+EPSNFController::canParkAcquisitions(Addr line, uint64_t control) const
+{
+    if (!control) return false;
+    for (const auto &entry : _retryQueue) {
+        if (entry.linePa == line &&
+            (!entry.nativeIncarnation || entry.parkPhase != 0 || entry.closeSent))
+            return false;
+    }
+    return true;
+}
+
+unsigned
+EPSNFController::acquisitionCount(Addr line) const
+{
+    unsigned count = 0;
+    for (const auto &entry : _retryQueue)
+        if (entry.linePa == line) ++count;
+    return count;
+}
+
+bool
+EPSNFController::parkAcquisition(Addr line, uint64_t control,
+                                  std::function<void()> onParked)
+{
+    const unsigned count = acquisitionCount(line);
+    if (!count || !canParkAcquisitions(line, control)) return false;
+    // Bounded by the fixed descriptor bank. Install the whole barrier before
+    // sending, so even immediate response delivery cannot finish early.
+    auto remaining = std::make_shared<unsigned>(count);
+    auto complete = std::make_shared<std::function<void()>>(std::move(onParked));
+    for (auto &entry : _retryQueue) {
+        if (entry.linePa != line) continue;
+        fatal_if(!control || !entry.nativeIncarnation || entry.parkPhase,
+                 "Invalid acquisition park admission addr=%#lx", line);
+        entry.parkControl = control;
+        entry.parkPhase = 1;
+        entry.onParked = [remaining, complete] {
+            assert(*remaining > 0);
+            if (--*remaining == 0) {
+                auto callback = std::move(*complete);
+                if (callback) callback();
+            }
+        };
+        DPRINTF(RubyEP, "[EP-PARK-TX] node=%d socket=%d addr=%#lx incarnation=%lu control=%lu\n",
+                _nodeId, _socketId, line, entry.nativeIncarnation, control);
+        NetDest destination(m_ruby_system);
+        destination.add(entry.hnReq);
+        auto msg = std::make_shared<CHIResponseMsg>(
+            curTick(), cacheLineSize, m_ruby_system, line,
+            CHIResponseType_AcquirePark, m_machineID, destination,
+            false, false, entry.nativeIncarnation, control,
+            MessageSizeType_Control);
+        sendResponseReliable(msg);
+    }
+    return true;
+}
+
+void
+EPSNFController::resumeAcquisition(Addr line, uint64_t control)
+{
+    bool found = false;
+    for (auto &entry : _retryQueue) {
+        if (entry.linePa != line || entry.parkControl != control) continue;
+        found = true;
+        if (entry.parkPhase == 3 || entry.parkPhase == 0) continue;
+        fatal_if(entry.parkPhase != 2, "Resume before local control completion");
+        entry.parkPhase = 3;
+        NetDest destination(m_ruby_system);
+        destination.add(entry.hnReq);
+        auto msg = std::make_shared<CHIResponseMsg>(
+            curTick(), cacheLineSize, m_ruby_system, line,
+            CHIResponseType_AcquireResume, m_machineID, destination,
+            false, false, entry.nativeIncarnation, control,
+            MessageSizeType_Control);
+        sendResponseReliable(msg);
+    }
+    // A repeated local completion is harmless after all branches retired.
+    if (!found) {
+        DPRINTF(RubyEP, "[EP-PARK-STALE-RESUME] addr=%#lx control=%lu\n",
+                line, control);
+    }
+}
+
+void
+EPSNFController::rememberRetiredControl(const RetryEntry &entry)
+{
+    if (!entry.parkControl) return;
+    auto &retired = _retiredControls[_retiredControlCursor];
+    retired.line = entry.linePa;
+    retired.incarnation = entry.nativeIncarnation;
+    retired.control = entry.parkControl;
+    retired.responder = entry.hnReq;
+    _retiredControlCursor = (_retiredControlCursor + 1) % _retiredControls.size();
+}
+
+void
+EPSNFController::nativeAcquireDone(Addr line, uint64_t incarnation)
+{
+    for (auto it = _retryQueue.begin(); it != _retryQueue.end(); ++it) {
+        if (it->linePa != line || it->nativeIncarnation != incarnation)
+            continue;
+        fatal_if(!it->nativeDataPublished,
+                 "Native acquire retired before publication addr=%#lx id=%lu",
+                 line, incarnation);
+        it->nativeDone = true;
+        // Both existing opt-in flags select the late-retirement fixture. The
+        // descriptor already owns the real data and incarnation; only its local
+        // retirement callback is delayed. No permission/data is fabricated.
+        if (params().park_microtest && params().park_microtest_partial &&
+            !_parkMicrotestIssued) {
+            _parkMicrotestIssued = true;
+            const uint64_t control = allocateWriteIdentity();
+            auto late = [this, line, control] {
+                inform("[PARK-MICRO] stage=LATE_NATIVE_DONE node=%d line=%#lx control=%lu",
+                       _nodeId, line, control);
+                fatal_if(!parkAcquisition(line, control, [this, line, control] {
+                    inform("[PARK-MICRO] stage=PARKED node=%d line=%#lx control=%lu",
+                           _nodeId, line, control);
+                    _backend->getEpRnfController()->startCleanUnique(
+                        line, [this, line, control](bool ok) {
+                            fatal_if(!ok, "Late Park native control failed");
+                            inform("[PARK-MICRO] stage=LOCAL_CONTROL_DONE node=%d line=%#lx control=%lu",
+                                   _nodeId, line, control);
+                            resumeAcquisition(line, control);
+                        }, _socketId);
+                }), "Late Park fixture lost its retained descriptor");
+            };
+            if (params().park_microtest_wrap) {
+                it->microHeld = true;
+                _microLatePark = std::move(late);
+            } else {
+                schedule(new EventFunctionWrapper(std::move(late),
+                    name() + ".latePark", true), clockEdge(Cycles(8)));
+            }
+            return;
+        }
+        if (it->parkPhase != 0 || it->closeSent)
+            return; // An in-flight control identity is still a live obligation.
+        it->closeSent = true;
+        NetDest destination(m_ruby_system);
+        destination.add(it->hnReq);
+        auto close = std::make_shared<CHIResponseMsg>(
+            curTick(), cacheLineSize, m_ruby_system, line,
+            CHIResponseType_AcquireClose, m_machineID, destination,
+            false, false, incarnation, it->parkControl, MessageSizeType_Control);
+        auto duplicate = params().park_microtest_wrap
+            ? std::make_shared<CHIResponseMsg>(*close) : nullptr;
+        sendResponseReliable(close);
+        if (params().park_microtest_wrap) {
+            // Deliberately duplicate actual Close and exercise duplicate ACK
+            // consumption; each message owns a separate immutable wire copy.
+            sendResponseReliable(duplicate);
+        }
+        scheduleEvent(Cycles(1));
+        return;
+    }
 }
 
 bool
@@ -891,7 +1343,9 @@ EPSNFController::processPendingHAWrites()
                         pending.homePa, pending.storeCommitId,
                         pending.expectedMask, pending.data, pending.homeNode,
                         pending.homeSocket, pending.sourceSocket,
-                        pending.permissionReqId);
+                        pending.permissionReqId,
+                        pending.parentInvalidateReqId,
+                        pending.parentInvalidateEpoch);
                 } else {
                     result = _backend->commitStore(
                         pending.homePa, pending.requesterNode,
@@ -901,6 +1355,8 @@ EPSNFController::processPendingHAWrites()
                         pending.permissionReqId);
                 }
             }
+            if (pending.linePa == 0x14030000 && result != -2)
+                DPRINTF(RubyEPVerbose, "[WB-DIAG] stage=SNF_PERSIST_RESULT pa=%#lx node=%d socket=%d store=%lu req=%lu internal=%d release=%d parent=%lu result=%d\n", pending.linePa, _nodeId, pending.sourceSocket, pending.storeCommitId, pending.permissionReqId, pending.internalPublication, pending.replacementOwnerRelease, pending.parentInvalidateReqId, result);
             if (result == -2) {
                 pendingWork = true;
                 continue;
@@ -911,7 +1367,8 @@ EPSNFController::processPendingHAWrites()
             // in that case, so retry the same stable publication identity.
             // StoreCommit rejection remains fatal and exact-identity checked.
             if (result == 0 && pending.internalPublication &&
-                !pending.replacementOwnerRelease) {
+                !pending.replacementOwnerRelease &&
+                pending.parentInvalidateReqId == 0) {
                 pendingWork = true;
                 continue;
             }
@@ -977,6 +1434,11 @@ EPSNFController::publishHAWrite(uint64_t transactionId, PendingWrite &pending)
                  "EP_SNF node_id=%d: missing store completion id=%lu",
                  _nodeId, transactionId);
         PendingWrite &done = it->second;
+        if (done.boundaryToken.valid()) {
+            fatal_if(!_backend->boundaryTransactions().finishWrite(
+                         done.boundaryToken, done.storeCommitId, done.sourceSocket),
+                     "EPSNF stale boundary write completion id=%lu", transactionId);
+        }
         if (done.haWrite) {
             fatal_if(!_backend->acknowledgeHAPermission(
                          done.homePa, HAOperation::Write, HAStatus::Ok,

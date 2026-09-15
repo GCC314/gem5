@@ -15,3 +15,6 @@ class EPSNFController(EPController):
     socket_id = Param.Int(0, "v4-dual-socket: socket index")
     retry_cycles = Param.UInt64(20000, "Retry cycle count after BUSY grant")
     delta_noc_cycles = Param.UInt64(0, "Cross-socket NoC extra latency in cycles")
+    park_microtest = Param.Bool(False, "Test only: revoke first blocked acquisition through real CHI")
+    park_microtest_partial = Param.Bool(False, "Test only: inject Park between native data beats")
+    park_microtest_wrap = Param.Bool(False, "MICRO only: hold observer past 256 other real Close ACKs")

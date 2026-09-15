@@ -309,6 +309,7 @@ class EPRNFController : public EPController
      * removed from the map.
      */
     struct PendingChiTxn {
+        uint64_t generation = 0;
         uint64_t linePa;
         uint64_t epoch;          // v4: outer epoch for this transaction
         uint64_t reqId;          // v4: outer reqId for this transaction
@@ -373,7 +374,7 @@ class EPRNFController : public EPController
      */
     void startReadUnique(uint64_t linePa,
                          std::function<void(bool, const DataBlock &, bool)>
-                             onComplete);
+                             onComplete, int sourceSocket = 0);
 
     /**
      * Initiate a ReadShared to the local HN-F for read recall (§4.3.2).
@@ -382,7 +383,10 @@ class EPRNFController : public EPController
      */
     void startReadShared(uint64_t linePa,
                          std::function<void(bool, const DataBlock &, bool)>
-                             onComplete);
+                             onComplete, int sourceSocket = 0);
+    bool canStartBoundaryControl(uint64_t linePa) const {
+        return _pendingChiTxns.size() < 64 && !_pendingChiTxns.count(linePa);
+    }
 
     /**
      * Initiate a CleanUnique to the local HN-F for sharer invalidation
@@ -393,7 +397,8 @@ class EPRNFController : public EPController
      * @param onComplete Called when the CHI transaction completes
      */
     void startCleanUnique(uint64_t linePa,
-                          std::function<void(bool)> onComplete);
+                          std::function<void(bool)> onComplete,
+                          int sourceSocket = 0);
 
     // ---- v4: Helper ----
     /**
@@ -419,7 +424,8 @@ class EPRNFController : public EPController
     /** Send a CHI request (ReadShared/CleanUnique/ReadUnique) to HN-F via reqOut.
      *  @return true if the message was enqueued successfully. */
     bool sendChiRequest(uint64_t linePa, CHI::CHIRequestType reqType,
-                        CHI::EpProxyOp proxyOp = CHI::EpProxyOp_NoProxyOp);
+                        CHI::EpProxyOp proxyOp = CHI::EpProxyOp_NoProxyOp,
+                        int sourceSocket = 0);
 
     // v4-dual-socket: PA → socket → HN-F routing helpers (§3.3)
     int decodeHomeSocket(uint64_t linePa) const {
@@ -436,7 +442,11 @@ class EPRNFController : public EPController
     // Preserve each outer invalidation callback (and its captured identity)
     // while another CHI operation owns the line. Never turn ordinary busy
     // into a failed or silently acknowledged invalidation.
-    std::map<uint64_t, std::deque<std::function<void(bool)>>>
+    struct DeferredInvalidation {
+        std::function<void(bool)> onComplete;
+        int sourceSocket;
+    };
+    std::map<uint64_t, std::deque<DeferredInvalidation>>
         _deferredInvalidations;
 
     struct PendingResponseSend {
@@ -486,6 +496,7 @@ class EPRNFController : public EPController
     /** v4: Complete a PendingChiTxn — invoke callback, clean up,
      *  then process queued snoop or deferred CHI requests. */
     void finishChiTxn(uint64_t linePa, bool success);
+    uint64_t _nextChiGeneration = 1;
 
     // ---- v4: Retry Queue (§4.3.4) ----
     /**
@@ -571,6 +582,7 @@ class EPRNFController : public EPController
     Tick _lastChiRequestSendTick;
     // Queue of CHI requests deferred to a later event-processing cycle.
     struct DeferredChiRequest {
+        int sourceSocket = 0;
         uint64_t linePa;
         CHI::CHIRequestType reqType;
         CHI::EpProxyOp proxyOp;  // v4: proxy op for deferred request
