@@ -136,6 +136,7 @@ enum class CoherenceMessageType : uint16_t {
     HAPresenceProbeReq = 34, // query/validate line presence at an HA participant
     HAPresenceProbeResp = 35,// typed presence result
     NetworkExit = 36,        // UBIO/networksim application-level shutdown
+    RetainedAuthorityCommit = 37,
 };
 
 // ---- Message Flags ----
@@ -293,7 +294,8 @@ struct UBUpgradeDoneReqBody { /* no extra fields beyond header */ };
 
 struct UBUpgradeDoneRespBody {
     bool accepted;
-    UBUpgradeDoneRespBody() : accepted(false) {}
+    uint64_t committedEpoch; // zero means accepted but not committed yet
+    UBUpgradeDoneRespBody() : accepted(false), committedEpoch(0) {}
 };
 
 struct UBClearReqBody {
@@ -499,6 +501,7 @@ coherenceMsgTypeName(CoherenceMessageType t)
         case CoherenceMessageType::UpgradeResp:      return "UpgradeResp";
         case CoherenceMessageType::UpgradeDoneReq:   return "UpgradeDoneReq";
         case CoherenceMessageType::UpgradeDoneResp:  return "UpgradeDoneResp";
+        case CoherenceMessageType::RetainedAuthorityCommit: return "RetainedAuthorityCommit";
         case CoherenceMessageType::ClearReq:         return "ClearReq";
         case CoherenceMessageType::ClearResp:        return "ClearResp";
         case CoherenceMessageType::UpgradeAckNotify: return "UpgradeAckNotify";

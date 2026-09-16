@@ -457,8 +457,15 @@ UBAdapter::drainReliableOutputs()
         for (unsigned slot = 0; slot < 4; ++slot) {
             auto &out = _controlOutputs[peer][slot];
             if (!out.queued || !transportSend(out.reply.expand())) continue;
+            const auto header = out.reply.h;
             out.queued = false;
-            _controlReceipts.complete(peer, out.reply.h.seqNum);
+            _controlReceipts.complete(peer, header.seqNum);
+            if (_backend && (header.type == CoherenceMessageType::InvalidateAck ||
+                (header.type == CoherenceMessageType::RecallResp &&
+                 (header.flags & static_cast<uint32_t>(CFLAG_ACCEPTED)))))
+                _backend->controlReplyHandedOff(header.homeLinePa,
+                    header.dstNode, _socketId, header.epoch, header.reqId,
+                    (header.flags & static_cast<uint32_t>(CFLAG_DATA_RETURNED)) != 0);
         }
     }
     while (!_reliableOutputs.empty()) {
@@ -1344,8 +1351,9 @@ UBAdapter::sendUpgradeReq(uint64_t homePa, int requesterNode,
 int
 UBAdapter::sendUpgradeDoneReq(uint64_t homePa, int requesterNode,
                                 uint64_t epoch, uint64_t reqId,
-                                int homeNode, int homeSocket)
+                                int homeNode, int homeSocket, uint64_t *committedEpoch)
 {
+    if (committedEpoch) *committedEpoch = 0;
     DPRINTF(RubyEP,
             "UBAdapter node=%d socket=%d: sendUpgradeDoneReq homePa=0x%lx "
             "reqNode=%d epoch=%lu reqId=%lu homeNode=%d homeSocket=%d\n",
@@ -1362,6 +1370,8 @@ UBAdapter::sendUpgradeDoneReq(uint64_t homePa, int requesterNode,
     auto done = _readyResponses.find(doneKey);
     if (done != _readyResponses.end()) {
         const bool accepted = done->second.b.upgradeDoneResp.accepted;
+        if (committedEpoch)
+            *committedEpoch = done->second.b.upgradeDoneResp.committedEpoch;
         _readyResponses.erase(done);
         return accepted ? 1 : 0;
     }
@@ -2534,6 +2544,15 @@ UBAdapter::handleResponse(const framework::Message *m)
             coh ? static_cast<int>(coh->h.type) : -1,
             coh ? coh->h.reqId : 0UL);
     if (!coh) return;
+    if (coh->h.type == CoherenceMessageType::RetainedAuthorityCommit) {
+        if (_backend && coh->h.srcNode == coh->h.homeNode &&
+            coh->h.srcSocket == coh->h.homeSocket && coh->h.dstNode == _nodeId &&
+            coh->h.dstSocket == _socketId && coh->b.upgradeDoneResp.accepted)
+            _backend->retainedAuthorityCommitted(coh->h.homeLinePa,
+                coh->h.srcNode, _socketId, coh->h.epoch, coh->h.reqId,
+                coh->b.upgradeDoneResp.committedEpoch);
+        return;
+    }
 
     if (coh->h.type == CoherenceMessageType::ClearResp) {
         DPRINTF(RubyEP,
@@ -2633,6 +2652,9 @@ UBAdapter::handleResponse(const framework::Message *m)
     // Responses are consumed by the retry-based callers using exact identity.
     // Store in ready-response cache for retry-based sendReadReq
     cacheResponse(*coh);
+    if (coh->h.type == CoherenceMessageType::UpgradeDoneResp && _backend)
+        _backend->onUpgradeDoneRespArrived(coh->h.reqId, coh->h.homeLinePa,
+                                         _socketId);
 
     // The read reservation includes the response slot. Keep it until the
     // exact retry consumes the payload, not merely until transport arrival.

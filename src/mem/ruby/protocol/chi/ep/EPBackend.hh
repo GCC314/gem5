@@ -400,7 +400,8 @@ class EPBackend : public SimObject
                                      bool *outRejected = nullptr,
                                      bool *outNotSharer = nullptr,
                                      bool *outDeferred = nullptr,
-                                     bool forceResend = false);
+                                     bool forceResend = false,
+                                     bool *outLocalBlocked = nullptr);
 
     /**
      * Send OuterUpgradeDone after local upgrade completes.
@@ -413,6 +414,14 @@ class EPBackend : public SimObject
      */
     bool sendUpgradeDone(uint64_t line_pa, int homeNode, int sourceSocket,
                          uint64_t epoch, uint64_t reqId);
+    void onUpgradeDoneRespArrived(uint64_t reqId, uint64_t homePa,
+                                 int sourceSocket);
+    void controlReplyHandedOff(uint64_t homePa, int home, int socket,
+                              uint64_t epoch, uint64_t reqId,
+                              bool dataReturned = true);
+    void retainedAuthorityCommitted(uint64_t homePa, int home, int socket,
+                                    uint64_t oldEpoch, uint64_t reqId,
+                                    uint64_t newEpoch);
 
     // ---- v4: Clear / ClearAck (§3.5, §4.2.3) ----
     /**
@@ -1010,6 +1019,7 @@ class EPBackend : public SimObject
     bool authorityKey(Addr pa, uint32_t &key) const;
     bool reserveAuthority(Addr pa);
     struct AuthorityRelease {
+        uint64_t retainedEpoch = 0, releaseAttempt = 0;
         bool externalControlDone = false;
         BoundaryStableToken stable;
         BoundaryTransactions::Token ticket;
@@ -1134,6 +1144,11 @@ class EPBackend : public SimObject
     // (existing outstanding) — the death loop that hung TC3/8/10/11.
     struct PendingUpgradeTxn {
         BoundaryTransactions::Token ticket;
+        BoundaryStableToken authority;
+        uint64_t previousAuthorityEpoch = 0;
+        bool joinedForeground = false;
+        bool sent = false;
+        bool doneConsumed = false;
         bool valid;
         uint64_t linePa;
         int homeNode;
@@ -1154,6 +1169,20 @@ class EPBackend : public SimObject
         bool complete = false;
         BoundaryTransactions::Token ticket;
     };
+    struct ControlRetirement {
+        bool live = false;
+        bool dataNeeded = false;
+        bool retainedShared = false;
+        Addr homePa = 0;
+        int home = -1, socket = -1;
+        uint64_t controlEpoch = 0, reqId = 0, authorityEpoch = 0;
+        BoundaryStableToken authority;
+        BoundaryBorrowToken borrow;
+    };
+    std::array<ControlRetirement, BoundaryTransactions::Capacity> _controlRetirements{};
+    bool reserveControlRetirement(Addr localPa, Addr homePa, int home,
+                                  int socket, uint64_t epoch, uint64_t reqId,
+                                  bool dataNeeded = false, bool retainedShared = false);
     std::map<HALineKey, PendingInvalidation> _pendingInvalidations;
 
     // InvalidateReqs that arrived while a SnpCleanInvalid-upgrade was held.

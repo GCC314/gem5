@@ -121,6 +121,19 @@ class BoundaryAuthorityTable {
         return {candidate.valid() ? Admission::ReleaseCandidate : Admission::Busy,
                 candidate};
     }
+    // A fully revoking native control has handed its required data/ACK to the
+    // reliable Home path. This is not inferred from R_I or Home absence. The
+    // captured token and authority epoch must still name the same incarnation.
+    // Borrowers remain live until their own native completion.
+    BoundaryResult retireByControl(Token t, uint64_t epoch) {
+        auto *e = edit(t);
+        if (!e || !epoch || e->epoch != epoch) return BoundaryResult::Stale;
+        if (e->state != State::Live) return BoundaryResult::Busy;
+        e->epoch = 0;
+        e->access = RequesterLineState::R_I;
+        e->resident = false;
+        return BoundaryResult::Applied;
+    }
     BoundaryResult setFlags(Token t, uint16_t flags) {
         auto *e = edit(t);
         if (!e) return BoundaryResult::Stale;

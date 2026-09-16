@@ -122,7 +122,8 @@ class UBAdapter : public SimObject
 
     int sendUpgradeDoneReq(uint64_t homePa, int requesterNode,
                            uint64_t epoch, uint64_t reqId,
-                           int homeNode, int homeSocket);
+                           int homeNode, int homeSocket,
+                           uint64_t *committedEpoch = nullptr);
 
     int sendClearReq(uint64_t linePa, int srcNode,
                      uint64_t epoch, uint64_t reqId,

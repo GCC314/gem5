@@ -1887,6 +1887,7 @@ EPRNFController::completeHeldUpgrade(uint64_t linePa, bool dropRecoveryResend)
     bool rejected = false;
     bool notSharer = false;
     bool homeDeferred = false;
+    bool localBlocked = false;
 
     // Re-check the upgrade. With checkOnly semantics (an in-flight upgrade is
     // already pending in EPBackend::_pendingUpgradeTxns), this returns true once
@@ -1898,13 +1899,28 @@ EPRNFController::completeHeldUpgrade(uint64_t linePa, bool dropRecoveryResend)
         linePa, homeNode, upIt->second.sourceSocket, 1,
         UpgradeCause::LocalCleanUnique,
         epoch, reqId, &rejected, &notSharer, &homeDeferred,
-        dropRecoveryResend /*forceResend: retransmit same reqId on DROP*/);
+        dropRecoveryResend /*forceResend: retransmit same reqId on DROP*/,
+        &localBlocked);
     fatal_if(epoch == 0 || reqId == 0,
              "EP_RNF node_id=%d: upgrade lacks stable tuple PA=0x%lx "
              "sourceSocket=%d epoch=%lu reqId=%lu", _nodeId, linePa,
              upIt->second.sourceSocket, epoch, reqId);
     upIt->second.epoch = epoch;
     upIt->second.reqId = reqId;
+    if (localBlocked) {
+        // Poll local admission independently of the remote-loss budget. A
+        // request that never left this EP cannot have lost a Home response.
+        if (dropRecoveryResend && upIt->second.dropResendCount) {
+            --upIt->second.dropResendCount;
+            if (upIt->second.retryCount) --upIt->second.retryCount;
+        }
+        upIt->second.dropWatchdogArmed = false;
+        _upgradeRetryLines.insert(linePa);
+        const Cycles delay(ep_upgrade_retry_backoff_cycles(0));
+        upIt->second.retryReadyTick = clockEdge(delay);
+        scheduleEvent(delay);
+        return;
+    }
 
     if (accepted) {
         upIt->second.homeAccepted = true;

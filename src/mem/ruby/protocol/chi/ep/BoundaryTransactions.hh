@@ -137,6 +137,30 @@ class BoundaryTransactions
         retire(e);
         return BoundaryResult::Applied;
     }
+    // A native ReadShared may need an outer upgrade before its HN transaction
+    // can close. Attach that child to the committed foreground; do not wait for
+    // NativeClose (which depends on this child), or replace the parent's ID.
+    Token upgrade(uint64_t line, uint64_t epoch, int owner,
+                  uint64_t id, int socket, bool &joined) {
+        joined = false;
+        auto t = find(line);
+        auto *e = edit(t);
+        if (!e) return foreground(line, epoch, owner, id, socket);
+        if (!id || !e->foregroundId || e->owner != owner ||
+            e->foregroundSocket != socket ||
+            !(e->foregroundDone & HomeCommit) || e->controlCredit ||
+            e->escapeCredit || e->writeId || e->recallId || e->invalidateId)
+            return {};
+        if (e->operation != BoundaryOperation::None &&
+            (e->operation != BoundaryOperation::Upgrade ||
+             e->operationId != id || e->operationSocket != socket)) return {};
+        e->operation = BoundaryOperation::Upgrade;
+        e->operationId = id;
+        e->operationSocket = socket;
+        e->operationDone = false;
+        joined = true;
+        return t;
+    }
     unsigned creditUsage(BoundaryPool pool) const {
         unsigned count = 0;
         for (const auto &e : entries)
@@ -271,7 +295,9 @@ class BoundaryTransactions
         if (!t.valid()) t = allocate(line, epoch, owner, custody, true);
         auto *e = edit(t);
         if (e && e->foregroundId && !e->recallId && !e->writeId &&
-            e->operation == BoundaryOperation::None) e->epoch = epoch;
+            (e->operation == BoundaryOperation::None ||
+             (e->operation == BoundaryOperation::Upgrade && e->operationDone)))
+            e->epoch = epoch;
         if (!e || e->epoch != epoch || e->owner != owner || !id ||
             (e->mergedRecallId && e->mergedRecallId != id) ||
             (e->recallId && (e->recallId != id || e->recallSocket != socket)))
@@ -291,7 +317,9 @@ class BoundaryTransactions
         if (e && !e->ordinaryCredit &&
             creditUsage(BoundaryPool::Ordinary) >= ordinaryLimit) return {};
         if (e && e->foregroundId && !e->recallId && !e->writeId &&
-            e->operation == BoundaryOperation::None) e->epoch = epoch;
+            (e->operation == BoundaryOperation::None ||
+             (e->operation == BoundaryOperation::Upgrade && e->operationDone)))
+            e->epoch = epoch;
         if (!e || e->epoch != epoch || e->owner != owner || !id ||
             (e->writeId && (e->writeId != id || e->writeSocket != socket)))
             return {};
