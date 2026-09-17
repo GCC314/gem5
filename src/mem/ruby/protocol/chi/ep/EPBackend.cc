@@ -387,8 +387,12 @@ void EPBackend::startAuthorityRelease(BoundaryStableToken victim)
                 if (r.reqId != id || r.stable.generation != release.generation ||
                     r.stable.slot != release.slot) return;
                 fatal_if(!ok, "authority native release failed; custody retained");
+                const auto *joined = _boundaryTransactions.get(r.ticket);
+                const bool writebackOwnsCustody = joined && joined->writeId &&
+                    joined->epoch == r.identity && joined->owner == _nodeId;
                 fatal_if(!valid && r.access == RequesterLineState::R_M &&
-                         !_haEndpointEnabled, "authority release lost dirty owner data");
+                         !_haEndpointEnabled && !writebackOwnsCustody,
+                         "authority release lost dirty owner data");
                 r.nativeDone = true; r.dataValid = valid;
                 if (valid) r.data = data;
                 for (auto *snf : _epSnfs)
@@ -419,10 +423,26 @@ void EPBackend::progressAuthorityRelease()
     auto *adapter = getUBAdapter(r.socket);
     if (!adapter) return;
     bool homeDone = r.homeDone;
-    if (!homeDone && !_haEndpointEnabled && r.access == RequesterLineState::R_M) {
-        const int result = handleWritebackWithMeta(r.localPa, false,
-            r.data.getData(0, 64), r.identity, _nodeId, r.socket, &r.writeId);
-        homeDone = result == 1;
+    const auto *joined = _boundaryTransactions.get(r.ticket);
+    const bool joinedWrite = joined && joined->writeId &&
+        joined->epoch == r.identity && joined->owner == _nodeId;
+    const bool joinedRecall = joinedWrite && joined->mergedRecallId;
+    if (joinedWrite && !joined->persisted) return;
+    if (joinedWrite) r.persisted = true;
+    if (!homeDone && !_haEndpointEnabled &&
+        r.access == RequesterLineState::R_M && !joinedRecall) {
+        if (joinedWrite) {
+            // An unmerged exact DropOwner receipt proves both persistence and
+            // retirement. A merged write continues through the control proof
+            // below because RecallShared may retain a successor authority.
+            homeDone = true;
+        } else {
+            fatal_if(!r.dataValid,
+                     "authority release lost dirty owner data");
+            const int result = handleWritebackWithMeta(r.localPa, false,
+                r.data.getData(0, 64), r.identity, _nodeId, r.socket, &r.writeId);
+            homeDone = result == 1;
+        }
     } else if (!homeDone) {
         if (r.identity && r.dataValid && !r.persisted && !r.externalControlDone) {
             // Coherent capture is published before a clean/VI holder is dropped.
@@ -2762,6 +2782,7 @@ EPBackend::handleWritebackWithMeta(uint64_t line_pa, bool keepAsClean,
 
     // Update requester bookkeeping based on result
     auto it = _requesterLines.find(line_pa);
+    bool joinedBoundaryWrite = false;
     if (ok) {
         const auto token = _boundaryTransactions.find(line_pa);
         if (const auto *entry = _boundaryTransactions.get(token)) {
@@ -2769,6 +2790,7 @@ EPBackend::handleWritebackWithMeta(uint64_t line_pa, bool keepAsClean,
                 fatal_if(!_boundaryTransactions.publication(token,
                              *ioWritebackReqId, sourceSocket, mergedRecallReqId),
                          "OwnerWB boundary publication identity mismatch");
+                joinedBoundaryWrite = true;
             }
         }
         _writebackCount++;
@@ -2796,6 +2818,9 @@ EPBackend::handleWritebackWithMeta(uint64_t line_pa, bool keepAsClean,
             }
         }
     }
+
+    if (joinedBoundaryWrite)
+        progressAuthorityRelease();
 
     DPRINTF(RubyEP,
             "EPBackend node_id=%d: handleWriteback PA=0x%lx complete "
