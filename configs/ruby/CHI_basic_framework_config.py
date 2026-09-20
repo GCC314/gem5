@@ -96,7 +96,7 @@ class NodeAddressMap:
 
 class NodeConfig:
     def __init__(self, node_id, num_nodes=DEFAULT_N, seg_size=DEFAULT_SEG_SIZE,
-                 num_sockets=1):
+                 num_sockets=1, metadata_private_size=None):
         self.node_id = node_id
         self.num_nodes = num_nodes
         self.seg_size = seg_size
@@ -109,12 +109,16 @@ class NodeConfig:
         # (replaces old ubcc_exclusive_range).  Split evenly by socket.
         self.routing_window_base = self.phy_base + 1 * seg_size
         self.routing_window_size = seg_size
-        # v4-dual-socket: metadata_private_base is after all DSM segments
-        # (this is the 16MB metadata backstore, split by socket).
-        # Parameter name kept as metadata_private_* for EPBackend SimObject compat.
+        # v4-dual-socket: metadata_private_base is after all DSM segments.
+        # Phase 0: metadata_private_size is now a configurable parameter.
+        # Default: 128 MiB for rearchitecture validation.
+        # Legacy 16 MiB only if explicitly requested via metadata_private_size.
         dsm_count = num_nodes * num_sockets
         self.metadata_private_base = self.phy_base + (2 + dsm_count) * seg_size
-        self.metadata_private_size = 16 * 1024 * 1024
+        if metadata_private_size is not None:
+            self.metadata_private_size = metadata_private_size
+        else:
+            self.metadata_private_size = 128 * 1024 * 1024  # Phase 0 default: 128 MiB
         self.metadata_private_end = (
             self.metadata_private_base + self.metadata_private_size
         )

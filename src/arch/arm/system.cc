@@ -84,7 +84,7 @@ ArmSystem::ArmSystem(const Params &p)
       release(p.release),
       multiProc(p.multi_proc)
 {
-    if (p.auto_reset_addr) {
+    if (FullSystem && workload && p.auto_reset_addr) {
         _resetAddr = workload->getEntry();
     } else {
         _resetAddr = p.reset_addr;
@@ -93,7 +93,9 @@ ArmSystem::ArmSystem(const Params &p)
                 workload->getEntry(), _resetAddr);
     }
 
-    bool wl_is_64 = (workload->getArch() == loader::Arm64);
+    bool wl_is_64 = FullSystem && workload\
+        ? (workload->getArch() == loader::Arm64)\
+        : _highestELIs64;
     if (wl_is_64 != _highestELIs64) {
         warn("Highest ARM exception-level set to AArch%d but the workload "
               "is for AArch%d. Assuming you wanted these to match.",

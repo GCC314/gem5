@@ -32,8 +32,13 @@ SyncWaitManager::barrierArrive(ThreadContext *tc, uint32_t mask,
     if (mask == 0)
         return -EINVAL;
 
+    // Bit 31 tags the portable-startup barrier; it is not a plane.
+    const uint32_t planeMask = mask & ~0x80000000u;
+    if (planeMask == 0)
+        return -EINVAL;
+
     uint32_t max_valid = (1u << MAX_NODE_COUNT) - 1u;
-    if (mask & ~max_valid)
+    if (planeMask & ~max_valid)
         return -EINVAL;
 
     auto &bs = _barriers[mask];

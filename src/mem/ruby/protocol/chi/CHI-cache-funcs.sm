@@ -418,9 +418,12 @@ void initializeTBE(TBE tbe, Addr addr, int storSlot) {
   tbe.is_stale := false;
 
    // v4: Derive epRnfMachineID from epRnfMachineVersion
-   if (epRnfMachineVersion >= 0) {
-     tbe.epRnfMachineID := createMachineID(MachineType:Cache, intToID(epRnfMachineVersion));
-   }
+  if (epRnfMachineVersion >= 0) {
+    tbe.epRnfMachineID := createMachineID(MachineType:Cache, intToID(epRnfMachineVersion));
+  }
+  if (metaRnfMachineVersion >= 0) {
+    tbe.metaRnfMachineID := createMachineID(MachineType:Cache, intToID(metaRnfMachineVersion));
+  }
 
   // v4: Reset proxy op to no-op; will be set in allocateRequestTBE if needed
   tbe.epProxyOp := EpProxyOp:NoProxyOp;

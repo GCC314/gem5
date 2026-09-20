@@ -167,6 +167,11 @@ machine(MachineType:Cache, "Cache coherency protocol") :
   // EP-RNF MachineID version (-1 if none, overridden by config if EP-RNF exists)
   int epRnfMachineVersion := -1;
 
+  // MetaRNF issues non-allocating ReadOnce transactions for the private
+  // metadata range. The HN-F still caches these lines, but never records the
+  // MetaRNF as a directory sharer.
+  int metaRnfMachineVersion := -1;
+
   // If the responder has the line in UC or UD state, propagate this state
   // on a ReadShared. Notice data won't be deallocated if dealloc_on_unique is
   // set
@@ -668,6 +673,7 @@ machine(MachineType:Cache, "Cache coherency protocol") :
     // v4: EP-RNF MachineID derived from epRnfMachineVersion at init time.
     // Used by HN-F to track EP-RNF in dir_sharers for snoop fanout.
     MachineID epRnfMachineID, desc="EP-RNF MachineID for dir_sharers tracking";
+    MachineID metaRnfMachineID, desc="MetaRNF MachineID for private metadata reads";
 
     // v4: EP proxy operation type carried from CHIRequestMsg to TBE.
     // Set during allocateRequestTBE from in_msg.ep_proxy_op.
