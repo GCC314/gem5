@@ -352,13 +352,10 @@ EPBackend::recordHAInstall(uint64_t localLinePa, HAOperation operation,
     entry.homeNode = homeNode;
     entry.outerStartTick = 0;
     _haRequesterLines[{sourceSocket, localLinePa}] = entry;
-}
-
-void
-EPBackend::recordHADirtyData(uint64_t localLinePa, int sourceSocket,
-                             const DataBlock &data)
-{
-    _haDirtyData[{sourceSocket, localLinePa}] = data;
+    // A completed HA install means this node really holds the line (allocating
+    // read or write). Record node residency so a later owner recall is served
+    // by the real cache hierarchy instead of short-circuiting to no-data.
+    _haNodeResident.insert(localLinePa);
 }
 
 void
@@ -377,12 +374,41 @@ EPBackend::registerHADataCache(int sourceSocket, CacheMemory *cache)
 }
 
 void
+EPBackend::observeHAHomeFinal(Addr localLinePa, int homeSocket, bool present)
+{
+    if (!_haEndpointEnabled || !isDsmAddrCrossNode(localLinePa))
+        return;
+    // HN final I follows dirty persistence and absence of every upstream
+    // holder, unlike an L1 replacement. Retire endpoint metadata here. The
+    // fixed-size Home bitmap conservatively retains its lease until a coherent
+    // probe; never emit an unversioned release that could clear a newer grant.
+    if (!present) {
+        _haNodeResident.erase(localLinePa);
+        for (int socket = 0; socket < _numSockets; ++socket)
+            _haRequesterLines.erase({socket, localLinePa});
+    } else {
+        _haNodeResident.insert(localLinePa);
+    }
+    std::vector<HARemoteMissKey> installed;
+    for (const auto &item : _haRemoteMisses) {
+        if (std::get<0>(item.first) == localLinePa &&
+            item.second.homeSocket == homeSocket && item.second.awaitingInstall)
+            installed.push_back(item.first);
+    }
+    for (const auto &key : installed)
+        completeHARemoteGrant(std::get<0>(key), std::get<2>(key),
+                             std::get<3>(key), std::get<1>(key));
+}
+
+void
 EPBackend::invalidateHADataCaches(int sourceSocket, uint64_t localLinePa)
 {
-    fatal_if(sourceSocket < 0 ||
-                 sourceSocket >= static_cast<int>(_haDataCachesBySocket.size()),
-             "EPBackend node_id=%d: invalid HA invalidate socket=%d PA=0x%lx",
-             _nodeId, sourceSocket, localLinePa);
+    // HA-only helper. No HA data cache is registered outside the HA endpoint
+    // profile, so an empty/unbound socket is a no-op rather than a fault.
+    if (sourceSocket < 0 ||
+        sourceSocket >= static_cast<int>(_haDataCachesBySocket.size())) {
+        return;
+    }
     for (CacheMemory *cache : _haDataCachesBySocket[sourceSocket]) {
         if (cache->isTagPresent(localLinePa))
             cache->deallocate(localLinePa);
@@ -489,7 +515,7 @@ EPBackend::handleHAPresenceProbeRequest(const CoherenceMessage &request,
     const auto requester = _haRequesterLines.find({targetSocket, localPa});
     const uint64_t observedEpoch = requester == _haRequesterLines.end()
         ? 0 : requester->second.epoch;
-    const bool present = hasHADataCacheLine(targetSocket, localPa);
+    const bool present = _haNodeResident.count(localPa) != 0;
 
     auto complete = [this, key, reqId = request.h.reqId, localPa,
                       targetSocket, observedEpoch, present](bool ok) {
@@ -536,7 +562,7 @@ EPBackend::handleHAPresenceProbeRequest(const CoherenceMessage &request,
                     if (ok)
                         invalidateHADataCaches(targetSocket, localPa);
                     complete(ok);
-                });
+                }, targetSocket);
         }
     } else {
         complete(false);
@@ -1833,6 +1859,33 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
     _lastRecallMsg = recallMsg;
     _recallReceivedCount++;
 
+    if (!_pendingRecalls.emplace(recallMsg.linePa, recallMsg.homeNode,
+                                 recallMsg.epoch, recallMsg.reqId,
+                                 recallMsg.sourceSocket).second) {
+        DPRINTF(RubyEP, "[RECALL-COALESCE] PA=0x%lx reqId=%lu\n",
+                recallMsg.linePa, recallMsg.reqId);
+        return true;
+    }
+
+    const Addr observedPa = recallMsg.ownerLocalPa != 0
+        ? recallMsg.ownerLocalPa : recallMsg.linePa;
+    if (_haEndpointEnabled && !_haNodeResident.count(observedPa)) {
+        // A lease can outlive the last physical copy. HN final I is a coherent
+        // negative observation after dirty persistence; never substitute L1
+        // absence or zero payload for this proof.
+        OuterRecallResponse response;
+        response.linePa = recallMsg.linePa;
+        response.ownerNode = recallMsg.ownerNode;
+        response.homeNode = recallMsg.homeNode;
+        response.epoch = recallMsg.epoch;
+        response.reqId = recallMsg.reqId;
+        response.sourceSocket = recallMsg.sourceSocket;
+        response.ackReceived = true;
+        response.dataReturned = false;
+        sendRecallResponse(response);
+        return true;
+    }
+
     // Track active recall for self-snoop detection in EPRNFController.
     // Store both local PA (matches SnpCleanInvalid msg->m_addr) and home PA.
     {
@@ -1920,18 +1973,6 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
                 resp.ackReceived = success;
                 resp.dataReturned = capturedMsg.dataNeeded &&
                     resp.ackReceived && capturedDataValid;
-                if (capturedMsg.dataNeeded && resp.ackReceived) {
-                    const HALineKey key{capturedMsg.sourceSocket,
-                                        capturedMsg.ownerLocalPa != 0
-                                            ? capturedMsg.ownerLocalPa
-                                            : capturedMsg.linePa};
-                    auto dirty = _haDirtyData.find(key);
-                    if (dirty != _haDirtyData.end()) {
-                        resp.dataReturned = true;
-                        resp.dataPayload = dirty->second;
-                        resp.hasDataPayload = true;
-                    }
-                }
                 if (resp.dataReturned) {
                     if (capturedDataValid && !resp.hasDataPayload)
                         resp.dataPayload = capturedData;
@@ -1990,7 +2031,7 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
         // R2: Clear stale recall capture data before initiating new recall
         setRecallCaptureData(DataBlock(64), false);
         _epRnfCtrl->startReadUnique(ownerLocalPa,
-            [this, capturedMsg](bool success, const DataBlock &capturedData,
+            [this, capturedMsg, ownerLocalPa](bool success, const DataBlock &capturedData,
                                 bool capturedDataValid) {
                 inform(
                              "[RECALL-PROXY-CALLBACK] node=%d homePA=0x%lx "
@@ -1998,6 +2039,17 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
                              _nodeId, capturedMsg.linePa, capturedMsg.reqId,
                              success ? 1 : 0,
                               capturedDataValid ? 1 : 0, curTick());
+                // HA-only: a unique recall must actually drop this node's copy so
+                // a later local read misses and re-fetches from Home. The CHI
+                // proxy scrubs the TBE, but the L1 line may survive; deallocate
+                // it and retire the HA residency/probe metadata.
+                if (_haEndpointEnabled) {
+                    invalidateHADataCaches(capturedMsg.sourceSocket,
+                                           ownerLocalPa);
+                    _haNodeResident.erase(ownerLocalPa);
+                    for (int socket = 0; socket < _numSockets; ++socket)
+                        _haRequesterLines.erase({socket, ownerLocalPa});
+                }
                 if (_verboseLog) {
                 DPRINTF(RubyEP, "[RECALL-DIAG] node=%d ReadUnique callback success=%d\n",
                         _nodeId, success);
@@ -2017,18 +2069,6 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
                 resp.ackReceived = success;
                 resp.dataReturned = capturedMsg.dataNeeded &&
                     resp.ackReceived && capturedDataValid;
-                if (capturedMsg.dataNeeded && resp.ackReceived) {
-                    const HALineKey key{capturedMsg.sourceSocket,
-                                        capturedMsg.ownerLocalPa != 0
-                                            ? capturedMsg.ownerLocalPa
-                                            : capturedMsg.linePa};
-                    auto dirty = _haDirtyData.find(key);
-                    if (dirty != _haDirtyData.end()) {
-                        resp.dataReturned = true;
-                        resp.dataPayload = dirty->second;
-                        resp.hasDataPayload = true;
-                    }
-                }
                 if (resp.dataReturned) {
                     if (capturedDataValid && !resp.hasDataPayload)
                         resp.dataPayload = capturedData;
@@ -2099,6 +2139,9 @@ EPBackend::sendRecallResponse(const OuterRecallResponse &response)
     // Store for inspection
     _lastRecallResponse = response;
     _recallResponseSentCount++;
+    _pendingRecalls.erase(std::make_tuple(response.linePa, response.homeNode,
+                                         response.epoch, response.reqId,
+                                         response.sourceSocket));
 
     // NOTE: active recall tracking is NOT cleared here.
     // The SnpCleanInvalid from the RECALL arrives AFTER sendRecallResponse
@@ -2391,7 +2434,9 @@ EPBackend::publishInternalWriteback(uint64_t homePa, uint64_t publicationId,
                                     uint64_t byteMask, const uint8_t *data,
                                     int homeNode, int homeSocket,
                                     int sourceSocket,
-                                    uint64_t &ioWritebackReqId)
+                                    uint64_t &ioWritebackReqId,
+                                    uint64_t parentReqId,
+                                    uint64_t parentEpoch)
 {
     fatal_if(!data || byteMask == 0 || publicationId == 0,
              "EPBackend node_id=%d: invalid internal publication PA=0x%lx "
@@ -2408,7 +2453,18 @@ EPBackend::publishInternalWriteback(uint64_t homePa, uint64_t publicationId,
     return adapter->sendWritebackReq(
         homePa, -1, 0, UBWritebackKind::InternalPublication,
         UBWriteDisposition::MemoryOnly, byteMask, homeNode, homeSocket, data,
-        &ioWritebackReqId);
+        &ioWritebackReqId, parentReqId, parentEpoch);
+}
+
+bool
+EPBackend::getPendingInvalidation(uint64_t localPa, int socket,
+                                  OuterInvalidateMsg &message) const
+{
+    auto it = _pendingInvalidations.find(HALineKey{socket, localPa});
+    if (it == _pendingInvalidations.end() || it->second.complete)
+        return false;
+    message = it->second.message;
+    return true;
 }
 
 bool
@@ -2520,6 +2576,27 @@ EPBackend::handleInvalidationRequest(const OuterInvalidateMsg &invMsg)
                            ? invMsg.sharerLocalPa
                            : invMsg.linePa;
     bool hadLocalCopy = false;
+    const HALineKey invKey{invMsg.sourceSocket, lookupPa};
+    auto pendingInv = _pendingInvalidations.find(invKey);
+    if (pendingInv != _pendingInvalidations.end()) {
+        const auto &original = pendingInv->second.message;
+        // R_I blocks new local accesses, but is NOT proof of CHI completion.
+        if (original.reqId != invMsg.reqId || original.epoch != invMsg.epoch ||
+            original.homeNode != invMsg.homeNode ||
+            original.linePa != invMsg.linePa)
+            return false; // transport retains a different control generation
+        if (!pendingInv->second.complete)
+            return true; // exact retransmission joins the original barrier
+        OuterInvalidationAck ack;
+        ack.linePa = original.linePa;
+        ack.ackNode = _nodeId;
+        ack.homeNode = original.homeNode;
+        ack.sourceSocket = original.sourceSocket;
+        ack.epoch = original.epoch;
+        ack.reqId = original.reqId;
+        if (sendInvalidationAck(ack)) _pendingInvalidations.erase(pendingInv);
+        return true;
+    }
     {
         const HALineKey haKey{invMsg.sourceSocket, lookupPa};
         auto it = _haEndpointEnabled ? _haRequesterLines.find(haKey)
@@ -2614,7 +2691,7 @@ EPBackend::handleInvalidationRequest(const OuterInvalidateMsg &invMsg)
     // is idempotent, so ack immediately. This is the requester-side complement
     // to keeping the home directory's sharer mask fresh: even if a stale sharer
     // slips into the target mask, the invalidation still drains.
-    if (!hadLocalCopy) {
+    if (!hadLocalCopy && !_haEndpointEnabled) {
         if (_verboseLog) {
         DPRINTF(RubyEP, "[INVAL-DIAG] node=%d no local copy PA=0x%lx — immediate ack "
                "(stale sharer)\n",
@@ -2641,20 +2718,35 @@ EPBackend::handleInvalidationRequest(const OuterInvalidateMsg &invMsg)
     if (_epRnfCtrl) {
         // Capture invMsg by value for the callback
         OuterInvalidateMsg capturedMsg = invMsg;
+        _pendingInvalidations.emplace(invKey, PendingInvalidation{invMsg, false});
         if (_verboseLog) {
         DPRINTF(RubyEP, "[INVAL-DIAG] node=%d calling startCleanUnique PA=0x%lx\n",
                 _nodeId, capturedMsg.sharerLocalPa);
         }
         _epRnfCtrl->startCleanUnique(
             capturedMsg.sharerLocalPa,
-            [this, capturedMsg](bool ok) {
+            [this, capturedMsg, invKey](bool ok) {
                 if (_verboseLog) {
                 DPRINTF(RubyEP, "[INVAL-DIAG] node=%d startCleanUnique callback PA=0x%lx ok=%d\n",
                         _nodeId, capturedMsg.linePa, ok);
                 }
-                if (ok && _haEndpointEnabled)
+                fatal_if(!ok,
+                         "InvalidateOnly failed; refusing outer ACK PA=%#lx",
+                         capturedMsg.sharerLocalPa);
+                // HA-only: the invalidation must actually drop this node's copy
+                // so a later local read misses and re-fetches the latest value
+                // from Home. The CHI proxy may scrub only the TBE; deallocate
+                // the L1 line and retire the HA residency/requester metadata.
+                // UBCC keeps its own invalidation bookkeeping and never
+                // registers HA data caches, so it must not enter here.
+                if (_haEndpointEnabled) {
                     invalidateHADataCaches(capturedMsg.sourceSocket,
                                            capturedMsg.sharerLocalPa);
+                    _haNodeResident.erase(capturedMsg.sharerLocalPa);
+                    for (int socket = 0; socket < _numSockets; ++socket)
+                        _haRequesterLines.erase(
+                            {socket, capturedMsg.sharerLocalPa});
+                }
                 OuterInvalidationAck ack;
                 ack.linePa = capturedMsg.linePa;
                 ack.ackNode = _nodeId;
@@ -2662,8 +2754,9 @@ EPBackend::handleInvalidationRequest(const OuterInvalidateMsg &invMsg)
                 ack.sourceSocket = capturedMsg.sourceSocket;
                 ack.epoch = capturedMsg.epoch;
                 ack.reqId = capturedMsg.reqId;
-                sendInvalidationAck(ack);
-            });
+                _pendingInvalidations.at(invKey).complete = true;
+                if (sendInvalidationAck(ack)) _pendingInvalidations.erase(invKey);
+            }, capturedMsg.sourceSocket);
         return true;
     } else {
         fatal("EPBackend node_id=%d: invalidation path requires EP-RNF "

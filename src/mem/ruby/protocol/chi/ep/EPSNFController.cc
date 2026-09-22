@@ -5,6 +5,7 @@
 #include "base/logging.hh"
 #include "debug/RubyCHIGeneric.hh"
 #include "debug/RubyEP.hh"
+#include "debug/RubyEPVerbose.hh"
 #include "mem/ruby/common/DataBlock.hh"
 #include "mem/ruby/protocol/CHI/CHIDataMsg.hh"
 #include "mem/ruby/protocol/CHI/CHIRequestMsg.hh"
@@ -57,6 +58,11 @@ void
 EPSNFController::init()
 {
     EPController::init();
+    DPRINTF(RubyEPVerbose, "[WB-DIAG] stage=ARMED tracePa=0x14030000 node=%d socket=%d\n",
+            _nodeId, _socketId);
+    if (debug::RubyEPVerbose) {
+        trace::output().flush();
+    }
     fatal_if(!_backend, "EP_SNF node_id=%d: no backend attached", _nodeId);
 
     // Phase 1: Store SimObject params into file-local statics.
@@ -108,7 +114,7 @@ EPSNFController::wakeup()
     if (_backend)
         _backend->wakeup();
 
-    processPendingHAWrites();
+    processPendingWrites();
 
     // Q3: Process retry queue — request grants that were previously BUSY
     if (!_retryQueue.empty()) {
@@ -185,10 +191,8 @@ EPSNFController::wakeup()
                                   neededPerm = it->neededPerm,
                                   writeIntent = it->writeIntent,
                                   publishOnData = it->publishOnData] {
-                            if (_backend->haEndpointEnabled()) {
-                                _backend->completeHARemoteGrant(
-                                    linePa, neededPerm, writeIntent, _socketId);
-                            }
+                            // HA InstallAck is emitted by the HN final observer,
+                            // not when the SN merely enqueues its last data beat.
                             if (publishOnData) {
                                 _backend->notifyLocalLinePublished(
                                     linePa, _socketId);
@@ -271,6 +275,20 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
         pending.disposition = static_cast<UBWriteDisposition>(
             msg->m_ubcc_write_disposition);
         pending.internalPublication = msg->m_ubcc_internal_writeback;
+        // The HN's actual InvalidateOnly TBE marks this sub-operation. Capture
+        // the control identity once, before any publication retry; ordinary HN
+        // maintenance on the same PA must never borrow this authorization.
+        if (pending.internalPublication &&
+            msg->m_ep_proxy_op == EpProxyOp_InvalidateOnly &&
+            !_backend->haEndpointEnabled()) {
+            OuterInvalidateMsg parent;
+            fatal_if(!_backend->getPendingInvalidation(
+                         pending.linePa, pending.sourceSocket, parent),
+                     "InvalidateOnly publication has no live control PA=%#lx",
+                     pending.linePa);
+            pending.parentInvalidateReqId = parent.reqId;
+            pending.parentInvalidateEpoch = parent.epoch;
+        }
         fatal_if(msg->m_ubcc_store_auth_valid == pending.internalPublication,
                  "EP_SNF node_id=%d: WriteNoSnp must be exactly one of "
                  "authorized StoreCommit or HN internal publication PA=0x%lx",
@@ -285,7 +303,10 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
                       (pending.internalPublication &&
                        (pending.requesterNode != -1 ||
                         pending.permissionEpoch != 0)) ||
-                      pending.disposition != UBWriteDisposition::MemoryOnly,
+                       (pending.disposition != UBWriteDisposition::MemoryOnly &&
+                        !(pending.internalPublication &&
+                          pending.disposition == UBWriteDisposition::DropOwner &&
+                          msg->m_type == CHIRequestType_WriteNoSnp)),
                  "EP_SNF node_id=%d: invalid StoreCommit authorization "
                  "PA=0x%lx requester=%d disposition=%d", _nodeId,
                  msg->m_addr, pending.requesterNode,
@@ -304,11 +325,25 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
             pending.expectedMask = ~0ULL;
         }
 
-        if (_backend->haEndpointEnabled()) {
-            fatal_if(pending.internalPublication,
-                     "EP_SNF node_id=%d: HN internal WriteNoSnp publication "
-                     "is UBCC-only; HA requires an explicit owner disposition "
-                     "PA=0x%lx", _nodeId, msg->m_addr);
+        // The replacement TBE proves local quiescence; capture this node's
+        // existing permission incarnation, never infer the owner from Home's
+        // current PA lookup. Keep wire-data identity separate from the release
+        // snapshot, since NCBWrData must still match the original CHI request.
+        if (pending.internalPublication &&
+            pending.disposition == UBWriteDisposition::DropOwner &&
+            !_backend->haEndpointEnabled()) {
+            const auto permission = _backend->inspectRequesterState(pending.linePa);
+            if (pending.linePa == 0x14030000)
+                DPRINTF(RubyEPVerbose, "[WB-DIAG] stage=SNF_PERMISSION pa=%#lx node=%d socket=%d valid=%d state=%d epoch=%lu\n", pending.linePa, _nodeId, pending.sourceSocket, permission.valid, permission.state, permission.epoch);
+            if (permission.valid && permission.state ==
+                static_cast<int>(RequesterLineState::R_M)) {
+                pending.replacementOwnerRelease = true;
+                pending.releaseRequester = _nodeId;
+                pending.releaseEpoch = permission.epoch;
+            }
+        }
+
+        if (_backend->haEndpointEnabled() && !pending.internalPublication) {
             pending.haWrite = true;
             fatal_if(!_backend->resolveHAStoreTarget(
                          msg->m_addr, pending.sourceSocket, pending.homePa,
@@ -332,6 +367,16 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
                 pending.homeNode, pending.homeNode,
                 _backend->addrMap().dsmOffset(msg->m_addr),
                 pending.homeSocket);
+        }
+        if (pending.linePa == 0x14030000) {
+            DPRINTF(RubyEPVerbose, "[WB-DIAG] stage=SNF_CREATE pa=%#lx homePA=%#lx node=%d socket=%d home=%d homeSocket=%d txn=%lu dbid=%lu store=%lu internal=%d disposition=%d proxy=%d release=%d requester=%d epoch=%lu releaseRequester=%d releaseEpoch=%lu parent=%lu parentEpoch=%lu mask=%#lx\n",
+                    pending.linePa, pending.homePa, _nodeId, pending.sourceSocket,
+                    pending.homeNode, pending.homeSocket, pending.originalTxnId,
+                    pending.dbid, pending.storeCommitId, pending.internalPublication,
+                    static_cast<int>(pending.disposition), static_cast<int>(msg->m_ep_proxy_op),
+                    pending.replacementOwnerRelease, pending.requesterNode,
+                    pending.permissionEpoch, pending.releaseRequester, pending.releaseEpoch,
+                    pending.parentInvalidateReqId, pending.parentInvalidateEpoch, pending.expectedMask);
         }
         _pendingWrites.emplace(pending.dbid, pending);
 
@@ -598,10 +643,7 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
             pending.onSent = [this, linePa = msg->m_addr, neededPerm,
                               writeIntent,
                               publishOnData = msg->m_ubcc_publish_on_data] {
-                if (_backend->haEndpointEnabled()) {
-                    _backend->completeHARemoteGrant(
-                        linePa, neededPerm, writeIntent, _socketId);
-                }
+                // HA completion waits for HN coherent publication.
                 if (publishOnData) {
                     _backend->notifyLocalLinePublished(linePa, _socketId);
                 }
@@ -845,7 +887,7 @@ EPSNFController::recvDataMsg(const CHIDataMsg *msg)
 }
 
 void
-EPSNFController::processPendingHAWrites()
+EPSNFController::processPendingWrites()
 {
     if (!_backend)
         return;
@@ -870,12 +912,20 @@ EPSNFController::processPendingHAWrites()
                     pending.homeNode, pending.homeSocket,
                     pending.permissionReqId, response, pending.sourceSocket);
             } else {
-                if (pending.internalPublication) {
+                if (pending.replacementOwnerRelease) {
+                    pending.permissionReqId = pending.storeCommitId;
+                    result = _backend->handleWritebackWithMeta(
+                        pending.linePa, false, pending.data,
+                        pending.releaseEpoch, pending.releaseRequester,
+                        pending.sourceSocket, &pending.permissionReqId);
+                } else if (pending.internalPublication) {
                     result = _backend->publishInternalWriteback(
                         pending.homePa, pending.storeCommitId,
                         pending.expectedMask, pending.data, pending.homeNode,
                         pending.homeSocket, pending.sourceSocket,
-                        pending.permissionReqId);
+                        pending.permissionReqId,
+                        pending.parentInvalidateReqId,
+                        pending.parentInvalidateEpoch);
                 } else {
                     result = _backend->commitStore(
                         pending.homePa, pending.requesterNode,
@@ -885,6 +935,8 @@ EPSNFController::processPendingHAWrites()
                         pending.permissionReqId);
                 }
             }
+            if (pending.linePa == 0x14030000 && result != -2)
+                DPRINTF(RubyEPVerbose, "[WB-DIAG] stage=SNF_PERSIST_RESULT pa=%#lx node=%d socket=%d store=%lu req=%lu internal=%d release=%d parent=%lu result=%d\n", pending.linePa, _nodeId, pending.sourceSocket, pending.storeCommitId, pending.permissionReqId, pending.internalPublication, pending.replacementOwnerRelease, pending.parentInvalidateReqId, result);
             if (result == -2) {
                 pendingWork = true;
                 continue;
@@ -894,7 +946,9 @@ EPSNFController::processPendingHAWrites()
             // request for the same line is still active; no data was persisted
             // in that case, so retry the same stable publication identity.
             // StoreCommit rejection remains fatal and exact-identity checked.
-            if (result == 0 && pending.internalPublication) {
+            if (result == 0 && pending.internalPublication &&
+                !pending.replacementOwnerRelease &&
+                pending.parentInvalidateReqId == 0) {
                 pendingWork = true;
                 continue;
             }
@@ -921,7 +975,7 @@ EPSNFController::processPendingHAWrites()
             pending.granted = true;
         }
 
-        publishHAWrite(transactionId, pending);
+        completePendingWrite(transactionId, pending);
     }
 
     if (pendingWork)
@@ -929,20 +983,20 @@ EPSNFController::processPendingHAWrites()
 }
 
 void
-EPSNFController::publishHAWrite(uint64_t transactionId, PendingWrite &pending)
+EPSNFController::completePendingWrite(uint64_t transactionId, PendingWrite &pending)
 {
     fatal_if(!pending.granted || pending.permissionReqId == 0,
              "EP_SNF node_id=%d: publish before persistence PA=0x%lx id=%lu",
              _nodeId, pending.linePa, transactionId);
     pending.completionQueued = true;
 
-    ++_haWritePublishCount;
-    if (_haWritePublishCount <= kHAWriteTraceLimit) {
-        inform("[HA-WRITE-PUBLISH] node=%d pa=0x%lx homePa=0x%lx "
+    ++_writePublishCount;
+    if (_writePublishCount <= kWriteTraceLimit) {
+        inform("[EP-WRITE-PUBLISH] node=%d pa=0x%lx homePa=0x%lx "
                "reqId=%lu publishCount=%lu tick=%lu\n", _nodeId,
                pending.linePa,
                pending.homePa, pending.permissionReqId,
-               _haWritePublishCount, curTick());
+               _writePublishCount, curTick());
     }
 
     NetDest destination(m_ruby_system);
@@ -968,12 +1022,12 @@ EPSNFController::publishHAWrite(uint64_t transactionId, PendingWrite &pending)
                      "EP_SNF node_id=%d: failed to queue HA Write ack id=%lu",
                      _nodeId, transactionId);
         }
-        ++_haWriteAckCount;
-        if (_haWriteAckCount <= kHAWriteTraceLimit) {
-            inform("[HA-WRITE-ACK] node=%d pa=0x%lx reqId=%lu "
+        ++_writeAckCount;
+        if (_writeAckCount <= kWriteTraceLimit) {
+            inform("[EP-WRITE-COMPLETE] node=%d pa=0x%lx reqId=%lu "
                    "reqCount=%lu respCount=%lu ackCount=%lu tick=%lu\n",
-                    _nodeId, done.linePa, done.permissionReqId, _haWriteReqCount,
-                   _haWriteRespCount, _haWriteAckCount, curTick());
+                    _nodeId, done.linePa, done.permissionReqId, _writeReqCount,
+                   _writeRespCount, _writeAckCount, curTick());
         }
         _pendingWrites.erase(it);
     });

@@ -170,7 +170,10 @@ class Sequencer : public RubyPort
                                 bool storeMiss = false);
     int requestHAStorePermission(Addr address, DataBlock& data);
     void completeHAStore(Addr address, DataBlock& data, bool externalHit);
-    void acknowledgeHAPermission(Addr address);
+    // True iff the last HA store grant was permission-only (UseLocal): the
+    // requester owns the singleton latest line and must keep its local value.
+    bool haStoreGrantUseLocal(Addr address) const;
+    void notifyEndpointPublication(Addr address);
 
     virtual int functionalWrite(Packet *func_pkt) override;
 
@@ -303,6 +306,9 @@ class Sequencer : public RubyPort
         int homeSocket = 0;
         bool isWrite = false;
         bool granted = false;
+        // Home granted permission without data: the requester holds the
+        // singleton latest line and must keep its local value.
+        bool useLocal = false;
         uint64_t byteMask = 0;
         DataBlock writeData{64};
     };

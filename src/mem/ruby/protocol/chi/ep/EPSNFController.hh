@@ -55,6 +55,11 @@ class EPSNFController : public EPController
         MachineID requestor;
         bool haWrite = false;
         bool internalPublication = false;
+        uint64_t parentInvalidateReqId = 0;
+        uint64_t parentInvalidateEpoch = 0;
+        bool replacementOwnerRelease = false;
+        int releaseRequester = -1;
+        uint64_t releaseEpoch = 0;
         bool dataComplete = false;
         bool granted = false;
         bool completionQueued = false;
@@ -71,8 +76,8 @@ class EPSNFController : public EPController
     // controller version[47:32], monotonic sequence[31:0].
     uint64_t _nextWriteIdentity = 1;
     uint64_t allocateWriteIdentity();
-    void processPendingHAWrites();
-    void publishHAWrite(uint64_t transactionId, PendingWrite &pending);
+    void processPendingWrites();
+    void completePendingWrite(uint64_t transactionId, PendingWrite &pending);
 
     // Q3: Retry queue for blocked grants
     struct RetryEntry {
@@ -132,12 +137,12 @@ class EPSNFController : public EPController
     bool _verboseLog = false;
 
     // Bounded, cumulative proof markers for HA Write request/response/ack.
-    uint64_t _haWriteReqCount = 0;
-    uint64_t _haWriteRespCount = 0;
-    uint64_t _haWriteAckCount = 0;
-    uint64_t _haWriteAssembledCount = 0;
-    uint64_t _haWritePublishCount = 0;
-    static constexpr uint64_t kHAWriteTraceLimit = 256;
+    uint64_t _writeReqCount = 0;
+    uint64_t _writeRespCount = 0;
+    uint64_t _writeAckCount = 0;
+    uint64_t _writeAssembledCount = 0;
+    uint64_t _writePublishCount = 0;
+    static constexpr uint64_t kWriteTraceLimit = 256;
 };
 
 } // namespace ruby

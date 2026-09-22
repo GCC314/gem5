@@ -233,8 +233,10 @@ Sequencer::requestHAReadPermission(Addr address, DataBlock& data,
     fatal_if(state.isWrite,
              "%s: HA read/write overlap for line %#x", name(), lineAddr);
 
-    if (state.granted)
+    if (state.granted) {
+        data = state.writeData;
         return 2;
+    }
 
     UBHAPermissionRespBody response;
     const int status = m_haEpBackend->requestHAPermission(
@@ -262,7 +264,7 @@ Sequencer::requestHAReadPermission(Addr address, DataBlock& data,
              "%s: successful HA read response lacks 64-byte data for line %#x",
              name(), lineAddr);
     data.setData(response.data, 0, 64);
-    m_haEpBackend->recordHADirtyData(lineAddr, m_haSourceSocket, data);
+    state.writeData = data;
     state.granted = true;
     inform("[HA-SLICC-GATE] seq=%s phase=READ_GRANTED pa=%#x reqId=%lu "
            "epoch=%lu\n", name(), lineAddr, state.reqId, state.epoch);
@@ -310,12 +312,27 @@ Sequencer::requestHAStorePermission(Addr address, DataBlock& data)
             state.byteMask |= 1ULL << (offset + i);
         state.writeData = DataBlock(64);
         state.writeData.setData(pkt);
+        // Preserve the rest of the line from the node's own cache copy. When
+        // this node is the singleton latest holder (Home has no newer line), the
+        // full line must travel to Home so it can persist the merged result
+        // instead of writing a partial line over the authoritative value.
+        if (m_haEpBackend) {
+            DataBlock localLine(64);
+            if (m_haEpBackend->readHADataCacheLine(
+                    m_haSourceSocket, lineAddr, localLine)) {
+                for (unsigned i = 0; i < 64; ++i)
+                    if (!(state.byteMask & (1ULL << i)))
+                        state.writeData.setByte(i, localLine.getByte(i));
+            }
+        }
     }
     fatal_if(!state.isWrite,
              "%s: HA read/write overlap for line %#x", name(), lineAddr);
 
-    if (state.granted)
+    if (state.granted) {
+        data = state.writeData;
         return 2;
+    }
 
     UBHAPermissionRespBody response;
     const int status = m_haEpBackend->requestHAPermission(
@@ -343,17 +360,35 @@ Sequencer::requestHAStorePermission(Addr address, DataBlock& data)
     fatal_if(response.status != HAStatus::Ok,
              "%s: HA write permission denied for line %#x status=%s", name(),
              lineAddr, haStatusName(response.status));
-    fatal_if(!response.hasData,
+    // UseLocal (reserved[0]==1): the requester owns the singleton latest line,
+    // so Home sends no data and the local value must be preserved. Otherwise
+    // the response carries the authoritative final line.
+    const bool useLocal = response.reserved[0] == 1;
+    fatal_if(!useLocal && !response.hasData,
              "%s: successful HA write response lacks final 64-byte data "
              "for line %#x", name(), lineAddr);
-    data.setData(response.data, 0, 64);
+    if (!useLocal) {
+        data.setData(response.data, 0, 64);
+        state.writeData = data;
+    }
     state.granted = true;
+    state.useLocal = useLocal;
     inform("[HA-SLICC-GATE] seq=%s phase=WRITE_GRANTED pa=%#x reqId=%lu "
-           "epoch=%lu\n", name(), lineAddr, state.reqId, state.epoch);
+           "epoch=%lu useLocal=%d\n", name(), lineAddr, state.reqId,
+           state.epoch, useLocal ? 1 : 0);
     return 2;
 #else
     return 0;
 #endif
+}
+
+bool
+Sequencer::haStoreGrantUseLocal(Addr address) const
+{
+    const Addr lineAddr = makeLineAddress(address);
+    auto it = m_haPermissions.find(lineAddr);
+    return it != m_haPermissions.end() && it->second.granted &&
+           it->second.isWrite && it->second.useLocal;
 }
 
 void
@@ -365,15 +400,10 @@ Sequencer::completeHAStore(Addr address, DataBlock& data, bool externalHit)
     // store completes under this permission; any aliases are reissued.
     writeCallback(address, data, externalHit, MachineType_NUM, Cycles(0),
                   Cycles(0), Cycles(0), true);
-    // writeCallback applies the CPU packet bytes to the authoritative final64.
-    // Capture only afterwards so a later HA owner recall returns the actual
-    // dirty line rather than the pre-store permission base.
-    m_haEpBackend->recordHADirtyData(makeLineAddress(address),
-                                     m_haSourceSocket, data);
 }
 
 void
-Sequencer::acknowledgeHAPermission(Addr address)
+Sequencer::notifyEndpointPublication(Addr address)
 {
 #if RUBY_PROTOCOL_CHI
     // Finalize invokes this action for every transaction. Avoid RubyPort's
@@ -1493,13 +1523,7 @@ Sequencer::recordRequestType(SequencerRequestType requestType) {
 void
 Sequencer::evictionCallback(Addr address)
 {
-    if (needsHAPermission(address)) {
-        fatal_if(!m_haEpBackend->handleEvict(makeLineAddress(address)),
-                 "%s: failed to notify HA home of local eviction for line %#x",
-                 name(), makeLineAddress(address));
-        inform("[HA-SLICC-GATE] seq=%s phase=EVICT pa=%#x\n",
-               name(), makeLineAddress(address));
-    }
+    // HA node lifetime is observed at the address-selected HN, not at L1.
     llscClearMonitor(address);
     ruby_eviction_callback(address);
 }

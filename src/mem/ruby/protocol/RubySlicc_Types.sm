@@ -142,7 +142,8 @@ structure (Sequencer, external = "yes") {
   int requestHAReadPermission(Addr, DataBlock, bool);
   int requestHAStorePermission(Addr, DataBlock);
   void completeHAStore(Addr, DataBlock, bool);
-  void acknowledgeHAPermission(Addr);
+  bool haStoreGrantUseLocal(Addr);
+  void notifyEndpointPublication(Addr);
 
   void atomicCallback(Addr, DataBlock);
   void atomicCallback(Addr, DataBlock, bool);

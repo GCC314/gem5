@@ -250,6 +250,9 @@ struct UBWritebackReqBody {
         : kind(UBWritebackKind::OwnerWriteback),
           disposition(UBWriteDisposition::DropOwner), hasData(0), reserved{},
           byteMask(0), data{} {}
+    // Optional InvalidateReq dependency; never an architectural owner epoch.
+    uint64_t parentInvalidateReqId = 0;
+    uint64_t parentInvalidateEpoch = 0;
 };
 
 struct UBWritebackRespBody {
