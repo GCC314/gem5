@@ -4601,12 +4601,22 @@ action(Callback_HAStorePermission, desc="") {
     tbe.actions.push(Event:CheckCacheFill);
     tbe.actions.push(Event:TagArrayWrite);
   } else if (tbe.dataUnique == false) {
-    // A non-fill HA store whose local uniqueness was lost to a recall:
-    // reacquire locally, then run the HA-only reinstall. Never fall through to
-    // Final with the mutation unexecuted.
-    tbe.actions.pushFront(Event:HAStoreReinstall);
-    tbe.actions.pushFront(Event:CheckUpgrade_FromStore);
-    tbe.actions.pushFront(Event:SendCleanUnique);
+    // A shared-line upgrade already owns the typed HA Write grant. Sequencer
+    // has installed Home's authoritative final64 in dataBlk (UseLocal was
+    // handled above). Do not reacquire through CleanUnique: its downstream
+    // ReadNoSnp becomes another HA Read, queued behind this Write's InstallAck,
+    // while this TBE would wait for that Read before reaching publication.
+    // Publish the granted line just as for an HA store-miss fill, including
+    // restoring validity if a recall invalidated the old local copy.
+    tbe.dataBlkValid.fillMask();
+    tbe.dataValid := true;
+    tbe.dataUnique := true;
+    tbe.dataDirty := false;
+    tbe.dataToBeInvalid := false;
+    sequencer.completeHAStore(tbe.addr, tbe.dataBlk, tbe.haStoreExternalHit);
+    tbe.dataDirty := true;
+    tbe.actions.push(Event:CheckCacheFill);
+    tbe.actions.push(Event:TagArrayWrite);
   } else if (tbe.dataValid) {
     // Publish unique ownership only after the typed HA write grant.
     tbe.dataUnique := true;
