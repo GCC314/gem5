@@ -29,17 +29,21 @@ int
 SyncWaitManager::barrierArrive(ThreadContext *tc, uint32_t mask,
                                 uint32_t activeThreads)
 {
-    if (mask == 0)
+    // Bit 31 explicitly identifies portable startup, not an actual plane.
+    // Keep the tagged mask as the state/wire key so ordinary barriers cannot
+    // consume a startup release (or vice versa).
+    const uint32_t planeMask = mask & ~0x80000000u;
+    if (planeMask == 0)
         return -EINVAL;
 
     uint32_t max_valid = (1u << MAX_NODE_COUNT) - 1u;
-    if (mask & ~max_valid)
+    if (planeMask & ~max_valid)
         return -EINVAL;
 
     auto &bs = _barriers[mask];
 
     if (bs.activeThreads == 0)
-        bs.activeThreads = __builtin_popcount(mask) * activeThreads;
+        bs.activeThreads = __builtin_popcount(planeMask) * activeThreads;
 
     // Local-node expected thread count for this barrier generation.
     // The workload supplies the authoritative per-node thread count via the
@@ -62,7 +66,7 @@ SyncWaitManager::barrierArrive(ThreadContext *tc, uint32_t mask,
             localBits |= (1u << _sockets[s].barrierBit);
     }
     if (localBits > 0)
-        crossNode = (mask & ~localBits) != 0;
+        crossNode = (planeMask & ~localBits) != 0;
     bs.crossNode = crossNode;
 
     for (uint32_t &seq : bs.earlyReleases) {
@@ -83,18 +87,24 @@ SyncWaitManager::barrierArrive(ThreadContext *tc, uint32_t mask,
         // per-thread let a node's first arriving thread complete the global
         // barrier before its siblings arrived, desynchronizing `generation`.
         //
-        // If a remote release already arrived for this generation, release
-        // immediately (the local threads were the stragglers).
+        // If a remote release arrived before all local socket threads, retain
+        // it until every local participant reaches this generation. Releasing
+        // the first arrival advances the generation underneath the remaining
+        // socket thread and permanently desynchronizes dual-socket barriers.
         if (bs.remoteReleased) {
-            for (ThreadContext *t : bs.waiting)
-                t->activate();
-            bs.waiting.clear();
-            bs.activeThreads = 0;
-            bs.localExpected = 0;
-            bs.remoteReleased = false;
-            bs.reachedSent = false;
-            bs.crossNode = false;
-            bs.generation++;  // advance generation for next barrier
+            if (bs.waiting.size() >= bs.localExpected) {
+                for (ThreadContext *t : bs.waiting)
+                    t->activate();
+                bs.waiting.clear();
+                bs.activeThreads = 0;
+                bs.localExpected = 0;
+                bs.remoteReleased = false;
+                bs.reachedSent = false;
+                bs.crossNode = false;
+                bs.generation++;  // advance generation for next barrier
+            } else {
+                tc->suspend();
+            }
             return 0;
         }
 
@@ -142,15 +152,22 @@ SyncWaitManager::releaseBarrier(uint32_t mask, uint32_t seq)
     // this process's current waiting generation.
 
     if (seq == bs.generation && (bs.crossNode || !bs.waiting.empty())) {
-        for (ThreadContext *t : bs.waiting)
-            t->activate();
-        bs.waiting.clear();
-        bs.activeThreads = 0;
-        bs.localExpected = 0;
-        bs.remoteReleased = false;
-        bs.reachedSent = false;
-        bs.crossNode = false;
-        bs.generation++;  // advance generation for next barrier
+        // A release may arrive after only the first local socket thread. Keep
+        // it pending until every local participant reaches this generation;
+        // otherwise the late socket thread is inserted into the next barrier.
+        bs.remoteReleased = true;
+        if (bs.localExpected > 0 &&
+            bs.waiting.size() >= bs.localExpected) {
+            for (ThreadContext *t : bs.waiting)
+                t->activate();
+            bs.waiting.clear();
+            bs.activeThreads = 0;
+            bs.localExpected = 0;
+            bs.remoteReleased = false;
+            bs.reachedSent = false;
+            bs.crossNode = false;
+            bs.generation++;  // advance generation for next barrier
+        }
     } else if (seq >= bs.generation) {
         for (uint32_t &saved : bs.earlyReleases) {
             if (saved == seq)

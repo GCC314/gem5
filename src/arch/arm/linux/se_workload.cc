@@ -48,6 +48,7 @@
 #include "base/trace.hh"
 #include "cpu/thread_context.hh"
 #include "mem/se_translating_port_proxy.hh"
+#include "sim/sim_exit.hh"
 #include "sim/syscall_emul.hh"
 #include "sim/sync_wait.hh"
 
@@ -171,6 +172,15 @@ syncWaitFuncOld(SyscallDesc *desc, ThreadContext *tc, uint64_t node_mask)
     int ret = sys->syncWait.barrierArrive(tc,
         static_cast<uint32_t>(node_mask), 2); // legacy: popcount default
     return (ret < 0) ? (int64_t)ret : (int64_t)node_mask;
+}
+
+static SyscallReturn
+switchCpuFunc(SyscallDesc *desc, ThreadContext *tc)
+{
+    inform("[HYBRID-SWITCH-SYSCALL] cpu=%d tick=%lu", tc->cpuId(),
+           curTick());
+    exitSimLoopNow("switchcpu");
+    return 0;
 }
 
 class SyscallTable32 : public SyscallDescTable<EmuLinux::SyscallABI32>
@@ -524,6 +534,7 @@ class SyscallTable32 : public SyscallDescTable<EmuLinux::SyscallABI32>
               {base + 398, "sys_rseq", ignoreFunc},
               {base + 435, "clone3", clone3Func<ArmLinux32>},
                {base + 436, "sync_wait", syncWaitFunc<EmuLinux::SyscallABI32>},
+               {base + 437, "switch_cpu", switchCpuFunc},
           })
     {}
 };
@@ -820,6 +831,7 @@ class SyscallTable64 : public SyscallDescTable<EmuLinux::SyscallABI64>
                {base + 294, "kexec_file_load"},
                {base + 435, "clone3", clone3Func<ArmLinux64>},
                {base + 436, "sync_wait", syncWaitFunc<EmuLinux::SyscallABI64>},
+               {base + 437, "switch_cpu", switchCpuFunc},
                {base + 1024, "open", openFunc<ArmLinux64>},
                {base + 1025, "link"},
                {base + 1026, "unlink", unlinkFunc},

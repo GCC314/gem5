@@ -332,6 +332,14 @@ machine(MachineType:Cache, "Cache coherency protocol") :
     ReadNoSnp,                   desc="", in_trans="yes";
     ReadOnce,                    desc="", in_trans="yes";
     CleanUnique,                 desc="", in_trans="yes";
+    // UBCC invalidate-first: an InvalidateOnly proxy CleanUnique arriving
+    // while a pre-grant demand TBE owns the line. Runs the control on a
+    // snoop TBE (hazard) so the demand's protocol debt is preserved in place.
+    CleanUnique_Hazard,          desc="", in_trans="yes";
+    // UBCC invalidate-first: resume a demand that was suspended under a
+    // control hazard. Restores to BUSY_BLKD so both a pre-ReadNoSnp demand
+    // (SendReadNoSnp) and a post-ReadNoSnp demand (SendCompData) can continue.
+    RestoreDemandHazard,         desc="", in_trans="yes";
     MakeReadUnique,              desc="", in_trans="yes";
     Evict,                       desc="", in_trans="yes";
     WriteBackFull,               desc="", in_trans="yes";
@@ -786,6 +794,15 @@ machine(MachineType:Cache, "Cache coherency protocol") :
     bool requestorToBeOwner,          desc="Sets dir_ownerExists";
     bool requestorToBeExclusiveOwner, desc="Sets dir_ownerIsExcl";
     // NOTE: requestor always added to dir_sharers if updateDirOnCompAck is set
+
+    // UBCC invalidate-first: a demand suspended under a control hazard. Its
+    // late data/responses are buffered but not processed until the control
+    // hands the directory back (so the invalidation ACK is never premature).
+    bool ubccDemandFrozen, default="false", desc="Demand suspended under UBCC control hazard";
+    // Set if late data arrived while frozen: the demand was pre-grant and must
+    // be re-driven (fresh outer request) after the control, never installed
+    // behind the invalidation ACK.
+    bool ubccDemandRedrive, default="false", desc="Frozen demand received pre-grant data";
 
     // Set for incoming snoop requests
     bool snpNeedsData,  desc="Set if snoop requires data as response";

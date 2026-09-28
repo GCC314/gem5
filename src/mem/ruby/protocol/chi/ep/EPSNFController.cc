@@ -332,7 +332,9 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
         if (pending.internalPublication &&
             pending.disposition == UBWriteDisposition::DropOwner &&
             !_backend->haEndpointEnabled()) {
-            const auto permission = _backend->inspectRequesterState(pending.linePa);
+            auto permission = _backend->inspectRecallCustody(pending.linePa);
+            if (!permission.valid)
+                permission = _backend->inspectRequesterState(pending.linePa);
             if (pending.linePa == 0x14030000)
                 DPRINTF(RubyEPVerbose, "[WB-DIAG] stage=SNF_PERMISSION pa=%#lx node=%d socket=%d valid=%d state=%d epoch=%lu\n", pending.linePa, _nodeId, pending.sourceSocket, permission.valid, permission.state, permission.epoch);
             if (permission.valid && permission.state ==
@@ -494,6 +496,10 @@ EPSNFController::recvRequestMsg(const CHIRequestMsg *msg)
         DPRINTF(RubyCHIGeneric,
                 "EP_SNF node_id=%d: grant BUSY for PA=0x%lx, queuing retry\n",
                 _nodeId, msg->m_addr);
+        warn("[DIAG-SNF-RETRY] node=%d PA=0x%lx grantResult=%d neededPerm=%d "
+             "writeIntent=%d retryQ=%zu tick=%llu\n",
+             _nodeId, msg->m_addr, grantResult, neededPerm, (int)writeIntent,
+             _retryQueue.size() + 1, (unsigned long long)curTick());
         EPSNFController::RetryEntry entry;
         entry.linePa = msg->m_addr;
         entry.neededPerm = neededPerm;

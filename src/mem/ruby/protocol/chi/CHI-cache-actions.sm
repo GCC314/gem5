@@ -317,6 +317,59 @@ action(Initiate_Request, desc="") {
   incomingTransactionStart(address, curTransitionEvent(), initial, was_retried);
 }
 
+// UBCC invalidate-first: run an EP proxy control request (CleanUnique
+// InvalidateOnly) as a snoop-TBE hazard over a suspended, pre-grant demand.
+// The demand req TBE stays allocated in TBEs[addr]; its dir/cache state and
+// protocol debt are untouched. The control sees the live directory and, on
+// completion, RestoreFromHazard copies the post-invalidation directory back.
+action(Initiate_Request_Hazard, desc="") {
+  assert(is_valid(tbe));
+  assert(tbe.is_req_tbe);
+  TBE demand_tbe := tbe;
+  // The proxy request reserved a request-TBE slot; the control runs on a
+  // snoop TBE instead, so release the request reservation and take a snoop
+  // reservation. Availability was checked before triggering this event.
+  storTBEs.decrementReserved();
+  storSnpTBEs.incrementReserved();
+  bool was_retried := false;
+  peek(reqRdyPort, CHIRequestMsg) {
+    set_tbe(allocateSnoopTBEForReq(address, in_msg));
+    was_retried := in_msg.allowRetry == false;
+  }
+  assert(tbe.is_snp_tbe);
+
+  tbe.is_req_hazard := true;
+  // Freeze the demand: its late data/responses are buffered (routed to the
+  // demand TBE) but ProcessNextState is suppressed until the control completes.
+  demand_tbe.ubccDemandFrozen := true;
+  tbe.wakeup_pending_req := demand_tbe.wakeup_pending_req;
+  tbe.wakeup_pending_snp := demand_tbe.wakeup_pending_snp;
+  tbe.wakeup_pending_tgr := demand_tbe.wakeup_pending_tgr;
+  demand_tbe.wakeup_pending_req := false;
+  demand_tbe.wakeup_pending_snp := false;
+  demand_tbe.wakeup_pending_tgr := false;
+
+  copyCacheAndDirTBEs(demand_tbe, tbe);
+  // Refresh the live directory: the control must invalidate actual sharers,
+  // not the demand's older snapshot.
+  DirEntry dir_entry := getDirEntry(address);
+  if (is_valid(dir_entry)) {
+    tbe.dir_sharers := dir_entry.sharers;
+    tbe.dir_owner := dir_entry.owner;
+    tbe.dir_ownerExists := dir_entry.ownerExists;
+    tbe.dir_ownerIsExcl := dir_entry.ownerIsExcl;
+  } else {
+    tbe.dir_sharers.clear();
+    tbe.dir_ownerExists := false;
+  }
+  tbe.dataToBeInvalid := false;
+  tbe.doCacheFill := false;
+  tbe.use_DMT := false;
+  tbe.use_DCT := false;
+
+  tbe.actions.pushNB(Event:TagArrayRead);
+}
+
 action(Initiate_Request_DVM, desc="") {
   peek(reqRdyPort, CHIRequestMsg) {
     // "address" for DVM = transaction ID
@@ -406,6 +459,9 @@ action(RestoreFromHazard, desc="") {
 
   deallocateSnpTBE(tbe);
   set_tbe(hazard_tbe);
+  // UBCC invalidate-first: unfreeze the resumed demand so it processes any
+  // data buffered during the control hazard.
+  tbe.ubccDemandFrozen := false;
 
   // if the pending request is a WB or Evict then it becomes a stale request
   // if data is no longer in the expected state
@@ -423,6 +479,24 @@ action(RestoreFromHazard, desc="") {
 
   // a pending action from the original request may have been stalled during
   // the hazard and needs to wakeup up now
+  wakeupPendingTgrs(tbe);
+}
+
+// UBCC invalidate-first: resume a demand suspended under a control hazard.
+// Copies only the control's post-invalidation directory back; the demand's
+// buffered data and its own protocol debt are preserved.
+action(RestoreDemandHazard, desc="") {
+  assert(is_valid(tbe));
+  assert(tbe.is_snp_tbe);
+  assert(tbe.is_req_hazard);
+  TBE demand_tbe := getHazardTBE(tbe);
+  copyDirTBEs(tbe, demand_tbe);
+  demand_tbe.wakeup_pending_req := tbe.wakeup_pending_req;
+  demand_tbe.wakeup_pending_snp := tbe.wakeup_pending_snp;
+  demand_tbe.wakeup_pending_tgr := tbe.wakeup_pending_tgr;
+  deallocateSnpTBE(tbe);
+  set_tbe(demand_tbe);
+  tbe.ubccDemandFrozen := false;
   wakeupPendingTgrs(tbe);
 }
 
@@ -2596,6 +2670,16 @@ action(ExpectNCBWrData_A, desc="") {
   // Thus the mask bits do not care
 }
 
+// UBCC invalidate-first: a control (CleanUnique InvalidateOnly) that ran as a
+// snoop-TBE hazard over a suspended demand must hand the post-invalidation
+// directory back to the demand TBE only after its own protocol completion
+// (CompAck). This never fires for ordinary requests (is_req_hazard == false).
+action(MaybeRestoreHazard, desc="") {
+  if (is_valid(tbe) && tbe.is_req_hazard) {
+    tbe.actions.push(Event:RestoreDemandHazard);
+  }
+}
+
 action(ExpectCompAck, desc="") {
   assert(is_valid(tbe));
   tbe.expected_req_resp.addExpectedRespType(CHIResponseType:CompAck);
@@ -4353,7 +4437,11 @@ action(Pop_SeqInPort, desc="") {
 
 action(ProcessNextState, desc="") {
   assert(is_valid(tbe));
-  processNextState(address, tbe, cache_entry);
+  // A demand frozen under a UBCC control hazard buffers its late
+  // data/responses; it resumes only when the control restores it.
+  if (tbe.ubccDemandFrozen == false) {
+    processNextState(address, tbe, cache_entry);
+  }
 }
 
 action(ProcessNextState_ClearPending, desc="") {

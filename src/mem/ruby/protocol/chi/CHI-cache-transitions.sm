@@ -392,6 +392,25 @@ transition({I, SC, UC, SD, UD, RU, RSC, RSD, RUSD, RUSC,
   ProcessNextState;
 }
 
+// UBCC invalidate-first: an InvalidateOnly proxy CleanUnique arrives while a
+// pre-grant demand TBE owns the line (BUSY_INTR). Run the control on a snoop
+// TBE as a hazard; the demand's TBE, actions and protocol debt are preserved.
+transition({BUSY_INTR, BUSY_BLKD}, CleanUnique_Hazard, BUSY_BLKD) {
+  Initiate_Request_Hazard;
+  Initiate_CleanUnique;
+  Pop_ReqRdyQueue;
+  ProcessNextState;
+}
+
+// Resume the demand after its control hazard completed (CompAck received).
+// Target BUSY_BLKD: the demand's own action queue then picks the correct
+// next transition (SendReadNoSnp pre-grant, SendCompData post-grant).
+transition(BUSY_BLKD, RestoreDemandHazard, BUSY_BLKD) {
+  Pop_TriggerQueue;
+  RestoreDemandHazard;
+  ProcessNextState;
+}
+
 transition({I, SC, UC, SD, UD, RU, RSC, RSD, RUSD, RUSC,
             SC_RSC, SD_RSD, SD_RSC, UC_RSC, UC_RU, UD_RU, UD_RSD, UD_RSC},
             CleanUnique_Stale, BUSY_BLKD) {
@@ -1623,6 +1642,7 @@ transition({BUSY_BLKD,BUSY_INTR}, CompAck) {
   Receive_ReqResp;
   UpdateDirState_FromReqResp;
   Pop_RespInQueue;
+  MaybeRestoreHazard;
   ProcessNextState;
 }
 

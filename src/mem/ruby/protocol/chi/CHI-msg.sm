@@ -48,6 +48,7 @@ enumeration(EpProxyOp, desc="EP-RNF proxy operation type (gem5 internal only)") 
   NoProxyOp;
   InvalidateOnly;
   RecallUnique;
+  RecallShared;
 }
 
 enumeration(CHIRequestType, desc="") {

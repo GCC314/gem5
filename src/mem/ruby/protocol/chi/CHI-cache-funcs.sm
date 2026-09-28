@@ -91,6 +91,14 @@ DirEntry getDirEntry(Addr addr), return_by_pointer = "yes" {
 
 State getState(TBE tbe, CacheEntry cache_entry, Addr addr) {
   if (is_valid(tbe)) {
+      // Only a parked HA permission callback is interruptible here. Its
+      // unmodified, transaction-owned line must be available to a Home recall
+      // while the CPU waits for that very permission. Reuse the CHI hazard
+      // TBE path rather than publishing a software snapshot or faking an Ack.
+      if (tbe.state == State:BUSY_BLKD &&
+          tbe.pendAction == Event:HAStorePermission) {
+        return State:BUSY_INTR;
+      }
       return tbe.state;
   } else if (is_valid(cache_entry)) {
     return cache_entry.state;
@@ -571,6 +579,41 @@ TBE allocateSnoopTBE(Addr addr, CHIRequestMsg in_msg), return_by_pointer="yes" {
   return tbe;
 }
 
+// UBCC invalidate-first: allocate a snoop TBE to run an EP proxy control
+// request (CleanUnique InvalidateOnly) as a hazard over a suspended demand.
+// The snoop-TBE storage slot is reserved by the caller.
+TBE allocateSnoopTBEForReq(Addr addr, CHIRequestMsg in_msg), return_by_pointer="yes" {
+  storSnpTBEs.decrementReserved();
+  assert(storSnpTBEs.areNSlotsAvailable(1));
+
+  snpTBEs.allocate(addr);
+  TBE tbe := snpTBEs[addr];
+  initializeTBE(tbe, addr, storSnpTBEs.addEntryToNewSlot());
+
+  assert(tbe.is_req_tbe == false);
+  assert(tbe.is_repl_tbe == false);
+  assert(tbe.is_dvm_tbe == false);
+  assert(tbe.is_dvm_snp_tbe == false);
+  tbe.is_snp_tbe := true;
+
+  tbe.accAddr := addr;
+  tbe.accSize := blockSize;
+  tbe.requestor := in_msg.requestor;
+  tbe.fwdRequestor := in_msg.fwdRequestor;
+  tbe.reqType := in_msg.type;
+  tbe.txnId := in_msg.txnId;
+  tbe.ubccIngressSocket := in_msg.ubcc_ingress_socket;
+  tbe.epProxyOp := in_msg.ep_proxy_op;
+  tbe.snpNeedsData := in_msg.retToSrc;
+  tbe.is_local_pf := in_msg.is_local_pf;
+  tbe.is_remote_pf := in_msg.is_remote_pf;
+
+  tbe.use_DMT := false;
+  tbe.use_DCT := false;
+
+  return tbe;
+}
+
 TBE allocateDvmSnoopTBE(Addr txnId, CHIRequestMsg in_msg), return_by_pointer="yes" {
   // We must have reserved resources for this allocation
   storDvmSnpTBEs.decrementReserved();
@@ -823,6 +866,7 @@ void prepareRequestRetry(TBE tbe, CHIRequestMsg & out_msg) {
   out_msg.ubcc_store_requester := tbe.pendReqUbccStoreRequester;
   out_msg.ubcc_permission_epoch := tbe.pendReqUbccPermissionEpoch;
   out_msg.ubcc_write_disposition := tbe.pendReqUbccWriteDisposition;
+  out_msg.ep_proxy_op := tbe.epProxyOp;
 }
 
 void prepareRequestRetryDVM(TBE tbe, CHIRequestMsg & out_msg) {
@@ -1101,6 +1145,17 @@ void copyCacheAndDirTBEs(TBE src, TBE dst) {
   printTBEState(dst);
 }
 
+// UBCC invalidate-first: copy only the directory from a completed control
+// back to the resumed demand, preserving the demand's own (buffered) data.
+void copyDirTBEs(TBE src, TBE dst) {
+  assert(is_valid(src));
+  assert(is_valid(dst));
+  dst.dir_sharers := src.dir_sharers;
+  dst.dir_owner := src.dir_owner;
+  dst.dir_ownerExists := src.dir_ownerExists;
+  dst.dir_ownerIsExcl := src.dir_ownerIsExcl;
+}
+
 void deallocateReqTBE(TBE tbe) {
   assert(is_valid(tbe));
   assert(tbe.is_req_tbe);
@@ -1237,7 +1292,8 @@ State makeFinalState(TBE tbe, CacheEntry cache_entry, DirEntry dir_entry) {
   // any local owner/sharer rights after completion.
   if (epRnfMachineVersion >= 0 &&
       tbe.requestor == tbe.epRnfMachineID &&
-      tbe.epProxyOp != EpProxyOp:NoProxyOp) {
+      tbe.epProxyOp != EpProxyOp:NoProxyOp &&
+      tbe.epProxyOp != EpProxyOp:RecallShared) {
     return State:I;
   }
 

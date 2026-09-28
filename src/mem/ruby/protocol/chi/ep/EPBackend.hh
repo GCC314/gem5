@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <array>
 #include <map>
+#include <set>
 #include <string>
 #include <tuple>
 #include <vector>
@@ -447,6 +448,8 @@ class EPBackend : public SimObject
      * @return          True if recall was accepted/processed
      */
     bool handleRecallRequest(const OuterRecallMsg &recallMsg);
+    // Access may already be revoked while a replacement still owns dirty data.
+    RequesterLineSnapshot inspectRecallCustody(uint64_t localPa) const;
 
     /**
      * Send a recall response back to the home UBCC.
@@ -575,7 +578,11 @@ class EPBackend : public SimObject
     int publishInternalWriteback(uint64_t homePa, uint64_t publicationId,
                                  uint64_t byteMask, const uint8_t *data,
                                  int homeNode, int homeSocket, int sourceSocket,
-                                 uint64_t &ioWritebackReqId);
+                                 uint64_t &ioWritebackReqId,
+                                 uint64_t parentReqId = 0,
+                                 uint64_t parentEpoch = 0);
+    bool getPendingInvalidation(uint64_t localPa, int socket,
+                                OuterInvalidateMsg &message) const;
 
     /**
      * Called by EPSNFController when HN-F completes a WriteNoSnp write
@@ -835,9 +842,8 @@ class EPBackend : public SimObject
                                  int sourceSocket = 0);
     void recordHAInstall(uint64_t localLinePa, HAOperation operation,
                          uint64_t permissionEpoch, int homeNode,
-                         uint64_t reqId, int sourceSocket);
-    void recordHADirtyData(uint64_t localLinePa, int sourceSocket,
-                           const DataBlock &data);
+                            uint64_t reqId, int sourceSocket);
+    void observeHAHomeFinal(Addr localLinePa, int homeSocket, bool present);
     void registerHADataCache(int sourceSocket, CacheMemory *cache);
     void invalidateHADataCaches(int sourceSocket, uint64_t localLinePa);
     bool hasHADataCacheLine(int sourceSocket, uint64_t localLinePa) const;
@@ -912,9 +918,21 @@ class EPBackend : public SimObject
     // ---- M5: Requester-Side Bookkeeping ----
     // Per-line entries tracking global permissions for remote DSM lines.
     std::map<uint64_t, RequesterLineEntry> _requesterLines;
+    struct RecallCustody {
+        RequesterLineSnapshot permission;
+        uint64_t reqId = 0;
+        bool persisted = false;
+        bool waiting = false;
+        OuterRecallResponse response;
+    };
+    std::map<uint64_t, RecallCustody> _recallCustody;
+    void completeRecallResponse(uint64_t localPa,
+                                const OuterRecallResponse &response);
     using HALineKey = std::pair<int, uint64_t>;
     std::map<HALineKey, RequesterLineEntry> _haRequesterLines;
-    std::map<HALineKey, DataBlock> _haDirtyData;
+    // Exact HN-observed resident addresses, bounded by physical HN cache and
+    // directory capacity. No data or stale per-L1 absence inference here.
+    std::set<Addr> _haNodeResident;
     std::vector<std::vector<CacheMemory *>> _haDataCachesBySocket;
     uint64_t _epochCounter = 0;
 
@@ -931,6 +949,8 @@ class EPBackend : public SimObject
     // ---- M6: Recall message envelopes ----
     OuterRecallMsg _lastRecallMsg;
     OuterRecallResponse _lastRecallResponse;
+    // Exact in-flight wire identity; a retry must not replace its callback.
+    std::set<std::tuple<uint64_t, int, uint64_t, uint64_t, int>> _pendingRecalls;
 
     // ---- M6: Recall counters ----
     uint64_t _recallReceivedCount;
@@ -1035,6 +1055,12 @@ class EPBackend : public SimObject
                                acceptedPending(false) {}
     };
     std::map<uint64_t, PendingUpgradeTxn> _pendingUpgradeTxns;
+
+    struct PendingInvalidation {
+        OuterInvalidateMsg message;
+        bool complete = false;
+    };
+    std::map<HALineKey, PendingInvalidation> _pendingInvalidations;
 
     // InvalidateReqs that arrived while a SnpCleanInvalid-upgrade was held.
     // They are deferred until the held snoop is resolved (SnpResp_I sent),

@@ -1900,6 +1900,24 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
         }
     }
 
+    // Preserve dirty custody BEFORE revoking access. EPSNF may receive an
+    // already-issued replacement only after this recall has changed R_M to I/S.
+    // The payload stays in native CHI/EPSNF storage, never in this descriptor.
+    if (!_haEndpointEnabled) {
+        const auto permission = inspectRequesterState(observedPa);
+        if (permission.valid && permission.state ==
+                static_cast<int>(RequesterLineState::R_M)) {
+            fatal_if(permission.epoch != recallMsg.epoch ||
+                         _recallCustody.count(observedPa),
+                     "Recall dirty custody incarnation mismatch PA=%#lx",
+                     observedPa);
+            RecallCustody custody;
+            custody.permission = permission;
+            custody.reqId = recallMsg.reqId;
+            _recallCustody.emplace(observedPa, custody);
+        }
+    }
+
     // ---- M7: Update requester-side bookkeeping ----
     // Recall result split:
     //   - Read recall → old owner downgrades to shared (R_S)
@@ -1950,7 +1968,7 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
         // R2: Clear stale recall capture data before initiating new recall
         setRecallCaptureData(DataBlock(64), false);
         _epRnfCtrl->startReadShared(ownerLocalPa,
-            [this, capturedMsg](bool success, const DataBlock &capturedData,
+            [this, capturedMsg, ownerLocalPa](bool success, const DataBlock &capturedData,
                                 bool capturedDataValid) {
                 if (_verboseLog) {
                 DPRINTF(RubyEP, "[RECALL-DIAG] node=%d ReadShared callback success=%d valid=%d\n",
@@ -2015,7 +2033,7 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
                         }
                     }
                 }
-                sendRecallResponse(resp);
+                completeRecallResponse(ownerLocalPa, resp);
             });
     } else {
         // Write recall: ReadUnique with RecallUnique proxy op
@@ -2110,13 +2128,49 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
                         }
                     }
                 }
-                sendRecallResponse(resp);
+                completeRecallResponse(ownerLocalPa, resp);
             });
     }
 
     // Return true: recall initiated asynchronously.
     // The callback will send the response to the home UBCC.
     return true;
+}
+
+RequesterLineSnapshot
+EPBackend::inspectRecallCustody(uint64_t localPa) const
+{
+    auto it = _recallCustody.find(localPa);
+    if (it != _recallCustody.end() && !it->second.persisted)
+        return it->second.permission;
+    RequesterLineSnapshot empty{};
+    empty.valid = false;
+    return empty;
+}
+
+void
+EPBackend::completeRecallResponse(uint64_t localPa,
+                                  const OuterRecallResponse &response)
+{
+    auto it = _recallCustody.find(localPa);
+    if (it != _recallCustody.end()) {
+        auto &custody = it->second;
+        fatal_if(custody.permission.epoch != response.epoch ||
+                     custody.reqId != response.reqId,
+                 "Recall completion changed custody PA=%#lx", localPa);
+        if (!response.dataReturned && !custody.persisted) {
+            // HN miss is not proof of persistence: the replacement payload can
+            // still be travelling to EPSNF. Keep the exact recall pending until
+            // OwnerWriteback's ACK proves Home has published those bytes.
+            custody.response = response;
+            custody.waiting = true;
+            inform("[RECALL-CUSTODY-WAIT] node=%d PA=%#lx epoch=%lu reqId=%lu\n",
+                   _nodeId, localPa, response.epoch, response.reqId);
+            return;
+        }
+        _recallCustody.erase(it);
+    }
+    sendRecallResponse(response);
 }
 
 bool
@@ -2380,7 +2434,21 @@ EPBackend::handleWritebackWithMeta(uint64_t line_pa, bool keepAsClean,
     auto it = _requesterLines.find(line_pa);
     if (ok) {
         _writebackCount++;
-        if (it != _requesterLines.end()) {
+        if (!_haEndpointEnabled) {
+            auto custody = _recallCustody.find(line_pa);
+            if (custody != _recallCustody.end() &&
+                custody->second.permission.epoch == epochVal &&
+                requesterNode == _nodeId && dirtyData) {
+                custody->second.persisted = true;
+                if (custody->second.waiting) {
+                    const auto response = custody->second.response;
+                    inform("[RECALL-CUSTODY-PUBLISHED] node=%d PA=%#lx epoch=%lu reqId=%lu\n",
+                           _nodeId, line_pa, epochVal, response.reqId);
+                    completeRecallResponse(line_pa, response);
+                }
+            }
+        }
+        if (it != _requesterLines.end() && it->second.epoch == epochVal) {
             if (keepAsClean) {
                 // Owner retains clean exclusive (G_E)
                 it->second.state = RequesterLineState::R_E;
@@ -2710,6 +2778,25 @@ EPBackend::handleInvalidationRequest(const OuterInvalidateMsg &invMsg)
         ack.reqId = invMsg.reqId;
         sendInvalidationAck(ack);
         return true;
+    }
+
+    // [DIAG] dense state dump at the invalidation decision point (diagnostic
+    // only; no behaviour change). Captures the exact local state that decides
+    // whether we immediate-ack (no local copy) or take the CleanUnique barrier.
+    {
+        int rs = -1;
+        auto lg = _requesterLines.find(lookupPa);
+        if (lg != _requesterLines.end()) rs = static_cast<int>(lg->second.state);
+        int held = _epRnfCtrl ? (int)_epRnfCtrl->hasHeldUpgrade(lookupPa) : -1;
+        warn("[DIAG-INVAL] node=%d lookupPa=0x%lx homePa=0x%lx reqId=%llu epoch=%llu "
+             "hadLocalCopy=%d reqState=%d pendingRead=%d pendingInval=%d deferred=%d held=%d tick=%llu\n",
+             _nodeId, lookupPa, invMsg.linePa,
+             (unsigned long long)invMsg.reqId, (unsigned long long)invMsg.epoch,
+             (int)hadLocalCopy, rs,
+             (int)_pendingReadTxns.count(invMsg.linePa),
+             (int)_pendingInvalidations.count(invKey),
+             (int)_deferredInvalidationReqs.count(lookupPa),
+             held, (unsigned long long)curTick());
     }
 
     // ---- v4 (§4.2.4): FIXED — use EP-RNF.startCleanUnique, wait for

@@ -639,7 +639,8 @@ UBAdapter::sendWritebackReq(uint64_t homePa, int requesterNode,
                              uint64_t epochVal, UBWritebackKind kind,
                              UBWriteDisposition disposition, uint64_t byteMask,
                              int homeNode, int homeSocket,
-                             const uint8_t *dirtyData, uint64_t *ioReqId)
+                             const uint8_t *dirtyData, uint64_t *ioReqId,
+                             uint64_t parentReqId, uint64_t parentEpoch)
 {
     if (!_port) {
         fatal("UBAdapter node=%d socket=%d: sendWritebackReq called with no transport bound\n",
@@ -660,8 +661,14 @@ UBAdapter::sendWritebackReq(uint64_t homePa, int requesterNode,
     auto ready = _readyResponses.find(responseKey);
     if (ready != _readyResponses.end()) {
         bool success = ready->second.b.writebackResp.success;
+        const bool deferred = ready->second.h.flags &
+            static_cast<uint32_t>(CFLAG_DEFERRED);
         _readyResponses.erase(ready);
         _inflightWritebackReqs.erase(reqId);
+        if (deferred) {
+            fatal_if(success, "deferred writeback cannot be successful");
+            return -2;
+        }
         return success ? 1 : 0;
     }
     if (_inflightWritebackReqs.count(reqId))
@@ -688,6 +695,8 @@ UBAdapter::sendWritebackReq(uint64_t homePa, int requesterNode,
     req.b.writebackReq.kind = kind;
     req.b.writebackReq.disposition = disposition;
     req.b.writebackReq.byteMask = byteMask;
+    req.b.writebackReq.parentInvalidateReqId = parentReqId;
+    req.b.writebackReq.parentInvalidateEpoch = parentEpoch;
     fatal_if(kind == UBWritebackKind::OwnerWriteback &&
                  (byteMask != ~0ULL ||
                   (disposition != UBWriteDisposition::DropOwner &&

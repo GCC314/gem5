@@ -92,7 +92,8 @@ class UBAdapter : public SimObject
                           UBWriteDisposition disposition, uint64_t byteMask,
                           int homeNode, int homeSocket,
                          const uint8_t *dirtyData = nullptr,
-                         uint64_t *ioReqId = nullptr);
+                         uint64_t *ioReqId = nullptr,
+                         uint64_t parentReqId = 0, uint64_t parentEpoch = 0);
 
     int sendEvictReq(uint64_t homePa, int evictingNode,
                      uint64_t epochVal, int homeNode, int homeSocket);

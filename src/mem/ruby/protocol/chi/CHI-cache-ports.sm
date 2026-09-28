@@ -87,6 +87,15 @@ in_port(rspInPort, CHIResponseMsg, rspIn, rank=10,
                 nullCacheEntry(), tbe);
       } else {
         TBE tbe := getCurrentActiveTBE(in_msg.addr);
+        // UBCC invalidate-first: during a control hazard the demand TBE (not
+        // the control) owns all non-CompAck responses, so late demand data is
+        // buffered instead of being misrouted to the control.
+        if (is_valid(tbe) && tbe.is_snp_tbe && tbe.is_req_hazard &&
+            in_msg.type != CHIResponseType:CompAck) {
+          tbe := getHazardTBE(tbe);
+          // Late demand response while frozen ⇒ pre-grant; force a re-drive.
+          tbe.ubccDemandRedrive := true;
+        }
         DPRINTF(RubySlicc, "RSPIN: %s type=%s addr=%#x has_tbe=%d\n",
                 machineID, in_msg.type, in_msg.addr, is_valid(tbe));
         trigger(respToEvent(in_msg.type, tbe), in_msg.addr,
@@ -113,8 +122,16 @@ in_port(datInPort, CHIDataMsg, datIn, rank=9,
       // count up to block_size (64) instead of data_channel_size (32).
       // EPSNF sends a single 64B CompData with fillMask().
       assert(in_msg.bitMask.count() <= blockSize);
+      TBE dtbe := getCurrentActiveTBE(in_msg.addr);
+      // UBCC invalidate-first: route late demand data to the demand TBE
+      // (buffered while frozen) during a control hazard.
+      if (is_valid(dtbe) && dtbe.is_snp_tbe && dtbe.is_req_hazard) {
+        dtbe := getHazardTBE(dtbe);
+        // Late demand data while frozen ⇒ pre-grant; force a re-drive.
+        dtbe.ubccDemandRedrive := true;
+      }
       trigger(dataToEvent(in_msg.type), in_msg.addr,
-              getCacheEntry(in_msg.addr), getCurrentActiveTBE(in_msg.addr));
+              getCacheEntry(in_msg.addr), dtbe);
     }
   }
 }
@@ -325,6 +342,7 @@ in_port(reqRdyPort, CHIRequestMsg, reqRdy, rank=3,
         TBE tbe := getCurrentActiveTBE(in_msg.addr);
 
         DirEntry dir_entry := getDirEntry(in_msg.addr);
+        bool ubccHazardTriggered := false;
 
         // Special case for possibly stale writebacks or evicts
         if (in_msg.type == CHIRequestType:WriteBackFull) {
@@ -348,14 +366,42 @@ in_port(reqRdyPort, CHIRequestMsg, reqRdy, rank=3,
             trigger(Event:Evict_Stale, in_msg.addr, cache_entry, tbe);
           }
         } else if (in_msg.type == CHIRequestType:CleanUnique) {
-          if (is_invalid(dir_entry) ||
-              (dir_entry.sharers.isElement(in_msg.requestor) == false)) {
+          // An invalidate-only proxy is not a CPU permission upgrade: the
+          // configured EP need not hold a tracked copy, even in an empty dir.
+          bool invalidateOnlyProxy := (epRnfMachineVersion >= 0 &&
+                in_msg.requestor == createMachineID(
+                    MachineType:Cache, intToID(epRnfMachineVersion)) &&
+                in_msg.ep_proxy_op == EpProxyOp:InvalidateOnly);
+          if (!invalidateOnlyProxy &&
+              (is_invalid(dir_entry) ||
+               (dir_entry.sharers.isElement(in_msg.requestor) == false))) {
             trigger(Event:CleanUnique_Stale, in_msg.addr, cache_entry, tbe);
+          } else if (invalidateOnlyProxy && is_valid(tbe) && tbe.is_req_tbe &&
+                     tbe.epProxyOp == EpProxyOp:NoProxyOp &&
+                     tbe.state == State:BUSY_BLKD &&
+                     tbe.pendReqType == CHIRequestType:null &&
+                     tbe.dataValid == false &&
+                     tbe.expected_snp_resp.hasExpected() == false &&
+                     tbe.snd_pendEv == false &&
+                     storSnpTBEs.areNSlotsAvailable(1)) {
+            // UBCC invalidate-first (stage-1 only): the line is owned by a
+            // demand that has not yet issued its outer request, so no data can
+            // be in flight. Run the control as a snoop-TBE hazard so the
+            // demand yields instead of deadlocking with Home. Stage-2 (outer
+            // request already issued) is intentionally NOT hazarded: a
+            // pre-grant inner read must complete before the outer invalidate.
+            DPRINTF(RubySlicc,
+                    "[UBCC-CU-HAZARD] addr=%#x demandReq=%d activeReq=%d\n",
+                    in_msg.addr, tbe.reqType, tbe.pendReqType);
+            trigger(Event:CleanUnique, in_msg.addr, cache_entry, tbe);
+            ubccHazardTriggered := true;
           }
         }
 
         // Normal request path
-        trigger(reqToEvent(in_msg.type, in_msg.is_local_pf), in_msg.addr, cache_entry, tbe);
+        if (!ubccHazardTriggered) {
+          trigger(reqToEvent(in_msg.type, in_msg.is_local_pf), in_msg.addr, cache_entry, tbe);
+        }
       }
     }
   }
@@ -385,7 +431,10 @@ in_port(reqInPort, CHIRequestMsg, reqIn, rank=2,
       assert(!in_msg.usesTxnId);
       DPRINTF(RubySlicc, "[NF-REQIN-ARRIVE] addr=%#x type=%d allowRetry=%d\n",
         in_msg.addr, in_msg.type, in_msg.allowRetry);
-      if (in_msg.allowRetry) {
+      if (in_msg.ep_proxy_op != EpProxyOp:NoProxyOp) {
+        trigger(Event:AllocProxyRequest, in_msg.addr,
+              getCacheEntry(in_msg.addr), getCurrentActiveTBE(in_msg.addr));
+      } else if (in_msg.allowRetry) {
         trigger(Event:AllocRequest, in_msg.addr,
               getCacheEntry(in_msg.addr), getCurrentActiveTBE(in_msg.addr));
       } else {
@@ -396,8 +445,8 @@ in_port(reqInPort, CHIRequestMsg, reqIn, rank=2,
   }
 }
 bool reqInPort_rsc_stall_handler() {
-  error("reqInPort must never stall\n");
-  return false;
+  reqInPort.recycle(clockEdge(), cyclesToTicks(stall_recycle_lat));
+  return true;
 }
 
 

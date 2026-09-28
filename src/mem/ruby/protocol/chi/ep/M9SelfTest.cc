@@ -115,7 +115,7 @@ static_assert(static_cast<uint8_t>(cc::glob::UBWriteDisposition::MemoryOnly) == 
               static_cast<uint8_t>(cc::glob::UBWriteDisposition::DropOwner) == 1 &&
               static_cast<uint8_t>(cc::glob::UBWriteDisposition::KeepClean) == 2,
               "writeback disposition wire values changed");
-static_assert(sizeof(cc::glob::UBWritebackReqBody) == 80,
+static_assert(sizeof(cc::glob::UBWritebackReqBody) == 96,
               "writeback request wire body must remain 80 bytes");
 static_assert(offsetof(cc::glob::UBWritebackReqBody, kind) == 0 &&
               offsetof(cc::glob::UBWritebackReqBody, disposition) == 1 &&
