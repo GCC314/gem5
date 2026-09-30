@@ -340,6 +340,24 @@ EPBackend::recordHAInstall(uint64_t localLinePa, HAOperation operation,
     fatal_if(sourceSocket < 0 || sourceSocket >= _numSockets,
              "EPBackend node_id=%d: invalid HA install socket=%d PA=0x%lx",
              _nodeId, sourceSocket, localLinePa);
+    // Home tracks participants by node and excludes the entire requesting
+    // node from its write invalidations. HA stores install the granted line
+    // without a local CleanUnique (which would recurse into the outstanding
+    // Home transaction). Retire sibling-socket copies at publication instead,
+    // before InstallAck lets Home service another request. Keep the writer's
+    // freshly installed cache line and the node-wide residency intact.
+    if (operation == HAOperation::Write) {
+        for (int socket = 0;
+             socket < static_cast<int>(_haDataCachesBySocket.size()); ++socket) {
+            if (socket == sourceSocket)
+                continue;
+            for (CacheMemory *cache : _haDataCachesBySocket[socket]) {
+                if (cache->isTagPresent(localLinePa))
+                    cache->deallocate(localLinePa);
+            }
+            _haRequesterLines.erase({socket, localLinePa});
+        }
+    }
     RequesterLineEntry entry{};
     entry.lineAddr = localLinePa;
     entry.state = operation == HAOperation::Write
@@ -401,17 +419,20 @@ EPBackend::observeHAHomeFinal(Addr localLinePa, int homeSocket, bool present)
 }
 
 void
-EPBackend::invalidateHADataCaches(int sourceSocket, uint64_t localLinePa)
+EPBackend::invalidateHADataCaches(uint64_t localLinePa)
 {
-    // HA-only helper. No HA data cache is registered outside the HA endpoint
-    // profile, so an empty/unbound socket is a no-op rather than a fault.
-    if (sourceSocket < 0 ||
-        sourceSocket >= static_cast<int>(_haDataCachesBySocket.size())) {
-        return;
-    }
-    for (CacheMemory *cache : _haDataCachesBySocket[sourceSocket]) {
-        if (cache->isTagPresent(localLinePa))
-            cache->deallocate(localLinePa);
+    // HA-only helper. HA residency (`_haNodeResident`) is tracked per node,
+    // but the real data caches are registered per socket. A node-wide recall
+    // or invalidate must therefore drop the line from every socket of this
+    // node, not only the socket that happened to deliver the outer message;
+    // otherwise a sibling socket keeps a stale copy and later local reads
+    // observe old data (exposed on dual-socket nodes). No HA data cache is
+    // registered outside the HA endpoint profile, so an empty table is a no-op.
+    for (const auto &caches : _haDataCachesBySocket) {
+        for (CacheMemory *cache : caches) {
+            if (cache->isTagPresent(localLinePa))
+                cache->deallocate(localLinePa);
+        }
     }
 }
 
@@ -560,7 +581,7 @@ EPBackend::handleHAPresenceProbeRequest(const CoherenceMessage &request,
                 localPa, [this, targetSocket, localPa,
                           complete = std::move(complete)](bool ok) mutable {
                     if (ok)
-                        invalidateHADataCaches(targetSocket, localPa);
+                        invalidateHADataCaches(localPa);
                     complete(ok);
                 }, targetSocket);
         }
@@ -2062,8 +2083,7 @@ EPBackend::handleRecallRequest(const OuterRecallMsg &recallMsg)
                 // proxy scrubs the TBE, but the L1 line may survive; deallocate
                 // it and retire the HA residency/probe metadata.
                 if (_haEndpointEnabled) {
-                    invalidateHADataCaches(capturedMsg.sourceSocket,
-                                           ownerLocalPa);
+                    invalidateHADataCaches(ownerLocalPa);
                     _haNodeResident.erase(ownerLocalPa);
                     for (int socket = 0; socket < _numSockets; ++socket)
                         _haRequesterLines.erase({socket, ownerLocalPa});
@@ -2827,8 +2847,7 @@ EPBackend::handleInvalidationRequest(const OuterInvalidateMsg &invMsg)
                 // UBCC keeps its own invalidation bookkeeping and never
                 // registers HA data caches, so it must not enter here.
                 if (_haEndpointEnabled) {
-                    invalidateHADataCaches(capturedMsg.sourceSocket,
-                                           capturedMsg.sharerLocalPa);
+                    invalidateHADataCaches(capturedMsg.sharerLocalPa);
                     _haNodeResident.erase(capturedMsg.sharerLocalPa);
                     for (int socket = 0; socket < _numSockets; ++socket)
                         _haRequesterLines.erase(

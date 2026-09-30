@@ -845,7 +845,7 @@ class EPBackend : public SimObject
                             uint64_t reqId, int sourceSocket);
     void observeHAHomeFinal(Addr localLinePa, int homeSocket, bool present);
     void registerHADataCache(int sourceSocket, CacheMemory *cache);
-    void invalidateHADataCaches(int sourceSocket, uint64_t localLinePa);
+    void invalidateHADataCaches(uint64_t localLinePa);
     bool hasHADataCacheLine(int sourceSocket, uint64_t localLinePa) const;
     bool readHADataCacheLine(int sourceSocket, uint64_t localLinePa,
                              DataBlock &data) const;
